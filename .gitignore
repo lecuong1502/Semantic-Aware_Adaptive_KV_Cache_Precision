@@ -1,1 +1,12 @@
 graduation_thesis/
+.venv/
+# Build artifacts
+build/
+dist/
+*.egg-info/
+_skbuild/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
