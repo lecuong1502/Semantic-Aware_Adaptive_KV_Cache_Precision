@@ -1,17 +1,17 @@
 """RMSNorm against a float64 NumPy reference.
 
-Tolerances come from ADR-0006: max relative error < 2e-3, mean < 2e-4.
+Tolerances come from ADR-0006, stated in ulps of the kernel's output format:
+max relative error < 4 ulp, mean < 1 ulp. This kernel writes fp16, whose largest
+relative ulp is 2^-11.
 
 **There are two roundings, not one.** The kernel's domain is fp16, which is what
 the engine stores, but Seam B's surface is fp32 NumPy. So arbitrary fp32 input
 is rounded on the way in, and the result is rounded again on store. The kernel
 itself accumulates in fp32 and contributes no error of its own beyond that.
 
-Most tests below therefore use fp16-exact inputs, which isolates the kernel by
-removing the input rounding the *caller* caused. That is a deliberate narrowing
-and it is declared rather than hidden: `test_arbitrary_fp32_input_*` measures the
-unnarrowed case, and one of them is an expected failure against ADR-0006's mean
-bound. See #3.
+Both cases are measured. `make_case` uses fp16-exact inputs, which isolates the
+kernel by removing the rounding the *caller* caused; `make_case_fp32` uses the
+contract Seam B actually advertises. Both are held to the same gate.
 
 On the error measure: rounding to fp16 is relative for normal values and bounded
 by 2^-11 ~ 4.9e-4. Below fp16's smallest normal (6.104e-5) values are subnormal
@@ -26,8 +26,14 @@ import pytest
 from microinfer import _microinfer
 
 FP16_MIN_NORMAL = 6.103515625e-05
-MAX_REL = 2e-3
-MEAN_REL = 2e-4
+
+#: Largest relative ulp of fp16. Derived, never hardcoded: ADR-0006 states the
+#: per-kernel tolerances in ulps of the *output* format, so a future kernel
+#: writing fp32 inherits a proportionally tighter bound automatically.
+FP16_REL_ULP = 2.0**-11  # 4.8828125e-04
+
+MAX_REL = 4 * FP16_REL_ULP  # 1.953e-03
+MEAN_REL = 1 * FP16_REL_ULP  # 4.883e-04
 EPS = 1e-6
 
 
@@ -92,27 +98,16 @@ def test_row_count_is_a_parameter(rows):
     assert_within_gate(*make_case(rows, 128, seed=rows))
 
 
-def test_arbitrary_fp32_input_still_meets_the_max_bound():
-    x, w = make_case_fp32(128, 896)
-    err = relative_error(_microinfer.rmsnorm(x, w, EPS), reference_rmsnorm(x, w, EPS))
-    assert err.max() < MAX_REL, f"max relative error {err.max():.3e}"
+@pytest.mark.parametrize("hidden", [128, 896, 1536])
+def test_arbitrary_fp32_input_meets_the_gate(hidden):
+    """The contract Seam B advertises, with both roundings in play.
 
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ADR-0006's mean bound of 2e-4 is unreachable when arbitrary fp32 input "
-        "is rounded into the kernel's fp16 domain and the result is rounded "
-        "again on store. Measured mean is ~2.9e-4 across hidden sizes, against a "
-        "theoretical floor of ~1.8e-4 for a single fp16 rounding. This is a "
-        "property of two roundings, not of the implementation. Raised on #3: "
-        "either Seam B's contract becomes fp16, or ADR-0006's mean bound is "
-        "amended for kernels whose output dtype is fp16. Strict, so this fails "
-        "loudly if the situation changes."
-    ),
-)
-def test_arbitrary_fp32_input_meets_the_adr_0006_mean_bound():
-    assert_within_gate(*make_case_fp32(128, 896))
+    This was a strict xfail while ADR-0006's mean bound stood at 2e-4, which is
+    0.41 ulp — only 14% above the floor a single fp16 rounding produces, and so
+    unreachable for a value rounded twice. The ADR is now stated in ulps and the
+    case passes on its merits.
+    """
+    assert_within_gate(*make_case_fp32(128, hidden, seed=hidden))
 
 
 def test_rows_are_independent():

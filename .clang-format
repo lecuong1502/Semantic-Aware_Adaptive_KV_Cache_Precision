@@ -1,0 +1,33 @@
+# The style this repo's C++/CUDA uses. Chosen to agree with what the editor in
+# use already produces — Allman braces, two-space indent, indented namespaces,
+# pointers bound right — so that saving a file does not churn the diff.
+#
+# The one place it goes further than the editor: the editor enforces no column
+# limit, so indenting a block silently pushed comments past 80 columns. This
+# config rewraps them.
+#
+# Format everything before committing:
+#
+#     clang-format -i $(git ls-files '*.cu' '*.cpp' '*.h')
+#
+# Verified idempotent against clang-format 23.1.1: running it twice leaves the
+# sources byte-identical.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+BreakBeforeBraces: Allman
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+NamespaceIndentation: All
+ColumnLimit: 80
+PointerAlignment: Right
+ReferenceAlignment: Right
+FixNamespaceComments: true
+AccessModifierOffset: -2
+
+# Include order is meaningful here: CUDA headers, then the standard library,
+# then this project's own. Leave the author's grouping alone.
+SortIncludes: false
+IncludeBlocks: Preserve
