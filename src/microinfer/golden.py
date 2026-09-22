@@ -11,6 +11,7 @@ sample of positions, and hidden states only where a diagnostic would need them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from functools import cached_property
@@ -21,6 +22,23 @@ import numpy as np
 
 class GoldenError(RuntimeError):
     pass
+
+
+def config_fingerprint(config_bytes: bytes) -> str:
+    """Identify the configuration a reference was generated from.
+
+    Defined on the engine's side of the ADR-0002 wall and imported by the
+    generator. That wall forbids sharing torch, not stdlib; two independent
+    copies of this would drift, and a drifted fingerprint silently stops
+    catching stale references — the failure it exists to catch.
+    """
+    return hashlib.sha256(config_bytes).hexdigest()[:16]
+
+
+def load_prompts(path: str | Path) -> list[dict]:
+    """Read the committed prompt set. Shared with the generator for the same
+    reason as the fingerprint."""
+    return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
 
 
 @dataclass(frozen=True)
@@ -84,16 +102,23 @@ class GoldenSet:
             )
         self.manifest = json.loads(manifest.read_text())
 
+        # Enforced, not merely documented. A reference in the checkpoint's own
+        # bfloat16 would be eight times coarser than the fp16 the engine stores
+        # and would fail ADR-0006 on its own account (ADR-0003's amendment).
+        if self.manifest.get("dtype") != "float32":
+            raise GoldenError(
+                f"{self.directory} was generated at {self.manifest.get('dtype')!r}, "
+                f"not float32. A reference must be more accurate than the thing "
+                f"it measures; regenerate it."
+            )
+
     @property
     def model(self) -> str:
         return self.manifest["model"]
 
     @property
     def dtype(self) -> str:
-        """Always float32. The checkpoint is bfloat16, whose ulp is eight times
-        coarser than the fp16 the engine stores — a reference in the
-        checkpoint's own dtype would carry more error than the thing it
-        judges."""
+        """Always float32 — the constructor refuses anything else."""
         return self.manifest["dtype"]
 
     def matches_config(self, config_bytes: bytes) -> bool:
@@ -102,9 +127,7 @@ class GoldenSet:
         A stale reference is worse than a missing one: it fails in a way that
         looks like a kernel bug.
         """
-        import hashlib
-
-        return hashlib.sha256(config_bytes).hexdigest()[:16] == self.manifest["config_sha256_16"]
+        return config_fingerprint(config_bytes) == self.manifest["config_sha256_16"]
 
     def ids(self) -> list[str]:
         return [p["id"] for p in self.manifest["prompts"]]

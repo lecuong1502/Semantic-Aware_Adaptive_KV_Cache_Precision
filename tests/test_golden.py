@@ -53,12 +53,30 @@ def test_reading_golden_tensors_does_not_pull_in_torch():
     assert "torch" not in sys.modules
 
 
-def test_the_generator_asks_for_float32_explicitly():
+def test_the_generator_loads_the_model_as_float32():
     """The checkpoint is bfloat16. Loading it at its own dtype would make the
-    reference eight times coarser than the engine it judges."""
-    source = GENERATOR.read_text()
-    assert "torch.float32" in source
-    assert "bfloat16" not in source.split('"""')[2] or True  # only in prose
+    reference eight times coarser than the engine it judges (ADR-0003).
+
+    Checked against the call in the AST rather than by grepping the file, so a
+    mention of float32 in a comment cannot satisfy it.
+    """
+    tree = ast.parse(GENERATOR.read_text())
+    loads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "from_pretrained"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "AutoModelForCausalLM"
+    ]
+    assert len(loads) == 1, "expected exactly one model load to inspect"
+
+    dtype = next((kw for kw in loads[0].keywords if kw.arg in ("dtype", "torch_dtype")), None)
+    assert dtype is not None, "the model is loaded without an explicit dtype"
+    assert ast.unparse(dtype.value) == "torch.float32", (
+        f"the model is loaded as {ast.unparse(dtype.value)}, not torch.float32"
+    )
 
 
 # -- the prompt set ---------------------------------------------------------
@@ -147,7 +165,19 @@ def test_hidden_states_are_shaped_for_the_per_layer_diagnostic():
     with_hidden = [i for i in golden if i.hidden_states is not None]
     assert with_hidden, "no prompt carries hidden states; the diagnostic has nothing to use"
     for item in with_hidden:
-        layers, seq, hidden = item.hidden_states.shape
+        layers, positions, hidden = item.hidden_states.shape
         assert layers == cfg.num_hidden_layers + 1, "embedding output plus one per layer"
-        assert seq == len(item)
         assert hidden == cfg.hidden_size
+        # At the sampled positions, aligned with the logits, so a red gate at a
+        # sampled position has a per-layer trace for that same position.
+        assert positions == len(item.logit_positions)
+
+
+def test_hidden_states_reach_the_long_prompts():
+    """Where a first-diverging layer is most likely to show — RoPE at high
+    positions, and cache precision — is exactly where the diagnostic is needed."""
+    golden = require_golden()
+    groups = {
+        p["group"] for p in golden.manifest["prompts"] if p["has_hidden_states"]
+    }
+    assert "adversarial" in groups, "only short prompts carry the diagnostic"

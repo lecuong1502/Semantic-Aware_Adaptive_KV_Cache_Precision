@@ -70,16 +70,26 @@ a description of code that does not exist.
 This ADR said golden tensors are "stored", and #6 had to decide what that meant
 in practice. They are **not committed**. `tests/golden/` is ignored.
 
-The figures, once they existed to measure:
+The figures, measured on both models after the storage layout settled:
 
-| | measured | |
-|---|---:|---|
-| Qwen2.5-0.5B, 24 prompts | 108.8 MiB | 83.5 logits + 25.2 hidden states |
-| Qwen2.5-1.5B, projected | 133.7 MiB | hidden states scale with layers and width |
-| both | **242 MiB** | |
+| | total | logits | hidden states |
+|---|---:|---:|---:|
+| Qwen2.5-0.5B, 24 prompts | 206.1 MiB | 193.6 | 12.5 |
+| Qwen2.5-1.5B, 24 prompts | 218.4 MiB | 193.6 | 24.8 |
+| both | **424.5 MiB** | | |
 
-That is already more than the repository should carry, and git keeps every
-regeneration forever — changing one prompt would add another 242 MiB to history
+Logits dominate and cannot be reduced further without weakening the gate: a
+distribution over Qwen2.5's 151,936-token vocabulary is 608 KiB, and 334 sampled
+positions is what ADR-0006's KL term is computed over.
+
+An earlier layout stored hidden states at every position rather than at the
+sampled ones and came to 909.5 MiB, 76% of it activations for three long
+prompts. Sampling them cut that to 37 MiB across both models without changing
+the question the diagnostic answers, which is *which layer* diverged rather than
+at which position.
+
+424 MiB is more than the repository should carry, and git keeps every
+regeneration forever — changing one prompt would add another 424 MiB to history
 permanently, with no way to reclaim it short of rewriting the repo.
 
 The trade this accepts is real and should be stated rather than glossed. A clean

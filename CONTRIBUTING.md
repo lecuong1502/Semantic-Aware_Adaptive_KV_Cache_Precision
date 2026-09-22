@@ -136,13 +136,18 @@ the GPU can take video memory, and VRAM taken by the reference generator is
 indistinguishable at the NVML reading from the external contention RQ2 exists to
 measure. `torch.cuda.is_available()` must be `False` in that environment.
 
-Two properties of the output are load-bearing:
+Three properties of the output are load-bearing:
 
 - **It is generated in fp32, never in the checkpoint's bfloat16.** bf16's
   relative ulp is `2^-8`, eight times coarser than the fp16 the engine stores. A
   bf16 reference would carry more error than the implementation it judges and
   would exceed ADR-0006's own 4-ulp bound before the engine rounded once.
-- **It is not committed.** 242 MiB across both models, and git keeps every
+- **Its KL term is a sample.** Top-1 agreement is exact — an argmax is stored at
+  every position. Mean KL needs whole distributions, which are 608 KiB each, so
+  full logits are kept at 16 positions per prompt and the gate's KL is the mean
+  over those. ADR-0006's second amendment records that the sample size is a
+  storage budget rather than a measurement, and makes validating it part of #12.
+- **It is not committed.** 424 MiB across both models, and git keeps every
   regeneration forever. `GoldenSet` refuses with the command that would make
   one, and tests skip rather than fail. The manifest hashes the `config.json`
   it was generated from, so a stale reference is caught rather than mistaken for

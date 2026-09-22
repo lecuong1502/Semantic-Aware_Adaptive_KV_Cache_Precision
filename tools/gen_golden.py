@@ -19,48 +19,93 @@ float64.
 every position of every prompt would be gigabytes. What ADR-0006 actually needs
 is narrower:
 
-- top-1 agreement at *every* position — an argmax per position is enough, and
-  costs four bytes;
-- mean KL over a *sample* of positions — that needs full distributions, so full
-  logits are kept for a handful of deterministically chosen positions;
-- a per-layer diagnostic that names the first layer to diverge — needed only
-  when the gate is already red, so hidden states are kept for a few short
-  prompts rather than for all of them.
+- **Top-1 agreement at every position.** An argmax per position satisfies it in
+  four bytes, so this term of the gate is exact.
+- **Mean KL.** This needs whole distributions, and a whole distribution is
+  151,936 floats. ADR-0006 defines the term over a stated sample for that
+  reason; this file supplies the sample, it does not redefine the gate.
+- **A per-layer diagnostic** naming the first layer to diverge. Wanted only once
+  the gate is already red. Kept for a subset of prompts, and within those only
+  at the sampled positions: the question is which *layer* went wrong, which
+  needs every layer at a few positions rather than every position.
+
+**Top-k truncation was tried and rejected**, because it looks obviously right
+and is not. Storing only the most probable tokens per position would have made
+every position affordable. Measured on the real 0.5B references, the probability
+mass outside the top 2048 tokens reaches **0.35** at the least certain
+positions — the model is genuinely uncertain early in a prompt, and a truncated
+distribution would corrupt KL far past the 1e-3 bound. Recorded here because the
+idea is attractive enough that someone will propose it again.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 REPO = Path(__file__).resolve().parent.parent
 
-#: Full logits are kept at this many positions per prompt, for the KL term.
-LOGIT_SAMPLES = 8
+# The fingerprint and the prompt loader are shared with the engine's reader
+# rather than reimplemented, because two copies of a fingerprint drift and a
+# drifted fingerprint silently stops catching stale references.
+#
+# Loaded by path, not as `microinfer.golden`, and that detail is the ADR-0002
+# wall showing itself. Importing the package runs its __init__, which loads the
+# CUDA extension — and this environment deliberately has no CUDA extension and
+# no GPU-capable torch. golden.py itself imports only the standard library and
+# NumPy, so loading the module alone is safe.
+def _load_shared():
+    spec = importlib.util.spec_from_file_location(
+        "_microinfer_golden_shared", REPO / "src" / "microinfer" / "golden.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    # Registered before execution: @dataclass resolves its own module through
+    # sys.modules, and a module loaded by path is not there unless put there.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
-#: Hidden states are kept only for prompts in these groups — enough to localise
-#: a divergence without storing a gigabyte of activations.
-HIDDEN_GROUPS = {"short"}
+
+_shared = _load_shared()
+config_fingerprint = _shared.config_fingerprint
+load_prompts = _shared.load_prompts
+
+#: Positions per prompt at which full logits are kept, for ADR-0006's KL term.
+#:
+#: Not derived from a measurement, because the measurement is not available yet:
+#: KL is between this reference and the engine, and the engine does not produce
+#: logits until #12. ADR-0006's amendment records that and makes validating this
+#: number part of that ticket. Until then it is a storage budget — 16 positions
+#: across 24 prompts is roughly 230 MiB per model.
+LOGIT_SAMPLES = 16
+
+#: Hidden states are kept only for prompts in these groups.
+#:
+#: `adversarial` is here deliberately. A first-diverging layer is most likely to
+#: show on a long prompt, where RoPE at high positions and cache precision
+#: actually bite — so keeping the diagnostic only for short prompts would leave
+#: a red gate on a long one with nothing to localise it.
+HIDDEN_GROUPS = {"short", "adversarial"}
 
 
 def sample_positions(length: int, count: int) -> np.ndarray:
-    """Positions to keep full logits for: deterministic, and always including
-    the last, which is the one that decides the next token."""
+    """Positions to keep full logits for: deterministic, evenly spaced, and
+    always including the last, which is the one that decides the next token."""
     if length <= count:
         return np.arange(length, dtype=np.int32)
-    return np.unique(np.linspace(0, length - 1, count).round().astype(np.int32))
-
-
-def config_fingerprint(model_dir: Path) -> str:
-    """So a regenerated reference can be told apart from a stale one."""
-    return hashlib.sha256((model_dir / "config.json").read_bytes()).hexdigest()[:16]
+    positions = np.linspace(0, length - 1, count).round().astype(np.int32)
+    # Spacing above one makes these strictly increasing; asserted rather than
+    # de-duplicated, so a change to the spacing rule fails loudly.
+    assert np.all(np.diff(positions) > 0), "sampled positions must be distinct"
+    return positions
 
 
 def generate(model_dir: Path, prompts_path: Path, out_dir: Path, seed: int) -> None:
@@ -72,17 +117,19 @@ def generate(model_dir: Path, prompts_path: Path, out_dir: Path, seed: int) -> N
     model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
     model.eval()
 
-    prompts = [json.loads(line) for line in prompts_path.read_text().splitlines() if line.strip()]
+    prompts = load_prompts(prompts_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = {
         "model": model_dir.name,
-        "config_sha256_16": config_fingerprint(model_dir),
+        "config_sha256_16": config_fingerprint((model_dir / "config.json").read_bytes()),
         "dtype": "float32",
         "checkpoint_dtype": json.loads((model_dir / "config.json").read_text())["torch_dtype"],
+        # Recorded for reproducibility, though a forward pass under no_grad with
+        # no sampling has no stochastic step for it to govern today.
         "seed": seed,
         "torch": torch.__version__,
-        "transformers": __import__("transformers").__version__,
+        "transformers": transformers.__version__,
         "logit_samples": LOGIT_SAMPLES,
         "hidden_groups": sorted(HIDDEN_GROUPS),
         "prompts": [],
@@ -104,8 +151,16 @@ def generate(model_dir: Path, prompts_path: Path, out_dir: Path, seed: int) -> N
             "logits": logits[positions].numpy().astype(np.float32),
         }
         if out.hidden_states is not None:
-            # (layers + 1, seq, hidden) — the first entry is the embedding output.
-            arrays["hidden_states"] = torch.stack(out.hidden_states)[:, 0].numpy().astype(np.float32)
+            # (layers + 1, len(positions), hidden); the first entry is the
+            # embedding output.
+            #
+            # Kept at the sampled positions only, not at every one. The
+            # diagnostic's job is to name the first layer that diverges, which
+            # needs every *layer* at a few positions — not every position. At
+            # every position the long prompts cost 691 MiB across both models,
+            # against 51 MiB this way, and the question it answers is the same.
+            stacked = torch.stack(out.hidden_states)[:, 0]
+            arrays["hidden_states"] = stacked[:, positions].numpy().astype(np.float32)
 
         path = out_dir / f"{prompt['id']}.npz"
         np.savez(path, **arrays)

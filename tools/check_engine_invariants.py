@@ -21,8 +21,15 @@ ESCAPE = "invariant-ok"
 # would report that reservation as used memory — indistinguishable from the
 # external contention RQ2 measures. It belongs only to the offline golden
 # tensor generator under tools/, which runs in its own environment.
-TORCH = re.compile(r"^\s*(?:import\s+torch\b|from\s+torch[\s.]|import\s+transformers\b|from\s+transformers[\s.])")
-TORCH_SCOPE = ("src/", "tests/")
+TORCH = re.compile(
+    r"^\s*(?:import\s+torch\b|from\s+torch[\s.]"
+    r"|import\s+transformers\b|from\s+transformers[\s.])"
+)
+
+#: The only file permitted to import torch. An allowlist rather than a list of
+#: forbidden directories, so the rule matches what CONTRIBUTING claims: one file
+#: in the whole repository, not "anywhere outside src/ and tests/".
+TORCH_ALLOWED = frozenset({"tools/gen_golden.py"})
 
 # CONTEXT.md. The unit is a `page` and the mapping is a `page table`; vLLM calls
 # them blocks. CUDA's own blockIdx, blockDim and thread-block vocabulary is a
@@ -55,10 +62,11 @@ def main(argv: list[str]) -> int:
             if ESCAPE in line:
                 continue
 
-            if scoped(name, TORCH_SCOPE) and TORCH.search(line):
+            if name not in TORCH_ALLOWED and TORCH.search(line):
                 failures.append(
-                    f"{name}:{n}: ADR-0002 — torch/transformers must not be imported "
-                    f"where the engine runs; it belongs in tools/ only\n    {line.strip()}"
+                    f"{name}:{n}: ADR-0002 — torch and transformers may be imported "
+                    f"in {' or '.join(sorted(TORCH_ALLOWED))} and nowhere else\n"
+                    f"    {line.strip()}"
                 )
 
             if scoped(name, VOCAB_SCOPE) and VOCAB.search(line):
