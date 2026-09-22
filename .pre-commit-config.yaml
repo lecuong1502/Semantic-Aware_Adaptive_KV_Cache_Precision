@@ -1,0 +1,46 @@
+# Runs on `git commit`. Install once with:
+#
+#     pip install -e ".[dev]"
+#     pre-commit install
+#
+# Tests are deliberately not run here. They need the CUDA extension built and a
+# visible GPU, so a hook that ran them would block a commit made from a machine
+# without one — and the whole point of a commit hook is that it is cheap enough
+# never to be worth skipping.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # docs_research/ is the author's own research record, corrected by its
+      # author (see issue #4). A hook does not get to rewrite it.
+      - id: trailing-whitespace
+        exclude: ^docs_research/
+      - id: end-of-file-fixer
+        exclude: ^docs_research/
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: check-added-large-files
+        # Golden tensors are stored (ADR-0002), but a stray model checkpoint is
+        # not something to discover after a push.
+        args: ["--maxkb=2048"]
+
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: clang-format (C++ / CUDA)
+        # Pinned to the same version as the dev extra, so the hook and a manual
+        # run cannot disagree about what the style is.
+        entry: clang-format -i
+        language: python
+        additional_dependencies: ["clang-format==23.1.1"]
+        types_or: [c++, cuda]
+
+      - id: engine-invariants
+        name: "engine invariants (ADR-0002, CONTEXT.md vocabulary)"
+        # `script`, not `system`: system would need a `python` on PATH, and
+        # Ubuntu ships only `python3`. The shebang settles it.
+        entry: tools/check_engine_invariants.py
+        language: script
+        pass_filenames: true
+        types_or: [python, c++, cuda, text]

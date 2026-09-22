@@ -9,4 +9,3 @@ __pycache__/
 *.py[cod]
 *.so
 .pytest_cache/
-

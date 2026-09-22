@@ -134,15 +134,47 @@ through triage; triage is for issues that arrive raw.
 `ready-for-human` means it. Issue #4 corrects the author's own research notes,
 and an agent should not silently rewrite someone's research record.
 
-## Formatting
+## Formatting and the commit hook
 
-`.clang-format` at the repo root is the C++/CUDA style. Format before
-committing:
+Install once, after cloning:
 
 ```bash
 pip install -e ".[dev]"
+pre-commit install
+```
+
+`.pre-commit-config.yaml` then runs on every `git commit`: whitespace hygiene,
+`clang-format` over C++ and CUDA, and two project-specific guards described
+below. To format by hand without committing:
+
+```bash
 clang-format -i $(git ls-files '*.cu' '*.cpp' '*.h')
 ```
+
+**Tests are deliberately not in the hook.** They need the CUDA extension built
+and a visible GPU, so a hook that ran them would block a commit made from a
+machine without one — and a commit hook is only worth having if it is cheap
+enough that nobody is tempted to skip it. Run `pytest` before pushing.
+
+### The two guards
+
+`tools/check_engine_invariants.py` enforces the two rules above that a reader
+would otherwise have to remember:
+
+- **ADR-0002** — `torch` and `transformers` may not be imported under `src/` or
+  `tests/`, and may not be pinned in `requirements.txt`. They belong to the
+  offline golden tensor generator under `tools/`, which runs in its own
+  environment.
+- **CONTEXT.md** — `block table`, `block_id` and their variants are rejected
+  under `src/`, `tests/` and `tools/`. CUDA's own `blockIdx`, `blockDim` and
+  thread-block vocabulary is a different word for a different thing and is not
+  matched.
+
+When the forbidden text is the subject rather than the sin — quoting vLLM's
+terminology, say — end the line with `invariant-ok`.
+
+`docs_research/` is excluded from the whitespace hooks. It is the author's
+research record and a hook does not get to rewrite it.
 
 The style was chosen to agree with what the editor already in use produces —
 Allman braces, two-space indent, indented namespaces, pointers bound right —
