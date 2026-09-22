@@ -112,11 +112,25 @@ def describe(path: Path) -> list[TensorInfo]:
     ]
 
 
-def check_fp16_range(name: str, values: np.ndarray) -> float | None:
-    """Return the offending magnitude if this tensor will not survive fp16.
+def check_fp16_range(name: str, values: np.ndarray) -> str | None:
+    """Return why this tensor will not survive conversion to fp16, or None.
 
-    bf16 reaches ~3.4e38; fp16 stops at 65504. A weight past that becomes an
-    infinity on conversion and poisons everything downstream, silently.
+    Two ways to fail, and they need separate handling because one of them is
+    invisible to the obvious test.
+
+    **Out of range.** bf16 carries float32's exponent and reaches past 3e38;
+    fp16 stops at 65504. A weight beyond that becomes an infinity.
+
+    **Not a number.** Every comparison with NaN is false, so a bare
+    `peak > FP16_MAX` lets a NaN straight through — the exact silent corruption
+    this function exists to stop. It is checked first, on its own.
     """
-    peak = float(np.abs(values).max()) if values.size else 0.0
-    return peak if peak > FP16_MAX else None
+    if values.size == 0:
+        return None
+    if np.isnan(values).any():
+        count = int(np.isnan(values).sum())
+        return f"{count} NaN value(s)"
+    peak = float(np.abs(values).max())  # infinity compares greater, so it lands here
+    if peak > FP16_MAX:
+        return f"magnitude {peak:.3e} exceeds fp16's maximum of {FP16_MAX:.0f}"
+    return None

@@ -15,7 +15,6 @@ import pytest
 from conftest import require_model
 from microinfer import weights
 
-MODELS = Path(__file__).resolve().parent.parent / "models"
 
 
 def write_safetensors(path: Path, tensors: dict[str, tuple[str, np.ndarray]]) -> None:
@@ -86,8 +85,19 @@ def test_a_file_that_is_not_safetensors_fails_clearly(tmp_path):
 
 def test_fp16_range_check_catches_what_bf16_can_hold_and_fp16_cannot():
     assert weights.check_fp16_range("ok", np.array([1.0, -65000.0], dtype=np.float32)) is None
-    over = weights.check_fp16_range("bad", np.array([1.0, 1e30], dtype=np.float32))
-    assert over is not None and over > weights.FP16_MAX
+    assert weights.check_fp16_range("empty", np.array([], dtype=np.float32)) is None
+    for bad in (1e30, np.inf, -np.inf):
+        reason = weights.check_fp16_range("bad", np.array([1.0, bad], dtype=np.float32))
+        assert reason is not None and "exceeds" in reason
+
+
+def test_nan_does_not_slip_past_the_range_check():
+    """Every comparison with NaN is false, so `peak > FP16_MAX` alone lets one
+    through — the exact silent corruption the check exists to stop. It has its
+    own test because it is invisible to the obvious one."""
+    reason = weights.check_fp16_range("bad", np.array([1.0, np.nan, np.nan], dtype=np.float32))
+    assert reason is not None
+    assert "NaN" in reason and "2" in reason
 
 
 # --- against the real checkpoint -------------------------------------------

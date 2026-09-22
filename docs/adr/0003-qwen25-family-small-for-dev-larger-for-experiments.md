@@ -95,7 +95,18 @@ nothing loaded. The 6141 MiB figure from `nvidia-smi`, which the arithmetic
 above was computed against, is the physical size; roughly 380 MiB is already
 held by the driver and the desktop before the engine starts.
 
-This does not change any conclusion — the percentages shift slightly in the
-project's favour, since the same reclaimable bytes are a larger share of a
-smaller budget — but the **absolute** headroom is smaller than stated. Reported
-figures should say which denominator they use.
+The table at the top of this ADR is computed against 6141 MiB. Re-run against
+the memory CUDA actually offers, every figure moves in the project's favour,
+because the same reclaimable bytes are a larger share of a smaller budget:
+
+| model | context | KV at FP16 | reclaimed by INT4 | of 6141 MiB | of 5762 MiB |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 8K | 96 MiB | 72 MiB | 1.2% | 1.2% |
+| Qwen2.5-0.5B | 32K | 384 MiB | 288 MiB | 4.7% | 5.0% |
+| Qwen2.5-1.5B | 8K | 224 MiB | 168 MiB | 2.7% | 2.9% |
+| Qwen2.5-1.5B | 32K | 896 MiB | 672 MiB | 10.9% | **11.7%** |
+
+No conclusion changes, and the argument for the 1.5B at 32K gets slightly
+stronger. What does change is the **absolute** headroom, which is 379 MiB
+smaller than this ADR assumed. Every reported figure should say which
+denominator it uses; the engine's own footprint report uses CUDA's.

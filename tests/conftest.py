@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from microinfer import weights
+from microinfer.models import UPSTREAM
 
 MODELS = Path(__file__).resolve().parent.parent / "models"
 
@@ -26,11 +27,10 @@ def require_model(name: str) -> Path:
     checkpoint = directory / "model.safetensors"
 
     if not checkpoint.is_file():
-        upstream = name.replace("qwen2.5", "Qwen2.5").replace("b-instruct", "B-Instruct")
         pytest.skip(
             f"{name} is not downloaded. Fetch it with:\n"
             f"  curl -L --create-dirs -o models/{name}/model.safetensors \\\n"
-            f"    https://huggingface.co/Qwen/{upstream}/resolve/main/model.safetensors"
+            f"    https://huggingface.co/{UPSTREAM[name]}/resolve/main/model.safetensors"
         )
 
     try:

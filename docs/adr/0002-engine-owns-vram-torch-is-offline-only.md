@@ -26,10 +26,38 @@ that the test suite compares against.
 
 ## Consequences
 
-- Weights are loaded with the `safetensors` numpy backend and copied to device
-  with `cudaMemcpy`. No torch tensor ever exists in the engine process.
+- Weights are copied to device with `cudaMemcpy`, and no torch tensor ever
+  exists in the engine process. **The `safetensors` NumPy backend is not used —
+  see the amendment below.**
 - Golden reference tensors are generated once per (model, prompt set) pair and
   stored; regenerating them requires a machine with torch and the HF model, and
   is a deliberate, infrequent act.
 - Python performs no arithmetic. It sequences kernel calls; every tensor
   operation happens in CUDA.
+
+---
+
+## Amendment: the safetensors container is parsed directly, not through its NumPy backend
+
+This ADR said weights would load through "the `safetensors` numpy backend". They
+do not, and #5 found out why: **Qwen2.5 ships bfloat16, and NumPy has no
+bfloat16**. The NumPy backend cannot return a bf16 tensor for the same reason —
+there is no array type to put it in. Taking the dependency would have bought a
+loader that cannot load this project's only checkpoints.
+
+`microinfer/weights.py` therefore reads the container itself. It is a small,
+well-specified format: an 8-byte little-endian length, a JSON header mapping
+each tensor to a dtype, a shape and a byte range, and the data. The decode from
+bf16 is a shift, not an approximation — bfloat16 *is* the top sixteen bits of a
+float32, so widening is exact.
+
+Recorded rather than quietly done, because CONTRIBUTING requires a change that
+contradicts an ADR to say so, and the original wording would otherwise read as
+a description of code that does not exist.
+
+### Consequences
+
+- `safetensors` is not a dependency and should not become one for this purpose.
+- The reader owns two checks the library would have provided: an unknown dtype
+  is an error rather than a guess, and a truncated file is named as truncated
+  rather than surfacing as a reshape error deep in the parser.

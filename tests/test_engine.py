@@ -13,7 +13,6 @@ import pytest
 from conftest import require_model
 from microinfer import ConfigMismatch, Engine, ModelConfig, expected_weight_bytes, kv_cache_bytes
 
-MODELS = Path(__file__).resolve().parent.parent / "models"
 MIB = 1024 * 1024
 
 
@@ -39,12 +38,19 @@ def test_kv_cache_at_32k_matches_the_table_in_adr_0003():
     assert kv_cache_bytes(cfg("qwen2.5-0.5b-instruct"), 32768) == 384 * MIB
 
 
-def test_kv_cache_scales_with_precision():
-    """The one term the engine can renegotiate mid-session."""
+def test_raw_cache_bytes_scale_linearly_with_element_size():
+    """Element size is the one term the engine can renegotiate mid-session.
+
+    These are *raw* bytes with scale metadata excluded, which is why the ratios
+    are clean powers of two. They are not compression ratios: ADR-0005 puts
+    INT4 at 4.63 effective bits once its 1280 bytes per page are counted, and
+    CONTRIBUTING forbids quoting 4x for it.
+    """
     c = cfg("qwen2.5-1.5b-instruct")
     fp16 = kv_cache_bytes(c, 32768, bytes_per_element=2)
     assert kv_cache_bytes(c, 32768, bytes_per_element=1) == fp16 // 2
     assert kv_cache_bytes(c, 32768, bytes_per_element=0.5) == fp16 // 4
+    assert isinstance(kv_cache_bytes(c, 32768, bytes_per_element=0.5), int)
 
 
 def test_expected_weight_bytes_is_in_the_right_region():
@@ -101,14 +107,64 @@ def test_loads_and_reports_weights_within_one_percent_of_config(name):
 def test_footprint_separates_weights_cache_and_workspace():
     engine = Engine(require_model("qwen2.5-0.5b-instruct"))
     engine.load_weights()
-    fp = engine.footprint(context_length=8192)
+    fp = engine.footprint()
 
     assert fp.weights > 0
-    assert fp.kv_cache == kv_cache_bytes(engine.config, 8192)
-    assert fp.workspace == 0  # nothing allocates workspace yet
+    assert fp.kv_cache == 0  # nothing allocates a cache yet; #14 will
+    assert fp.workspace == 0
     assert fp.engine_total == fp.weights + fp.kv_cache + fp.workspace
     assert fp.device_total > fp.device_free > 0
     assert "weights" in fp.render() and "MiB" in fp.render()
+
+
+def test_unaccounted_stays_positive_and_does_not_move_with_a_projection():
+    """`unaccounted` is measurement minus measurement.
+
+    An earlier version folded the projected cache into the same object, so this
+    number shrank as the projection grew and went negative past a large enough
+    context — a figure whose whole job is to separate causes, mixing them.
+    """
+    engine = Engine(require_model("qwen2.5-0.5b-instruct"))
+    engine.load_weights()
+    before = engine.footprint().unaccounted
+    assert before > 0
+
+    engine.project_kv_cache(32768)  # a projection must not touch the account
+    assert engine.footprint().unaccounted == pytest.approx(before, rel=0.05)
+
+
+def test_reported_weights_match_what_the_driver_says_was_taken():
+    """Turns a self-report into a measurement.
+
+    `footprint.weights` sums what the engine believes it uploaded. This checks
+    that belief against cudaMemGetInfo across the load — the same reading
+    ADR-0007's allocator will be judged by.
+    """
+    from microinfer import _microinfer
+
+    engine = Engine(require_model("qwen2.5-0.5b-instruct"))
+    free_before = _microinfer.device_memory_info()["free"]
+    engine.load_weights()
+    free_after = _microinfer.device_memory_info()["free"]
+
+    taken = free_before - free_after
+    claimed = engine.footprint().weights
+
+    # The driver may round up and never down, so the claim can only understate.
+    assert taken >= claimed
+
+    # It understates by a lot, and the reason is the number of allocations
+    # rather than their size: one tensor per parameter group means ~290 separate
+    # cudaMalloc calls, each rounded up. Measured on this machine, overhead runs
+    # 0.5% at ten allocations, 9% at a hundred and 27% at 290. The bound here is
+    # loose on purpose — it is there to catch a factor-of-two accounting bug,
+    # not to pin down an allocator's granularity. The waste itself is filed
+    # separately; see the note in ADR-0007.
+    assert taken < claimed * 1.5, (
+        f"driver took {taken / MIB:.1f} MiB against a claim of "
+        f"{claimed / MIB:.1f} MiB — more overhead than allocation granularity "
+        f"explains"
+    )
 
 
 def test_torch_is_absent_after_loading_a_model():

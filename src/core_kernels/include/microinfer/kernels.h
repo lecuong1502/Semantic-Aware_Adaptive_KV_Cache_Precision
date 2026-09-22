@@ -46,7 +46,9 @@ namespace microinfer
     DeviceTensor &operator=(const DeviceTensor &) = delete;
 
     size_t numel() const { return count_; }
-    size_t nbytes() const { return count_ * 2; }
+    // Out of line so it can say sizeof(__half) rather than a literal 2. This
+    // is the number Footprint.weights reports; it should not be a guess.
+    size_t nbytes() const;
     void download(float *out) const;
     const void *data() const { return ptr_; }
 

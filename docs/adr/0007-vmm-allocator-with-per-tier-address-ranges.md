@@ -42,3 +42,29 @@ driver.
   regardless of how many pages are downgraded. This is bounded and belongs in
   the overhead measurement §7 asks for.
 - The engine links against the CUDA driver API, not only the runtime API.
+
+---
+
+## Note from #5: allocation count is itself a cost
+
+Loading Qwen2.5-0.5B as one `cudaMalloc` per parameter group — 290 of them —
+took 1080 MiB from the driver for 942 MiB of weights. Measured on this machine,
+the overhead tracks the *number* of allocations rather than their size:
+
+| allocations | claimed | taken | overhead |
+|---:|---:|---:|---:|
+| 10 | 915.5 MiB | 919.7 MiB | 0.5% |
+| 100 | 915.5 MiB | 999.8 MiB | 9.2% |
+| 290 | 915.5 MiB | 1158.8 MiB | 26.6% |
+
+Two consequences for this decision.
+
+**It supports the choice.** Packing pages from the low end of one reserved range
+per tier means the cache is a handful of granule mappings, not one allocation
+per page. At 28,672 pages on the 1.5B at 32K, an allocation-per-page design
+would lose more to granularity than the mechanism reclaims.
+
+**It is a live cost elsewhere.** 240 MiB of overhead on a 5762 MiB budget is
+roughly 40% of what requantising the whole cache to INT4 would reclaim. Weight
+loading should use one arena with offsets rather than an allocation per tensor.
+That is not this ticket's work and is filed separately.

@@ -9,13 +9,7 @@
 namespace microinfer
 {
 
-  MemoryInfo device_memory_info()
-  {
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
-    return MemoryInfo{free_bytes, total_bytes};
-  }
+  size_t DeviceTensor::nbytes() const { return count_ * sizeof(__half); }
 
   DeviceTensor::DeviceTensor(const float *host, size_t count) : count_(count)
   {
@@ -24,8 +18,9 @@ namespace microinfer
       return;
     }
 
-    // Converted on the host so the device never holds an fp32 copy. On a 6 GiB
-    // card a transient fp32 staging buffer would double the peak for no reason.
+    // Converted on the host so the device never holds an fp32 copy. On a card
+    // this small a transient fp32 staging buffer would double the peak for
+    // nothing.
     std::vector<__half> staged(count);
     for (size_t i = 0; i < count; ++i)
     {
@@ -33,9 +28,25 @@ namespace microinfer
     }
 
     cuda_check(cudaMalloc(&ptr_, count * sizeof(__half)), "cudaMalloc");
-    cuda_check(cudaMemcpy(ptr_, staged.data(), count * sizeof(__half),
-                          cudaMemcpyHostToDevice),
-               "cudaMemcpy weights host-to-device");
+
+    // A throw here would abandon the allocation: the destructor does not run
+    // for an object whose constructor threw. That leak would be permanent and
+    // invisible except as a smaller free-memory reading — which is the exact
+    // signal RQ2 depends on, so it would corrupt the measurement rather than
+    // merely waste memory.
+    try
+    {
+      cuda_check(cudaMemcpy(ptr_, staged.data(), count * sizeof(__half),
+                            cudaMemcpyHostToDevice),
+                 "cudaMemcpy weights host-to-device");
+    }
+    catch (...)
+    {
+      cudaFree(ptr_);
+      ptr_ = nullptr;
+      count_ = 0;
+      throw;
+    }
   }
 
   DeviceTensor::~DeviceTensor()
