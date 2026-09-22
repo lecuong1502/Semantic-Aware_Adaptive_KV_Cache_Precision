@@ -68,3 +68,35 @@ would lose more to granularity than the mechanism reclaims.
 roughly 40% of what requantising the whole cache to INT4 would reclaim. Weight
 loading should use one arena with offsets rather than an allocation per tensor.
 That is not this ticket's work and is filed separately.
+
+---
+
+## Note from #6: how to measure the contract, and how not to
+
+This decision's contract — that reclaimed pages genuinely return to the driver —
+is verified by reading `cudaMemGetInfo` around an allocator operation. #6 hit
+that reading's failure modes on a much smaller test, and #10 should not have to
+rediscover them.
+
+**Settle this process's own frees first.** A device buffer dropped by an earlier
+test may be collected while a later one is measuring, freeing memory between the
+two readings and shrinking the delta. Measured here: an exact 32 MiB allocation
+read as 27.1 MiB. `tests/conftest.py::stable_free_bytes` runs `gc.collect()`
+before reading, and the allocator tests should use it rather than calling
+`device_memory_info` directly.
+
+**Do not assume other processes are the problem.** Sampling free memory sixty
+times across three idle seconds moved it by 0.19 MiB in total. External
+contention is real on this machine, but it is not what makes a suite flaky —
+this project's own deferred frees are.
+
+**Size the allocation so the residual noise is negligible, and measure the
+tolerance rather than guessing it.** The noise observed is absolute, a few MiB,
+so a small allocation cannot be asserted exactly while a large one can be
+asserted within a few percent.
+
+The last point cuts both ways here, and the wrong direction is dangerous. A
+tolerance loose enough to stop a test flaking is also loose enough to hide a
+leak of the same size — and a leak is exactly what this ADR exists to prevent.
+When an allocator assertion goes flaky, the shortfall should be measured before
+the bound is widened.

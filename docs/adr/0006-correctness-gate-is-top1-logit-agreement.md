@@ -78,3 +78,50 @@ automatically, rather than inheriting a tolerance calibrated for fp16.
 
 Nothing above touches the merge gate. That remains top-1 logit agreement >= 99%
 with mean `KL(HF || ours)` < 1e-3, and generated text remains a smoke test.
+
+---
+
+## Amendment: the KL term is an estimate over a stated sample
+
+This ADR set the gate as "top-1 agreement >= 99% of positions, and mean
+`KL(HF || ours)` < 1e-3", and #6 had to build the reference that gate is
+computed against. The two terms turn out to cost very different amounts, and
+the ADR did not say so.
+
+**Top-1 agreement is exact.** The reference stores its own argmax at every
+position, four bytes each. Nothing is approximated.
+
+**Mean KL cannot be, at any reasonable price.** KL needs whole distributions,
+and a distribution over Qwen2.5's vocabulary is 151,936 floats — 608 KiB per
+position, so roughly 3.4 GiB for one model's 24 prompts. The reference therefore
+keeps full logits at **16 evenly spaced positions per prompt, always including
+the last**, and the gate's KL term is the mean over those.
+
+Storing only the most probable tokens per position was tried first, because it
+would have made every position affordable. It does not work: measured on the
+real references, the probability mass outside the top 2048 tokens reaches
+**0.35** at the least certain positions. The model is genuinely uncertain early
+in a prompt, and a truncated distribution would corrupt KL far past the bound
+being tested. Recorded because the idea is attractive enough to be proposed
+again.
+
+### The sample size is not yet justified, and that is deliberate
+
+Sixteen is a storage budget, not a measurement. The quantity that would justify
+it — how much the sample mean varies around the true mean — is a property of the
+*difference* between the reference and the engine, and **the engine does not
+produce logits until #12**. It cannot be measured today.
+
+**#12 therefore owes this ADR a validation**: with the engine producing logits,
+compare the sampled mean against a mean over a much denser set of positions for
+at least one prompt, and either confirm 16 or change it. Until that is done, a
+KL figure quoted against this gate should say it is a sample mean over 16
+positions per prompt.
+
+### Consequences
+
+- A gate report states both terms separately. The top-1 figure is exact; the KL
+  figure carries its sample size.
+- `LOGIT_SAMPLES` in the generator is the single place the sample size is set,
+  and changing it invalidates every stored reference — the manifest records it
+  so a mismatch is visible.

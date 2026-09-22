@@ -140,12 +140,12 @@ def test_reported_weights_match_what_the_driver_says_was_taken():
     that belief against cudaMemGetInfo across the load — the same reading
     ADR-0007's allocator will be judged by.
     """
-    from microinfer import _microinfer
+    from conftest import stable_free_bytes
 
     engine = Engine(require_model("qwen2.5-0.5b-instruct"))
-    free_before = _microinfer.device_memory_info()["free"]
+    free_before = stable_free_bytes()
     engine.load_weights()
-    free_after = _microinfer.device_memory_info()["free"]
+    free_after = stable_free_bytes()
 
     taken = free_before - free_after
     claimed = engine.footprint().weights
