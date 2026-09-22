@@ -78,7 +78,7 @@ Three layers, with distinct jobs:
 
 | Layer | Where | Tolerance | Blocks a merge? |
 |---|---|---|---|
-| Per-kernel vs float64 NumPy | Seam B | max rel err < 2e-3, mean < 2e-4 | **Yes** |
+| Per-kernel vs float64 NumPy | Seam B | max < 4 ulp, mean < 1 ulp of the output dtype | **Yes** |
 | Per-layer vs golden tensors | Seam A | cosine similarity > 0.999 | No — diagnostic |
 | **Logits vs golden** | Seam A | **top-1 ≥ 99%, mean KL < 1e-3** | **Yes — this is the gate** |
 | Greedy text vs HuggingFace | Seam A | 64 tokens, ≥ 8 of 10 prompts | No — smoke test |
@@ -110,6 +110,10 @@ first; it names the first diverging layer.
 - **Quoting a compression ratio without metadata.** Scale metadata is a flat 1280
   bytes per page at every quantised tier. INT4 is 4.63 effective bits, not 4.
   Claiming "4x" is false.
+- **Quoting a per-kernel tolerance as an absolute number.** ADR-0006 states them
+  in ulps of the kernel's *output* format, because a bound near a format's noise
+  floor measures the format rather than the implementation. For fp16 that is
+  max < 1.953e-3 and mean < 4.883e-4; derive it, do not hardcode it.
 - **Reporting a benchmark without its context.** Measurements come from a laptop
   whose memory and clocks depend on what else is running. Every entry records
   configuration, hardware, driver version and git commit.
