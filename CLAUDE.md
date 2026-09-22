@@ -6,7 +6,7 @@ importance, in response to unpredictable VRAM contention on consumer GPUs.
 
 Research background, architecture, and the milestone build order live in
 `docs_research/semantic-aware-adaptive-kv-cache.md`. The thesis source is
-`docs/graduation_thesis.tex`.
+`docs/paper.tex`.
 
 ## Language
 
