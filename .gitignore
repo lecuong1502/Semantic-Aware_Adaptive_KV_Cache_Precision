@@ -9,3 +9,6 @@ __pycache__/
 *.py[cod]
 *.so
 .pytest_cache/
+
+# Model weights: downloaded, never committed. See CONTRIBUTING.
+models/

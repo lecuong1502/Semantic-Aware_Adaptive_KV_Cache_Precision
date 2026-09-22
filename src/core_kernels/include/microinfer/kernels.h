@@ -24,4 +24,37 @@ namespace microinfer
   void rmsnorm(const float *x, const float *weight, float *out, int rows,
                int hidden, float eps);
 
+  // Device memory as the *driver* sees it, from cudaMemGetInfo. This is the
+  // same quantity NVML reports and the one RQ2 turns on, so the engine reads it
+  // rather than tracking its own allocations and trusting the two to agree.
+  struct MemoryInfo
+  {
+    size_t free_bytes;
+    size_t total_bytes;
+  };
+
+  MemoryInfo device_memory_info();
+
+  // An owned block of fp16 on the device. Weights arrive as fp32 from the host
+  // and are stored fp16, which is what every kernel reads.
+  class DeviceTensor
+  {
+  public:
+    DeviceTensor(const float *host, size_t count);
+    ~DeviceTensor();
+    DeviceTensor(const DeviceTensor &) = delete;
+    DeviceTensor &operator=(const DeviceTensor &) = delete;
+
+    size_t numel() const { return count_; }
+    // Out of line so it can say sizeof(__half) rather than a literal 2. This
+    // is the number Footprint.weights reports; it should not be a guess.
+    size_t nbytes() const;
+    void download(float *out) const;
+    const void *data() const { return ptr_; }
+
+  private:
+    void *ptr_ = nullptr;
+    size_t count_ = 0;
+  };
+
 } // namespace microinfer

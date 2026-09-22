@@ -16,6 +16,14 @@ namespace microinfer
     return version;
   }
 
+  MemoryInfo device_memory_info()
+  {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+    return MemoryInfo{free_bytes, total_bytes};
+  }
+
   std::string device_name()
   {
     cudaDeviceProp props{};
