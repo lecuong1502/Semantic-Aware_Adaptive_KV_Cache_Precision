@@ -1,1 +1,14 @@
 graduation_thesis/
+.venv/
+# Build artifacts
+build/
+dist/
+*.egg-info/
+_skbuild/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Golden reference tensors are generated offline (ADR-0002); regenerate, do not commit.
+tests/golden/
