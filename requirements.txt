@@ -1,0 +1,45 @@
+# MicroInfer — pinned environment
+#
+# pyproject.toml is the source of truth for what the package *depends on*; this
+# file records the exact versions the results in experiments/ were produced
+# with. When the two disagree, pyproject.toml defines the contract and this file
+# records history. Keep both in step when a dependency changes.
+#
+#     python3 -m venv .venv && source .venv/bin/activate
+#     pip install -r requirements.txt
+#     pip install -e ".[test]"
+#
+# Verified on Ubuntu 24.04, CUDA 12.9, GCC 13.3, CMake 3.28.3, Python 3.12.3,
+# RTX 4050 Laptop (compute capability 8.9).
+#
+# ---------------------------------------------------------------------------
+# PyTorch MUST NOT BE ADDED TO THIS FILE.
+#
+# Its caching allocator retains freed device memory rather than returning it to
+# the driver, so nvmlDeviceGetMemoryInfo would report that reservation as used
+# memory — indistinguishable from the external contention this project exists to
+# detect. RQ2's entire signal is that NVML reading (ADR-0002).
+#
+# PyTorch and transformers belong only to the offline golden tensor generator,
+# which runs in a separate environment and never in a process that runs the
+# engine. tests/test_toolchain.py asserts torch is absent from sys.modules.
+# ---------------------------------------------------------------------------
+
+# Runtime
+numpy==2.5.3
+
+# Build. Needed explicitly only for `pip install -e . --no-build-isolation`;
+# an isolated build resolves these from pyproject.toml's build-system.requires.
+scikit-build-core==1.0.3
+pybind11==3.1.0
+
+# Test
+pytest==9.1.1
+
+# Transitive, pinned so the environment is reproducible rather than merely
+# satisfiable.
+iniconfig==2.3.0
+packaging==26.3
+pathspec==1.1.1
+pluggy==1.6.0
+Pygments==2.21.0

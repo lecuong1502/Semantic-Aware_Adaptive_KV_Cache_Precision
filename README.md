@@ -165,9 +165,13 @@ and `cuMemMap`, which the allocator needs, live only in the driver API.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt  # pinned versions the recorded results used
 pip install -e ".[test]"         # builds the CUDA extension via scikit-build-core
 pytest                           # kernel and toolchain tests
 ```
+
+`pyproject.toml` defines what the package depends on; `requirements.txt` pins
+the exact versions a result was produced with.
 
 Target GPU architecture is detected from the card present at build time. Build
 for a different target by overriding it:
