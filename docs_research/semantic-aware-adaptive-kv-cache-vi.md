@@ -28,7 +28,7 @@
 - **Hệ thống inference consumer/edge**: llama.cpp, PowerInfer, ATSInfer, APEX — các hệ thống kỹ thuật xử lý OOM bằng cách từ chối/crash hoặc offload tĩnh; không có công trình nào xử lý việc thích ứng precision **giữa phiên** do áp lực VRAM **từ bên ngoài** (không phải do chính model) gây ra.
 
 ### 3. Khảo sát vấn đề (RQ1)
-- Setup thực nghiệm: laptop RTX 4050/4060, model + bộ prompt cố định, các nguồn tải nền (Chrome nhiều tab, Discord chia sẻ màn hình, OBS ghi hình, demo game).
+- Setup thực nghiệm: laptop **RTX 4050 Laptop GPU, 6141 MiB** (không phải "4050/4060" — con số 6 GiB chính là thứ khiến số học KV footprint ở ADR-0003 trở nên ràng buộc; một chiếc 4060 8 GiB sẽ đổi mọi ngưỡng bên dưới), model + bộ prompt cố định, các nguồn tải nền (Chrome nhiều tab, Discord chia sẻ màn hình, OBS ghi hình, demo game).
 - Đo đạc: VRAM khả dụng theo thời gian (qua NVML polling), phương sai, tần suất/độ lớn của spike, tương quan với các hành vi người dùng phổ biến.
 - Sản phẩm: một bộ "VRAM contention trace" nhỏ + thống kê mô tả — đây là đóng góp thực nghiệm có thể trích dẫn được, ngay cả trước khi đến phần đóng góp hệ thống.
 
@@ -181,12 +181,13 @@ function plan(scores, pressure, tiers, recency_floor):
 - **Hysteresis cho chính policy**: không re-plan thường xuyên hơn mỗi `M` decode step (ví dụ 8–16) để giới hạn overhead re-quantization.
 
 ### 3.4 Paged Mixed-Precision KV Cache Manager
-- Sở hữu paged KV cache xây từ đầu (xem Milestone 1, mục 4.1): mỗi page có field `precision_tier` trong entry block table, cùng với chỉ mục logical→physical thông thường.
+- Sở hữu paged KV cache xây từ đầu (xem Milestone 1, mục 4.1): mỗi page có field `precision_tier` trong entry **page table**, cùng với chỉ mục logical→physical thông thường. (vLLM gọi đây là *block table*; `CONTEXT.md` chốt thuật ngữ của dự án là *page table*. Phần còn lại của tài liệu này vài chỗ vẫn dùng từ cũ.)
 - **Đường hạ cấp**: áp dụng kernel quantize INT8/INT4 của chính engine tại chỗ, giải phóng byte không dùng đến của precision cao hơn trả về allocator.
 - **Đường nâng cấp**: 2 phương án cần cài đặt và so sánh:
   - *(a) Recompute-on-upgrade*: chạy lại forward pass của prefix liên quan cho block đó — tốn kém nhưng luôn đúng.
   - *(b) Retain-buffer*: giữ 1 bản shadow FP16 nhỏ (ở CPU hoặc dạng nén) cho các block vừa bị hạ cấp gần đây (LRU buffer có giới hạn) để việc nâng cấp chỉ là copy-back nhanh thay vì tính lại — có chi phí bộ nhớ riêng, đáng để ablate.
-- **Tương tác với allocator**: đổi precision tier làm thay đổi kích thước byte của page; manager cần hỗ trợ resize/di chuyển page trong pool (hoặc over-provision slot theo từng tier để tránh fragmentation — đơn giản hơn cho bản triển khai đầu tiên).
+- **Tương tác với allocator**: đổi precision tier làm thay đổi kích thước byte của page, và số byte giải phóng phải quay về **driver**. `nvmlDeviceGetMemoryInfo` báo cáo thứ driver đã cấp phát đi, nên byte được tái sử dụng bên trong pool riêng là vô hình với phép đo duy nhất mà RQ2 có. Vì vậy cache reserve một dải địa chỉ ảo cho mỗi tier qua CUDA VMM API — `cuMemAddressReserve`, `cuMemCreate`, `cuMemMap` — xếp page chặt từ đầu dải, và trả granule về bằng `cuMemUnmap`/`cuMemRelease` khi chúng trống. Xem ADR-0007.
+- **Đã bác: over-provision slot theo từng tier.** Bản nháp trước của mục này đề xuất nó vì "đơn giản hơn cho bản triển khai đầu tiên". Đây là phương án *duy nhất* không thể hoạt động: một page INT4 ghi vào slot cỡ FP16 lãng phí phần chênh, không có gì trả về driver, NVML không nhúc nhích, và phản ứng với RED pressure trở thành một no-op không đo được. Chọn nó đồng nghĩa với việc rút RQ2 khỏi luận án. Giữ lại trên hồ sơ thay vì xoá, vì đây là lối tắt hấp dẫn và sẽ có người đề xuất lại.
 
 ### 3.5 Contention Simulator (cho thí nghiệm có kiểm soát)
 - Một tiện ích độc lập, cấp phát/giải phóng GPU memory theo pattern có thể cấu hình (hàm bậc thang, sawtooth, spike ngẫu nhiên) để tái tạo lại trace thực nghiệm của RQ1 một cách xác định cho thí nghiệm RQ2/RQ3 — tách biệt "cơ chế có hoạt động không" khỏi "chờ 1 tab Chrome thật spike memory".
@@ -200,7 +201,9 @@ Phần này viết sao cho bạn có thể giao từng phần, theo thứ tự, 
 ### 4.1 Thứ tự build đề xuất
 
 **Milestone 0 — Đường inference tối thiểu chạy được (chưa có adaptivity)**
-1. Forward pass cơ bản của 1 decoder-only transformer bằng CUDA/C++ (hoặc Python + custom kernel qua `pybind11`) cho 1 model mở nhỏ (0.5–1.5B tham số) — attention + GEMM FP16 thuần, chưa paging, dùng 1 buffer KV cache cố định kích thước. Mục tiêu: đúng, chưa cần tối ưu, verify với reference implementation của HuggingFace trên cùng prompt/seed.
+1. Forward pass cơ bản của 1 decoder-only transformer — Python orchestrator điều khiển các CUDA kernel tự viết qua `pybind11`, cuBLAS lo phần dense projection (ADR-0001) — attention FP16 thuần, chưa paging, dùng 1 buffer KV cache cố định kích thước.
+   - **Model không phải lựa chọn tự do.** Qwen2.5-0.5B-Instruct để phát triển, Qwen2.5-1.5B-Instruct ở context 32K để chạy thí nghiệm (ADR-0003). Khoảng "0.5–1.5B tham số" trước đây không sống sót qua số học: ở 0.5B với context 8K, **toàn bộ** KV cache là 96 MiB, đập hết xuống INT4 thu hồi được 72 MiB — trong khi một tab Chrome ngốn 200–400 MiB. Ở quy mô đó cơ chế không cứu nổi một lần OOM nào, và RQ2 chết trước khi viết dòng code đầu tiên. Chỉ cột context dài mới vượt ngưỡng.
+   - Mục tiêu: đúng, chưa cần tối ưu, verify với reference của HuggingFace trên prompt/seed cố định. **Cổng nghiệm thu là top-1 logit agreement ≥ 99% với mean KL < 1e-3, không phải khớp văn bản sinh ra** — cuBLAS cộng dồn theo đường khác, nên chênh 1e-4 ở logit tại chỗ hai ứng viên sát nhau sẽ lật argmax và làm mọi token sau đó rẽ nhánh (ADR-0006).
 2. Thêm KV cache **dạng paged** (precision cố định, chỉ FP16) — block table logical, physical page pool, cấp phát/giải phóng page. Verify: output giống hệt bản không paging.
 3. Thêm kernel quantize/dequantize INT8 và INT4 cho block KV cache, dùng *tĩnh* trước (quantize 1 lần lúc cấp phát, chưa chuyển đổi runtime). Verify: mức suy giảm perplexity so với FP16 trên 1 tập held-out, khớp với kỳ vọng đã công bố của scheme quantization đã chọn (ví dụ gần tương đương mức suy giảm mà KIVI/KVQuant từng báo cáo).
 
@@ -230,27 +233,50 @@ Khi giao 1 module cho AI coding assistant, cung cấp:
 - Với mọi kernel CUDA mới (đặc biệt Milestone 0, vì không có implementation tham chiếu sẵn có để dựa vào), luôn validate bằng số với 1 reference PyTorch/HuggingFace trên cùng seed/prompt cố định trước khi tin vào bất kỳ con số benchmark nào — 1 benchmark cho thấy "tăng tốc" từ 1 kernel bị lỗi là 1 kiểu lỗi thường gặp cần đề phòng rõ ràng, và dễ mắc phải hơn khi xây từ đầu so với khi extend code đã biết đúng.
 - Duy trì 1 **benchmark log** liên tục (config, phần cứng, git commit hash, kết quả) ngay từ phiên bản chạy được đầu tiên — đây sẽ trở thành experiment log của paper, giúp tránh phải suy ra lại kết quả sau này.
 
-### 4.4 Cấu trúc repo đề xuất
+### 4.4 Cấu trúc repo
+
+Viết lại cho khớp với repo thực tế; cấu trúc phẳng ở bản nháp trước của mục này
+có trước ADR-0002. Hình dạng này suy ra từ ADR-0002: một Python orchestrator
+điều khiển CUDA extension, PyTorch không xuất hiện ở đâu trong process chạy
+engine.
+
 ```
-adaptive-kv-inference/
-├── core_kernels/              # Milestone 0: attention, GEMM, paged cache, static quant — xây từ đầu
-│   └── tests/                 # validate số học với reference PyTorch/HF
-├── contention_simulator/
-├── vram_monitor/
-├── attention_scorer/
-├── precision_controller/
-│   └── tests/                 # unit test logic thuần, không cần GPU
-├── kv_cache_manager/          # re-quantization runtime trên nền paged cache của core_kernels
-├── orchestrator/               # tích hợp decode loop
-├── eval/
-│   ├── datasets/               # hội thoại / QA văn bản dài / tóm tắt
-│   ├── metrics/
-│   └── run_experiment.py       # tạo bảng so sánh 4 điều kiện
-├── experiments/logs/          # benchmark log dạng append-only (xem mục 4.3)
-└── paper/                     # outline, hình ảnh, bản nháp (nguồn của tài liệu này)
+├── pyproject.toml                 # scikit-build-core + CMake; torch không phải dependency
+├── CMakeLists.txt                 # link CUDA::cudart VÀ CUDA::cuda_driver (ADR-0007)
+├── requirements.txt               # môi trường đã pin; torch không bao giờ được xuất hiện (ADR-0002)
+├── CONTEXT.md                     # glossary — đơn vị là `page`, không bao giờ là `block`
+├── CONTRIBUTING.md
+├── .clang-format                  # Allman, thụt 2 space, namespace có thụt lề
+├── .pre-commit-config.yaml        # clang-format + hai engine invariant
+├── docs/
+│   ├── adr/                       # quyết định kiến trúc, kèm phương án đã bác
+│   └── agents/                    # quy ước issue tracker và triage
+├── src/
+│   ├── microinfer/                # Python orchestrator. Điều phối kernel; không làm toán
+│   └── core_kernels/              # CUDA tự viết
+│       ├── rmsnorm.cu  rope.cu  swiglu.cu
+│       ├── attention.cu           # online softmax, causal mask, GQA
+│       ├── paged_cache.cu         # page table + VMM allocator (ADR-0007)
+│       ├── quant.cu               # quantise-dequantise INT8/INT4/INT2 (ADR-0005, ADR-0008)
+│       ├── gemm.cu                # wrapper mỏng gọi cuBLAS (ADR-0001)
+│       ├── bindings.cpp           # pybind11. NumPy vào/ra ở bề mặt hướng test (Seam B)
+│       └── include/microinfer/
+├── tests/
+│   ├── test_*.py                  # Seam A (Engine) và Seam B (extension)
+│   └── golden/                    # tensor tham chiếu: sinh offline, lưu lại, hiếm khi sinh lại
+├── tools/
+│   ├── gen_golden.py              # nơi DUY NHẤT torch và transformers xuất hiện (ADR-0002)
+│   └── check_engine_invariants.py # thực thi luật đó lúc commit
+├── studies/                       # tiled GEMM vs cuBLAS — cố ý nằm ngoài đường inference (ADR-0001)
+├── experiments/logs/              # benchmark log chỉ ghi thêm: config, phần cứng, commit
+└── graduation_thesis/             # nguồn bài báo
 ```
 
----
+Hai ranh giới trong cây thư mục đó mang theo quyết định chứ không phải sở thích.
+`tools/` là thư mục duy nhất được phép import PyTorch, vì caching allocator của
+nó sẽ làm hỏng chính phép đo NVML mà RQ2 dựa vào. Và `studies/` không nằm trong
+import graph của engine, nên một tiled GEMM tự viết chậm hơn cuBLAS không thể
+nhiễm độc bất kỳ phép đo latency nào.
 
 ## 5. Kiến thức Cần có
 
