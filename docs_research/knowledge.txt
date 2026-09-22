@@ -1,0 +1,275 @@
+I. CUDA/GPU Programming:
+1. CUDA (Compute Unified Device Architecture):
+- Thread/Block/Grid:
+	+ Thread: smallest executing units, run on a CUDA core.
+	+ Warp: 32-thread group execute synchronizingly in SIMT model (Single Instruction - Multiple Threads).
+	+ Block: threads group to the shared memory, synchronize through __syncthreads().
+	+ Grid: group the blocks for 1 launch kernel.
+	+ Need to understand deeply: how to compute thread index (blockIdx, threadIdx, blockDim, gridDim) to map the data.
+	
+- Warp divergence:
+	+ When threads in the same warp go through different if/else branchs -> GPU must run sequentially each branch -> decrease the performance.
+	+ Important: Casual masking need to be written to avoid the unnecessary divergence.
+	
+- Occupancy:
+	+ The rate that warps are active on 1 SM (Streaming Multiprocessor) with maximum.
+	+ Limited by: the number of register/thread, shared memory/block, thread/block.
+	+ Tools: CUDA Occupancy Calculator, or Nsight Compute.
+	
+2. Memory Hierarchy:
+- Register: Fastest -> Per thread -> Using: Temporary variable, accumulator within a loop.
+- Shared Memory: Very Fast -> Per block -> Using: Shared data among threads of blocks (Tile of GEMM, K/V in attention).
+- L2 Cache: Fast -> All GPU -> Using: Automatic, no control directly but need to understand to optimize locality.
+- Global Memory (HBM): Slowest -> All GPU -> Using: Store main tensor, main bottleneck of most of LLM inference kernel.
+
+- Memory coalescing:
+	+ When threads in 1 warp access the adjacent addresses in global memory -> consolidate into a single memory transaction instead of multiple small transactions.
+	
+- Roofline model:
+	+ Analysis tool: Is your kernel limited by compute (FLOPs) or memory bandwidth?
+	+ Formula: Arithmetic Intensity = FLOPS / Byte accessed.
+	+ Attention decode (batch = 1) is often memory-bound. (Need KV cache quantization)
+	+ Big GEMM is often compute-bound.
+
+3. Necessary Kernels:
+- Tiled GEMM (General Matrix Multiply):
+	+ Idea: Divide the large matrix into small tiles, load them into shared memory, and perform computations within shared memory instead of repeatedly reading from global memory.
+	
+- Online Softmax:
+	+ Problem: softmax need to know max and sum before normalizing.
+	+ Online Softmax (in Flash Attention): compute incrementally, update max/sum when iterating through each block, avoid materializing the entire attention matrix.
+	
+- Reduction:
+	+ Technique for aggregating values ​​(sum, max) across multiple threads — using warp shuffle instructions (`__shfl_down_sync`) to avoid the slower combination of shared memory and `__syncthreads`.
+	+ Application: softmax, layer norm, attention importance score (EWMA per block).
+	
+4. Profiling Tools:
+- Nsight Systems (nsys):
+	+ Follow timeline: the time when kernel runs, gap/idle time?, CPU-GPU overlap?
+	+ Use to track: kernel launch overhead, GPU idle waits CPU.
+	
+- Nsight Compute (ncu):
+	+ Special Analysis: real occupancy, memory throughput, warp stall reasons.
+	+ Important metric: sm__throughput, dram__throughput, achieved_occupancy.
+
+5. Connect CUDA to Python (pybind11):
+- Write CUDA kernel -> compute to shared library -> expose by pybind11.
+- Important: manage memory between PyTorch tensor and CUDA kernel -> use torch::Tensor C++ API or raw CUDA pointer through .data_ptr().
+
+
+
+II. Transformer Architecture & Inference Internals:
+1. Transformer Decoder-only:
+- Detailed Self-Attention:
+	+ Formula: Attention(Q, K, V) = sofmax(Q * K^T / sqrt(d_k)) * V.
+	+ Why to divide sqrt(d_k): Avoid excessively large dot-product values ​​that cause softmax saturation (leading to vanishing gradients during training, while also affecting numerical stability during inference).
+	+ Multi-head attention: divide d_model to h smaller heads, each head learns different attention patterns, then concat them.
+	+ Causal masking: The rationale (the decoder must only see preceding tokens) and efficient implementation (typically using offsets or indices rather than explicitly creating a mask matrix to save memory).
+	
+- Important attention variants to know:
+	+ MHA (Multi-Head Attention): each head has a K/V - largest K/V cache.
+	+ MQA (Multi-Query Attention): all heads use a shared K/V - decrease KV cache but decrease the quality.
+	+ GQA (Grouped-Query Attention): group multiple shared Q heads to 1 K/V head.
+	
+- Position Encoding:
+	+ RoPE (Rotary Position Embedding): standard of most of open-source models (LLaMA, Mistral, Qwen).
+	
+2. KV Cache:
+- Problem:
+	+ In autoregressive decoding, generating each new token requires recomputing attention against *all* preceding tokens.
+	+ Without caching: K and V must be recomputed for the entire sequence at each step → O(n²) complexity per step, which is highly inefficient.
+	+ With caching: K and V are computed only for the new token while previously computed K and V values ​​are reused → reduces complexity to O(n) per step.
+	
+	KV_cache_size = 2 (K và V) × num_layers × num_kv_heads × head_dim × seq_len × batch_size × bytes_per_element
+	
+3. Paged Attention:
+- Problem: Contiguous allocation for the maximum sequence length from the start leads to waste (if the output is shorter than expected) or causes fragmentation when handling multiple requests of varying lengths.
+
+- Idea: (from virtual memory in OS)
+	+ Divide the KV cache into fixed-size "pages" (e.g., 16 tokens per page).
+	+ Block table: maps logical blocks (sequence order) to physical blocks (actual locations in the memory pool).
+	+ Allocate pages based on actual demand; the final length does not need to be known in advance.
+	
+4. Basic Quantization:
+- Symmetric vs Asymmetric Quantization:
+	+ Symmetric: q = round(x / scale); used when the value distribution is symmetric around zero.
+	+ Asymmetric: q = round(x / scale) + zero_point; used when the distribution is skewed (e.g., after an activation function).
+	+ KV caches typically use asymmetric quantization because Key/Value value distributions are not perfectly symmetric.
+	
+- Per-tensor vs Per-channel vs Per-token quantization:
+	+ Per-tensor: 1 scale for all tensors - simple but decrease the accuracy.
+	+ Per-channel: each channel (dimension) has its own scale.
+	+ Per-token: each token has its own scale—commonly used for KV caches because the magnitudes of tokens can vary significantly.
+	+ It is necessary to determine the granularity for each tier (INT8/INT4) in the project and explain the associated trade-offs in the paper.
+	
+- Affect to the accuracy:
+	+ Outlier: Some large outliers in the K/V ratio can stretch the scale, reducing accuracy for the majority of the remaining values.
+	+ Metrics: perplexity degradation when applying INT8/INT4 with FP16 baseline.
+	
+5. Attention Weight (use for Importance Score):
+- Attention weights (the output of the softmax function) represent the "degree of attention" a query token allocates to each past key token.
+- It is crucial to understand the limitations: a high attention weight does not necessarily equate to "semantic importance"—this is an assumption that must be empirically verified (as in RQ3) rather than an established fact (many papers argue that "attention is not explanation").
+- The "attention sink" phenomenon: the initial token (often the BOS token) frequently receives very high attention weights regardless of semantics. Awareness of this phenomenon is essential to avoid misinterpreting importance scores; otherwise, your importance map might artificially prioritize retaining the first token.
+
+
+III. OS and System:
+1. GPU Memory Management:
+- How NVIDIA allocates VRAM:
+	+ VRAM is managed by driver (CUDA driver + kernel-mode driver), not OS.
+	+ Each CUDA process has 1 own context that keep 1 part of VRAM for weights, buffer, workspace.
+	+ When multiple processes run concurrently on a single GPU, the driver allocates resources on demand without a default "reservation" mechanism; this is precisely the source of the contention issue your project addresses.
+	+ It is important to understand that—unlike multi-tenant data centers (which employ technologies like MIG—Multi-Instance GPU—or MPS—Multi-Process Service—to isolate resources)—standard consumer GPUs lack mechanisms to isolate or guarantee VRAM allocation between processes. This distinction is the key factor justifying your entire project.
+
+- Memory oversubscription and Unified Memory (UM):
+	+ CUDA has UM to allow to oversubscribe VRAM.
+	+ cudaMallocManaged vs cudaMalloc.
+
+2. NVML API (NVIDIA Management Library):
+- Core function:
+	+ nvmlDeviceGetMemoryInfo(): return total/free/used memory - main API for VRAM Pressure Monitor.
+	+ nvmlDeviceGetUtilizationRates(): % usage of GPU compute.
+	+ Python binding: package nvidia-ml-py (import as pynvml)
+
+- Limitation section:
+	+ It is polling-based rather than event-driven, meaning there is always a latency between the actual change in VRAM and its detection (depending on the polling interval).
+	+ It does not provide detailed, real-time information on which process is consuming additional VRAM (while an API exists to list processes, it incurs higher overhead and should not be called at every step).
+	+ There is a trade-off between a short polling interval (fast detection but high CPU usage) and a long one (resource-efficient but slow detection)—this is a parameter you need to ablate in the paper.
+
+3. Concurrency (Threading/Async):
+- Why to need: VRAM Monitor must run parallelly with main decode loop, not block main thread (if not, each polling will decrease the speed of generating tokens).
+
+- Tech stacks:
+	+ Python: Use the `threading` module (since CUDA calls often release the GIL during kernel execution, threading remains effective for I/O-bound tasks like NVML polling) or `asyncio` if a more event-driven architecture is desired.
+	+ C++ (if implementing the core in C++): Use `std::thread` and `std::atomic` to share the pressure state between the monitor thread and the main thread without requiring heavy locking mechanisms.
+	+ Race conditions to avoid: The Precision Controller reading importance scores while the Attention Scorer is updating them—this requires a synchronization mechanism (e.g., a mutex or double-buffering, where the main thread writes to buffer A while the Controller reads from buffer B, followed by a swap).
+	+ CUDA Streams: Understand the stream concept to realize that KV cache re-quantization (Milestone 2) can run on a separate stream, overlapping with the computation of the next decoding step if designed carefully—this represents an advanced optimization opportunity.
+
+4. Basic Control Systems (For Precision Controller):
+- Hysteresis: 
+	+ A concept borrowed from control engineering: the system does not react immediately when a signal crosses a threshold; instead, the signal must remain stable for a specific duration or number of measurements.
+	+ Rationale: Without this delay, the system would "thrash"—constantly downgrading and upgrading buffers as VRAM usage fluctuates around the threshold—resulting in inefficiency and potentially performing worse than taking no action at all.
+	+ Implementation: Count the number of consecutive signal readings in the new state before executing the state transition (a debouncing counter).
+
+- Basic feedback loop: Measure (VRAM) -> decide (policy) -> action (requantize) -> measure again.
+
+- Rate limiting: Limiting the maximum frequency at which the system is permitted to act - a simple form of "cooldown period"—helps bound overhead and prevent instability.
+
+5. Metrics and Benchmark:
+- Latency percentiles (P50/P99):
+	+ Why not rely solely on the average?: Occasional re-quantization events causing latency spikes might not significantly impact the average, yet they can severely affect the user experience—P99 latency is a better reflection of "common worst-case scenarios" than the average.
+	
+- Throughput measurement (Tokens/second): measure prefill throughput (tokens/s for prompt processing) and decode throughput (tokens/s for new token generation) separately, as the two stages have different characteristics (compute-bound vs. memory-bound).
+
+
+IV. NLP Evaluation Methodology:
+1. Evaluation Metrics:
+- Perplexity:
+	+ Formula: PPL = exp(-1/N * Σ log P(token_i | context))
+	+ Meaning: It measures how "surprised" the model is by real data—the lower the value, the better.
+	+ Application: Measure perplexity degradation when applying quantization (INT8/INT4) compared to the FP16 baseline using a held-out dataset; this serves as a mandatory "sanity check" before proceeding to task-specific evaluation.
+	+ Limitations to note: Perplexity is a general metric that does not indicate which types of content are most affected by degradation (which is precisely why task-specific evaluation is required for RQ3).
+	
+- ROUGE-L:
+	+ Measures the overlap between the generated summary and the reference summary based on the Longest Common Subsequence (LCS).
+	+ It has three variants—Recall, Precision, and F1—with F1 typically being the reported metric.
+	+ A significant limitation is that ROUGE measures only surface-level (lexical) overlap and does not capture semantics; consequently, two semantically equivalent paraphrases that use different words will receive a low score. This limitation should be explicitly stated in the paper when using ROUGE as the primary metric.
+	
+- BERTScore:
+	+ Use embeddings from a BERT-like model to calculate semantic similarity between the candidate and reference, rather than relying on lexical overlap.
+	+ This addresses ROUGE's limitations (by capturing paraphrases) but depends on the quality of the embedding model used; the specific model must be stated when reporting results (e.g., the `bert-score` package defaults to RoBERTa-large).
+	+ Recommendation: Report both ROUGE-L and BERTScore—this is standard practice in summarization research to mutually compensate for each metric's limitations.
+	
+- Exact Match (EM) and F1:
+	+ EM: The answer must match exactly (usually after normalization: converting to lowercase, removing punctuation, and stripping articles like "a," "an," or "the").
+	+ F1: Measures the overlap between the predicted answer and the reference answer (token-level precision/recall)—more lenient than EM.
+	+ This is the standard metric from SQuAD, widely used for extractive QA.
+	
+2. Benchmark "Needle in a Haystack":
+- Idea:
+	+ Insert a specific piece of information (the "needle"—e.g., a random fact) at a designated position within a long text (the "haystack"), then query the model about that information.
+	+ Measure accuracy based on the needle's position (beginning, middle, or end of the context) and the context length—generating a "heatmap" that reveals where the model struggles.
+
+- Why it is specifically suitable?:
+	+ You can exercise precise control: identify exactly which block of the paged KV cache contains the "needle," then—when that block undergoes precision reduction (due to the adaptive policy), measure the extent to which the accuracy of the response regarding that needle declines.
+	+ This is the most direct method to validate RQ3 (i.e., whether semantic-aware allocation offers better protection for critical regions compared to uniform quantization).
+
+- Design:
+	+ Generate multiple (haystack, needle, question) triplets with varying haystack lengths (e.g., 2K, 8K, 16K tokens) and different needle positions (10%, 50%, and 90% of the total length).
+	+ For Vietnamese: Maybe create these yourself by concatenating long VNese Wikipedia texts and inserting custom-written factual sentences (this offers better control than using existing datasets, as popular "needle-in-haystack" benchmarks are primarily in English).
+	
+3. LLM-as-Judge:
+- How it works:
+	+ Use a more powerful LLM (e.g., GPT-4 or Claude) to score the output quality of the model under test based on a specific rubric (e.g., a 1–5 scale for coherence, relevance, and factuality).
+	+ Typically employs prompt templates with few-shot examples to ensure more consistent scoring by the judge LLM.
+
+- Limitations to be explicitly stated in the paper (crucial for scientific integrity):
+	+ Self-preference bias: The judge LLM tends to award higher scores to outputs that mirror its own writing style.
+	+ Position bias: When comparing two answers (A/B), the judge LLM tends to favor a specific presentation order; positions should be randomized during comparison.
+	+ Does not fully replace human evaluation: "LLM-as-judge" should be viewed as a proxy; ideally, it should be cross-referenced with a small amount of human evaluation (even a few dozen samples can enhance reliability).
+	+ Mitigation strategies: Use clear rubrics, require the judge to provide a rationale before assigning a score ("chain-of-thought judging"), and report inter-rater agreement if possible.
+	
+4. Multi-turn Dialogue Evaluation (MT-Bench methodology):
+- Typical Structure:
+	+ The question set is designed as dialogue pairs consisting of two or more turns, where subsequent turns often depend on the context of the preceding ones (testing follow-up capabilities and backward referencing).
+	+ Scoring is performed either on a turn-by-turn basis or for dialogue as a whole.
+
+- Customization:
+	+ It is necessary to design specific question types, such as "anchor-fact recall": the initial turn provides a specific piece of information (name, figure, event), and subsequent turns—spaced far enough from the first to ensure the information falls within the range where precision is likely to degrade—ask for that information again.
+	+ Two-dimensional measurement: (1) exact-match accuracy of the recalled information, and (2) overall dialogue coherence (evaluated via an LLM-as-judge approach).
+	
+5. Experimental Design:
+- Controlled Comparison:
+	+ The most important principle: when comparing "uniform quantization" and "semantic-aware quantization," the average total compression ratio must be equal—otherwise, any difference in results might simply stem from the varying compression levels rather than the allocation strategy.
+	+ The design must ensure that both methods compress exactly X% of the total cache capacity, differing only in the selection of which blocks to compress.
+	
+- Statistical significance:
+	+ Run each condition multiple times (using different seeds or multiple samples from a sufficiently large test set) to calculate a confidence interval, rather than reporting a single figure.
+	+ Use paired comparisons whenever possible (e.g: using the same set of questions while varying only the condition) to increase the statistical sensitivity of comparison.
+	
+- Ablation study: Remove individual policy components (e.g., the recency floor, layer weighting, or periodic re-scoring) to demonstrate the contribution of each part—reviewers often request this, so it is best to prepare these results from the start rather than waiting until a revision is requested.
+
+
+
+V. Research Skills:
+1. Reading paper efficiently:
+- Turn 1: Read Abstract, Introduction, main result images/tables - target of the paper.
+- Turn 2: Read the Method and Related Work sections carefully - understand their approach and compare it with your intended approach.
+- Turn 3: Read Experiment setup, Appendix carefully - often contains hyperparameter, how to choose baseline.
+
+- Tools: Semantic Scholar/Google Scholar, Connected Papers.
+
+2. Controlled Experimental Design:
+- The "change one variable at a time" principle: When comparing two conditions, they should differ by exactly one factor—the one being tested—while all other factors (model, dataset, prompt, seed, hardware) must remain constant.
+
+- Ablation Study:
+	+ Remove recency floor → determine if the recency floor is necessary.
+	+ Remove layer weighting (use uniform weighting instead of layer-based weighting) → determine if prioritizing deeper layers is beneficial.
+	+ Adjust re-scoring frequency (R) → trade-off between overhead and importance map accuracy.
+	+ Adjust α in EWMA → policy sensitivity to sudden contextual changes.
+	
+3. How to write Related Work exactly:
+- A common pitfall to avoid is listing papers in a "Paper A does X; Paper B does Y; Paper C does Z" format—this is weak writing that fails to demonstrate critical thinking.
+
+- Correct approach follows a structure of "grouping by approach, then identifying the gap":
+	+ Group related papers based on their shared approach (e.g., "static offline quantization" as one group, "datacenter adaptive serving" as another).
+	+ For each group, briefly summarize the core idea and key representative works.
+	+ Most importantly: after each group (or at the end of the section), clearly state the assumption that the group fails to satisfy within the context of your specific problem.
+	+ A useful example: "While [Method X] achieves strong results in [context], it assumes [assumption] which does not hold in [your setting], motivating our approach."
+	
+4. Basic statistical knowledge:
+- Confidence Interval:
+	+ Do not simply report a single average value; the degree of variation must be known (e.g., mean ± 95% CI, or mean ± standard deviation).
+	+ Simple calculation method: run the experiment N times (N ≥ 5 is the minimum acceptable level for most system experiments) and use the standard error of the mean.
+
+- Significance of running multiple seeds/iterations
+	+ LLM sampling involves randomness (temperature > 0), so a single run could be a lucky or unlucky outlier.
+	+ Experiments involving latency or throughput also require multiple runs because real-world systems are subject to noise (e.g., background processes, thermal throttling on laptops—a factor particularly relevant to your topic).
+
+- Paired vs. Unpaired Comparison
+	+ Paired t-test: used when comparing two conditions using the same set of questions (where results for both conditions are obtained for each question); this is more sensitive and suitable for your experimental design.
+	+ Unpaired: used when the two groups are completely independent; less suitable for this specific case, but important to understand to avoid incorrect usage.
+	
+5. Scientific Writing:
+- Write clearly and concisely—avoid unnecessarily complex sentences; scientific writing prioritizes precision over "flowery" language.
+- Back up every key claim with evidence (data, citations)—avoid making assertions without supporting information.
+- Adhere to the standard "IMRaD" structure (Introduction, Methods, Results, and Discussion) as reflected in outline—practice writing each section according to its specific purpose (the Introduction sells the idea; Methods provide an objective description; Results present facts without interpretation; and the Discussion interprets the significance).
