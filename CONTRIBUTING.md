@@ -134,6 +134,24 @@ through triage; triage is for issues that arrive raw.
 `ready-for-human` means it. Issue #4 corrects the author's own research notes,
 and an agent should not silently rewrite someone's research record.
 
+## Formatting
+
+`.clang-format` at the repo root is the C++/CUDA style. Format before
+committing:
+
+```bash
+pip install -e ".[dev]"
+clang-format -i $(git ls-files '*.cu' '*.cpp' '*.h')
+```
+
+The style was chosen to agree with what the editor already in use produces —
+Allman braces, two-space indent, indented namespaces, pointers bound right —
+so that saving a file does not churn the diff. It differs in one respect: the
+editor enforces no column limit, so indenting a block silently pushed comments
+past 80 columns. The config rewraps them.
+
+Python has no formatter configured. Add one when it starts to matter.
+
 ## Commits and pull requests
 
 Branch from `main`; do not commit to it directly. Keep commits small enough that
