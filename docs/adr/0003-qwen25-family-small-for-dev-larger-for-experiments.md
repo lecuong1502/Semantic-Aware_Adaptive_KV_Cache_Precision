@@ -47,4 +47,55 @@ not about model quality.**
   not optional.
 - All model configs above were taken from prior knowledge and must be verified
   against each model's `config.json` at download time before any kernel is
-  written against them.
+  written against them. **This has now been done — see the amendment below.**
+
+---
+
+## Amendment: constants verified, and two assumptions that were never written down
+
+Every constant above was checked against each model's `config.json` on
+2026-09-22 (#5). Both cards are committed under `src/microinfer/model_cards/`,
+with the expectation held separately in `models.py` so that the copy cannot
+check itself.
+
+**Nothing was wrong.** Layer counts, hidden sizes, head counts, KV head counts,
+derived head dimensions, RoPE theta, tied embeddings, 32K context and the
+absence of rope scaling all match what was assumed.
+
+Two things were *unstated*, which is a worse failure mode than a wrong constant
+because nothing existed to check.
+
+### The checkpoints are bfloat16, not float16
+
+Both models ship `torch_dtype: bfloat16`. Every kernel, ADR-0005 and ADR-0006
+assume fp16 throughout, so **every weight load crosses a format boundary**.
+
+The crossing is safe in one direction and lossy in the other, and not in the way
+intuition suggests. bf16 is float32 with the low sixteen mantissa bits removed:
+same 8-bit exponent, 7 bits of mantissa. fp16 has 5 exponent bits and 10 of
+mantissa. So converting bf16 to fp16 *gains* precision and *loses range* —
+bf16 reaches past 3e38 where fp16 stops at 65504. A weight beyond that line
+becomes an infinity in silence.
+
+The engine therefore range-checks every tensor on load and refuses rather than
+converting. For these two checkpoints no tensor comes close, but that is a fact
+about these weights, not a guarantee about bf16 checkpoints.
+
+**The consequence reaches past this ticket.** Golden reference tensors (#6) must
+be generated in fp32, not in the checkpoint's native bf16. bf16's relative ulp is
+2^-8, eight times coarser than fp16's 2^-11, so a bf16 reference would carry
+more error than the implementation being measured against it — and would exceed
+ADR-0006's max bound of 4 fp16 ulps on its own. A reference must be more
+accurate than the thing it judges.
+
+### The card has 6141 MiB; CUDA offers 5762 MiB
+
+`cudaMemGetInfo` on this machine reports 5762 MiB total and 5392 MiB free with
+nothing loaded. The 6141 MiB figure from `nvidia-smi`, which the arithmetic
+above was computed against, is the physical size; roughly 380 MiB is already
+held by the driver and the desktop before the engine starts.
+
+This does not change any conclusion — the percentages shift slightly in the
+project's favour, since the same reclaimable bytes are a larger share of a
+smaller budget — but the **absolute** headroom is smaller than stated. Reported
+figures should say which denominator they use.

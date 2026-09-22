@@ -23,4 +23,17 @@ except Exception as exc:  # pragma: no cover - environment failure, not logic
         "GPU. Check `nvidia-smi`."
     ) from exc
 
-__all__ = ["CUDA_DRIVER_VERSION", "_microinfer"]
+from .config import ConfigMismatch, ModelConfig  # noqa: E402
+from .engine import Engine, expected_weight_bytes, kv_cache_bytes  # noqa: E402
+from .footprint import Footprint  # noqa: E402
+
+__all__ = [
+    "CUDA_DRIVER_VERSION",
+    "ConfigMismatch",
+    "Engine",
+    "Footprint",
+    "ModelConfig",
+    "_microinfer",
+    "expected_weight_bytes",
+    "kv_cache_bytes",
+]

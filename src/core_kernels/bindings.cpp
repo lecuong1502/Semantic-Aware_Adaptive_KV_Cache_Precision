@@ -1,6 +1,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -56,6 +57,30 @@ namespace
 
 } // namespace
 
+namespace
+{
+
+  py::array_t<float> tensor_to_numpy(const microinfer::DeviceTensor &t)
+  {
+    py::array_t<float> out(static_cast<py::ssize_t>(t.numel()));
+    float *ptr = out.mutable_data();
+    {
+      py::gil_scoped_release release;
+      t.download(ptr);
+    }
+    return out;
+  }
+
+  std::unique_ptr<microinfer::DeviceTensor> upload_fp16(FloatArray host)
+  {
+    const auto count = static_cast<size_t>(host.size());
+    const float *ptr = host.data();
+    py::gil_scoped_release release;
+    return std::make_unique<microinfer::DeviceTensor>(ptr, count);
+  }
+
+} // namespace
+
 PYBIND11_MODULE(_microinfer, m)
 {
   m.doc() = "MicroInfer CUDA kernels (Seam B: NumPy in, NumPy out)";
@@ -65,6 +90,33 @@ PYBIND11_MODULE(_microinfer, m)
         "which ADR-0007's allocator requires.");
 
   m.def("device_name", &microinfer::device_name, "Name of CUDA device 0.");
+
+  py::class_<microinfer::DeviceTensor>(m, "DeviceTensor",
+                                       "Owned fp16 storage on the device.")
+      .def_property_readonly("numel", &microinfer::DeviceTensor::numel)
+      .def_property_readonly("nbytes", &microinfer::DeviceTensor::nbytes,
+                             "Bytes occupied on the device. fp16, so two per "
+                             "element — not the size of the host array it came "
+                             "from.")
+      .def("to_numpy", &tensor_to_numpy,
+           "Copy back to the host as fp32. For tests; not a hot path.");
+
+  m.def("upload_fp16", &upload_fp16, py::arg("host"),
+        "Upload a float32 array to the device as fp16. The conversion happens "
+        "on the host so the device never holds an fp32 copy.");
+
+  m.def(
+      "device_memory_info",
+      []()
+      {
+        const auto info = microinfer::device_memory_info();
+        py::dict d;
+        d["free"] = info.free_bytes;
+        d["total"] = info.total_bytes;
+        return d;
+      },
+      "Free and total device memory as cudaMemGetInfo reports it — the same "
+      "quantity NVML sees, and the one RQ2 turns on.");
 
   m.def("rmsnorm", &rmsnorm, py::arg("x"), py::arg("weight"), py::arg("eps"),
         "RMSNorm over the last axis: x / sqrt(mean(x^2) + eps) * weight.\n"
