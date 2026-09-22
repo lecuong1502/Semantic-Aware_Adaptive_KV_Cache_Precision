@@ -28,7 +28,7 @@
 - **Consumer/edge inference systems**: llama.cpp, PowerInfer, ATSInfer, APEX — engineering systems that handle OOM by refusing/crashing or static offload; none handle *mid-session* precision adaptation triggered by *external* (non-model) VRAM contention.
 
 ### 3. Problem Characterization (RQ1)
-- Experimental setup: laptop with RTX 4050/4060, fixed model + prompt set, background load generators (Chrome with N tabs, Discord screen-share, OBS recording, a game demo).
+- Experimental setup: laptop with an **RTX 4050 Laptop GPU, 6141 MiB** (not "4050/4060" — the 6 GiB figure is what makes the KV footprint arithmetic in ADR-0003 binding, and an 8 GiB 4060 would change every threshold below), fixed model + prompt set, background load generators (Chrome with N tabs, Discord screen-share, OBS recording, a game demo).
 - Measurements: available VRAM over time (via NVML polling), variance, spike frequency/magnitude, correlation with common user actions.
 - Deliverable: a small "VRAM contention trace" dataset + descriptive statistics — this is a citable empirical contribution even before the systems contribution.
 
@@ -181,12 +181,13 @@ function plan(scores, pressure, tiers, recency_floor):
 - **Hysteresis on the policy itself**: do not re-plan more often than every `M` decode steps (e.g., 8–16) to bound re-quantization overhead.
 
 ### 3.4 Paged Mixed-Precision KV Cache Manager
-- Owns a paged KV cache, built from scratch (see Milestone 1, Section 4.1): each page has a `precision_tier` field in its block table entry, alongside the usual logical→physical page index.
+- Owns a paged KV cache, built from scratch (see Milestone 1, Section 4.1): each page has a `precision_tier` field in its **page table** entry, alongside the usual logical→physical page index. (vLLM calls this a *block table*; `CONTEXT.md` fixes the project's term as *page table*. The rest of this document still uses the older word in places.)
 - **Downgrade path**: apply the engine's own INT8/INT4 quantization kernel in place, free the now-unused higher-precision bytes back to the allocator.
 - **Upgrade path**: two options to implement and compare:
   - *(a) Recompute-on-upgrade*: re-run the affected prefix's forward pass for that block — costly but always correct.
   - *(b) Retain-buffer*: keep a small CPU-side or compressed FP16 shadow copy for recently-downgraded blocks (bounded LRU buffer) so upgrade is a fast copy-back instead of recompute — introduces its own memory cost, worth an ablation.
-- **Allocator interaction**: precision tier changes the byte footprint of a page; the manager must support resizing/moving pages within the pool (or over-provision page slots per tier to avoid fragmentation — simpler for a first implementation).
+- **Allocator interaction**: precision tier changes the byte footprint of a page, and the freed bytes must return to the **driver**. `nvmlDeviceGetMemoryInfo` reports what the driver has handed out, so bytes recycled inside a private pool are invisible to the only measurement RQ2 has. The cache therefore reserves one virtual address range per tier through the CUDA VMM API — `cuMemAddressReserve`, `cuMemCreate`, `cuMemMap` — packs pages from the low end of each range, and releases granules with `cuMemUnmap`/`cuMemRelease` as they fall empty. See ADR-0007.
+- **Rejected: over-provisioning page slots per tier.** An earlier draft of this section proposed it as "simpler for a first implementation". It is the one approach that *cannot* work: an INT4 page written into an FP16-sized slot wastes the difference, nothing returns to the driver, NVML never moves, and the response to RED pressure becomes a no-op that cannot be measured. Adopting it would mean withdrawing RQ2 from the thesis. Kept on the record rather than deleted, because it is an attractive shortcut and someone will propose it again.
 
 ### 3.5 Contention Simulator (for controlled experiments)
 - A standalone utility that allocates/frees GPU memory in configurable patterns (step function, sawtooth, random spikes) to reproduce RQ1's empirical traces deterministically for RQ2/RQ3 experiments — decouples "does the mechanism work" from "waiting for a real Chrome tab to spike memory."
@@ -200,7 +201,9 @@ This section is written so you can hand each part, in order, to an AI coding ass
 ### 4.1 Suggested build order
 
 **Milestone 0 — Minimal working inference path (no adaptivity yet)**
-1. A basic decoder-only transformer forward pass in CUDA/C++ (or Python + custom kernels via `pybind11`) for a small open model (e.g., a 0.5–1.5B parameter model) — plain FP16 attention + GEMM, no paging yet, single fixed-size KV cache buffer. Goal: correct, unoptimized, verified against a HuggingFace reference implementation on the same prompt/seed.
+1. A basic decoder-only transformer forward pass — a Python orchestrator over hand-written CUDA kernels via `pybind11`, with cuBLAS for the dense projections (ADR-0001) — plain FP16 attention, no paging yet, single fixed-size KV cache buffer.
+   - **Model is not a free choice.** Qwen2.5-0.5B-Instruct for development, Qwen2.5-1.5B-Instruct at 32K context for the experiments (ADR-0003). The earlier "0.5–1.5B parameter model" range does not survive the arithmetic: at 0.5B with an 8K context the *entire* KV cache is 96 MiB, and flattening all of it to INT4 reclaims 72 MiB — against contention spikes of 200–400 MiB from a browser tab. The mechanism could not avoid a single OOM at that scale, and RQ2 would be dead before a line of code was written. Only the long-context column clears the threshold.
+   - Goal: correct, unoptimized, verified against a HuggingFace reference on a fixed prompt and seed. **The gate is top-1 logit agreement ≥ 99% with mean KL < 1e-3, not matching generated text** — cuBLAS accumulates along a different path, so a 1e-4 logit difference at a near-tie flips an argmax and diverges everything after it (ADR-0006).
 2. Add a **paged** KV cache (fixed precision, FP16 only) — logical block table, physical page pool, page allocation/free. Validate: output identical to the non-paged version.
 3. Add INT8 and INT4 quantize/dequantize kernels for KV cache blocks, usable *statically* (i.e., quantize once at allocation, no runtime switching yet). Validate: perplexity delta on a held-out set vs. FP16, matches published expectations for the quantization scheme chosen (e.g., roughly in line with KIVI/KVQuant-reported degradation).
 
@@ -230,27 +233,50 @@ When handing a module to an AI coding assistant, give it:
 - For every new CUDA kernel (Milestone 0 especially, since there is no prior reference implementation to lean on), always validate numerically against a PyTorch/HuggingFace reference on a fixed seed/prompt before trusting any benchmark numbers — a benchmark showing a "speedup" from a broken kernel is a common failure mode to guard against explicitly, and it's easier to fall into when starting from scratch than when extending known-correct code.
 - Keep a running **benchmark log** (config, hardware, git commit hash, results) from the very first working version — this becomes the paper's experiment log and saves you from re-deriving results later.
 
-### 4.4 Suggested repo layout
+### 4.4 Repo layout
+
+Written to match what the repository actually is, which the flat layout in an
+earlier draft of this section predates. The shape follows from ADR-0002: a
+Python orchestrator over a CUDA extension, with PyTorch nowhere in the engine
+process.
+
 ```
-adaptive-kv-inference/
-├── core_kernels/              # Milestone 0: attention, GEMM, paged cache, static quant — built from scratch
-│   └── tests/                 # numerical validation vs. PyTorch/HF reference
-├── contention_simulator/
-├── vram_monitor/
-├── attention_scorer/
-├── precision_controller/
-│   └── tests/                 # pure-logic unit tests, no GPU needed
-├── kv_cache_manager/          # runtime re-quantization on top of core_kernels' paged cache
-├── orchestrator/               # decode loop integration
-├── eval/
-│   ├── datasets/               # dialogue / long-doc QA / summarization
-│   ├── metrics/
-│   └── run_experiment.py       # produces the 4-condition comparison table
-├── experiments/logs/          # append-only benchmark log (see 4.3)
-└── paper/                     # outline, figures, drafts (this document's source)
+├── pyproject.toml                 # scikit-build-core + CMake; torch is not a dependency
+├── CMakeLists.txt                 # links CUDA::cudart AND CUDA::cuda_driver (ADR-0007)
+├── requirements.txt               # pinned environment; torch must never appear (ADR-0002)
+├── CONTEXT.md                     # glossary — the unit is a `page`, never a `block`
+├── CONTRIBUTING.md
+├── .clang-format                  # Allman, 2-space, namespaces indented
+├── .pre-commit-config.yaml        # clang-format + the two engine invariants
+├── docs/
+│   ├── adr/                       # architectural decisions, with rejected options
+│   └── agents/                    # issue tracker and triage conventions
+├── src/
+│   ├── microinfer/                # Python orchestrator. Sequences kernels; does no arithmetic
+│   └── core_kernels/              # hand-written CUDA
+│       ├── rmsnorm.cu  rope.cu  swiglu.cu
+│       ├── attention.cu           # online softmax, causal mask, GQA
+│       ├── paged_cache.cu         # page table + VMM allocator (ADR-0007)
+│       ├── quant.cu               # INT8 / INT4 / INT2 quantise-dequantise (ADR-0005, ADR-0008)
+│       ├── gemm.cu                # thin cuBLAS wrapper (ADR-0001)
+│       ├── bindings.cpp           # pybind11. NumPy in/out at the test-facing surface (Seam B)
+│       └── include/microinfer/
+├── tests/
+│   ├── test_*.py                  # Seam A (Engine) and Seam B (extension)
+│   └── golden/                    # reference tensors: generated offline, stored, regenerated rarely
+├── tools/
+│   ├── gen_golden.py              # the ONLY place torch and transformers appear (ADR-0002)
+│   └── check_engine_invariants.py # enforces that rule on commit
+├── studies/                       # tiled GEMM vs cuBLAS — deliberately off the inference path (ADR-0001)
+├── experiments/logs/              # append-only benchmark log: config, hardware, commit
+└── graduation_thesis/             # paper source
 ```
 
----
+Two boundaries in that tree carry decisions rather than taste. `tools/` is the
+only directory where PyTorch may be imported, because its caching allocator
+would otherwise corrupt the NVML reading RQ2 depends on. And `studies/` is
+unreachable from the engine's import graph, so a hand-written GEMM that is
+slower than cuBLAS cannot contaminate a latency measurement.
 
 ## 5. Knowledge Roadmap (Prerequisite Learning Plan)
 
