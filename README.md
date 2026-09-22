@@ -165,7 +165,7 @@ and `cuMemMap`, which the allocator needs, live only in the driver API.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e .                 # builds the CUDA extension via scikit-build-core
+pip install -e ".[test]"         # builds the CUDA extension via scikit-build-core
 pytest                           # kernel and toolchain tests
 ```
 

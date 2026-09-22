@@ -6,6 +6,9 @@ compile time. Discovering that when the allocator is written would be late.
 """
 
 import subprocess
+import sys
+
+import pytest
 
 import microinfer
 from microinfer import _microinfer
@@ -20,8 +23,15 @@ def test_driver_api_call_succeeded_at_import():
     assert microinfer.CUDA_DRIVER_VERSION > 0
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="ldd is Linux-only")
 def test_extension_is_linked_against_libcuda():
-    """Assert the linkage directly, not just that a call happened to work."""
+    """Assert the linkage directly, not only that a call happened to work.
+
+    This inspects the build product rather than behaviour, which CONTRIBUTING
+    generally discourages. It earns its place here because proving the build is
+    this ticket's entire purpose, and because a driver symbol could in principle
+    resolve through another loaded module rather than through this one.
+    """
     out = subprocess.run(
         ["ldd", _microinfer.__file__], capture_output=True, text=True, check=True
     ).stdout
@@ -35,6 +45,4 @@ def test_device_is_visible():
 def test_pytorch_is_not_in_the_engine_process():
     """ADR-0002: PyTorch's caching allocator would corrupt the NVML reading the
     whole project depends on. It is never imported in a process running the engine."""
-    import sys
-
     assert "torch" not in sys.modules

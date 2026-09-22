@@ -10,5 +10,3 @@ __pycache__/
 *.so
 .pytest_cache/
 
-# Golden reference tensors are generated offline (ADR-0002); regenerate, do not commit.
-tests/golden/
