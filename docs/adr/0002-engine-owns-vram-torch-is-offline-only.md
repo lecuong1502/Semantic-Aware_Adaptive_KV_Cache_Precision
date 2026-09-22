@@ -31,7 +31,8 @@ that the test suite compares against.
   see the amendment below.**
 - Golden reference tensors are generated once per (model, prompt set) pair and
   stored; regenerating them requires a machine with torch and the HF model, and
-  is a deliberate, infrequent act.
+  is a deliberate, infrequent act. **"Stored" means on disk, not in git — see
+  the second amendment below.**
 - Python performs no arithmetic. It sequences kernel calls; every tensor
   operation happens in CUDA.
 
@@ -61,3 +62,42 @@ a description of code that does not exist.
 - The reader owns two checks the library would have provided: an unknown dtype
   is an error rather than a guess, and a truncated file is named as truncated
   rather than surfacing as a reshape error deep in the parser.
+
+---
+
+## Second amendment: "stored" means on disk, not committed
+
+This ADR said golden tensors are "stored", and #6 had to decide what that meant
+in practice. They are **not committed**. `tests/golden/` is ignored.
+
+The figures, once they existed to measure:
+
+| | measured | |
+|---|---:|---|
+| Qwen2.5-0.5B, 24 prompts | 108.8 MiB | 83.5 logits + 25.2 hidden states |
+| Qwen2.5-1.5B, projected | 133.7 MiB | hidden states scale with layers and width |
+| both | **242 MiB** | |
+
+That is already more than the repository should carry, and git keeps every
+regeneration forever — changing one prompt would add another 242 MiB to history
+permanently, with no way to reclaim it short of rewriting the repo.
+
+The trade this accepts is real and should be stated rather than glossed. A clean
+checkout cannot run the tests that need a reference until someone regenerates
+it, which needs the checkpoint and a torch environment. That is a worse
+onboarding story than a committed reference would give.
+
+It is accepted because the alternative is worse in a way that cannot be undone,
+and because the cost is bounded: `GoldenSet` refuses with the exact command
+rather than failing obscurely, the tests skip rather than fail, and the manifest
+carries a hash of the `config.json` the reference was generated from, so a stale
+reference is caught rather than mistaken for a kernel bug.
+
+### Consequences
+
+- The reference is reproducible rather than archived. `tools/gen_golden.py`
+  pins the seed, the prompt set is committed, and the manifest records the
+  torch and transformers versions used — those three are what make regeneration
+  give the same answer.
+- If a result in the thesis ever turns on a specific reference, that reference
+  must be archived deliberately and outside git, with its manifest.

@@ -29,8 +29,12 @@ def require_model(name: str) -> Path:
     if not checkpoint.is_file():
         pytest.skip(
             f"{name} is not downloaded. Fetch it with:\n"
-            f"  curl -L --create-dirs -o models/{name}/model.safetensors \\\n"
-            f"    https://huggingface.co/{UPSTREAM[name]}/resolve/main/model.safetensors"
+            f"  curl -L --fail --retry 5 --retry-all-errors -C - --create-dirs \\\n"
+            f"    -o models/{name}/model.safetensors \\\n"
+            f"    https://huggingface.co/{UPSTREAM[name]}/resolve/main/model.safetensors\n"
+            f"  Then re-run: a truncated file is reported as truncated, not as absent.\n"
+            f"  --fail matters: without it curl exits 0 on a connection the server\n"
+            f"  closed early, leaving a short file that looks like a successful download."
         )
 
     try:

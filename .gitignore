@@ -12,3 +12,11 @@ __pycache__/
 
 # Model weights: downloaded, never committed. See CONTRIBUTING.
 models/
+
+# The golden tensor generator lives in its own environment: it is the only
+# place torch may appear, and it must never sit beside the engine (ADR-0002).
+.venv-golden/
+
+# Golden reference tensors: 242 MiB across both models, and git keeps every
+# regeneration forever. Stored on disk, not in history. See ADR-0002.
+tests/golden/
