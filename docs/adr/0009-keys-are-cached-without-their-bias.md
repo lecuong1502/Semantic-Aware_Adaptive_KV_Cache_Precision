@@ -135,3 +135,14 @@ and its sampled mean KL fell from 1.28e-2 to 5.3e-3. The set's mean KL fell
 from 8.0e-4 to 4.4e-4. The same change exposed that the KL sample can
 understate as well as overstate; ADR-0006 has the correction. adversarial-00's
 remaining divergence is still not isolated.
+
+---
+
+## Note from #36: adversarial-00's remaining divergence, explained
+
+The note above left it "not isolated". #36 isolated it, and it is not a defect
+of this decision or of any kernel: adversarial-00 amplifies any small error in
+its embedding about a thousand times, where an ordinary prompt carries it
+forward unchanged. An engine that rounds activations to fp16 cannot follow the
+reference on it, whichever rounding is removed. ADR-0010 has the evidence, and
+keeps the residual stream in fp32 for what that does for every other prompt.
