@@ -1,6 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
 #include "microinfer/kernels.h"
@@ -26,7 +28,7 @@ namespace microinfer
     // consumer parts, but this is one sincos per pair per token, which is
     // noise next to the projections around it.
     __global__ void rope_kernel(const __half *__restrict__ x,
-                                const int *__restrict__ positions,
+                                const int32_t *__restrict__ positions,
                                 __half *__restrict__ out, int heads,
                                 int head_dim, double theta)
     {
@@ -53,7 +55,7 @@ namespace microinfer
 
   } // namespace
 
-  void rope(const float *x, const int *positions, float *out, int seq,
+  void rope(const float *x, const int32_t *positions, float *out, int seq,
             int heads, int head_dim, double theta)
   {
     if (seq <= 0 || heads <= 0 || head_dim <= 0)
@@ -62,7 +64,7 @@ namespace microinfer
     }
 
     const size_t count = static_cast<size_t>(seq) * heads * head_dim;
-    const size_t pos_bytes = static_cast<size_t>(seq) * sizeof(int);
+    const size_t pos_bytes = static_cast<size_t>(seq) * sizeof(int32_t);
 
     DeviceBuffer dev_x(count * sizeof(__half));
     DeviceBuffer dev_pos(pos_bytes);
@@ -74,8 +76,8 @@ namespace microinfer
         "cudaMemcpy positions host-to-device");
 
     rope_kernel<<<seq * heads, kBlockThreads>>>(
-        dev_x.as<const __half>(), dev_pos.as<const int>(), dev_out.as<__half>(),
-        heads, head_dim, theta);
+        dev_x.as<const __half>(), dev_pos.as<const int32_t>(),
+        dev_out.as<__half>(), heads, head_dim, theta);
     cuda_check(cudaGetLastError(), "rope kernel launch");
     cuda_check(cudaDeviceSynchronize(), "rope kernel execution");
 

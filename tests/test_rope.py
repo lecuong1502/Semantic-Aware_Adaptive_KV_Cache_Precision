@@ -10,7 +10,9 @@ The reference is written as complex multiplication, deliberately not in the
 kernel's cos/sin shape: `(x1 + i*x2) * exp(i * pos * inv_freq)`, whose real and
 imaginary parts are the two halves of the output.
 
-Every dimension and theta come from the model cards, never literals (issue #7).
+Every dimension and theta in a test of correctness comes from the model cards,
+never a literal (issue #7). The input-validation tests at the end use literals,
+because what they check is a shape the model never has.
 """
 
 import numpy as np
@@ -30,7 +32,7 @@ def positions_for(cfg: ModelConfig) -> np.ndarray:
     The far end is what makes this list worth having. An fp32 angle
     `pos * inv_freq` carries an absolute error that grows with the position.
     Simulated at the fastest frequency (test_the_gate_would_reject_an_fp32_angle),
-    it costs 5.5 ulp at 2049 and 60 ulp at max_position_embeddings - 1, the last
+    it costs 18 ulp at 2049 and 60 ulp at max_position_embeddings - 1, the last
     position the model ever sees. Near zero it costs nothing, which is why a
     kernel that gets this wrong passes a test of small positions."""
     return np.array([0, 1, 2, 31, 32, 1000, 2047, 2048, 2049, 4097, 16384,

@@ -4,6 +4,7 @@
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
 #include "microinfer/kernels.h"
+#include "microinfer/launch.h"
 #include "microinfer/staging.h"
 
 namespace microinfer
@@ -52,12 +53,7 @@ namespace microinfer
     upload_fp16(dev_gate, gate, count, "cudaMemcpy gate host-to-device");
     upload_fp16(dev_up, up, count, "cudaMemcpy up host-to-device");
 
-    // Enough thread blocks to fill the device several times over; the
-    // grid-stride loop covers whatever is left, so the grid never has to
-    // scale with count.
-    const size_t wanted = (count + kBlockThreads - 1) / kBlockThreads;
-    const int grid = static_cast<int>(wanted < 4096 ? wanted : 4096);
-
+    const int grid = grid_stride_blocks(count, kBlockThreads);
     swiglu_kernel<<<grid, kBlockThreads>>>(dev_gate.as<const __half>(),
                                            dev_up.as<const __half>(),
                                            dev_out.as<__half>(), count);

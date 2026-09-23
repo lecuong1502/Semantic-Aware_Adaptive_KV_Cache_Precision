@@ -5,6 +5,7 @@
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
 #include "microinfer/kernels.h"
+#include "microinfer/launch.h"
 #include "microinfer/staging.h"
 
 namespace microinfer
@@ -92,8 +93,7 @@ namespace microinfer
       upload_fp16(dev_bias, bias, out_features,
                   "cudaMemcpy bias host-to-device");
 
-      const size_t wanted = (out_count + kBlockThreads - 1) / kBlockThreads;
-      const int grid = static_cast<int>(wanted < 4096 ? wanted : 4096);
+      const int grid = grid_stride_blocks(out_count, kBlockThreads);
       broadcast_rows_kernel<<<grid, kBlockThreads>>>(
           dev_bias.as<const __half>(), dev_out.as<__half>(), out_features,
           out_count);

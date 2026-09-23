@@ -41,16 +41,21 @@ def accumulation_floor(terms: np.ndarray, n: int) -> np.ndarray:
 
     `terms` is, per output, the sum of the absolute values of what was added.
     fp32 accumulation over `n` of them errs by about sqrt(n) * u32 * terms (the
-    probabilistic bound — Higham & Mary, 2019 — which is what is observed; the
-    worst case n * u32 is loose by orders of magnitude). The floor is the
-    magnitude at which that error is one fp16 ulp.
+    probabilistic bound of Higham & Mary, 2019; the worst case n * u32 is loose
+    by orders of magnitude). The floor is the magnitude at which that error
+    uses the whole max budget, MAX_REL, and no more: accumulation is allowed to
+    be the worst thing about an output, but not to exceed the gate on its own.
 
-    This is deliberately not `terms` itself. A dot product's terms outweigh its
-    result by ~sqrt(n), so measuring against them would forgive an fp16
-    accumulator; test_linear.py shows this floor does not. Measured on the
-    model's projections, the kernel's worst error under it is 1.00 ulp — the
-    fp16 output rounding alone."""
-    return np.sqrt(n) * (FP32_REL_ULP / FP16_REL_ULP) * terms
+    Calibrated rather than assumed. On the model's projections the observed
+    error is at most 0.19 of the bound, and the floor replaces |y| for 1.4% of
+    outputs at n = 896 and 13.7% at n = 8960. Stating the floor against one ulp
+    instead of four would have covered 51% at n = 8960, the review of #7
+    measured, and at that point it is the floor, not the result, being judged.
+
+    Deliberately not `terms` itself. A dot product's terms outweigh its result
+    by ~sqrt(n), so measuring against them would forgive an fp16 accumulator;
+    test_linear.py shows this floor does not."""
+    return np.sqrt(n) * FP32_REL_ULP * terms / MAX_REL
 
 
 def input_rounding_floor(terms: np.ndarray) -> np.ndarray:

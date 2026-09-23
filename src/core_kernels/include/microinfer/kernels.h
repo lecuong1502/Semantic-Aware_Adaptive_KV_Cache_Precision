@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace microinfer
@@ -32,7 +33,7 @@ namespace microinfer
   //
   // theta is a parameter because it is config: Qwen2.5 uses 1e6 with no
   // scaling, which is why ADR-0003 chose it over Llama-3.2.
-  void rope(const float *x, const int *positions, float *out, int seq,
+  void rope(const float *x, const int32_t *positions, float *out, int seq,
             int heads, int head_dim, double theta);
 
   // The MLP activation, silu(gate) * up, elementwise over `count` values.

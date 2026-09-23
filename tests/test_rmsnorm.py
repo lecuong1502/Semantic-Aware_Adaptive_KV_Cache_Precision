@@ -17,8 +17,7 @@ in `ulp_gate`.
 
 import numpy as np
 import pytest
-from ulp_gate import MAX_REL, fp16_exact, relative_error
-from ulp_gate import assert_within_gate as assert_gate
+from ulp_gate import MAX_REL, assert_within_gate, fp16_exact, relative_error
 
 from microinfer import _microinfer
 
@@ -48,14 +47,14 @@ def make_case_fp32(rows: int, hidden: int, seed: int = 0):
     return x, w
 
 
-def assert_within_gate(x, w, eps=EPS):
+def check(x, w, eps=EPS):
     """Both bounds from ADR-0006. The mean is the one that catches systematic
     drift, so no test may check only the max."""
-    return assert_gate(_microinfer.rmsnorm(x, w, eps), reference_rmsnorm(x, w, eps))
+    return assert_within_gate(_microinfer.rmsnorm(x, w, eps), reference_rmsnorm(x, w, eps))
 
 
 def test_matches_float64_reference():
-    assert_within_gate(*make_case(64, 896))
+    check(*make_case(64, 896))
 
 
 # 896 is Qwen2.5-0.5B's hidden size and 1536 is Qwen2.5-1.5B's (ADR-0003). The
@@ -66,17 +65,17 @@ def test_matches_float64_reference():
 # over here.
 @pytest.mark.parametrize("hidden", [64, 128, 896, 1536, 2048, 4096])
 def test_hidden_size_is_a_parameter(hidden):
-    assert_within_gate(*make_case(8, hidden, seed=hidden))
+    check(*make_case(8, hidden, seed=hidden))
 
 
 @pytest.mark.parametrize("hidden", [1, 3, 31, 33, 100, 897])
 def test_hidden_size_need_not_be_a_multiple_of_the_warp(hidden):
-    assert_within_gate(*make_case(4, hidden, seed=hidden))
+    check(*make_case(4, hidden, seed=hidden))
 
 
 @pytest.mark.parametrize("rows", [1, 2, 7, 512])
 def test_row_count_is_a_parameter(rows):
-    assert_within_gate(*make_case(rows, 128, seed=rows))
+    check(*make_case(rows, 128, seed=rows))
 
 
 @pytest.mark.parametrize("hidden", [128, 896, 1536])
@@ -88,7 +87,7 @@ def test_arbitrary_fp32_input_meets_the_gate(hidden):
     unreachable for a value rounded twice. The ADR is now stated in ulps and the
     case passes on its merits.
     """
-    assert_within_gate(*make_case_fp32(128, hidden, seed=hidden))
+    check(*make_case_fp32(128, hidden, seed=hidden))
 
 
 def test_rows_are_independent():

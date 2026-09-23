@@ -74,19 +74,19 @@ def make_case(rows: int, in_features: int, out_features: int, bias: bool, seed: 
     return x, w, b
 
 
-def summed(x, b) -> int:
+def term_count(x, b) -> int:
     """How many terms each output adds: in_features products, plus the bias."""
     return x.shape[1] + (b is not None)
 
 
-def gate(got, x, w, b=None):
+def within_gate(got, x, w, b=None):
     """The gate for fp16-exact input."""
     ref, terms = reference_linear(x, w, b)
-    return assert_within_gate(got, ref, accumulation_floor(terms, summed(x, b)))
+    return assert_within_gate(got, ref, accumulation_floor(terms, term_count(x, b)))
 
 
 def check(x, w, b):
-    return gate(_microinfer.linear(x, w, b), x, w, b)
+    return within_gate(_microinfer.linear(x, w, b), x, w, b)
 
 
 @pytest.mark.parametrize("name,proj", CASES)
@@ -121,14 +121,14 @@ def test_the_gate_would_reject_fp16_accumulation():
     more. The failure it exists to catch — partial sums kept in fp16, which is
     what reduced-precision split-K does and why the wrapper disallows it — is
     simulated in NumPy and checked to fail at the widest reduction the model
-    has: measured, 118 ulp max. Were the floor `terms` itself it would pass,
+    has: measured, 370 ulp max. Were the floor `terms` itself it would pass,
     at 3.0 ulp max and 0.33 mean."""
     cfg = ModelConfig.from_card(MODELS[0])
     x, w, _ = make_case(2, cfg.intermediate_size, 256, bias=False, seed=13)
     products = (x[:, None, :] * w[None, :, :]).astype(np.float16)
     fp16_accumulated = np.cumsum(products, axis=-1, dtype=np.float16)[..., -1].astype(np.float32)
     with pytest.raises(AssertionError):
-        gate(fp16_accumulated, x, w)
+        within_gate(fp16_accumulated, x, w)
 
 
 @pytest.mark.parametrize("rows,in_f,out_f", [(3, 5, 7), (1, 1, 1), (17, 33, 65), (2, 896, 3)])
@@ -142,7 +142,7 @@ def test_weight_is_used_as_out_by_in_not_transposed():
     shape. Only a comparison against `x @ w.T` specifically catches it."""
     x, w, _ = make_case(4, 128, 128, bias=False)
     got = _microinfer.linear(x, w)
-    gate(got, x, w)
+    within_gate(got, x, w)
     assert not np.allclose(got, x.astype(np.float64) @ w.astype(np.float64), atol=1e-2)
 
 
@@ -150,7 +150,7 @@ def test_bias_is_added_once_per_row():
     x, w, b = make_case(5, 64, 32, bias=True)
     with_bias = _microinfer.linear(x, w, b)
     without = _microinfer.linear(x, w)
-    gate(with_bias, x, w, b)
+    within_gate(with_bias, x, w, b)
     assert not np.array_equal(with_bias, without)
 
 
@@ -159,8 +159,8 @@ def test_rows_are_independent():
     all_rows = _microinfer.linear(x, w, b)
     for i in (0, 9, 15):
         one = _microinfer.linear(x[i : i + 1].copy(), w, b)
-        gate(one, x[i : i + 1], w, b)
-        gate(all_rows[i : i + 1], x[i : i + 1], w, b)
+        within_gate(one, x[i : i + 1], w, b)
+        within_gate(all_rows[i : i + 1], x[i : i + 1], w, b)
 
 
 def test_rejects_mismatched_inner_dimension():

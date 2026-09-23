@@ -154,9 +154,10 @@ summed to 1.64. That error belongs to the caller's downcast, not to any kernel.
 using `terms` — the sum of the absolute values of what that element adds. There
 are two floors, and each admits exactly one error source (`tests/ulp_gate.py`):
 
-- **fp16-exact input — the kernel's gate.** `sqrt(n) * u32/u16 * terms` for a
-  sum of `n` terms: the magnitude at which fp32 accumulation's probabilistic
-  error (Higham & Mary, 2019) equals one fp16 ulp.
+- **fp16-exact input — the kernel's gate.** `sqrt(n) * u32 * terms / MAX_REL`
+  for a sum of `n` terms: the magnitude at which fp32 accumulation's
+  probabilistic error bound (Higham & Mary, 2019) uses the whole 4-ulp max
+  budget, and no more.
 - **Arbitrary fp32 input — the Seam B check.** `terms` itself: rounding each
   operand to fp16 moves the result by up to half an fp16 ulp of its terms, and
   no kernel can avoid that.
@@ -172,11 +173,42 @@ reduced-precision split-K reduction does — at the model's widest reduction
 | floor | max | mean | verdict |
 |---|---:|---:|---|
 | `terms` | 3.0 ulp | 0.33 ulp | **passes** |
-| `sqrt(n) * u32/u16 * terms` | 118 ulp | 19.5 ulp | fails |
+| `sqrt(n) * u32 * terms / MAX_REL` | 370 ulp | 30.5 ulp | fails |
+
+### How much of the output the floor judges
+
+A floor replaces |y| for every output smaller than it, so its size decides how
+much of a test is still a relative-error test. The review of #7 measured this
+against a first version of the floor that spent one ulp, not four, on
+accumulation — and found it judging **51%** of `down_proj`'s outputs at n = 8960
+against the floor. That was measuring the floor.
+
+The floor is therefore calibrated against what fp32 accumulation actually does.
+On the model's projections the observed error is at most **0.19** of the
+probabilistic bound, and the bound is allowed the full max budget:
+
+| projection | n | outputs judged against the floor | worst error |
+|---|---:|---:|---:|
+| q_proj, 0.5B | 896 | 1.4% | 1.05 ulp |
+| down_proj, 0.5B | 4864 | 7.6% | 1.00 ulp |
+| down_proj, 1.5B | 8960 | 13.7% | 1.03 ulp |
+
+Even at the bound itself — five times the error observed — an output at the
+floor would sit exactly at 4 ulp, not past it.
 
 Both simulations live in the test suite as tests *of the gate* — fp16
 accumulation in `test_linear.py`, an fp32 RoPE angle in `test_rope.py` — so a
 future loosening of the floor that stops catching either shows up as a failure.
+
+### RoPE is closer to float64 than HuggingFace is
+
+The RoPE kernel forms its angle in fp64. HuggingFace forms it in fp32, which is
+18 ulp out at position 2049 and 60 ulp out at 32767 at the fastest frequency.
+The kernel is judged against float64 here, so at long contexts it will
+disagree with the golden reference **because the reference is the less
+accurate of the two**. The golden prompts are short, so the difference does not
+reach the gate today. **#12 should expect it** before treating a late-position
+logit mismatch as an engine bug.
 
 ### What this does not change
 

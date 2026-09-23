@@ -89,6 +89,13 @@ not available. A 1e-4 logit difference at a near-tie flips an argmax and every
 token after it diverges — the suite then goes red across the board while pointing
 at nothing. Investigate it; do not gate on it.
 
+**A kernel whose output is a sum is measured against its terms where they
+cancel.** Projections and RoPE add terms that can cancel to near zero. Relative
+error there has no bound, however correct the kernel is. Their tests floor the
+denominator per output, and the floor is calibrated so that it judges at most
+about 14% of outputs. See ADR-0006's amendment on cancellation, and use the
+helpers in `tests/ulp_gate.py` rather than a new floor.
+
 The per-layer layer exists to answer *where*. When the gate goes red, run it
 first; it names the first diverging layer.
 
