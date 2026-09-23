@@ -300,3 +300,34 @@ logit mismatch as an engine bug.
 
 The tolerances stay at 4 ulp max and 1 ulp mean. Product-shaped kernels pass no
 floor and are measured exactly as before. The merge gate is untouched.
+
+---
+
+## Note from #15: chunked prefill agrees within a bound, not to the bit
+
+#15 prefills a long prompt in chunks, so that the workspace is sized to a chunk
+rather than to the prompt. Its ticket asked for output *identical* to
+single-shot prefill. That is not available, for a reason the engine does not
+control:
+
+- **Attention is row-invariant.** A query's output does not depend on which
+  other queries share its launch. The last 37 queries alone give the same
+  bits as they do inside a launch of 300.
+- **cuBLAS is not.** It chooses algorithm, tiling and split-K from the GEMM's
+  shape, so one row of a projection can round differently depending on how
+  many rows the GEMM has. Measured against a 1,090-row GEMM, the same rows
+  computed in GEMMs of 1, 37, 128 and 512 rows were bit-identical for some
+  sizes and projections and not for others. This happens between prefill and
+  decode in any engine that uses cuBLAS, not only between chunks.
+
+The owner chose to state equivalence as a measured bound rather than to pin
+cuBLAS's algorithm. On the 23 prompts other than adversarial-00, at chunks of
+1, 37, 128 and 512, the logits agree within 0.096 and KL within 7.5e-5, and the
+argmax is the same at every position except two near-ties. `test_chunked_prefill.py`
+allows twice the logit difference, and allows an argmax to change only where
+single-shot's top two logits are closer than that.
+
+adversarial-00 is excluded, as ADR-0010 explains. It amplifies these
+differences a thousand times, to logit differences of up to 9 and seven
+changed argmaxes at a chunk of 128. With the default chunk of 512 it runs in
+one chunk, and is unaffected.

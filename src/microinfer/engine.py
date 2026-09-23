@@ -77,10 +77,20 @@ class Engine:
     #: is proven bit-identical to.
     KV_CACHES = ("paged", "contiguous")
 
-    def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged"):
+    #: Tokens per prefill chunk (#15). A long prompt is prefilled this many
+    #: positions at a time, so the workspace is sized to a chunk, not to the
+    #: prompt: that is what lets a 32K-token prompt run on a 6 GiB card.
+    DEFAULT_PREFILL_CHUNK = 512
+
+    def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
+                 prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
+        if prefill_chunk is not None and prefill_chunk < 1:
+            raise ValueError(f"prefill_chunk must be positive or None, got {prefill_chunk}")
         self.kv_cache = kv_cache
+        #: None prefills a prompt in one step, with a workspace for all of it.
+        self.prefill_chunk = prefill_chunk
         self.model_dir = Path(model_dir)
         self.config = ModelConfig.from_model_dir(self.model_dir)
 
@@ -177,23 +187,25 @@ class Engine:
         when the gate goes red.
         """
         ids = self._check_ids(token_ids)
-        n = len(ids)
-        cache = self._new_cache(capacity=n)
-        ws = model.Workspace(self.config, rows=n)
-        captured: list | None = [] if capture_hidden_states else None
-        with self._holding(cache, ws):
-            self._model.run(ws, cache, ids, captured)
-            logits = self._model.logits(ws, n)
+        self._check_window(len(ids))
+        cache = self._new_cache(capacity=len(ids))
+        logits, states = [], []
+        for chunk, ws in self._prefill(cache, ids, hidden_states=capture_hidden_states):
+            logits.append(self._model.logits(ws, len(chunk)))
+            if capture_hidden_states:
+                states.append(np.stack(ws.captured))
+        logits = np.concatenate(logits)
         if capture_hidden_states:
-            return logits, np.stack(captured)
+            # Each chunk captured every state for its own positions.
+            return logits, np.concatenate(states, axis=1)
         return logits
 
     def generate(self, prompt, max_new_tokens: int = 64, *, stop_at_eos: bool = True) -> np.ndarray:
         """Greedy continuation of one prompt: the new token ids only.
 
         `prompt` is text, which is tokenised, or token ids. The prompt is
-        prefilled in one step, then each new token is decoded against the
-        cache. Stops after `max_new_tokens`, or at an end-of-sequence token,
+        prefilled in chunks of `prefill_chunk` positions, then each new token
+        is decoded against the cache. Stops after `max_new_tokens`, or at an end-of-sequence token,
         which is included, as HuggingFace's generate includes it.
         """
         ids = self.encode(prompt) if isinstance(prompt, str) else self._check_ids(prompt)
@@ -204,13 +216,12 @@ class Engine:
 
         # The last new token is never fed back, so the cache needs one row less
         # than prompt plus output.
+        self._check_window(len(ids) + max_new_tokens - 1)
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
-        prefill = model.Workspace(self.config, rows=len(ids))
         out: list[int] = []
-        with self._holding(cache, prefill):
-            self._model.run(prefill, cache, ids)
-            out.append(self._model.greedy_last(prefill, len(ids)))
-        del prefill
+        for chunk, ws in self._prefill(cache, ids):
+            if cache.length == len(ids):  # the last chunk: its last row decides
+                out.append(self._model.greedy_last(ws, len(chunk)))
 
         step = model.Workspace(self.config, rows=1)
         with self._holding(cache, step):
@@ -235,6 +246,34 @@ class Engine:
             raise ValueError(f"token ids must lie in [0, {self.config.vocab_size}); "
                              f"got [{ids.min()}, {ids.max()}]")
         return ids.astype(np.int32)
+
+    def _check_window(self, positions: int) -> None:
+        """Refuse, before any work, a sequence the model was not built for: past
+        max_position_embeddings its RoPE angles were never trained, and the
+        paged cache reserves exactly that many positions."""
+        window = self.config.max_position_embeddings
+        if positions > window:
+            raise ValueError(f"{positions} positions exceed the model's context window of "
+                             f"{window}: shorten the prompt or ask for fewer new tokens")
+
+    def _prefill(self, cache, ids: np.ndarray, *, hidden_states: bool = False):
+        """Run `ids` into `cache` a chunk at a time, yielding each chunk and
+        the workspace holding its final-normed states, which the next chunk
+        overwrites.
+
+        One workspace serves every chunk, sized to the chunk rather than to the
+        prompt (#15). The cache already continues a sequence from its length:
+        each chunk's positions, its RoPE angles and its causal mask follow from
+        where the one before it stopped."""
+        n = len(ids)
+        size = n if self.prefill_chunk is None else min(self.prefill_chunk, n)
+        ws = model.Workspace(self.config, rows=size)
+        with self._holding(cache, ws):
+            for start in range(0, n, size):
+                chunk = ids[start:start + size]
+                ws.captured = [] if hidden_states else None
+                self._model.run(ws, cache, chunk, ws.captured)
+                yield chunk, ws
 
     def _new_cache(self, capacity: int):
         """A cache for one sequence. The contiguous one is sized for `capacity`
