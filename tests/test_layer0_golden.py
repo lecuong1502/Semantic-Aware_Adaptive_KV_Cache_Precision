@@ -17,6 +17,12 @@ instead of HuggingFace's contiguous one drops it to between 0.01 and 0.91, so
 the threshold would notice the mistake GQA is most likely to make, and
 `test_the_threshold_rejects_interleaved_kv_heads` keeps it that way.
 
+This belongs at Seam A by CONTRIBUTING: a per-layer golden comparison is
+`Engine(..., capture_hidden_states=True)`'s job. `Engine.forward` does not exist
+yet, so the layer is assembled here from Seam B kernels as a stand-in, and
+should move to Seam A, compared through the engine's own forward pass, once
+that exists. Until then the forward below is the only one in the repository.
+
 The layer's embedding input is looked up from the checkpoint, not read from
 `hidden_states[0]`, because attention needs every position and the reference
 keeps only a sample. Where the two overlap they agree exactly: the lookup is a
@@ -57,7 +63,7 @@ LAYER_0 = [
 class Layer0:
     cfg: ModelConfig
     checkpoint: Path
-    w: dict[str, np.ndarray]
+    weights: dict[str, np.ndarray]
 
     def embed(self, token_ids: np.ndarray) -> np.ndarray:
         return read_tensor(self.checkpoint, "model.embed_tokens.weight", rows=token_ids)
@@ -68,7 +74,7 @@ class Layer0:
         `kv_order`, when given, expands k and v to one head per query head in
         that order before attention, so a test can stand in a wrong mapping
         without a wrong kernel."""
-        cfg, w = self.cfg, self.w
+        cfg, w = self.cfg, self.weights
         seq = len(h)
         heads, kv_heads, head_dim = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
         positions = np.arange(seq, dtype=np.int32)
@@ -98,8 +104,8 @@ class Layer0:
 def layer0(request) -> Layer0:
     name = request.param
     checkpoint = require_model(name) / "model.safetensors"
-    w = {n: read_tensor(checkpoint, f"model.layers.0.{n}") for n in LAYER_0}
-    return Layer0(ModelConfig.from_card(name), checkpoint, w)
+    weights = {n: read_tensor(checkpoint, f"model.layers.0.{n}") for n in LAYER_0}
+    return Layer0(ModelConfig.from_card(name), checkpoint, weights)
 
 
 def golden_with_hidden_states(cfg: ModelConfig):
@@ -127,11 +133,11 @@ def test_layer_0_matches_the_reference_at_every_sampled_position(layer0):
     """Every prompt that carries hidden states: the short ones, and the
     adversarial ones up to 890 tokens, so the causal tiles are crossed many
     times over."""
-    worst = {}
+    lowest_cosine = {}
     for item in golden_with_hidden_states(layer0.cfg):
         got = layer0.forward(layer0.embed(item.token_ids))
-        worst[item.prompt_id] = cosine(got[item.logit_positions], item.hidden_states[1]).min()
-    failing = {k: v for k, v in worst.items() if not v > MIN_COSINE}
+        lowest_cosine[item.prompt_id] = cosine(got[item.logit_positions], item.hidden_states[1]).min()
+    failing = {k: v for k, v in lowest_cosine.items() if not v > MIN_COSINE}
     assert not failing, f"cosine similarity at or below {MIN_COSINE}: {failing}"
 
 

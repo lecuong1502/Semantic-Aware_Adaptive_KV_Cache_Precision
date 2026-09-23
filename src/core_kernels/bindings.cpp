@@ -213,14 +213,8 @@ namespace
       throw std::invalid_argument("k " + shape_of(k) + " and v " + shape_of(v) +
                                   " must have the same shape");
     }
-    if (k.shape(1) == 0 || q.shape(1) % k.shape(1) != 0)
-    {
-      throw std::invalid_argument(
-          "q has " + std::to_string(q.shape(1)) + " heads and k has " +
-          std::to_string(k.shape(1)) +
-          "; the KV head count must divide the query head count, so that "
-          "every KV head serves the same number of query heads");
-    }
+    // Head counts that do not group are rejected by microinfer::attention
+    // itself, which every caller reaches, not only this one.
     if (q.shape(2) != k.shape(2))
     {
       throw std::invalid_argument(
