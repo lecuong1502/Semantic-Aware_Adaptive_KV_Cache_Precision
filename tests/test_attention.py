@@ -1,8 +1,11 @@
 """Causal attention with online softmax, against a float64 NumPy reference.
 
-This ticket is the case `num_key_value_heads == num_attention_heads`; grouped-
-query attention is the next one. So the head count here is a parameter the
-model cards supply, but q, k and v always share it.
+**Grouped-query attention.** k and v may carry fewer heads than q: with
+`group = num_attention_heads / num_key_value_heads`, query head `h` reads KV
+head `h // group`, as HuggingFace's `repeat_kv` arranges it. Both models this
+project runs use two KV heads (groups of 7 and 6), so grouping is the case that
+matters. `group == 1` is ordinary multi-head attention and keeps every test
+written for it before grouping existed (#8, #9).
 
 **Causal alignment is bottom-right.** With `seq_q` queries over `seq_k` keys,
 query `i` sits at absolute position `seq_k - seq_q + i` and attends keys at
@@ -51,11 +54,19 @@ def query_positions(seq_q: int, seq_k: int) -> np.ndarray:
     return np.arange(seq_q) + (seq_k - seq_q)
 
 
+def expand_kv(q, kv):
+    """Give every query head its KV head, repeated in HuggingFace's order:
+    query head h gets KV head h // group. The reference materialises this; the
+    kernel only indexes it."""
+    return np.repeat(kv, q.shape[1] // kv.shape[1], axis=1)
+
+
 def reference_weights(q, k, positions=None):
     """float64 causal softmax weights, (heads, seq_q, seq_k), and the mask used.
 
     `positions` are the queries' absolute positions, bottom-right aligned by
-    default."""
+    default. k may carry fewer heads than q."""
+    k = expand_kv(q, k)
     seq_q, _, head_dim = q.shape
     seq_k = k.shape[0]
     if positions is None:
@@ -78,6 +89,7 @@ def reference_attention(q, k, v, positions=None):
     if positions is None:
         positions = query_positions(seq_q, k.shape[0])
     p, masked = reference_weights(q, k, positions)
+    k, v = expand_kv(q, k), expand_kv(q, v)
     q64, k64, v64 = (a.astype(np.float64) for a in (q, k, v))
 
     out = np.einsum("hqk,khd->qhd", p, v64)
@@ -102,11 +114,13 @@ def check(q, k, v, positions=None, got=None):
     return assert_within_gate(got, ref, floor_from_bound(bound))
 
 
-def make_qkv(seq_q, seq_k, heads, head_dim, seed=0):
+def make_qkv(seq_q, seq_k, heads, head_dim, seed=0, kv_heads=None):
+    """kv_heads defaults to heads: ordinary multi-head attention."""
+    kv_heads = heads if kv_heads is None else kv_heads
     rng = np.random.default_rng(seed)
     q = fp16_exact(rng.standard_normal((seq_q, heads, head_dim)))
-    k = fp16_exact(rng.standard_normal((seq_k, heads, head_dim)))
-    v = fp16_exact(rng.standard_normal((seq_k, heads, head_dim)))
+    k = fp16_exact(rng.standard_normal((seq_k, kv_heads, head_dim)))
+    v = fp16_exact(rng.standard_normal((seq_k, kv_heads, head_dim)))
     return q, k, v
 
 
@@ -186,6 +200,58 @@ def test_the_gate_would_reject_fp16_softmax_weights():
     fp16_weights = fp16_exact(np.einsum("hqk,khd->qhd", p16, v.astype(np.float64)))
     with pytest.raises(AssertionError, match="relative error"):
         check(q, k, v, got=fp16_weights)
+
+
+# --- grouped-query attention ---------------------------------------------
+
+
+@pytest.mark.parametrize("name", MODELS)
+@pytest.mark.parametrize("seq", [1, TILE_K - 1, TILE_K + 1, 257])
+def test_grouped_query_attention_at_model_shapes(name, seq):
+    """The configuration the engine actually runs: every query head of the
+    model, sharing the model's two KV heads. Both grouping factors, 7 and 6,
+    come from the cards."""
+    cfg = ModelConfig.from_card(name)
+    assert cfg.num_key_value_heads < cfg.num_attention_heads
+    check(*make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=seq,
+                    kv_heads=cfg.num_key_value_heads))
+
+
+@pytest.mark.parametrize("name", MODELS)
+def test_grouped_decode_one_query_sees_every_key(name):
+    cfg = ModelConfig.from_card(name)
+    check(*make_qkv(1, 300, cfg.num_attention_heads, cfg.head_dim, seed=3,
+                    kv_heads=cfg.num_key_value_heads))
+
+
+@pytest.mark.parametrize("heads,kv_heads", [(8, 1), (8, 2), (8, 4), (6, 3), (7, 1), (12, 12)])
+def test_grouping_factor_is_a_parameter(heads, kv_heads):
+    """Group sizes the models do not use, including one KV head for all (MQA)
+    and none shared at all, so nothing can quietly assume 7 or 6."""
+    check(*make_qkv(TILE_K + 5, TILE_K + 5, heads, 64, seed=heads * 10 + kv_heads,
+                    kv_heads=kv_heads))
+
+
+@pytest.mark.parametrize("name", MODELS)
+def test_each_query_head_reads_its_own_group_kv_head(name):
+    """Change one KV head, and exactly its group of query heads moves.
+
+    The mapping is the thing grouping can get wrong while still matching a
+    reference that happens to be symmetric. HuggingFace assigns query head h to
+    KV head h // group (contiguous groups); h % kv_heads (interleaved) is the
+    plausible mistake, and it passes any test whose KV heads are identical."""
+    cfg = ModelConfig.from_card(name)
+    heads, kv_heads = cfg.num_attention_heads, cfg.num_key_value_heads
+    group = heads // kv_heads
+    q, k, v = make_qkv(TILE_K + 3, TILE_K + 3, heads, cfg.head_dim, seed=4, kv_heads=kv_heads)
+    base = _microinfer.attention(q, k, v)
+    for changed in range(kv_heads):
+        k2, v2 = k.copy(), v.copy()
+        k2[:, changed] = -k2[:, changed]
+        v2[:, changed] = -v2[:, changed]
+        moved = _microinfer.attention(q, k2, v2)
+        differs = [not np.array_equal(moved[:, h], base[:, h]) for h in range(heads)]
+        assert differs == [h // group == changed for h in range(heads)], f"KV head {changed}"
 
 
 # --- causality -------------------------------------------------------------
@@ -318,11 +384,11 @@ def test_rejects_more_queries_than_keys():
         _microinfer.attention(q, k, v)
 
 
-def test_rejects_differing_head_counts():
-    """Grouped-query attention is the next ticket; until then a mismatch is an
-    error, not a silent broadcast."""
-    q, _, _ = make_qkv(4, 4, 4, 64)
-    _, k, v = make_qkv(4, 4, 2, 64)
+@pytest.mark.parametrize("heads,kv_heads", [(4, 3), (7, 2), (2, 4)])
+def test_rejects_head_counts_that_do_not_group(heads, kv_heads):
+    """Every KV head must serve the same number of query heads. A remainder has
+    no defined grouping, and more KV heads than query heads has none either."""
+    q, k, v = make_qkv(4, 4, heads, 64, kv_heads=kv_heads)
     with pytest.raises(ValueError, match="head"):
         _microinfer.attention(q, k, v)
 

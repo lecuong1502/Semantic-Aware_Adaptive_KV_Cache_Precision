@@ -213,13 +213,13 @@ namespace
       throw std::invalid_argument("k " + shape_of(k) + " and v " + shape_of(v) +
                                   " must have the same shape");
     }
-    if (q.shape(1) != k.shape(1))
+    if (k.shape(1) == 0 || q.shape(1) % k.shape(1) != 0)
     {
       throw std::invalid_argument(
           "q has " + std::to_string(q.shape(1)) + " heads and k has " +
           std::to_string(k.shape(1)) +
-          "; every query head needs its own KV head until grouped-query "
-          "attention exists");
+          "; the KV head count must divide the query head count, so that "
+          "every KV head serves the same number of query heads");
     }
     if (q.shape(2) != k.shape(2))
     {
@@ -244,11 +244,12 @@ namespace
     const int seq_q = static_cast<int>(q.shape(0));
     const int seq_k = static_cast<int>(k.shape(0));
     const int heads = static_cast<int>(q.shape(1));
+    const int kv_heads = static_cast<int>(k.shape(1));
     const int head_dim = static_cast<int>(q.shape(2));
     {
       py::gil_scoped_release release;
       microinfer::attention(q_ptr, k_ptr, v_ptr, out_ptr, seq_q, seq_k, heads,
-                            head_dim);
+                            kv_heads, head_dim);
     }
     return out;
   }
@@ -339,8 +340,9 @@ PYBIND11_MODULE(_microinfer, m)
 
   m.def("attention", &attention, py::arg("q"), py::arg("k"), py::arg("v"),
         "Causal attention with online softmax over q (seq_q, heads, head_dim) "
-        "and k, v (seq_k, heads, head_dim), seq_q <= seq_k.\n"
-        "Queries align to the last keys. No score matrix or mask is "
+        "and k, v (seq_k, kv_heads, head_dim), seq_q <= seq_k;\n"
+        "kv_heads must divide heads (grouped-query attention). Queries align "
+        "to the last keys. No score matrix or mask is "
         "materialised.");
 
   py::dict tiles;
