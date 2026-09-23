@@ -112,6 +112,26 @@ namespace microinfer
     size_t count_ = 0;
   };
 
+  // fp32 on the device, uninitialised: the residual stream, which ADR-0010
+  // keeps in fp32 rather than fp16.
+  class DeviceFloats
+  {
+  public:
+    explicit DeviceFloats(size_t count);
+    ~DeviceFloats();
+    DeviceFloats(const DeviceFloats &) = delete;
+    DeviceFloats &operator=(const DeviceFloats &) = delete;
+
+    size_t count() const { return count_; }
+    size_t nbytes() const { return count_ * sizeof(float); }
+    float *data() const { return ptr_; }
+    void download(float *out) const;
+
+  private:
+    float *ptr_ = nullptr;
+    size_t count_ = 0;
+  };
+
   // int32 on the device, uploaded from the host: token ids and positions, which
   // the forward pass needs on the device and which are never fp16.
   class DeviceIndex

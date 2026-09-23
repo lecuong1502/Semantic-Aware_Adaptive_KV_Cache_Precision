@@ -128,6 +128,19 @@ namespace microinfer
     gemm(x, weight, out, CUDA_R_32F, 0.0f, rows, in_features, out_features);
   }
 
+  void device::linear_accumulate(const __half *x, const __half *weight,
+                                 float *out, int rows, int in_features,
+                                 int out_features)
+  {
+    if (rows <= 0 || out_features <= 0)
+    {
+      return;
+    }
+    // beta = 1: the product is added to what `out` holds, inside the GEMM, in
+    // fp32, and never rounded to fp16 on the way (ADR-0010).
+    gemm(x, weight, out, CUDA_R_32F, 1.0f, rows, in_features, out_features);
+  }
+
   void linear(const float *x, const float *weight, const float *bias,
               float *out, int rows, int in_features, int out_features)
   {

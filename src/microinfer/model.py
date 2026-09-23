@@ -180,7 +180,8 @@ class Workspace:
         q_width = cfg.num_attention_heads * cfg.head_dim
         kv_width = cfg.num_key_value_heads * cfg.head_dim
         hidden, intermediate = cfg.hidden_size, cfg.intermediate_size
-        self.residual = device.empty(rows * hidden)
+        # fp32 (ADR-0010): projections add into it with no fp16 rounding.
+        self.residual = device.empty_f32(rows * hidden)
         self.normed = device.empty(rows * hidden)
         self.q_raw = device.empty(rows * q_width)
         self.q = device.empty(rows * q_width)
@@ -188,7 +189,6 @@ class Workspace:
         self.k = device.empty(rows * kv_width)
         self.v = device.empty(rows * kv_width)
         self.attended = device.empty(rows * q_width)
-        self.projected = device.empty(rows * hidden)
         self.gate = device.empty(rows * intermediate)
         self.up = device.empty(rows * intermediate)
         self.activated = device.empty(rows * intermediate)
@@ -197,7 +197,8 @@ class Workspace:
 
     @property
     def nbytes(self) -> int:
-        return sum(t.nbytes for t in vars(self).values() if isinstance(t, Tensor))
+        return sum(t.nbytes for t in vars(self).values()
+                   if isinstance(t, (Tensor, device.FloatTensor)))
 
 
 @dataclass(frozen=True)
@@ -234,7 +235,11 @@ class Model:
             if hidden_states is not None:
                 hidden_states.append(tensor.to_numpy()[: n * hidden].reshape(n, hidden))
 
-        device.embed(ids, self.weights.embed, ws.residual, hidden, cfg.vocab_size)
+        # The residual stream is fp32 from here to the final norm (ADR-0010).
+        # fp16 rounding of o_proj's output in layer 0, added into an fp16
+        # residual, was the error that layers 2 and 3 amplified ~30x on
+        # adversarial-00 (#36).
+        device.embed_f32(ids, self.weights.embed, ws.residual, hidden, cfg.vocab_size)
         capture_state(ws.residual)
 
         for i, w in enumerate(self.weights.layers):
@@ -246,7 +251,7 @@ class Model:
             # bias reaches 147 against an input-dependent part of 5 to 11, and
             # at that magnitude fp16's ulp is as large as what distinguishes one
             # key from the next. Attention adds the bias back, rotated, in fp32.
-            device.rmsnorm(ws.residual, w.input_layernorm_weight, ws.normed, n, hidden, eps)
+            device.rmsnorm_f32(ws.residual, w.input_layernorm_weight, ws.normed, n, hidden, eps)
             device.linear(ws.normed, w.self_attn_q_proj_weight, w.self_attn_q_proj_bias,
                           ws.q_raw, n, hidden, q_width)
             device.linear(ws.normed, w.self_attn_k_proj_weight, None, ws.k_raw, n, hidden, kv_width)
@@ -256,23 +261,22 @@ class Model:
             device.rope(ws.k_raw, positions, ws.k, n, kv_heads, head_dim, cfg.rope_theta)
             cache.store(i, ws.k, ws.v, start, n)
             cache.attend(i, ws.q, w.self_attn_k_proj_bias, ws.attended, n, start + n)
-            device.linear(ws.attended, w.self_attn_o_proj_weight, None, ws.projected,
-                          n, q_width, hidden)
-            device.add(ws.residual, ws.projected, ws.residual, n * hidden)
+            device.linear_accumulate(ws.attended, w.self_attn_o_proj_weight, ws.residual,
+                                     n, q_width, hidden)
 
             # MLP block.
-            device.rmsnorm(ws.residual, w.post_attention_layernorm_weight, ws.normed, n, hidden, eps)
+            device.rmsnorm_f32(ws.residual, w.post_attention_layernorm_weight, ws.normed, n,
+                               hidden, eps)
             device.linear(ws.normed, w.mlp_gate_proj_weight, None, ws.gate, n, hidden, intermediate)
             device.linear(ws.normed, w.mlp_up_proj_weight, None, ws.up, n, hidden, intermediate)
             device.swiglu(ws.gate, ws.up, ws.activated, n * intermediate)
-            device.linear(ws.activated, w.mlp_down_proj_weight, None, ws.projected,
-                          n, intermediate, hidden)
-            device.add(ws.residual, ws.projected, ws.residual, n * hidden)
+            device.linear_accumulate(ws.activated, w.mlp_down_proj_weight, ws.residual,
+                                     n, intermediate, hidden)
 
             if i < cfg.num_hidden_layers - 1:
                 capture_state(ws.residual)
 
-        device.rmsnorm(ws.residual, self.weights.norm, ws.normed, n, hidden, eps)
+        device.rmsnorm_f32(ws.residual, self.weights.norm, ws.normed, n, hidden, eps)
         capture_state(ws.normed)
         cache.length = start + n
 
