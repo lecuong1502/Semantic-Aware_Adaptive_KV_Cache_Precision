@@ -200,6 +200,42 @@ Both simulations live in the test suite as tests *of the gate* — fp16
 accumulation in `test_linear.py`, an fp32 RoPE angle in `test_rope.py` — so a
 future loosening of the floor that stops catching either shows up as a failure.
 
+### Attention's floor admits the scores' rounding as well (#8)
+
+Attention's output is a sum of value rows weighted by softmax, and those
+weights are not exact. Each score is itself an fp32 dot product over
+`head_dim`, and its rounding becomes a relative error in every weight. The
+accumulation floor does not see this. With that floor alone the kernel read
+5–7 ulp at head_dim 128, on outputs whose weights were right to fp32 precision.
+So attention's bound has a second term:
+
+    (sqrt(n) + sqrt(d) * max_j sum_d |q_d k_jd| / sqrt(d)) * u32 * terms
+
+The term is real rather than fitted. A simulation in which *only* the scores
+are fp32, with everything else exact, already reads 5.4 ulp without it.
+
+It is also not generous. The first version counted the term twice, on the
+argument that each weight is divided by a denominator carrying the same error.
+The review of #8 measured that version at about ten times the error the
+scores actually cause, so the factor went. At one the term has the same slack
+as the accumulation term, about five times:
+
+| case | outputs judged against the floor | worst error |
+|---|---:|---:|
+| prefill, head_dim 64 | 0.8% | 1.04 ulp |
+| prefill, head_dim 128 | 1.4% | 1.03 ulp |
+| rising maximum, head_dim 64 / 128 | 0.06% / 0.37% | 1.04 ulp |
+
+The gate still rejects the next optimisation a kernel would reach for, holding
+the softmax weights in fp16 for the P·V product, at 83 ulp. That trade may be
+worth making later, but it would go through this ADR, not past it.
+
+A score offset of about 1000, which the stability test uses, is a different
+matter. An fp32 score that large has an ulp of 6e-5. The floor is honest about
+that, so it judges most of that test's outputs against their terms, and the
+test is a stability test only. The precision claim at large scores belongs to
+the test in which the maximum rises tile by tile.
+
 ### RoPE is closer to float64 than HuggingFace is
 
 The RoPE kernel forms its angle in fp64. HuggingFace forms it in fp32, which is

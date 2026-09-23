@@ -47,6 +47,27 @@ namespace microinfer
   void linear(const float *x, const float *weight, const float *bias,
               float *out, int rows, int in_features, int out_features);
 
+  // Attention tiles: queries per thread block, and keys per step of the online
+  // softmax. Public so that tests can place sequence lengths relative to them
+  // (a length below one tile, one that is not a multiple of it) instead of
+  // guessing.
+  constexpr int kAttentionTileQ = 16;
+  constexpr int kAttentionTileK = 32;
+
+  // Causal scaled dot-product attention with online softmax: out =
+  // softmax(q k^T / sqrt(head_dim), causal) v, per head, never materialising
+  // the score matrix or a mask. q and out are (seq_q, heads, head_dim); k and v
+  // are (seq_k, heads, head_dim), with seq_q <= seq_k.
+  //
+  // Causal alignment is bottom-right: query i is at position seq_k - seq_q + i
+  // and sees keys at positions up to it. Prefill (seq_q == seq_k) and decode
+  // (seq_q == 1) are the same rule.
+  //
+  // Every query head has its own KV head here. Grouped-query attention, where
+  // several query heads share one, is #9.
+  void attention(const float *q, const float *k, const float *v, float *out,
+                 int seq_q, int seq_k, int heads, int head_dim);
+
   // Device memory as the *driver* sees it, from cudaMemGetInfo. This is the
   // same quantity NVML reports and the one RQ2 turns on, so the engine reads it
   // rather than tracking its own allocations and trusting the two to agree.

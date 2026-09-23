@@ -90,11 +90,16 @@ token after it diverges — the suite then goes red across the board while point
 at nothing. Investigate it; do not gate on it.
 
 **A kernel whose output is a sum is measured against its terms where they
-cancel.** Projections and RoPE add terms that can cancel to near zero. Relative
-error there has no bound, however correct the kernel is. Their tests floor the
-denominator per output, and the floor is calibrated so that it judges at most
-about 14% of outputs. See ADR-0006's amendment on cancellation, and use the
-helpers in `tests/ulp_gate.py` rather than a new floor.
+cancel.** Projections, RoPE and attention add terms that can cancel to near
+zero, where a relative error has no bound however correct the kernel is. Their
+tests floor the denominator per output (ADR-0006, amendment on cancellation).
+A floor comes from `tests/ulp_gate.py`: `accumulation_floor` for a plain sum,
+or `floor_from_bound` with a bound that names each error source it admits, as
+attention's does for its scores. A new bound is calibrated against measured
+error before it is used, and the ADR records the share of outputs it judges.
+On ordinary inputs that share has been under 14%. A test in which a floor
+judges most outputs, as attention's stability test does, is not a precision
+test, and its docstring says so.
 
 The per-layer layer exists to answer *where*. When the gate goes red, run it
 first; it names the first diverging layer.

@@ -1,16 +1,23 @@
 cmake_minimum_required(VERSION 3.24)
+
+# Detected from the GPU present at build time rather than hardcoded. Override
+# for a different target, e.g. -DCMAKE_CUDA_ARCHITECTURES=89 for Ada.
+#
+# This must come before project(). Enabling the CUDA language initialises
+# CMAKE_CUDA_ARCHITECTURES to nvcc's own default, sm_52, so a check placed
+# after project() always finds it defined and never applies `native`. That
+# happened: every build until this one was Maxwell code that the driver
+# JIT-compiled from PTX on first load.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 project(microinfer LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# Detected from the GPU present at build time rather than hardcoded. Override
-# for a different target, e.g. -DCMAKE_CUDA_ARCHITECTURES=89 for Ada.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
 
 # For the editor, not the build: clangd and the VS Code C/C++ extension read the
 # exact nvcc include paths from this, so CUDA headers resolve in the IDE.
@@ -21,6 +28,7 @@ find_package(pybind11 CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 pybind11_add_module(_microinfer
+  src/core_kernels/attention.cu
   src/core_kernels/bindings.cpp
   src/core_kernels/device.cu
   src/core_kernels/device_tensor.cu
