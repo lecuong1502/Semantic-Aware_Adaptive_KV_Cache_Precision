@@ -1,42 +1,13 @@
-"""NVML's own reading of device memory, through ctypes.
+"""NVML readings for the tests: the engine's own reader (microinfer.nvml),
+plus the one thing only a test needs.
 
-`nvmlDeviceGetMemoryInfo` is the measurement RQ2 stands on and the one
-ADR-0007's allocator is judged by, so the allocator tests read NVML itself
-rather than `cudaMemGetInfo` and trust the two to agree. The library ships with
-the NVIDIA driver; ctypes reaches it without adding a Python dependency, which
-matters for a project whose environment is pinned deliberately.
+Kept as a module of its own so the allocator tests read `nvml.free_bytes()`
+as they always have.
 """
 
-import ctypes
 import gc
-from functools import cache
 
-
-class _Memory(ctypes.Structure):
-    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
-                ("used", ctypes.c_ulonglong)]
-
-
-@cache
-def _device():
-    lib = ctypes.CDLL("libnvidia-ml.so.1")
-    _check(lib.nvmlInit_v2(), "nvmlInit_v2")
-    handle = ctypes.c_void_p()
-    _check(lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle)),
-           "nvmlDeviceGetHandleByIndex_v2")
-    return lib, handle
-
-
-def _check(status: int, what: str) -> None:
-    if status != 0:
-        raise RuntimeError(f"{what} failed with NVML status {status}")
-
-
-def memory() -> _Memory:
-    lib, handle = _device()
-    info = _Memory()
-    _check(lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(info)), "nvmlDeviceGetMemoryInfo")
-    return info
+from microinfer.nvml import memory  # noqa: F401 - re-exported for the tests
 
 
 def free_bytes() -> int:

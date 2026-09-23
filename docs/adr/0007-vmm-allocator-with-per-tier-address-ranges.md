@@ -113,9 +113,10 @@ The allocator reads it at construction and nothing assumes it.
 address space, well beyond the 6 GiB card, moves NVML-reported free memory by
 nothing. Mapping and releasing 32 granules moves it by 32 granules each way, to
 within 0.16 of a granule over thirty cycles. The allocator tests read
-`nvmlDeviceGetMemoryInfo` through ctypes (`tests/nvml.py`) rather than
-`cudaMemGetInfo`. The two differ by about 90 MiB on this machine, so they are
-not interchangeable as absolute readings, even though their deltas agree.
+`nvmlDeviceGetMemoryInfo` through ctypes (`microinfer/nvml.py`, moved there from
+`tests/` by #13) rather than `cudaMemGetInfo`. The two differ by about 90 MiB on
+this machine, so they are not interchangeable as absolute readings, even though
+their deltas agree.
 
 **Contention on an idle desktop is ±6 MiB.** The display server, a browser and
 an editor share the GPU, and they move NVML's free reading by up to three

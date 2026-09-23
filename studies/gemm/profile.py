@@ -15,27 +15,24 @@ Performance counters need root on this machine (`RmProfilingAdminOnly: 1`), so
 report back (`ncu --import`) needs no privilege, so everything else happens
 here as the user.
 
-Results go to `results/` as JSON with the git commit, the hardware and whether
-anything else held the GPU. That is the form #13's benchmark log asks each
-entry to carry. #13 does not exist yet; when it does, these records should be
-migrated into it rather than left beside it.
+Results go to the project's benchmark log (#13), experiments/logs/benchmark.jsonl,
+as entries of kind gemm-study-timing and gemm-study-ncu. The log records the git
+commit, the hardware and whatever else held the GPU; this script adds how the
+numbers were taken. The ncu reports themselves stay in `results/`, uncommitted.
 
-This script imports the engine's config reader and nothing else of the engine.
-The dependency runs from the study to the engine, never back
-(tests/test_studies_isolation.py).
+This script imports the engine's config reader and its benchmark log, and
+nothing else of the engine. The dependency runs from the study to the engine,
+never back (tests/test_studies_isolation.py).
 """
 
 from __future__ import annotations
 
 import csv
 import io
-import json
 import os
 import re
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -45,6 +42,7 @@ BENCH = BUILD / "gemm_bench"
 RESULTS = STUDY / "results"
 
 sys.path.insert(0, str(REPO / "src"))
+from microinfer import benchlog  # noqa: E402
 from microinfer.config import ModelConfig  # noqa: E402
 from microinfer.models import VERIFIED  # noqa: E402
 
@@ -142,51 +140,19 @@ def git(*args: str) -> str:
                           check=True).stdout.strip()
 
 
-def environment() -> dict:
-    """Everything a number needs to be defended later (#13)."""
-    smi = ET.fromstring(subprocess.run(["nvidia-smi", "-q", "-x"], capture_output=True,
-                                       text=True, check=True).stdout)
-    gpu = smi.find("gpu")
-    processes = gpu.find("processes")
-    others = [
-        {"pid": int(p.findtext("pid")), "name": p.findtext("process_name"),
-         "type": p.findtext("type"), "used_memory": p.findtext("used_memory")}
-        for p in (processes if processes is not None else [])
-        if int(p.findtext("pid")) != os.getpid()
-    ]
-    return {
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "git_commit": git("rev-parse", "HEAD"),
-        # Tracked files only: the untracked records in results/ are this
-        # script's own output, not a change to what was measured.
-        "git_dirty": bool(git("status", "--porcelain", "--untracked-files=no",
-                              "--", "studies", "src")),
-        "gpu": gpu.findtext("product_name"),
-        "gpu_total_memory": gpu.findtext("fb_memory_usage/total"),
-        "driver_version": smi.findtext("driver_version"),
-        "cuda_version": smi.findtext("cuda_version"),
-        # Not exclusive on a desktop: the display server, a browser and an
-        # editor share the GPU. Recorded rather than pretended away.
-        "exclusive_gpu": not others,
-        "other_gpu_processes": others,
-        "models": sorted(VERIFIED),
-        "context_length": None,
-        "precision_tiers": None,
-    }
-
-
 def time_shapes(repeat: int) -> list[dict]:
     out = subprocess.run([BENCH, *bench_args(repeat)],
                          capture_output=True, text=True, check=True).stdout
     return list(csv.DictReader(io.StringIO(out)))
 
 
-def write_record(kind: str, record: dict) -> Path:
-    RESULTS.mkdir(exist_ok=True)
-    stamp = record["environment"]["timestamp"].replace(":", "").replace("+0000", "Z")
-    path = RESULTS / f"{stamp}-{record['environment']['git_commit'][:7]}-{kind}.json"
-    path.write_text(json.dumps(record, indent=2) + "\n")
-    return path
+def record(kind: str, config: dict, results: dict) -> None:
+    """One entry in the benchmark log: the shapes are the models' projections,
+    so the entry names both models; there is no context length or tier."""
+    entry = benchlog.append(kind, model=sorted(VERIFIED), context_length=None,
+                            precision_tiers=None, config=config, results=results)
+    print(f"appended {kind} to {benchlog.DEFAULT_LOG.relative_to(REPO)} "
+          f"at {benchlog.commit_label(entry)}")
 
 
 def cmd_time() -> None:
@@ -199,11 +165,11 @@ def cmd_time() -> None:
     for t in timings:
         t["model"], t["projection"] = labels[(int(t["rows"]), int(t["in_features"]),
                                               int(t["out_features"]))]
-    path = write_record("timing", {
-        "environment": environment(), "method": method(REPEAT),
-        "clock_control": "none: the driver's own clocks, recorded before and after",
-        "clocks_before": before, "clocks_after": after, "timings": timings})
-    print(f"wrote {path.relative_to(REPO)}")
+    record("gemm-study-timing",
+           config={"method": method(REPEAT),
+                   "clock_control": "none: the driver's own clocks, recorded before and after",
+                   "clocks_before": before, "clocks_after": after},
+           results={"timings": timings})
 
 
 def ncu_command(report: Path) -> list[str]:
@@ -321,13 +287,13 @@ def cmd_summarize(report: Path) -> None:
     expected = 3 * len(shapes())
     if len(calls) != expected:
         raise SystemExit(f"{report}: {len(calls)} calls attributed, {expected} expected")
-    record = {"environment": environment(), "ncu_report": report.name,
-              **measured_commit(report), "method": method(repeat=1),
-              "ncu_version": subprocess.run(["ncu", "--version"], capture_output=True,
-                                            text=True).stdout.strip().splitlines()[-1],
-              "clock_control": "ncu default (base clocks locked)", "calls": calls}
-    path = write_record("ncu", record)
-    print(f"wrote {path.relative_to(REPO)}")
+    record("gemm-study-ncu",
+           config={"ncu_report": report.name, **measured_commit(report),
+                   "method": method(repeat=1),
+                   "ncu_version": subprocess.run(["ncu", "--version"], capture_output=True,
+                                                 text=True).stdout.strip().splitlines()[-1],
+                   "clock_control": "ncu default (base clocks locked)"},
+           results={"calls": calls})
     for c in calls:
         top = ", ".join(f"{k} {v:.1f}" for k, v in list(c["stalls_per_issue"].items())[:3])
         print(f"{c['model'][:13]:13} {c['projection']:9} {c['rows']:4} {c['implementation']:6} "
