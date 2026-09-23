@@ -1,11 +1,10 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <vector>
-
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
 #include "microinfer/kernels.h"
+#include "microinfer/staging.h"
 
 namespace microinfer
 {
@@ -92,31 +91,14 @@ namespace microinfer
         static_cast<size_t>(rows) * static_cast<size_t>(hidden);
     const size_t weight_bytes = static_cast<size_t>(hidden) * sizeof(__half);
 
-    // The caller's arrays are fp32 but the kernel's domain is fp16, which is
-    // what the engine stores. This downcast is therefore a real rounding, not a
-    // formality: a caller passing arbitrary fp32 pays for it on top of the
-    // output rounding. See tests/test_rmsnorm.py, which measures both.
-    std::vector<__half> host_x(count);
-    std::vector<__half> host_w(hidden);
-    for (size_t i = 0; i < count; ++i)
-    {
-      host_x[i] = __float2half(x[i]);
-    }
-    for (int i = 0; i < hidden; ++i)
-    {
-      host_w[i] = __float2half(weight[i]);
-    }
-
     DeviceBuffer dev_x(count * sizeof(__half));
     DeviceBuffer dev_w(weight_bytes);
     DeviceBuffer dev_out(count * sizeof(__half));
 
-    cuda_check(cudaMemcpy(dev_x.raw(), host_x.data(), count * sizeof(__half),
-                          cudaMemcpyHostToDevice),
-               "cudaMemcpy x host-to-device");
-    cuda_check(cudaMemcpy(dev_w.raw(), host_w.data(), weight_bytes,
-                          cudaMemcpyHostToDevice),
-               "cudaMemcpy weight host-to-device");
+    // A real rounding for arbitrary fp32 input, not a formality: see
+    // staging.h, and tests/test_rmsnorm.py, which measures both roundings.
+    upload_fp16(dev_x, x, count, "cudaMemcpy x host-to-device");
+    upload_fp16(dev_w, weight, hidden, "cudaMemcpy weight host-to-device");
 
     rmsnorm_kernel<<<rows, kBlockThreads>>>(dev_x.as<const __half>(),
                                             dev_w.as<const __half>(),
@@ -126,15 +108,7 @@ namespace microinfer
     // is reported against the wrong operation.
     cuda_check(cudaDeviceSynchronize(), "rmsnorm kernel execution");
 
-    std::vector<__half> host_out(count);
-    cuda_check(cudaMemcpy(host_out.data(), dev_out.raw(),
-                          count * sizeof(__half), cudaMemcpyDeviceToHost),
-               "cudaMemcpy output device-to-host");
-
-    for (size_t i = 0; i < count; ++i)
-    {
-      out[i] = __half2float(host_out[i]);
-    }
+    download_fp16(out, dev_out, count, "cudaMemcpy output device-to-host");
   }
 
 } // namespace microinfer

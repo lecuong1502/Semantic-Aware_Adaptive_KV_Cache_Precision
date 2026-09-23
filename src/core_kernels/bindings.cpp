@@ -1,7 +1,10 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -52,6 +55,144 @@ namespace
       microinfer::rmsnorm(x_ptr, w_ptr, out_ptr, rows, hidden, eps);
     }
 
+    return out;
+  }
+
+  using IntArray =
+      py::array_t<int32_t, py::array::c_style | py::array::forcecast>;
+
+  std::string shape_of(const py::array &a)
+  {
+    std::string s = "(";
+    for (py::ssize_t i = 0; i < a.ndim(); ++i)
+    {
+      s += (i ? ", " : "") + std::to_string(a.shape(i));
+    }
+    return s + ")";
+  }
+
+  py::array_t<float> rope(FloatArray x, IntArray positions, double theta)
+  {
+    if (x.ndim() != 3)
+    {
+      throw std::invalid_argument(
+          "x must be 3-D (seq, heads, head_dim), got shape " + shape_of(x));
+    }
+    if (positions.ndim() != 1 || positions.shape(0) != x.shape(0))
+    {
+      throw std::invalid_argument("positions must be 1-D with one entry per "
+                                  "token: x has seq " +
+                                  std::to_string(x.shape(0)) +
+                                  ", positions has shape " +
+                                  shape_of(positions));
+    }
+    if (x.shape(2) % 2 != 0)
+    {
+      throw std::invalid_argument(
+          "head_dim must be even for rotate-half RoPE, got " +
+          std::to_string(x.shape(2)));
+    }
+    if (!(theta > 0.0))
+    {
+      throw std::invalid_argument("theta must be positive, got " +
+                                  std::to_string(theta));
+    }
+    const int32_t *pos_ptr = positions.data();
+    for (py::ssize_t i = 0; i < positions.shape(0); ++i)
+    {
+      if (pos_ptr[i] < 0)
+      {
+        throw std::invalid_argument("positions must not be negative, got " +
+                                    std::to_string(pos_ptr[i]) + " at index " +
+                                    std::to_string(i));
+      }
+    }
+
+    py::array_t<float> out({x.shape(0), x.shape(1), x.shape(2)});
+    const float *x_ptr = x.data();
+    float *out_ptr = out.mutable_data();
+    const int seq = static_cast<int>(x.shape(0));
+    const int heads = static_cast<int>(x.shape(1));
+    const int head_dim = static_cast<int>(x.shape(2));
+    {
+      py::gil_scoped_release release;
+      microinfer::rope(x_ptr, pos_ptr, out_ptr, seq, heads, head_dim, theta);
+    }
+    return out;
+  }
+
+  py::array_t<float> swiglu(FloatArray gate, FloatArray up)
+  {
+    if (gate.ndim() != 2 || up.ndim() != 2)
+    {
+      throw std::invalid_argument(
+          "gate and up must be 2-D (rows, intermediate), got " +
+          shape_of(gate) + " and " + shape_of(up));
+    }
+    if (gate.shape(0) != up.shape(0) || gate.shape(1) != up.shape(1))
+    {
+      throw std::invalid_argument("gate " + shape_of(gate) + " and up " +
+                                  shape_of(up) + " must have the same shape");
+    }
+
+    py::array_t<float> out({gate.shape(0), gate.shape(1)});
+    const float *g_ptr = gate.data();
+    const float *u_ptr = up.data();
+    float *out_ptr = out.mutable_data();
+    const auto count = static_cast<size_t>(gate.size());
+    {
+      py::gil_scoped_release release;
+      microinfer::swiglu(g_ptr, u_ptr, out_ptr, count);
+    }
+    return out;
+  }
+
+  py::array_t<float> linear(FloatArray x, FloatArray weight,
+                            std::optional<FloatArray> bias)
+  {
+    if (x.ndim() != 2)
+    {
+      throw std::invalid_argument(
+          "x must be 2-D (rows, in_features), got shape " + shape_of(x));
+    }
+    if (weight.ndim() != 2)
+    {
+      throw std::invalid_argument(
+          "weight must be 2-D (out_features, in_features), got shape " +
+          shape_of(weight));
+    }
+    if (weight.shape(1) != x.shape(1))
+    {
+      throw std::invalid_argument(
+          "weight " + shape_of(weight) + " does not match x " + shape_of(x) +
+          ": weight is (out_features, in_features) and x has in_features " +
+          std::to_string(x.shape(1)));
+    }
+    if (x.shape(1) == 0)
+    {
+      throw std::invalid_argument("in_features must be at least 1");
+    }
+    if (bias && (bias->ndim() != 1 || bias->shape(0) != weight.shape(0)))
+    {
+      throw std::invalid_argument("bias must be 1-D (out_features,) with "
+                                  "out_features " +
+                                  std::to_string(weight.shape(0)) +
+                                  ", got shape " + shape_of(*bias));
+    }
+
+    py::array_t<float> out({x.shape(0), weight.shape(0)});
+    const float *x_ptr = x.data();
+    const float *w_ptr = weight.data();
+    const float *b_ptr = bias ? bias->data() : nullptr;
+    float *out_ptr = out.mutable_data();
+    const int rows = static_cast<int>(x.shape(0));
+    const int in_features = static_cast<int>(x.shape(1));
+    const int out_features = static_cast<int>(weight.shape(0));
+    {
+      py::gil_scoped_release release;
+      microinfer::linear(x_ptr, w_ptr, b_ptr, out_ptr, rows, in_features,
+                         out_features);
+    }
     return out;
   }
 
@@ -122,4 +263,20 @@ PYBIND11_MODULE(_microinfer, m)
         "RMSNorm over the last axis: x / sqrt(mean(x^2) + eps) * weight.\n"
         "Accumulates in fp32, stores fp16. Shapes are parameters; nothing is "
         "hardcoded to a model.");
+
+  m.def("rope", &rope, py::arg("x"), py::arg("positions"), py::arg("theta"),
+        "Rotary position embedding, rotate-half form, over x (seq, heads, "
+        "head_dim) with one position per token.\n"
+        "theta comes from config.json; the angle is formed in fp64 and the "
+        "output stored fp16.");
+
+  m.def("swiglu", &swiglu, py::arg("gate"), py::arg("up"),
+        "silu(gate) * up, elementwise over two (rows, intermediate) arrays.\n"
+        "Computed in fp32, stored fp16.");
+
+  m.def("linear", &linear, py::arg("x"), py::arg("weight"),
+        py::arg("bias") = py::none(),
+        "x @ weight.T + bias through cublasGemmEx. weight is (out_features, "
+        "in_features), as the checkpoint stores it; bias is optional.\n"
+        "fp16 operands, fp32 accumulation, one fp16 rounding on store.");
 }

@@ -24,6 +24,28 @@ namespace microinfer
   void rmsnorm(const float *x, const float *weight, float *out, int rows,
                int hidden, float eps);
 
+  // Rotary position embedding, Qwen2's "rotate half" form: dimension j rotates
+  // with j + head_dim/2 by pos * theta^(-2j/head_dim). x is (seq, heads,
+  // head_dim) and positions is (seq,), one per token, so decode can rotate a
+  // single token at any position. Applied to queries and keys separately,
+  // since they differ in head count.
+  //
+  // theta is a parameter because it is config: Qwen2.5 uses 1e6 with no
+  // scaling, which is why ADR-0003 chose it over Llama-3.2.
+  void rope(const float *x, const int *positions, float *out, int seq,
+            int heads, int head_dim, double theta);
+
+  // The MLP activation, silu(gate) * up, elementwise over `count` values.
+  void swiglu(const float *gate, const float *up, float *out, size_t count);
+
+  // A dense projection, out = x W^T + bias, through cublasGemmEx: fp16
+  // operands, fp32 accumulation, one fp16 rounding at the end. ADR-0001:
+  // cuBLAS is a BLAS, not an inference engine, and this wrapper is where the
+  // boundary sits. x is (rows, in_features); weight is (out_features,
+  // in_features), the layout the checkpoint stores; bias may be null.
+  void linear(const float *x, const float *weight, const float *bias,
+              float *out, int rows, int in_features, int out_features);
+
   // Device memory as the *driver* sees it, from cudaMemGetInfo. This is the
   // same quantity NVML reports and the one RQ2 turns on, so the engine reads it
   // rather than tracking its own allocations and trusting the two to agree.

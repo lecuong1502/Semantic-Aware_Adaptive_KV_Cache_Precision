@@ -125,3 +125,60 @@ positions per prompt.
 - `LOGIT_SAMPLES` in the generator is the single place the sample size is set,
   and changing it invalidates every stored reference — the manifest records it
   so a mismatch is visible.
+
+---
+
+## Amendment: a kernel whose output is a sum is measured against its terms where they cancel
+
+The ulp tolerances above divide each error by the reference value, floored at
+fp16's smallest normal. That is right for RMSNorm and SwiGLU, whose outputs are
+products. It is wrong for a kernel whose output is a *sum* — a projection's dot
+product, or RoPE's `x1*cos - x2*sin` — and #7 found out why on its first run.
+
+A sum's rounding error is bounded by the magnitude of its terms, not of its
+result. Where the terms cancel, the result is small and its error is not, so the
+relative error grows without limit however correct the kernel is. Measured on
+the cuBLAS wrapper with fp16-exact inputs:
+
+| | value |
+|---|---:|
+| Worst error, outputs with \|y\| > 0.05 | 1.00 ulp — the fp16 store alone |
+| Worst error, all outputs | 60 ulp, at y = -8.6e-6 |
+| Outputs over 4 ulp | 74 of 311,296, all with \|y\| < 1.1e-3 |
+
+RoPE fed arbitrary fp32 showed the same thing from a different source: rounding
+x1 and x2 to fp16 on the way in cost 1084 ulp at an output of -9.7e-5 whose terms
+summed to 1.64. That error belongs to the caller's downcast, not to any kernel.
+
+**Such a kernel's test therefore floors the denominator per output element**,
+using `terms` — the sum of the absolute values of what that element adds. There
+are two floors, and each admits exactly one error source (`tests/ulp_gate.py`):
+
+- **fp16-exact input — the kernel's gate.** `sqrt(n) * u32/u16 * terms` for a
+  sum of `n` terms: the magnitude at which fp32 accumulation's probabilistic
+  error (Higham & Mary, 2019) equals one fp16 ulp.
+- **Arbitrary fp32 input — the Seam B check.** `terms` itself: rounding each
+  operand to fp16 moves the result by up to half an fp16 ulp of its terms, and
+  no kernel can avoid that.
+
+### Why the first floor is not simply `terms`
+
+A dot product's terms outweigh its result by about `sqrt(n)`, so measuring
+against them forgives errors that would matter. Simulating the failure this gate
+most needs to catch — partial sums held in fp16, which is what cuBLAS's
+reduced-precision split-K reduction does — at the model's widest reduction
+(n = 4864):
+
+| floor | max | mean | verdict |
+|---|---:|---:|---|
+| `terms` | 3.0 ulp | 0.33 ulp | **passes** |
+| `sqrt(n) * u32/u16 * terms` | 118 ulp | 19.5 ulp | fails |
+
+Both simulations live in the test suite as tests *of the gate* — fp16
+accumulation in `test_linear.py`, an fp32 RoPE angle in `test_rope.py` — so a
+future loosening of the floor that stops catching either shows up as a failure.
+
+### What this does not change
+
+The tolerances stay at 4 ulp max and 1 ulp mean. Product-shaped kernels pass no
+floor and are measured exactly as before. The merge gate is untouched.
