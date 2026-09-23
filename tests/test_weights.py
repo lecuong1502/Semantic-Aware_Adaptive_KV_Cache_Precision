@@ -57,6 +57,23 @@ def test_reads_bf16_f16_and_f32(tmp_path):
     assert got["a"].shape == (2, 2)
 
 
+@pytest.mark.parametrize("dtype", ["F32", "BF16", "F16"])
+def test_reads_one_tensor_or_chosen_rows_of_it(tmp_path, dtype):
+    """Rows are picked before decoding, which is only correct if the row stride
+    is the stored dtype's and not float32's. BF16 and F16 are where that shows."""
+    f32 = np.arange(24, dtype=np.float32).reshape(6, 2, 2)
+    stored = {"F32": f32, "BF16": (f32.view(np.uint32) >> 16).astype(np.uint16),
+              "F16": f32.astype(np.float16)}[dtype]
+    path = tmp_path / "m.safetensors"
+    write_safetensors(path, {"other": ("F32", np.zeros(3, np.float32)), "t": (dtype, stored)})
+
+    np.testing.assert_array_equal(weights.read_tensor(path, "t"), f32)
+    rows = np.array([4, 0, 4, 5])  # out of order and repeated, as token ids are
+    np.testing.assert_array_equal(weights.read_tensor(path, "t", rows=rows), f32[rows])
+    with pytest.raises(weights.WeightError, match="missing"):
+        weights.read_tensor(path, "missing")
+
+
 def test_unknown_dtype_is_an_error_not_a_guess(tmp_path):
     path = tmp_path / "m.safetensors"
     write_safetensors(path, {"a": ("I64", np.array([1, 2], dtype=np.int64))})

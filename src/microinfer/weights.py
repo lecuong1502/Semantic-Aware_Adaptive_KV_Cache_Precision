@@ -91,16 +91,40 @@ def iter_tensors(path: Path) -> Iterator[tuple[str, np.ndarray]]:
     for name, meta in header.items():
         if name == "__metadata__":
             continue
-        dtype = meta["dtype"]
-        if dtype not in _DECODERS:
-            raise WeightError(
-                f"{name}: dtype {dtype} is not supported. This project reads "
-                f"{', '.join(sorted(_DECODERS))}."
-            )
-        start, end = meta["data_offsets"]
-        raw = mapped[base + start : base + end]
-        values = _DECODERS[dtype](raw).reshape(meta["shape"])
-        yield name, values
+        yield name, _decode(name, meta, mapped, base)
+
+
+def read_tensor(path: Path, name: str, rows: np.ndarray | None = None) -> np.ndarray:
+    """One tensor as float32, or only the given rows of its first axis.
+
+    `rows` exists for the embedding table. A prompt needs a few hundred of its
+    151,936 rows, and decoding the whole table would cost a gigabyte of host
+    memory at float32 for the 1.5B model. The rows are picked while still in
+    the checkpoint's own dtype, so only they are ever decoded.
+    """
+    check_complete(path)
+    header, base = read_header(path)
+    if name not in header:
+        raise WeightError(f"{path.name} has no tensor named {name}")
+    mapped = np.memmap(path, dtype=np.uint8, mode="r")
+    return _decode(name, header[name], mapped, base, rows)
+
+
+def _decode(name: str, meta: dict, mapped: np.ndarray, base: int,
+            rows: np.ndarray | None = None) -> np.ndarray:
+    dtype = meta["dtype"]
+    if dtype not in _DECODERS:
+        raise WeightError(
+            f"{name}: dtype {dtype} is not supported. This project reads "
+            f"{', '.join(sorted(_DECODERS))}."
+        )
+    start, end = meta["data_offsets"]
+    raw = mapped[base + start : base + end]
+    shape = list(meta["shape"])
+    if rows is not None:
+        raw = np.ascontiguousarray(raw.reshape(shape[0], -1)[rows]).reshape(-1)
+        shape[0] = len(rows)
+    return _DECODERS[dtype](raw).reshape(shape)
 
 
 def describe(path: Path) -> list[TensorInfo]:
