@@ -16,6 +16,7 @@ import ctypes
 import os
 from dataclasses import dataclass, replace
 from functools import cache
+from typing import Literal
 
 _SUCCESS = 0
 _INSUFFICIENT_SIZE = 7
@@ -42,7 +43,7 @@ class _ProcessInfo(ctypes.Structure):
 class GpuProcess:
     pid: int
     name: str | None  # None where NVML may not name another user's process
-    kind: str  # "compute", "graphics", or "compute+graphics" for a process holding both
+    kind: Literal["compute", "graphics", "compute+graphics"]  # the last holds both
     used_bytes: int | None  # None where the driver does not report it
 
 

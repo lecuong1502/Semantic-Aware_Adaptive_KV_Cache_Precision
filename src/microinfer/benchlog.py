@@ -29,6 +29,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -43,6 +44,12 @@ DEFAULT_LOG = REPO / "experiments" / "logs" / "benchmark.jsonl"
 #: The precision tiers of ADR-0008 and CONTEXT.md: the only names a tier
 #: configuration may use.
 TIERS = frozenset({"FP16", "INT8", "INT4", "INT2"})
+
+#: A kind is kebab-case, so a plot can group by it. `peak_memory` predates the
+#: rule and stays: every entry of one measurement must share a kind, and the
+#: entries already written cannot be renamed.
+_KIND = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_KINDS_BEFORE_THE_RULE = frozenset({"peak_memory"})
 
 #: Tail read per step when finding the last entry. Entries run from under 1 KB
 #: to about 50 KB (an ncu summary), so this usually takes one or two reads.
@@ -137,6 +144,26 @@ def _last_hash(f) -> str | None:
     return None
 
 
+def _check_kind(kind: str) -> None:
+    if not (_KIND.fullmatch(kind) or kind in _KINDS_BEFORE_THE_RULE):
+        raise ValueError(f"kind {kind!r} is not kebab-case, as in gemm-study-timing")
+
+
+def _check_context_length(context_length) -> None:
+    """Tokens in the cache: one number, or a range for a measurement over many
+    sequences, as {"min": ..., "max": ...} with any further counts beside it.
+    A plot reads `min` and `max` from every range, whatever else it carries."""
+    if context_length is None or (isinstance(context_length, int) and context_length >= 0):
+        return
+    if isinstance(context_length, dict):
+        low, high = context_length.get("min"), context_length.get("max")
+        if (isinstance(low, int) and isinstance(high, int) and 0 <= low <= high
+                and all(isinstance(v, int) for v in context_length.values())):
+            return
+    raise ValueError(f"context_length is a token count, or a range with integer min <= max; "
+                     f"got {context_length!r}")
+
+
 def append(kind: str, *, results: dict, model: str | list[str] | None,
            context_length: int | dict | None,
            precision_tiers: dict | None, config: dict | None = None,
@@ -146,14 +173,16 @@ def append(kind: str, *, results: dict, model: str | list[str] | None,
     `model`, `context_length` and `precision_tiers` are required keywords: a
     result depends on them, so a caller must state them. None is allowed where
     one does not apply, but it has to be said. `model` may be a list, for a
-    measurement over several models' shapes, and `context_length` a dict where
-    one number would mislead, such as the range of prompt lengths a gate ran
-    over.
+    measurement over several models' shapes, and `context_length` a range
+    where one number would mislead, such as the prompt lengths a gate ran over.
+    `kind` is kebab-case.
 
     The entry is serialised in full before the file is opened, so results that
     are not JSON leave the log untouched.
     """
     log = Path(log)
+    _check_kind(kind)
+    _check_context_length(context_length)
     if precision_tiers is not None and not set(precision_tiers) <= TIERS:
         raise ValueError(f"precision tiers are {sorted(TIERS)}; got {sorted(precision_tiers)}")
     fields = {**environment(log), "kind": kind, "model": model,

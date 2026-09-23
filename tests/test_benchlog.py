@@ -99,6 +99,34 @@ def test_tier_names_are_the_project_s_own(tmp_path):
         entry(tmp_path / "log.jsonl", precision_tiers={"fp16": 1.0})
 
 
+@pytest.mark.parametrize("kind,ok", [("gate", True), ("gemm-study-timing", True),
+                                     ("peak_memory", True), ("Peak Memory", False),
+                                     ("new_kind", False), ("trailing-", False)])
+def test_kinds_are_kebab_case_except_the_one_written_before_the_rule(tmp_path, kind, ok):
+    """A plot groups by kind. peak_memory stays, because its entries already
+    exist and every entry of one measurement must share a kind."""
+    log = tmp_path / "log.jsonl"
+    if ok:
+        entry(log, kind=kind)
+    else:
+        with pytest.raises(ValueError, match="kebab-case"):
+            entry(log, kind=kind)
+
+
+@pytest.mark.parametrize("context_length,ok", [
+    (None, True), (0, True), (4096, True),
+    ({"min": 4, "max": 1090, "prompts": 24}, True),
+    ({"prompts": 10, "new_tokens": 64}, False),  # a range a plot cannot read
+    ({"min": 9, "max": 4}, False), (-1, False), ("long", False)])
+def test_a_context_length_is_a_count_or_a_readable_range(tmp_path, context_length, ok):
+    log = tmp_path / "log.jsonl"
+    if ok:
+        entry(log, context_length=context_length)
+    else:
+        with pytest.raises(ValueError, match="context_length"):
+            entry(log, context_length=context_length)
+
+
 def test_a_tracked_log_does_not_make_its_own_entries_dirty(tmp_path, monkeypatch):
     """The repository's log is tracked, so appending changes a tracked file.
     That must not mark the next entry dirty, or git_dirty would be true for

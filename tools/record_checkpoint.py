@@ -72,7 +72,7 @@ def main(argv: list[str]) -> int:
         log=args.log)
 
     # The smoke test: greedy tokens against HuggingFace's.
-    smoke = []
+    smoke, continued = [], []
     for item in golden:
         if item.generated is None:
             continue
@@ -82,11 +82,13 @@ def main(argv: list[str]) -> int:
         same = len(ours) == len(item.generated) and first == n
         smoke.append({"prompt": item.prompt_id, "match": same,
                       "first_divergence": None if same else first})
+        continued.append(len(item) + len(item.generated))
     matching = sum(s["match"] for s in smoke)
     print(f"\nsmoke: {matching}/{len(smoke)} match HuggingFace")
     benchlog.append(
         "smoke", model=args.model, precision_tiers=TIERS,
-        context_length={"prompts": len(smoke), "new_tokens": golden.manifest["smoke_tokens"]},
+        context_length={"min": min(continued), "max": max(continued), "prompts": len(smoke),
+                        "new_tokens": golden.manifest["smoke_tokens"]},
         config={"reference": reference, "greedy": golden.manifest["greedy"]},
         results={"matching": matching, "prompts": len(smoke), "per_prompt": smoke},
         log=args.log)
