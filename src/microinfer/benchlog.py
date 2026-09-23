@@ -167,14 +167,14 @@ def _models(model) -> str:
 
 def render(entries: list[dict]) -> str:
     """A summary table, one row per entry."""
-    rows = [f"{'#':>3}  {'timestamp':<25} {'commit':<8} {'kind':<14} {'model':<24} "
+    rows = [f"{'#':>3}  {'timestamp':<25} {'commit':<8} {'kind':<18} {'model':<44} "
             f"{'excl.':<5} results"]
     for number, e in enumerate(entries, start=1):
         commit = (e.get("git_commit") or "")[:7] + ("*" if e.get("git_dirty") else "")
         shown = ", ".join(f"{k}={v}" for k, v in e["results"].items()
                           if isinstance(v, (int, float, str)))
-        rows.append(f"{number:>3}  {e['timestamp']:<25} {commit:<8} {e['kind']:<14} "
-                    f"{_models(e['model']):<24} {'yes' if e['exclusive_gpu'] else 'no':<5} {shown}")
+        rows.append(f"{number:>3}  {e['timestamp']:<25} {commit:<8} {e['kind']:<18} "
+                    f"{_models(e['model']):<44} {'yes' if e['exclusive_gpu'] else 'no':<5} {shown}")
     return "\n".join(rows)
 
 

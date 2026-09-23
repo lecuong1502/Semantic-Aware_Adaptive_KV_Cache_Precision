@@ -30,21 +30,24 @@ the model cards. Each is measured at one row (decode) and at 512 rows
 
 ## Results
 
-Recorded in `results/`:
+Recorded in the benchmark log, `experiments/logs/benchmark.jsonl` (#13). They
+were measured before the log existed and were moved into it as entries 4 to 6.
+Each keeps its own measurement environment under `config.measured`; the files
+they came from are in git history.
 
-- `2026-09-23T050005Z-c1482f0-timing.json` holds CUDA-event timings: the
+- Entry 6, measured at `c1482f0` (`gemm-study-timing`), holds CUDA-event timings: the
   median of 50 launches after 3 warm-up launches, on inputs from seed 11. They
   run at whatever clocks the driver chooses, because locking clocks needs root.
   The record states the clocks before and after the run. Before is the idle
   P-state; after is 2640 MHz at P0.
-- `2026-09-23T045057Z-5a0572e-ncu.json` holds Nsight Compute 2025.2.1 metrics,
+- Entry 5, summarised at `5a0572e` (`gemm-study-ncu`), holds Nsight Compute 2025.2.1 metrics,
   profiled at commit `a0c0423` with ncu's default base-clock lock and cache
   flush. The kernels are unchanged between that commit and the timing's: the
   change between them is a comment, and one launcher template replacing two
   identical launchers.
-- `2026-09-23T044626Z-a0c0423-timing.json` is an earlier timing at `a0c0423`.
-  It does not record its warm-up count or seed and is superseded. It is kept
-  because results are appended, never rewritten.
+- Entry 4 is an earlier timing at `a0c0423`. It does not record its warm-up
+  count or seed and is marked superseded. It is kept because results are
+  appended, never rewritten.
 
 Every table and every figure below comes from the timing record and the ncu
 record above. TFLOP/s and GB/s figures are derived from the event timings.
@@ -187,8 +190,5 @@ Only `ncu` runs under sudo, and summarising the report needs no privilege. The
 summary records both the commit it was summarised at and the commit that was
 profiled, and it refuses to run if the measured sources changed between them.
 The `.ncu-rep` files are not committed (about 30 MiB each, 32 MB for this
-study's). The JSON records
-are.
-
-These records follow the fields #13's benchmark log asks for. When #13 lands,
-they should be migrated into it rather than kept beside it.
+study's). Their summaries are, as entries in the benchmark log: `time` and
+`summarize` each append one.

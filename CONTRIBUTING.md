@@ -127,8 +127,11 @@ first; it names the first diverging layer.
   floor measures the format rather than the implementation. For fp16 that is
   max < 1.953e-3 and mean < 4.883e-4; derive it, do not hardcode it.
 - **Reporting a benchmark without its context.** Measurements come from a laptop
-  whose memory and clocks depend on what else is running. Every entry records
-  configuration, hardware, driver version and git commit.
+  whose memory and clocks depend on what else is running. Every result goes into
+  the benchmark log with `microinfer.benchlog.append`, which records
+  configuration, hardware, driver version, git commit and what else held the
+  GPU. The log is append-only, and a test checks every committed version against
+  the next.
 
 ## Golden reference tensors
 

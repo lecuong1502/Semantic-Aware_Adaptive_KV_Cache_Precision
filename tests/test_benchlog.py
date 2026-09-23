@@ -127,3 +127,31 @@ def test_an_edited_log_fails_verification_where_it_was_edited(tmp_path, tamper, 
     log.write_text("\n".join(lines) + "\n")
     with pytest.raises(benchlog.LogTampered, match=f"entry {at}"):
         benchlog.verify(log)
+
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True,
+                          check=True).stdout
+
+
+def test_the_repository_log_has_only_ever_grown():
+    """Every committed version of experiments/logs/benchmark.jsonl is a prefix
+    of the next, and the working copy extends the newest. History is the one
+    record of the log that the log cannot rewrite itself."""
+    path = LOG.relative_to(REPO).as_posix()
+    commits = git("log", "--reverse", "--format=%H", "--", path).split()
+    versions = [git("show", f"{c}:{path}") for c in commits] + [LOG.read_text()]
+    for older, newer in zip(versions, versions[1:]):
+        assert newer.startswith(older), "an entry already committed was changed or removed"
+    benchlog.verify(LOG)
+
+
+def test_the_first_entries_are_the_engine_checkpoint_s_gate():
+    """#13 starts the log at the first working version: the Milestone 0
+    checkpoint's gate, as #12 left it, comes before anything else."""
+    rows = benchlog.read(LOG)
+    assert rows[0]["kind"] == "gate"
+    gate = rows[0]["results"]
+    assert gate["top1"] >= 0.99 and gate["kl_mean"] < 1e-3
+    assert gate["positions"] > 0 and gate["kl_samples"] > 0
+    assert rows[0]["model"] == "qwen2.5-0.5b-instruct"
