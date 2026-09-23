@@ -32,3 +32,18 @@ inference engine (vLLM, llama.cpp, TensorRT-LLM) is used at any point.
   naive → shared-memory-tiled → cuBLAS under `ncu`. It is a learning and
   benchmarking artifact, deliberately kept off the critical path and out of the
   inference path.
+
+---
+
+## Note from #11: the gap, measured
+
+The study the Consequences promised is in `studies/gemm/`. The "2–5x" estimate
+above turned out to be generous to a first hand-written GEMM. On the models'
+own projections at 512 rows, a shared-memory-tiled kernel is 9–27x slower than
+cuBLAS, and a naive one is 108–260x slower. In decode, where every
+implementation is bound by DRAM bandwidth, the tiled kernel is 5–22x slower.
+
+The causes differ by stage. The naive kernel is bound by the load/store queue,
+the tiled kernel by shared memory, and cuBLAS by the tensor pipe. The
+hand-written kernels use no tensor cores at all. The measurement strengthens
+this decision; it does not revise it. The write-up is `studies/gemm/README.md`.
