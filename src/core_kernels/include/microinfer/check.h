@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -31,6 +32,17 @@ namespace microinfer
       throw std::runtime_error(std::string(what) +
                                " failed: " + (name ? name : "unknown") + " (" +
                                (desc ? desc : "no description") + ")");
+    }
+  }
+
+  // cuBLAS has a third error domain of its own, cublasStatus_t. Same reasoning
+  // as driver_check: reported under its own name, never cast into another.
+  inline void cublas_check(cublasStatus_t status, const char *what)
+  {
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+      throw std::runtime_error(std::string(what) +
+                               " failed: " + cublasGetStatusString(status));
     }
   }
 

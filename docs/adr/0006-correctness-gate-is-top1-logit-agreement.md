@@ -125,3 +125,92 @@ positions per prompt.
 - `LOGIT_SAMPLES` in the generator is the single place the sample size is set,
   and changing it invalidates every stored reference — the manifest records it
   so a mismatch is visible.
+
+---
+
+## Amendment: a kernel whose output is a sum is measured against its terms where they cancel
+
+The ulp tolerances above divide each error by the reference value, floored at
+fp16's smallest normal. That is right for RMSNorm and SwiGLU, whose outputs are
+products. It is wrong for a kernel whose output is a *sum* — a projection's dot
+product, or RoPE's `x1*cos - x2*sin` — and #7 found out why on its first run.
+
+A sum's rounding error is bounded by the magnitude of its terms, not of its
+result. Where the terms cancel, the result is small and its error is not, so the
+relative error grows without limit however correct the kernel is. Measured on
+the cuBLAS wrapper with fp16-exact inputs:
+
+| | value |
+|---|---:|
+| Worst error, outputs with \|y\| > 0.05 | 1.00 ulp — the fp16 store alone |
+| Worst error, all outputs | 60 ulp, at y = -8.6e-6 |
+| Outputs over 4 ulp | 74 of 311,296, all with \|y\| < 1.1e-3 |
+
+RoPE fed arbitrary fp32 showed the same thing from a different source: rounding
+x1 and x2 to fp16 on the way in cost 1084 ulp at an output of -9.7e-5 whose terms
+summed to 1.64. That error belongs to the caller's downcast, not to any kernel.
+
+**Such a kernel's test therefore floors the denominator per output element**,
+using `terms` — the sum of the absolute values of what that element adds. There
+are two floors, and each admits exactly one error source (`tests/ulp_gate.py`):
+
+- **fp16-exact input — the kernel's gate.** `sqrt(n) * u32 * terms / MAX_REL`
+  for a sum of `n` terms: the magnitude at which fp32 accumulation's
+  probabilistic error bound (Higham & Mary, 2019) uses the whole 4-ulp max
+  budget, and no more.
+- **Arbitrary fp32 input — the Seam B check.** `terms` itself: rounding each
+  operand to fp16 moves the result by up to half an fp16 ulp of its terms, and
+  no kernel can avoid that.
+
+### Why the first floor is not simply `terms`
+
+A dot product's terms outweigh its result by about `sqrt(n)`, so measuring
+against them forgives errors that would matter. Simulating the failure this gate
+most needs to catch — partial sums held in fp16, which is what cuBLAS's
+reduced-precision split-K reduction does — at the model's widest reduction
+(n = 4864):
+
+| floor | max | mean | verdict |
+|---|---:|---:|---|
+| `terms` | 3.0 ulp | 0.33 ulp | **passes** |
+| `sqrt(n) * u32 * terms / MAX_REL` | 370 ulp | 30.5 ulp | fails |
+
+### How much of the output the floor judges
+
+A floor replaces |y| for every output smaller than it, so its size decides how
+much of a test is still a relative-error test. The review of #7 measured this
+against a first version of the floor that spent one ulp, not four, on
+accumulation — and found it judging **51%** of `down_proj`'s outputs at n = 8960
+against the floor. That was measuring the floor.
+
+The floor is therefore calibrated against what fp32 accumulation actually does.
+On the model's projections the observed error is at most **0.19** of the
+probabilistic bound, and the bound is allowed the full max budget:
+
+| projection | n | outputs judged against the floor | worst error |
+|---|---:|---:|---:|
+| q_proj, 0.5B | 896 | 1.4% | 1.05 ulp |
+| down_proj, 0.5B | 4864 | 7.6% | 1.00 ulp |
+| down_proj, 1.5B | 8960 | 13.7% | 1.03 ulp |
+
+Even at the bound itself — five times the error observed — an output at the
+floor would sit exactly at 4 ulp, not past it.
+
+Both simulations live in the test suite as tests *of the gate* — fp16
+accumulation in `test_linear.py`, an fp32 RoPE angle in `test_rope.py` — so a
+future loosening of the floor that stops catching either shows up as a failure.
+
+### RoPE is closer to float64 than HuggingFace is
+
+The RoPE kernel forms its angle in fp64. HuggingFace forms it in fp32, which is
+18 ulp out at position 2049 and 60 ulp out at 32767 at the fastest frequency.
+The kernel is judged against float64 here, so at long contexts it will
+disagree with the golden reference **because the reference is the less
+accurate of the two**. The golden prompts are short, so the difference does not
+reach the gate today. **#12 should expect it** before treating a late-position
+logit mismatch as an engine bug.
+
+### What this does not change
+
+The tolerances stay at 4 ulp max and 1 ulp mean. Product-shaped kernels pass no
+floor and are measured exactly as before. The merge gate is untouched.
