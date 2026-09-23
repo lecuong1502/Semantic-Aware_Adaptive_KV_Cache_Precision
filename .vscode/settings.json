@@ -1,0 +1,21 @@
+{
+  "files.watcherExclude": {
+    "**/.venv/**": true,
+    "**/.venv-golden/**": true,
+    "**/build/**": true,
+    "**/models/**": true,
+    "**/tests/golden/**": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/.venv-golden": true,
+    "**/build": true,
+    "**/models": true,
+    "**/tests/golden": true
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true
+  },
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python"
+}
