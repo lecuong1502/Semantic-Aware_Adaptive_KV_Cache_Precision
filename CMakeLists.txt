@@ -12,6 +12,10 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
+# For the editor, not the build: clangd and the VS Code C/C++ extension read the
+# exact nvcc include paths from this, so CUDA headers resolve in the IDE.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
