@@ -57,16 +57,18 @@ namespace microinfer
   // Causal scaled dot-product attention with online softmax: out =
   // softmax(q k^T / sqrt(head_dim), causal) v, per head, never materialising
   // the score matrix or a mask. q and out are (seq_q, heads, head_dim); k and v
-  // are (seq_k, heads, head_dim), with seq_q <= seq_k.
+  // are (seq_k, kv_heads, head_dim), with seq_q <= seq_k.
   //
   // Causal alignment is bottom-right: query i is at position seq_k - seq_q + i
   // and sees keys at positions up to it. Prefill (seq_q == seq_k) and decode
   // (seq_q == 1) are the same rule.
   //
-  // Every query head has its own KV head here. Grouped-query attention, where
-  // several query heads share one, is #9.
+  // Grouped-query attention: kv_heads divides heads, and query head h reads KV
+  // head h / (heads / kv_heads), HuggingFace's repeat_kv order. Both Qwen2.5
+  // models use kv_heads = 2; kv_heads == heads is ordinary multi-head
+  // attention.
   void attention(const float *q, const float *k, const float *v, float *out,
-                 int seq_q, int seq_k, int heads, int head_dim);
+                 int seq_q, int seq_k, int heads, int kv_heads, int head_dim);
 
   // Device memory as the *driver* sees it, from cudaMemGetInfo. This is the
   // same quantity NVML reports and the one RQ2 turns on, so the engine reads it

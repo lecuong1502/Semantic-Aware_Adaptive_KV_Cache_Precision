@@ -41,11 +41,24 @@ namespace microinfer
     // No mask tensor exists anywhere: whether key j is visible to query i is
     // the comparison j <= i + (seq_k - seq_q), computed where it is needed.
     //
-    // Layout is (tokens, heads, head_dim), row-major, for q, k, v and out.
-    __global__ void
-    attention_kernel(const __half *__restrict__ q, const __half *__restrict__ k,
-                     const __half *__restrict__ v, __half *__restrict__ out,
-                     int seq_q, int seq_k, int heads, int head_dim, float scale)
+    // Layout is (tokens, heads, head_dim), row-major, for q and out, and
+    // (tokens, kv_heads, head_dim) for k and v.
+    //
+    // Grouped-query attention is an indexing rule, nothing more: the block for
+    // query head h reads KV head h / group, where group = heads / kv_heads.
+    // That is HuggingFace's repeat_kv order — contiguous groups, not
+    // interleaved — and the KV heads are never copied out to one per query
+    // head. group == 1 is ordinary multi-head attention.
+    //
+    // Each query head's block loads its KV tile for itself, so a group's
+    // blocks load the same tile `group` times. Sharing one load across the
+    // group is an optimisation for later; it changes no arithmetic.
+    __global__ void attention_kernel(const __half *__restrict__ q,
+                                     const __half *__restrict__ k,
+                                     const __half *__restrict__ v,
+                                     __half *__restrict__ out, int seq_q,
+                                     int seq_k, int heads, int kv_heads,
+                                     int head_dim, float scale)
     {
       extern __shared__ float smem[];
       float *q_s = smem; // kAttentionTileQ x head_dim
@@ -67,6 +80,10 @@ namespace microinfer
       const int shift = seq_k - seq_q;
       const size_t token_stride = static_cast<size_t>(heads) * head_dim;
       const size_t head_offset = static_cast<size_t>(head) * head_dim;
+      const int group = heads / kv_heads;
+      const size_t kv_token_stride = static_cast<size_t>(kv_heads) * head_dim;
+      const size_t kv_head_offset =
+          static_cast<size_t>(head / group) * head_dim;
 
       // The scale is folded into q once, rather than applied to every score.
       for (int i = threadIdx.x; i < kAttentionTileQ * head_dim; i += blockDim.x)
@@ -102,7 +119,8 @@ namespace microinfer
           const int c = i / head_dim;
           const int d = i % head_dim;
           const bool in_range = k_first + c < seq_k;
-          const size_t at = (k_first + c) * token_stride + head_offset + d;
+          const size_t at =
+              (k_first + c) * kv_token_stride + kv_head_offset + d;
           k_s[i] = in_range ? k[at] : __float2half(0.0f);
           v_s[i] = in_range ? v[at] : __float2half(0.0f);
         }
@@ -189,15 +207,15 @@ namespace microinfer
   } // namespace
 
   void attention(const float *q, const float *k, const float *v, float *out,
-                 int seq_q, int seq_k, int heads, int head_dim)
+                 int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
   {
-    if (seq_q <= 0 || heads <= 0 || head_dim <= 0)
+    if (seq_q <= 0 || heads <= 0 || kv_heads <= 0 || head_dim <= 0)
     {
       return; // No elements exist, so there is nothing to write.
     }
 
     const size_t q_count = static_cast<size_t>(seq_q) * heads * head_dim;
-    const size_t kv_count = static_cast<size_t>(seq_k) * heads * head_dim;
+    const size_t kv_count = static_cast<size_t>(seq_k) * kv_heads * head_dim;
 
     DeviceBuffer dev_q(q_count * sizeof(__half));
     DeviceBuffer dev_k(kv_count * sizeof(__half));
@@ -221,7 +239,7 @@ namespace microinfer
     attention_kernel<<<grid, kBlockThreads, smem>>>(
         dev_q.as<const __half>(), dev_k.as<const __half>(),
         dev_v.as<const __half>(), dev_out.as<__half>(), seq_q, seq_k, heads,
-        head_dim, scale);
+        kv_heads, head_dim, scale);
     cuda_check(cudaGetLastError(), "attention kernel launch");
     cuda_check(cudaDeviceSynchronize(), "attention kernel execution");
 
