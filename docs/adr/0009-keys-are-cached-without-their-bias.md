@@ -96,3 +96,42 @@ that moves this prompt should be expected to move the gate.
   the cached keys cannot represent this prompt at all. So "FP16" is not a
   lossless baseline for Qwen2.5's cache unless the bias is kept out of it. That
   is a statement about the top of the tier ladder that the thesis rests on.
+
+---
+
+## Note from #14: keys under paging, and what completing them cost
+
+**A key's position is its logical position, not its slot.** The paged
+attention kernel passes `j`, the key's index in the sequence, to the bias
+rotation, and finds the key's bytes through the page table. A page that the
+allocator moves keeps its tokens' positions. `test_kv_pages.py` moves a page
+between launches with the key bias in play, and the output is unchanged.
+
+**The cost this ADR left unmeasured was large, and is now removed.** Forming
+the rotation's angle, cos and sin in fp64 for every element of every key tile
+made attention several times slower. The angle depends only on position and
+frequency, so a `RopeTable` now forms cos and sin once per position, in fp64
+rounded to fp32, and every layer reads it. For the 0.5B model that is 256
+bytes a position, against 12 KiB of cache. Measured on the 0.5B model at 1,090
+keys, median of seven, benchmark log entries 8 (before, at `e83c33d`) and 9
+(after, at `4123cb3`):
+
+| | fp64 per element | table |
+|---|---:|---:|
+| prefill attention, one layer, with the bias | 62.4 ms | 15.8 ms |
+| decode attention, one layer, with the bias | 2.88 ms | 0.77 ms |
+| a 1,090-token forward pass | 1.85 s | 0.74 s |
+| 64 decoded tokens after a 37-token prompt | 0.80 s | 0.57 s |
+
+Completing keys now costs about what the bias-free attention does, measured
+in the same runs: 19.7 ms and 0.64 ms.
+
+**The gate moved, and not because the engine became more accurate.** The
+table rounds cos and sin to fp32, and so does HuggingFace, whose rotary
+embedding computes them in fp32. The fp64 values were closer to the true
+rotation and further from the reference. On adversarial-00, the prompt most
+sensitive to exactly this, agreement rose from 199 to 200 of 207 positions,
+and its sampled mean KL fell from 1.28e-2 to 5.3e-3. The set's mean KL fell
+from 8.0e-4 to 4.4e-4. The same change exposed that the KL sample can
+understate as well as overstate; ADR-0006 has the correction. adversarial-00's
+remaining divergence is still not isolated.
