@@ -33,7 +33,9 @@ the model cards. Each is measured at one row (decode) and at 512 rows
 Recorded in the benchmark log, `experiments/logs/benchmark.jsonl` (#13). They
 were measured before the log existed and were moved into it as entries 4 to 6.
 Each keeps its own measurement environment under `config.measured`; the files
-they came from are in git history.
+they came from are in git history. Their top-level commit and timestamp are the
+migration's, not the measurement's, and entry 7, a correction, says so and
+restates when and at which commit each was measured.
 
 - Entry 6, measured at `c1482f0` (`gemm-study-timing`), holds CUDA-event timings: the
   median of 50 launches after 3 warm-up launches, on inputs from seed 11. They
