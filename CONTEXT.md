@@ -24,6 +24,20 @@ physical location, precision tier, and quantisation scales. vLLM calls this a
 should not use that name.
 _Avoid_: block table
 
+**Slot**:
+A page's position within its precision tier's address range, counted from the
+low end. A tier's live pages always occupy slots `0..n-1` with no holes;
+freeing a page moves the tier's last page into the vacated slot. A slot is
+where a page is *now*, never an identity: a page's identity is
+`(layer, page_index)`.
+_Avoid_: offset, index (that is `page_index`), position (that is a token's)
+
+**Granule**:
+The unit in which the driver backs a tier's address range with physical
+memory, as `cuMemGetAllocationGranularity` reports it. Memory returns to the
+driver a whole granule at a time, and only once no live page reaches into it.
+_Avoid_: chunk, block, slab
+
 **Precision tier**:
 The numeric format a page's keys and values are stored in: `FP16`, `INT8`,
 `INT4`, or `INT2`. A tier belongs to a `(layer, page)` pair, not to a token

@@ -100,3 +100,34 @@ tolerance loose enough to stop a test flaking is also loose enough to hide a
 leak of the same size — and a leak is exactly what this ADR exists to prevent.
 When an allocator assertion goes flaky, the shortfall should be measured before
 the bound is widened.
+
+---
+
+## Note from #10: what was observed when it was built
+
+**The granule is 2 MiB** on the RTX 4050 Laptop with driver 580.178.04, as
+`cuMemGetAllocationGranularity` reports at `CU_MEM_ALLOC_GRANULARITY_MINIMUM`.
+The allocator reads it at construction and nothing assumes it.
+
+**The contract holds exactly, and NVML is read directly.** Reserving 7.5 GiB of
+address space, well beyond the 6 GiB card, moves NVML-reported free memory by
+nothing. Mapping and releasing 32 granules moves it by 32 granules each way, to
+within 0.16 of a granule over thirty cycles. The allocator tests read
+`nvmlDeviceGetMemoryInfo` through ctypes (`tests/nvml.py`) rather than
+`cudaMemGetInfo`. The two differ by about 90 MiB on this machine, so they are
+not interchangeable as absolute readings, even though their deltas agree.
+
+**Contention on an idle desktop is ±6 MiB.** The display server, a browser and
+an editor share the GPU, and they move NVML's free reading by up to three
+granules over short intervals while this process does nothing. The allocator
+tests take the median of seven repetitions instead of widening a tolerance. A
+wider tolerance would also admit a leak of the same size. With granule release
+disabled, the central test and six others fail.
+
+**The CUDA context is about 87 MiB, and a cache must not be the last holder of
+it.** The cache retains the primary context and releases it on destruction. If
+nothing else holds the context, that release destroys it, and the next cache
+rebuilds it. A test that builds and drops caches then reads 87 MiB that no
+reservation took. The engine holds the context through the runtime API for its
+whole life, so this does not affect it, but any measurement of the cache must
+be taken with the context already alive.

@@ -9,6 +9,7 @@
 #include <string>
 
 #include "microinfer/kernels.h"
+#include "microinfer/paged_kv_cache.h"
 
 namespace py = pybind11;
 
@@ -278,6 +279,48 @@ namespace
     return std::make_unique<microinfer::DeviceTensor>(ptr, count);
   }
 
+  // A page's bytes cross Seam B as any C-contiguous array whose size is the
+  // page's; its dtype is the caller's business, as the page's contents are.
+  void write_page(microinfer::PagedKVCache &cache, int layer, int page_index,
+                  const py::array &host)
+  {
+    if (!(host.flags() & py::array::c_style))
+    {
+      throw std::invalid_argument(
+          "a page is written from a C-contiguous array");
+    }
+    const void *ptr = host.data();
+    const auto bytes = static_cast<std::size_t>(host.nbytes());
+    py::gil_scoped_release release;
+    cache.write({layer, page_index}, ptr, bytes);
+  }
+
+  py::array_t<uint8_t> read_page(const microinfer::PagedKVCache &cache,
+                                 int layer, int page_index)
+  {
+    const microinfer::PageKey key{layer, page_index};
+    const auto bytes = cache.page_bytes(cache.locate(key).tier);
+    py::array_t<uint8_t> out(static_cast<py::ssize_t>(bytes));
+    uint8_t *ptr = out.mutable_data();
+    {
+      py::gil_scoped_release release;
+      cache.read(key, ptr, bytes);
+    }
+    return out;
+  }
+
+  std::vector<std::pair<int, int>>
+  pages_in_slot_order(const microinfer::PagedKVCache &cache,
+                      microinfer::Tier tier)
+  {
+    std::vector<std::pair<int, int>> out;
+    for (const auto &key : cache.pages(tier))
+    {
+      out.emplace_back(key.layer, key.page_index);
+    }
+    return out;
+  }
+
 } // namespace
 
 PYBIND11_MODULE(_microinfer, m)
@@ -349,4 +392,71 @@ PYBIND11_MODULE(_microinfer, m)
   tiles["query"] = microinfer::kAttentionTileQ;
   tiles["key"] = microinfer::kAttentionTileK;
   m.attr("attention_tiles") = tiles;
+
+  using microinfer::PagedKVCache;
+  using microinfer::PageKey;
+  using microinfer::Tier;
+
+  py::enum_<Tier>(m, "Tier", "Precision tier, ADR-0008.")
+      .value("FP16", Tier::FP16)
+      .value("INT8", Tier::INT8)
+      .value("INT4", Tier::INT4)
+      .value("INT2", Tier::INT2);
+
+  py::register_exception<microinfer::PageNotFound>(m, "PageNotFound",
+                                                   PyExc_KeyError);
+
+  // No method returns a device address, and none may: a page moves whenever
+  // its tier's tail is retracted (ADR-0007).
+  py::class_<PagedKVCache>(
+      m, "PagedKVCache",
+      "The KV cache allocator of ADR-0007: one reserved virtual address range "
+      "per tier, backed by granules that return to the driver as they empty.\n"
+      "Pages are named by (layer, page_index) and packed from the low end of "
+      "their tier; freeing one moves the tier's tail page into its slot.")
+      .def(py::init<const std::array<std::size_t, microinfer::kTierCount> &,
+                    const std::array<std::size_t, microinfer::kTierCount> &>(),
+           py::arg("page_bytes"), py::arg("capacity_pages"),
+           "Both are indexed by Tier: the size of one page, and the most pages "
+           "the tier can hold. Reserves address space only.")
+      .def(
+          "allocate",
+          [](PagedKVCache &c, int layer, int page_index, Tier tier)
+          {
+            py::gil_scoped_release release;
+            c.allocate({layer, page_index}, tier);
+          },
+          py::arg("layer"), py::arg("page_index"), py::arg("tier"))
+      .def(
+          "free",
+          [](PagedKVCache &c, int layer, int page_index)
+          {
+            py::gil_scoped_release release;
+            c.free({layer, page_index});
+          },
+          py::arg("layer"), py::arg("page_index"))
+      .def("write", &write_page, py::arg("layer"), py::arg("page_index"),
+           py::arg("data"),
+           "Copy a C-contiguous array of exactly the page's size into it.")
+      .def("read", &read_page, py::arg("layer"), py::arg("page_index"),
+           "The page's bytes, as uint8.")
+      .def(
+          "locate",
+          [](const PagedKVCache &c, int layer, int page_index)
+          {
+            const auto loc = c.locate({layer, page_index});
+            return std::make_pair(loc.tier, loc.slot);
+          },
+          py::arg("layer"), py::arg("page_index"),
+          "(tier, slot) of a page, as the page table holds it now.")
+      .def("__contains__", [](const PagedKVCache &c, std::pair<int, int> key)
+           { return c.contains({key.first, key.second}); })
+      .def("pages", &pages_in_slot_order, py::arg("tier"),
+           "The tier's (layer, page_index) keys in slot order.")
+      .def("page_bytes", &PagedKVCache::page_bytes, py::arg("tier"))
+      .def("reserved_bytes", &PagedKVCache::reserved_bytes, py::arg("tier"))
+      .def("mapped_bytes", &PagedKVCache::mapped_bytes, py::arg("tier"),
+           "Device memory backing the tier now: whole granules.")
+      .def_property_readonly("granule_bytes", &PagedKVCache::granule_bytes,
+                             "From cuMemGetAllocationGranularity.");
 }

@@ -33,6 +33,7 @@ pybind11_add_module(_microinfer
   src/core_kernels/device.cu
   src/core_kernels/device_tensor.cu
   src/core_kernels/linear.cu
+  src/core_kernels/paged_kv_cache.cu
   src/core_kernels/rmsnorm.cu
   src/core_kernels/rope.cu
   src/core_kernels/swiglu.cu
