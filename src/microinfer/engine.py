@@ -79,7 +79,8 @@ class Engine:
 
     #: Tokens per prefill chunk (#15). A long prompt is prefilled this many
     #: positions at a time, so the workspace is sized to a chunk, not to the
-    #: prompt: that is what lets a 32K-token prompt run on a 6 GiB card.
+    #: prompt. With it, Qwen2.5-1.5B prefills its whole 32K-token window on a
+    #: 6 GiB card (benchmark log, prefill-throughput at 32768 tokens).
     DEFAULT_PREFILL_CHUNK = 512
 
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",

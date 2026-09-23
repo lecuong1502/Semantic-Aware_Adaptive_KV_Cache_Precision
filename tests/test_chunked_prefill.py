@@ -9,11 +9,13 @@ differently in a 37-row GEMM than in a 1,090-row one (measured: some sizes
 agree, some do not). Chunked and single-shot prefill therefore agree to
 within a bound, not to the bit. The same is already true of prefill (many
 rows) against decode (one) in every engine that uses cuBLAS. The bound was
-measured on the 23 prompts other than adversarial-00, at chunks of 1, 37, 128
-and 512: logits within 0.096, KL within 7.5e-5, and the argmax the same at
-every position except two near-ties. The assertions below allow twice the
-logit difference, and allow an argmax to change only where single-shot's top
-two logits are closer than that.
+measured by tools/chunked_agreement.py on the 23 prompts other than
+adversarial-00, at chunks of 1, 37, 128 and 512 (benchmark log,
+chunked-prefill-agreement): logits within 0.096, KL within 7.5e-5, and the
+argmax the same at every position except four near-ties. The assertions below
+allow twice the logit difference and twice the KL, and allow an argmax to
+change only where single-shot's top two logits are closer than the logit
+bound.
 
 adversarial-00 is left out, and ADR-0010 says why. It amplifies any error of
 its embedding about a thousand times, so the rounding differences between
@@ -36,10 +38,11 @@ REPO = Path(__file__).resolve().parent.parent
 MODEL = "qwen2.5-0.5b-instruct"
 MIB = 2**20
 
-#: Twice the largest logit difference measured between chunked and single-shot
-#: prefill on the well-conditioned prompts (0.096; module docstring).
+#: Twice the largest logit difference and KL measured between chunked and
+#: single-shot prefill on the well-conditioned prompts (0.096 and 7.5e-5;
+#: module docstring).
 LOGIT_BOUND = 0.2
-KL_BOUND = 2e-4
+KL_BOUND = 1.5e-4
 
 
 @pytest.fixture(scope="module")
@@ -181,8 +184,9 @@ def test_prefill_chunk_is_configured_and_checked():
 def test_a_32k_prompt_prefills_on_the_1_5b_model():
     """ADR-0003's experimental configuration on this 6 GiB card: the whole
     context window of Qwen2.5-1.5B, prefilled in chunks, then one token
-    chosen. Weights alone are 2.88 GiB; the benchmark log has the time it
-    takes and the memory it left (prefill-throughput, 32768 tokens)."""
+    chosen. Weights alone are 2.88 GiB. The benchmark log has the time it
+    takes and the memory it left (prefill-throughput, 32768 tokens): 715 s,
+    with 1161 MiB free at the peak."""
     e = Engine(require_model("qwen2.5-1.5b-instruct"))
     e.load_weights()
     window = e.config.max_position_embeddings

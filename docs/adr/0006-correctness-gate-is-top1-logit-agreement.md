@@ -321,13 +321,16 @@ control:
   decode in any engine that uses cuBLAS, not only between chunks.
 
 The owner chose to state equivalence as a measured bound rather than to pin
-cuBLAS's algorithm. On the 23 prompts other than adversarial-00, at chunks of
-1, 37, 128 and 512, the logits agree within 0.096 and KL within 7.5e-5, and the
-argmax is the same at every position except two near-ties. `test_chunked_prefill.py`
-allows twice the logit difference, and allows an argmax to change only where
-single-shot's top two logits are closer than that.
+cuBLAS's algorithm. `tools/chunked_agreement.py` measures it and logs it as
+`chunked-prefill-agreement` (entry `39d5fd7c`, at 14bc758). On the 23 prompts
+other than adversarial-00, at chunks of 1, 37, 128 and 512, over every
+position, the logits agree within 0.096 and KL within 7.5e-5. The argmax
+changes at two positions at a chunk of 1 and two at 128, all of them near-ties
+(single-shot's top two logits within 0.2). `test_chunked_prefill.py` allows
+twice the logit difference and twice the KL, and allows an argmax to change
+only at such a near-tie.
 
-adversarial-00 is excluded, as ADR-0010 explains. It amplifies these
-differences a thousand times, to logit differences of up to 9 and seven
-changed argmaxes at a chunk of 128. With the default chunk of 512 it runs in
-one chunk, and is unaffected.
+adversarial-00 is excluded, as ADR-0010 explains, and the same entry records
+it apart. It amplifies these differences about a thousand times, to logit
+differences of up to 9.1 and nine changed argmaxes at a chunk of 1. With the
+default chunk of 512 it runs in one chunk, and is unaffected.
