@@ -18,8 +18,7 @@ namespace
 
   using FloatArray =
       py::array_t<float, py::array::c_style | py::array::forcecast>;
-  using Gemm = void (*)(const __half *, const __half *, __half *, int, int,
-                        int);
+  using gemm_study::Gemm;
 
   // Fp32 host arrays are rounded to fp16 on the way in and widened on the way
   // out, with the same staging helpers the engine uses.

@@ -1,8 +1,9 @@
 """`studies/` is unreachable from the engine (ADR-0001, #11).
 
-A hand-written GEMM is realistically 2-5x slower than cuBLAS. If the engine
-could reach it, every latency figure in the paper would carry the doubt that it
-had, and a reviewer could not separate the cost of the adaptive policy from the
+The study measured its hand-written GEMM at 9-27x slower than cuBLAS on the
+models' prefill projections (studies/gemm/README.md), far beyond the 2-5x
+ADR-0001 assumed. If the engine could reach it, every latency figure in the
+paper would carry the doubt that it had, and a reviewer could not separate the cost of the adaptive policy from the
 cost of a slow matmul. So the boundary is asserted at every level a dependency
 could cross it: the Python import graph, the extension's build, and the wheel.
 """

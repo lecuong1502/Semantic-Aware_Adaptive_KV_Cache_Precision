@@ -1,7 +1,7 @@
 // The benchmark driver: every implementation on every shape given, on the same
 // device buffers, one after another.
 //
-//   gemm_bench [--repeat N] ROWS,IN,OUT [ROWS,IN,OUT ...]
+//   gemm_bench [--repeat N] [--warmup N] [--seed N] ROWS,IN,OUT [...]
 //
 // It prints one CSV line per (shape, implementation) with the median of N
 // timed launches. The timed launches, and only they, sit between
@@ -17,6 +17,7 @@
 #include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -37,7 +38,7 @@ namespace
   struct Implementation
   {
     const char *name;
-    void (*run)(const __half *, const __half *, __half *, int, int, int);
+    gemm_study::Gemm run;
   };
 
   const Implementation kImplementations[] = {
@@ -65,7 +66,11 @@ namespace
 
 int main(int argc, char **argv)
 {
+  // Defaults only. profile.py passes every one of these explicitly and records
+  // what it passed, so a result never depends on a default read from here.
   int repeat = 50;
+  int warmup = 3;
+  unsigned seed = 11;
   std::vector<Shape> shapes;
   for (int i = 1; i < argc; ++i)
   {
@@ -73,6 +78,16 @@ int main(int argc, char **argv)
     if (arg == "--repeat" && i + 1 < argc)
     {
       repeat = std::atoi(argv[++i]);
+      continue;
+    }
+    if (arg == "--warmup" && i + 1 < argc)
+    {
+      warmup = std::atoi(argv[++i]);
+      continue;
+    }
+    if (arg == "--seed" && i + 1 < argc)
+    {
+      seed = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
       continue;
     }
     Shape s{};
@@ -85,15 +100,16 @@ int main(int argc, char **argv)
     }
     shapes.push_back(s);
   }
-  if (shapes.empty() || repeat < 1)
+  if (shapes.empty() || repeat < 1 || warmup < 0)
   {
     std::fprintf(
         stderr,
-        "usage: gemm_bench [--repeat N] ROWS,IN,OUT [ROWS,IN,OUT ...]\n");
+        "usage: gemm_bench [--repeat N] [--warmup N] [--seed N] ROWS,IN,OUT "
+        "[ROWS,IN,OUT ...]\n");
     return 2;
   }
 
-  std::mt19937 rng(11);
+  std::mt19937 rng(seed);
   cudaEvent_t start, stop;
   gemm_study::cuda_check(cudaEventCreate(&start), "cudaEventCreate");
   gemm_study::cuda_check(cudaEventCreate(&stop), "cudaEventCreate");
@@ -121,7 +137,7 @@ int main(int argc, char **argv)
                  s.rows, s.in_features, s.out_features);
       };
 
-      for (int i = 0; i < 3; ++i) // warm-up, and cuBLAS's handle and heuristics
+      for (int i = 0; i < warmup; ++i) // cuBLAS's handle and heuristics too
       {
         launch();
       }

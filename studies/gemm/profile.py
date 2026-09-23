@@ -53,6 +53,13 @@ from microinfer.models import VERIFIED  # noqa: E402
 PREFILL_ROWS = 512
 DECODE_ROWS = 1
 
+#: How a timing is taken, passed to the bench explicitly and recorded with every
+#: result, so that no number depends on a default read from bench.cu. The
+#: median of REPEAT launches after WARMUP, on inputs drawn from SEED.
+REPEAT = 50
+WARMUP = 3
+SEED = 11
+
 #: The two hand-written stages, as ncu names them: namespace-qualified, with
 #: the signature. Any other kernel in a call is cuBLAS's.
 STUDY_KERNEL = re.compile(r"\bgemm_study::(naive|tiled)_kernel\(")
@@ -96,16 +103,38 @@ def shapes() -> list[tuple[str, str, int, int, int]]:
 
 
 def shape_args() -> list[str]:
-    return [f"{rows},{k},{n}" for _, _, rows, k, n in shapes()]
+    return [f"{rows},{in_features},{out_features}"
+            for _, _, rows, in_features, out_features in shapes()]
 
 
-def build() -> None:
+def build(quiet: bool = False) -> None:
+    """Configure once, then rebuild incrementally: a no-op when up to date.
+    tests/test_gemm_study.py builds through this too, quietly."""
+    run = dict(check=True, capture_output=quiet)
     if not (BUILD / "CMakeCache.txt").is_file():
         pybind11_dir = subprocess.run([sys.executable, "-m", "pybind11", "--cmakedir"],
                                       capture_output=True, text=True, check=True).stdout.strip()
         subprocess.run(["cmake", "-S", STUDY, "-B", BUILD, f"-Dpybind11_DIR={pybind11_dir}",
-                        f"-DPython_EXECUTABLE={sys.executable}"], check=True)
-    subprocess.run(["cmake", "--build", BUILD, "-j", str(os.cpu_count() or 1)], check=True)
+                        f"-DPython_EXECUTABLE={sys.executable}"], **run)
+    subprocess.run(["cmake", "--build", BUILD, "-j", str(os.cpu_count() or 1)], **run)
+
+
+def method(repeat: int) -> dict:
+    return {"repeat": repeat, "warmup": WARMUP, "seed": SEED, "statistic": "median"}
+
+
+def bench_args(repeat: int) -> list[str]:
+    return ["--repeat", str(repeat), "--warmup", str(WARMUP), "--seed", str(SEED), *shape_args()]
+
+
+def clocks() -> dict:
+    """The GPU's state as the driver reports it. Event timings run at whatever
+    clocks the driver chooses: locking them needs root, as the counters do, so
+    they are recorded before and after rather than controlled."""
+    fields = "clocks.sm,clocks.mem,temperature.gpu,power.draw,pstate"
+    values = subprocess.run(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader"],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    return dict(zip(fields.split(","), (v.strip() for v in values.split(","))))
 
 
 def git(*args: str) -> str:
@@ -147,7 +176,7 @@ def environment() -> dict:
 
 
 def time_shapes(repeat: int) -> list[dict]:
-    out = subprocess.run([BENCH, "--repeat", str(repeat), *shape_args()],
+    out = subprocess.run([BENCH, *bench_args(repeat)],
                          capture_output=True, text=True, check=True).stdout
     return list(csv.DictReader(io.StringIO(out)))
 
@@ -162,12 +191,18 @@ def write_record(kind: str, record: dict) -> Path:
 
 def cmd_time() -> None:
     build()
-    timings = time_shapes(repeat=50)
-    labels = {(r, k, n): (m, p) for m, p, r, k, n in shapes()}
+    before = clocks()
+    timings = time_shapes(REPEAT)
+    after = clocks()
+    labels = {(rows, in_features, out_features): (model, projection)
+              for model, projection, rows, in_features, out_features in shapes()}
     for t in timings:
         t["model"], t["projection"] = labels[(int(t["rows"]), int(t["in_features"]),
                                               int(t["out_features"]))]
-    path = write_record("timing", {"environment": environment(), "timings": timings})
+    path = write_record("timing", {
+        "environment": environment(), "method": method(REPEAT),
+        "clock_control": "none: the driver's own clocks, recorded before and after",
+        "clocks_before": before, "clocks_after": after, "timings": timings})
     print(f"wrote {path.relative_to(REPO)}")
 
 
@@ -175,7 +210,7 @@ def ncu_command(report: Path) -> list[str]:
     ncu = subprocess.run(["which", "ncu"], capture_output=True, text=True).stdout.strip() or "ncu"
     sections = [arg for s in SECTIONS for arg in ("--section", s)]
     return [ncu, "--profile-from-start", "off", *sections, "-f", "-o", str(report),
-            str(BENCH), "--repeat", "1", *shape_args()]
+            str(BENCH), *bench_args(repeat=1)]
 
 
 def cmd_ncu_command() -> None:
@@ -219,18 +254,21 @@ def attribute(kernels: list[dict]) -> list[dict]:
     """
     calls = []
     order = iter(shapes())
-    for k in kernels:
-        name = k["Kernel Name"]
-        match = STUDY_KERNEL.search(name)
+    shape = None
+    for kernel in kernels:
+        match = STUDY_KERNEL.search(kernel["Kernel Name"])
         impl = match.group(1) if match else "cublas"
         if impl == "naive":
-            model, proj, rows, kf, nf = next(order)
-            shape = {"model": model, "projection": proj, "rows": rows,
-                     "in_features": kf, "out_features": nf}
+            model, projection, rows, in_features, out_features = next(order)
+            shape = {"model": model, "projection": projection, "rows": rows,
+                     "in_features": in_features, "out_features": out_features}
+        if shape is None:
+            raise SystemExit(f"the first kernel in the report is {kernel['Kernel Name']!r}, "
+                             f"not the naive kernel the bench launches first")
         if impl == "cublas" and calls and calls[-1]["implementation"] == "cublas":
-            calls[-1]["kernels"].append(k)
+            calls[-1]["kernels"].append(kernel)
             continue
-        calls.append({**shape, "implementation": impl, "kernels": [k]})
+        calls.append({**shape, "implementation": impl, "kernels": [kernel]})
     return calls
 
 
@@ -238,14 +276,18 @@ def summarise_call(call: dict) -> dict:
     """Durations add up across a call's kernels; every other metric is read
     from its longest kernel, which is the GEMM itself."""
     kernels = call.pop("kernels")
-    main = max(kernels, key=lambda k: number(k[METRICS["duration_ns"]]) or 0)
+
+    def duration(kernel: dict) -> float:
+        return number(kernel[METRICS["duration_ns"]]) or 0.0
+
+    gemm = max(kernels, key=duration)
     out = dict(call)
-    out["kernel_names"] = [k["Kernel Name"] for k in kernels]
-    out["block_size"], out["grid_size"] = main.get("Block Size"), main.get("Grid Size")
+    out["kernel_names"] = [kernel["Kernel Name"] for kernel in kernels]
+    out["block_size"], out["grid_size"] = gemm.get("Block Size"), gemm.get("Grid Size")
     for key, metric in METRICS.items():
-        out[key] = number(main.get(metric, ""))
-    out["duration_ns"] = sum(number(k[METRICS["duration_ns"]]) or 0 for k in kernels)
-    stalls = {m.group(1): number(v) for col, v in main.items()
+        out[key] = number(gemm.get(metric, ""))
+    out["duration_ns"] = sum(map(duration, kernels))
+    stalls = {m.group(1): number(v) for col, v in gemm.items()
               if (m := STALL.match(col)) and number(v) is not None}
     out["stalls_per_issue"] = dict(sorted(stalls.items(), key=lambda kv: -kv[1]))
     return out
@@ -280,7 +322,7 @@ def cmd_summarize(report: Path) -> None:
     if len(calls) != expected:
         raise SystemExit(f"{report}: {len(calls)} calls attributed, {expected} expected")
     record = {"environment": environment(), "ncu_report": report.name,
-              **measured_commit(report),
+              **measured_commit(report), "method": method(repeat=1),
               "ncu_version": subprocess.run(["ncu", "--version"], capture_output=True,
                                             text=True).stdout.strip().splitlines()[-1],
               "clock_control": "ncu default (base clocks locked)", "calls": calls}

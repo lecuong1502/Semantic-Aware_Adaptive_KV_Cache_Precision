@@ -3,8 +3,8 @@ gate as the engine's projection (#11).
 
 The study lives in `studies/gemm/` and is built by its own CMake project, never
 by the engine's (ADR-0001; test_studies_isolation.py). This file builds it on
-first use, incrementally, so the study cannot quietly rot while the suite stays
-green.
+first use through the study's own `profile.py`, incrementally, so the study
+cannot quietly rot while the suite stays green.
 
 Both kernels compute what `_microinfer.linear` does: `y = x @ W.T` over fp16
 operands with fp32 accumulation and one fp16 rounding on store. So they are held
@@ -14,8 +14,7 @@ that is wrong would make its timings meaningless.
 """
 
 import importlib
-import os
-import subprocess
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -28,25 +27,21 @@ from microinfer.config import ModelConfig
 
 REPO = Path(__file__).resolve().parent.parent
 STUDY = REPO / "studies" / "gemm"
-BUILD = REPO / "build" / "studies-gemm"
 
 
 @pytest.fixture(scope="module")
 def study():
-    """Configure once, then rebuild incrementally: a no-op when up to date."""
-    if not (BUILD / "CMakeCache.txt").is_file():
-        pybind11_dir = subprocess.run([sys.executable, "-m", "pybind11", "--cmakedir"],
-                                      capture_output=True, text=True, check=True).stdout.strip()
-        subprocess.run(["cmake", "-S", STUDY, "-B", BUILD, f"-Dpybind11_DIR={pybind11_dir}",
-                        f"-DPython_EXECUTABLE={sys.executable}"],
-                       check=True, capture_output=True)
-    subprocess.run(["cmake", "--build", BUILD, "-j", str(os.cpu_count() or 1)],
-                   check=True, capture_output=True)
-    sys.path.insert(0, str(BUILD))
+    """Built by the study's own script, so the tests build exactly what gets
+    measured, then imported from the build directory."""
+    spec = importlib.util.spec_from_file_location("gemm_study_profile", STUDY / "profile.py")
+    profile = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(profile)
+    profile.build(quiet=True)
+    sys.path.insert(0, str(profile.BUILD))
     try:
         return importlib.import_module("_gemm_study")
     finally:
-        sys.path.remove(str(BUILD))
+        sys.path.remove(str(profile.BUILD))
 
 
 KERNELS = ["naive", "tiled"]

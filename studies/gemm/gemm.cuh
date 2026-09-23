@@ -62,8 +62,11 @@ namespace gemm_study
   // Both loads are coalesced: threadIdx.x runs along k, the contiguous axis of
   // both operands. Each value loaded from global memory is used kTile times
   // from shared memory instead of once, which is the whole point. The W tile
-  // is stored transposed-padded (kTile + 1 columns) so that reading it down a
-  // column in the inner loop does not put a warp's 32 threads on one bank.
+  // is stored transposed, as w_s[k][n], so that the inner loop reads a warp's
+  // 32 values from one contiguous row. The transposing store, w_s[tx][ty], is
+  // what walks down a column: its 32 threads write 32 rows apart, and the
+  // padding to kTile + 1 columns is what puts them on 32 different banks
+  // instead of one.
   __global__ void tiled_kernel(const __half *__restrict__ x,
                                const __half *__restrict__ w,
                                __half *__restrict__ y, int rows,
@@ -108,26 +111,26 @@ namespace gemm_study
     }
   }
 
-  inline dim3 grid_for(int rows, int out_features)
+  // The one signature every implementation and both kernels share, on device
+  // pointers.
+  using Gemm = void (*)(const __half *x, const __half *w, __half *y, int rows,
+                        int in_features, int out_features);
+
+  // Both hand-written kernels launch the same way: one kTile x kTile block per
+  // kTile x kTile tile of the output.
+  template <Gemm Kernel>
+  void launch(const __half *x, const __half *w, __half *y, int rows,
+              int in_features, int out_features)
   {
-    return dim3((out_features + kTile - 1) / kTile, (rows + kTile - 1) / kTile);
+    const dim3 grid((out_features + kTile - 1) / kTile,
+                    (rows + kTile - 1) / kTile);
+    Kernel<<<grid, dim3(kTile, kTile)>>>(x, w, y, rows, in_features,
+                                         out_features);
+    cuda_check(cudaGetLastError(), "GEMM study kernel launch");
   }
 
-  inline void naive(const __half *x, const __half *w, __half *y, int rows,
-                    int in_features, int out_features)
-  {
-    naive_kernel<<<grid_for(rows, out_features), dim3(kTile, kTile)>>>(
-        x, w, y, rows, in_features, out_features);
-    cuda_check(cudaGetLastError(), "naive GEMM launch");
-  }
-
-  inline void tiled(const __half *x, const __half *w, __half *y, int rows,
-                    int in_features, int out_features)
-  {
-    tiled_kernel<<<grid_for(rows, out_features), dim3(kTile, kTile)>>>(
-        x, w, y, rows, in_features, out_features);
-    cuda_check(cudaGetLastError(), "tiled GEMM launch");
-  }
+  inline constexpr Gemm naive = launch<naive_kernel>;
+  inline constexpr Gemm tiled = launch<tiled_kernel>;
 
   // The baseline, configured as the engine's projection is
   // (src/core_kernels/linear.cu): fp16 in and out, fp32 compute, and reduced-
