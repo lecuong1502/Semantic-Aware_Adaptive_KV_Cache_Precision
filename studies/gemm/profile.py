@@ -53,9 +53,15 @@ from microinfer.models import VERIFIED  # noqa: E402
 PREFILL_ROWS = 512
 DECODE_ROWS = 1
 
-#: Kernel names of the two hand-written stages; anything else in a call is
-#: cuBLAS's.
-STUDY_KERNELS = {"naive_kernel": "naive", "tiled_kernel": "tiled"}
+#: The two hand-written stages, as ncu names them: namespace-qualified, with
+#: the signature. Any other kernel in a call is cuBLAS's.
+STUDY_KERNEL = re.compile(r"\bgemm_study::(naive|tiled)_kernel\(")
+
+#: ncu reports each metric in the unit it finds readable, per metric, in the
+#: raw page's second row. Durations are normalised to nanoseconds.
+#: ncu 2025.2 writes "ms"; older versions wrote "msecond". Both are accepted.
+TIME_UNITS = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9,
+              "nsecond": 1.0, "usecond": 1e3, "msecond": 1e6, "second": 1e9}
 
 #: Raw ncu metrics, by the name the write-up uses.
 METRICS = {
@@ -122,7 +128,10 @@ def environment() -> dict:
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "git_commit": git("rev-parse", "HEAD"),
-        "git_dirty": bool(git("status", "--porcelain", "--", "studies", "src")),
+        # Tracked files only: the untracked records in results/ are this
+        # script's own output, not a change to what was measured.
+        "git_dirty": bool(git("status", "--porcelain", "--untracked-files=no",
+                              "--", "studies", "src")),
         "gpu": gpu.findtext("product_name"),
         "gpu_total_memory": gpu.findtext("fb_memory_usage/total"),
         "driver_version": smi.findtext("driver_version"),
@@ -185,8 +194,13 @@ def read_report(report: Path) -> list[dict]:
     out = subprocess.run(["ncu", "--import", str(report), "--csv", "--page", "raw"],
                          capture_output=True, text=True, check=True).stdout
     rows = list(csv.reader(io.StringIO(out)))
-    header, data = rows[0], rows[2:]
-    return [dict(zip(header, row)) for row in data]
+    header, units, data = rows[0], dict(zip(rows[0], rows[1])), rows[2:]
+    kernels = [dict(zip(header, row)) for row in data]
+    duration = METRICS["duration_ns"]
+    scale = TIME_UNITS[units[duration]]
+    for k in kernels:
+        k[duration] = str(number(k[duration]) * scale)
+    return kernels
 
 
 def number(value: str) -> float | None:
@@ -207,7 +221,8 @@ def attribute(kernels: list[dict]) -> list[dict]:
     order = iter(shapes())
     for k in kernels:
         name = k["Kernel Name"]
-        impl = next((v for key, v in STUDY_KERNELS.items() if name.startswith(key)), "cublas")
+        match = STUDY_KERNEL.search(name)
+        impl = match.group(1) if match else "cublas"
         if impl == "naive":
             model, proj, rows, kf, nf = next(order)
             shape = {"model": model, "projection": proj, "rows": rows,
@@ -236,12 +251,36 @@ def summarise_call(call: dict) -> dict:
     return out
 
 
+#: What the profiled binary is built from. A change anywhere else, this script
+#: included, cannot change a measurement.
+MEASURED_SOURCES = ["studies/gemm/gemm.cuh", "studies/gemm/bench.cu",
+                    "studies/gemm/CMakeLists.txt", "src/core_kernels/include"]
+
+
+def measured_commit(report: Path) -> dict:
+    """The commit the report was profiled at, which ncu-command writes into the
+    report's name, and whether the measured code is unchanged since.
+
+    ncu runs under sudo and this runs later as the user, often after a fix to
+    this script. The record's own git_commit is the summariser's; this says
+    which code produced the numbers."""
+    match = re.fullmatch(r"gemm-([0-9a-f]{7,40})\.ncu-rep", report.name)
+    if not match:
+        raise SystemExit(f"{report.name}: not named by ncu-command, so its commit is unknown")
+    commit = git("rev-parse", match.group(1))
+    changed = git("diff", "--name-only", commit, "--", *MEASURED_SOURCES)
+    if changed:
+        raise SystemExit(f"measured code changed since {commit[:7]}: {changed}; profile again")
+    return {"measured_commit": commit}
+
+
 def cmd_summarize(report: Path) -> None:
     calls = [summarise_call(c) for c in attribute(read_report(report))]
     expected = 3 * len(shapes())
     if len(calls) != expected:
         raise SystemExit(f"{report}: {len(calls)} calls attributed, {expected} expected")
     record = {"environment": environment(), "ncu_report": report.name,
+              **measured_commit(report),
               "ncu_version": subprocess.run(["ncu", "--version"], capture_output=True,
                                             text=True).stdout.strip().splitlines()[-1],
               "clock_control": "ncu default (base clocks locked)", "calls": calls}
