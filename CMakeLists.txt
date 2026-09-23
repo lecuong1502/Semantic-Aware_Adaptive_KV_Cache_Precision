@@ -21,6 +21,7 @@ find_package(pybind11 CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 pybind11_add_module(_microinfer
+  src/core_kernels/attention.cu
   src/core_kernels/bindings.cpp
   src/core_kernels/device.cu
   src/core_kernels/device_tensor.cu

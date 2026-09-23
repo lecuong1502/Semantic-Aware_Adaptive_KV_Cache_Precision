@@ -200,6 +200,35 @@ Both simulations live in the test suite as tests *of the gate* — fp16
 accumulation in `test_linear.py`, an fp32 RoPE angle in `test_rope.py` — so a
 future loosening of the floor that stops catching either shows up as a failure.
 
+### Attention's floor admits the scores' rounding as well (#8)
+
+Attention's output is a sum over value rows weighted by softmax, and the
+weights are not exact: each score is itself an fp32 dot product over
+`head_dim`, and its rounding becomes a relative error in every weight. The
+accumulation floor alone does not see that, and with it alone the kernel read
+5–7 ulp at head_dim 128 on outputs whose weights were right to fp32 precision.
+So attention's bound has a second term:
+
+    (sqrt(n) + 2 * sqrt(d) * max_j sum_d |q_d k_jd| / sqrt(d)) * u32 * terms
+
+The factor of two is because each weight is divided by a denominator carrying
+the same error. Calibrated the same way as before:
+
+| case | observed / bound | outputs judged against the floor | worst error |
+|---|---:|---:|---:|
+| prefill, head_dim 64 | ≤ 0.83 | 1.6% | 1.00 ulp |
+| prefill, head_dim 128 | ≤ 0.42 | 2.7% | 1.03 ulp |
+
+It still fails the next optimisation a kernel would reach for, which is holding
+the softmax weights in fp16 for the P·V product: 83 ulp. That trade may be worth
+making later, but it would go through this ADR, not past it.
+
+A score offset of ~1000, which the stability test uses, is a different matter.
+An fp32 score that large has an ulp of 6e-5, and the floor, which is honest
+about that, judges 94% of outputs against their terms. That test is therefore a
+stability test only. The precision claim at large scores belongs to a test in
+which the maximum rises tile by tile, where the floor judges 0.1% of outputs.
+
 ### RoPE is closer to float64 than HuggingFace is
 
 The RoPE kernel forms its angle in fp64. HuggingFace forms it in fp32, which is

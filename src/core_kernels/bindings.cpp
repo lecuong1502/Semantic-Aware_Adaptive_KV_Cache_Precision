@@ -196,6 +196,63 @@ namespace
     return out;
   }
 
+  py::array_t<float> attention(FloatArray q, FloatArray k, FloatArray v)
+  {
+    for (const auto *a : {&q, &k, &v})
+    {
+      if (a->ndim() != 3)
+      {
+        throw std::invalid_argument(
+            "q, k and v must be 3-D (tokens, heads, head_dim), got " +
+            shape_of(q) + ", " + shape_of(k) + ", " + shape_of(v));
+      }
+    }
+    if (k.shape(0) != v.shape(0) || k.shape(1) != v.shape(1) ||
+        k.shape(2) != v.shape(2))
+    {
+      throw std::invalid_argument("k " + shape_of(k) + " and v " + shape_of(v) +
+                                  " must have the same shape");
+    }
+    if (q.shape(1) != k.shape(1))
+    {
+      throw std::invalid_argument(
+          "q has " + std::to_string(q.shape(1)) + " heads and k has " +
+          std::to_string(k.shape(1)) +
+          "; every query head needs its own KV head until grouped-query "
+          "attention exists");
+    }
+    if (q.shape(2) != k.shape(2))
+    {
+      throw std::invalid_argument(
+          "q has head_dim " + std::to_string(q.shape(2)) +
+          " and k has head_dim " + std::to_string(k.shape(2)));
+    }
+    if (q.shape(0) > k.shape(0))
+    {
+      throw std::invalid_argument(
+          "seq_q " + std::to_string(q.shape(0)) + " exceeds seq_k " +
+          std::to_string(k.shape(0)) +
+          ": queries align to the last keys, so there must be at least as "
+          "many keys as queries");
+    }
+
+    py::array_t<float> out({q.shape(0), q.shape(1), q.shape(2)});
+    const float *q_ptr = q.data();
+    const float *k_ptr = k.data();
+    const float *v_ptr = v.data();
+    float *out_ptr = out.mutable_data();
+    const int seq_q = static_cast<int>(q.shape(0));
+    const int seq_k = static_cast<int>(k.shape(0));
+    const int heads = static_cast<int>(q.shape(1));
+    const int head_dim = static_cast<int>(q.shape(2));
+    {
+      py::gil_scoped_release release;
+      microinfer::attention(q_ptr, k_ptr, v_ptr, out_ptr, seq_q, seq_k, heads,
+                            head_dim);
+    }
+    return out;
+  }
+
 } // namespace
 
 namespace
@@ -279,4 +336,15 @@ PYBIND11_MODULE(_microinfer, m)
         "x @ weight.T + bias through cublasGemmEx. weight is (out_features, "
         "in_features), as the checkpoint stores it; bias is optional.\n"
         "fp16 operands, fp32 accumulation, one fp16 rounding on store.");
+
+  m.def("attention", &attention, py::arg("q"), py::arg("k"), py::arg("v"),
+        "Causal attention with online softmax over q (seq_q, heads, head_dim) "
+        "and k, v (seq_k, heads, head_dim), seq_q <= seq_k.\n"
+        "Queries align to the last keys. No score matrix or mask is "
+        "materialised.");
+
+  py::dict tiles;
+  tiles["query"] = microinfer::kAttentionTileQ;
+  tiles["key"] = microinfer::kAttentionTileK;
+  m.attr("attention_tiles") = tiles;
 }

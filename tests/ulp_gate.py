@@ -17,8 +17,10 @@ A sum's error is bounded by the magnitude of its *terms*, not of its result, so
 where the terms cancel a result near zero carries an error no correct kernel
 can avoid, and dividing by the result measures the cancellation. Such a test
 passes `floor`, one value per output element, from one of the two helpers
-below; each names the error source it admits and nothing else. A product-shaped
-kernel (RMSNorm, SwiGLU) has no sum and passes no floor.
+below, or from `floor_from_bound` with a bound the test derives itself (as
+attention does, to admit its scores' rounding too). Each names the error
+sources it admits and nothing else. A product-shaped kernel (RMSNorm, SwiGLU)
+has no sum and passes no floor.
 """
 
 import numpy as np
@@ -36,7 +38,14 @@ MEAN_REL = 1 * FP16_REL_ULP  # 4.883e-04
 FP32_REL_ULP = 2.0**-24
 
 
-def accumulation_floor(terms: np.ndarray, n: int) -> np.ndarray:
+def floor_from_bound(bound: np.ndarray) -> np.ndarray:
+    """The magnitude at which an absolute error of `bound` uses the whole max
+    budget, MAX_REL, and no more. Every floor here is one of these; they differ
+    only in which error sources their bound admits."""
+    return bound / MAX_REL
+
+
+def accumulation_floor(terms: np.ndarray, n) -> np.ndarray:
     """For fp16-exact inputs: the error an fp32 sum of `n` terms incurs.
 
     `terms` is, per output, the sum of the absolute values of what was added.
@@ -55,7 +64,7 @@ def accumulation_floor(terms: np.ndarray, n: int) -> np.ndarray:
     Deliberately not `terms` itself. A dot product's terms outweigh its result
     by ~sqrt(n), so measuring against them would forgive an fp16 accumulator;
     test_linear.py shows this floor does not."""
-    return np.sqrt(n) * FP32_REL_ULP * terms / MAX_REL
+    return floor_from_bound(np.sqrt(n) * FP32_REL_ULP * terms)
 
 
 def input_rounding_floor(terms: np.ndarray) -> np.ndarray:
