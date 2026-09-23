@@ -184,21 +184,3 @@ def test_a_32k_prompt_prefills_on_the_1_5b_model():
     assert out.shape == (1,) and 0 <= out[0] < e.config.vocab_size
     peak = e.peak_footprint()
     assert peak.workspace == model.Workspace(e.config, rows=e.prefill_chunk).nbytes
-
-
-@pytest.mark.skipif(os.environ.get("MICROINFER_LONG_TESTS") != "1",
-                    reason="tens of minutes; set MICROINFER_LONG_TESTS=1 to run")
-def test_a_32k_prompt_prefills_on_the_1_5b_model():
-    """ADR-0003's experimental configuration on this 6 GiB card: the whole
-    context window of Qwen2.5-1.5B, prefilled in chunks, then one token
-    chosen. Weights alone are 2.88 GiB; the benchmark log has the time it
-    takes and the memory it left (prefill-throughput, 32768 tokens)."""
-    e = Engine(require_model("qwen2.5-1.5b-instruct"))
-    e.load_weights()
-    window = e.config.max_position_embeddings
-    ids = np.random.default_rng(15).integers(1000, 100_000, window).astype(np.int32)
-    e.reset_peak()
-    out = e.generate(ids, 1, stop_at_eos=False)
-    assert out.shape == (1,) and 0 <= out[0] < e.config.vocab_size
-    peak = e.peak_footprint()
-    assert peak.workspace == model.Workspace(e.config, rows=e.prefill_chunk).nbytes
