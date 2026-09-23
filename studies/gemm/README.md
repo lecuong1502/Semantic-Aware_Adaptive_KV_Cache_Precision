@@ -32,11 +32,25 @@ the model cards. Each is measured at one row (decode) and at 512 rows
 
 Recorded in `results/`:
 
-- `2026-09-23T044626Z-a0c0423-timing.json` holds CUDA-event timings, the
-  median of 50 launches after warm-up, at the GPU's own clocks.
+- `2026-09-23T050005Z-c1482f0-timing.json` holds CUDA-event timings: the
+  median of 50 launches after 3 warm-up launches, on inputs from seed 11. They
+  run at whatever clocks the driver chooses, because locking clocks needs root.
+  The record states the clocks before and after the run. Before is the idle
+  P-state; after is 2640 MHz at P0.
 - `2026-09-23T045057Z-5a0572e-ncu.json` holds Nsight Compute 2025.2.1 metrics,
   profiled at commit `a0c0423` with ncu's default base-clock lock and cache
-  flush.
+  flush. The kernels are unchanged between that commit and the timing's: the
+  change between them is a comment, and one launcher template replacing two
+  identical launchers.
+- `2026-09-23T044626Z-a0c0423-timing.json` is an earlier timing at `a0c0423`.
+  It does not record its warm-up count or seed and is superseded. It is kept
+  because results are appended, never rewritten.
+
+Every table and every figure below comes from the timing record and the ncu
+record above. TFLOP/s and GB/s figures are derived from the event timings.
+ncu's own durations are at locked base clocks and give lower rates, for
+example 13–17 TFLOP/s for cuBLAS in prefill against 19–26 from the events, on
+every projection but `k_proj`.
 
 Hardware: RTX 4050 Laptop GPU, 6141 MiB, 24 MiB L2, driver 580.178.04.
 
@@ -48,27 +62,27 @@ comparisons, so they are less exposed to this than the absolute times.
 
 | model | projection | rows x in x out | naive µs | tiled µs | cuBLAS µs | naive ÷ cuBLAS | tiled ÷ cuBLAS |
 |---|---|---|---:|---:|---:|---:|---:|
-| 0.5B | q_proj | 512 x 896 x 896 | 8,899.6 | 834.6 | 43.0 | 207x | 19.4x |
-| 0.5B | k_proj | 512 x 896 x 128 | 1,527.8 | 133.1 | 14.1 | 108x | 9.4x |
-| 0.5B | gate_proj | 512 x 896 x 4864 | 46,909.4 | 4,066.3 | 186.4 | 252x | 21.8x |
-| 0.5B | down_proj | 512 x 4864 x 896 | 46,034.1 | 4,190.9 | 210.1 | 219x | 19.9x |
-| 1.5B | q_proj | 512 x 1536 x 1536 | 25,177.1 | 2,329.4 | 105.5 | 239x | 22.1x |
-| 1.5B | k_proj | 512 x 1536 x 256 | 4,457.5 | 393.6 | 27.6 | 161x | 14.3x |
-| 1.5B | gate_proj | 512 x 1536 x 8960 | 142,154.8 | 14,662.7 | 547.8 | 260x | 26.8x |
-| 1.5B | down_proj | 512 x 8960 x 1536 | 149,332.0 | 15,583.2 | 689.1 | 217x | 22.6x |
+| 0.5B | q_proj | 512 x 896 x 896 | 8,917.2 | 835.6 | 43.7 | 204x | 19.1x |
+| 0.5B | k_proj | 512 x 896 x 128 | 1,528.8 | 133.8 | 16.5 | 93x | 8.1x |
+| 0.5B | gate_proj | 512 x 896 x 4864 | 47,134.4 | 4,076.4 | 186.5 | 253x | 21.9x |
+| 0.5B | down_proj | 512 x 4864 x 896 | 47,366.1 | 4,220.9 | 190.8 | 248x | 22.1x |
+| 1.5B | q_proj | 512 x 1536 x 1536 | 25,761.1 | 2,262.0 | 105.3 | 245x | 21.5x |
+| 1.5B | k_proj | 512 x 1536 x 256 | 4,456.4 | 394.2 | 27.6 | 161x | 14.3x |
+| 1.5B | gate_proj | 512 x 1536 x 8960 | 147,272.9 | 15,680.7 | 550.6 | 267x | 28.5x |
+| 1.5B | down_proj | 512 x 8960 x 1536 | 148,920.3 | 15,391.7 | 675.1 | 221x | 22.8x |
 
 ### Decode, 1 row (event timing)
 
 | model | projection | rows x in x out | naive µs | tiled µs | cuBLAS µs | naive ÷ cuBLAS | tiled ÷ cuBLAS |
 |---|---|---|---:|---:|---:|---:|---:|
-| 0.5B | q_proj | 1 x 896 x 896 | 70.7 | 87.0 | 14.1 | 5x | 6.2x |
-| 0.5B | k_proj | 1 x 896 x 128 | 34.8 | 45.1 | 8.4 | 4x | 5.4x |
-| 0.5B | gate_proj | 1 x 896 x 4864 | 214.0 | 421.7 | 27.6 | 8x | 15.3x |
-| 0.5B | down_proj | 1 x 4864 x 896 | 467.8 | 537.6 | 24.6 | 19x | 21.9x |
-| 1.5B | q_proj | 1 x 1536 x 1536 | 96.3 | 169.6 | 15.0 | 6x | 11.3x |
-| 1.5B | k_proj | 1 x 1536 x 256 | 46.1 | 59.4 | 9.2 | 5x | 6.4x |
-| 1.5B | gate_proj | 1 x 1536 x 8960 | 579.3 | 1,160.9 | 176.1 | 3x | 6.6x |
-| 1.5B | down_proj | 1 x 8960 x 1536 | 982.0 | 1,427.5 | 157.5 | 6x | 9.1x |
+| 0.5B | q_proj | 1 x 896 x 896 | 74.8 | 87.8 | 14.3 | 5x | 6.1x |
+| 0.5B | k_proj | 1 x 896 x 128 | 35.7 | 45.9 | 9.0 | 4x | 5.1x |
+| 0.5B | gate_proj | 1 x 896 x 4864 | 214.0 | 420.9 | 27.6 | 8x | 15.2x |
+| 0.5B | down_proj | 1 x 4864 x 896 | 466.9 | 537.6 | 25.6 | 18x | 21.0x |
+| 1.5B | q_proj | 1 x 1536 x 1536 | 97.3 | 170.0 | 15.4 | 6x | 11.1x |
+| 1.5B | k_proj | 1 x 1536 x 256 | 46.0 | 59.4 | 9.2 | 5x | 6.4x |
+| 1.5B | gate_proj | 1 x 1536 x 8960 | 572.4 | 1,144.8 | 154.6 | 4x | 7.4x |
+| 1.5B | down_proj | 1 x 8960 x 1536 | 978.7 | 1,421.7 | 148.5 | 7x | 9.6x |
 
 ### Where the time goes (Nsight Compute)
 
@@ -88,8 +102,8 @@ Each figure is the range across the eight shapes of its regime.
 **The gap is far wider than ADR-0001 assumed.** The ADR rejected a
 hand-written GEMM on the estimate that one would be 2–5x slower than cuBLAS.
 Both stages here fall well outside that range. In prefill, the tiled kernel is
-**9–27x** slower (19–27x for every projection but the narrow `k_proj`), and
-the naive kernel is **108–260x** slower. The ADR's range belongs to a far more
+**8–28x** slower (19–28x for every projection but the narrow `k_proj`), and
+the naive kernel is **93–267x** slower. The ADR's range belongs to a far more
 developed kernel than either of these. So the measurement strengthens the
 decision; it does not revise it.
 
@@ -119,7 +133,7 @@ decision; it does not revise it.
   Each thread holds 102–254 registers of accumulator tiles, which caps
   residency. This is the research notes' warning in numbers: high occupancy
   does not mean fast. Both hand-written kernels run at 4–8x cuBLAS's occupancy
-  and are 9–260x slower.
+  and are 8–267x slower.
 
 A large part of the prefill gap is therefore not schedule but hardware. The
 hand-written kernels do scalar fp32 FMAs, and cuBLAS uses tensor cores. Closing
@@ -130,13 +144,14 @@ to spend.
 ### Decode: a GEMV, and square tiles are the wrong shape for it
 
 With one row, the projection is a matrix-vector product. It must read every
-weight once and does two FLOPs per weight, so it is bound by DRAM bandwidth
-whoever writes it.
+weight once and does two FLOPs per weight, so DRAM bandwidth is its ceiling
+whoever writes it. Only cuBLAS reaches that ceiling. The two hand-written
+kernels stop well short of it (DRAM at 3–29%), for reasons of their own.
 
 - **cuBLAS** switches to a non-tensor-core GEMV kernel
   (`internal::kernel<...>`) for most shapes, and reaches **93–95% of DRAM peak**
   on the 1.5B's `gate_proj` and `down_proj`. For those shapes the gap is only
-  3–9x, because there is less to win.
+  4–10x, because there is less to win.
 - **naive** launches 32×32 blocks, and with one row 31 of each block's 32 warps
   exit at once. Achieved occupancy falls to **2–7%**. The few warps left stall
   on `long_scoreboard`, waiting on global loads with nothing to hide the
@@ -150,7 +165,7 @@ whoever writes it.
   kernel would need a different decomposition: a warp per output feature,
   reducing along `in_features`.
 
-**Caveat on the decode timings.** cuBLAS's event-timed decode reaches 316–355
+**Caveat on the decode timings.** cuBLAS's event-timed decode reaches 315–340
 GB/s on the 0.5B's `gate_proj` and `down_proj`. That is more than this card's
 DRAM can deliver. Those weights (8.7 MB) fit in the 24 MiB L2, and a repeated
 launch finds them there. In real decode each layer reads different weights and
@@ -171,7 +186,8 @@ Performance counters need root on this machine (`RmProfilingAdminOnly: 1`).
 Only `ncu` runs under sudo, and summarising the report needs no privilege. The
 summary records both the commit it was summarised at and the commit that was
 profiled, and it refuses to run if the measured sources changed between them.
-The `.ncu-rep` files are not committed (about 30 MiB each). The JSON records
+The `.ncu-rep` files are not committed (about 30 MiB each, 32 MB for this
+study's). The JSON records
 are.
 
 These records follow the fields #13's benchmark log asks for. When #13 lands,
