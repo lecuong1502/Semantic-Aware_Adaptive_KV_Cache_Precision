@@ -83,9 +83,17 @@ that moves this prompt should be expected to move the gate.
   explicitly. A page moved by a tail swap (ADR-0007) keeps its tokens'
   positions, which are not its slot.
 - Completing a key costs one fp64 `sincos` per element per tile load, repeated
-  by every query head that reads the tile. It has not been measured against
-  the whole forward pass yet; if it matters, the rotated bias can be tabulated
-  once per layer.
+  by every query head that reads the tile. #14 measured it on the 0.5B model
+  at 1,090 keys: attention takes **3.3x as long in prefill** (60.5 ms a layer
+  against 18.2 ms) and **4x in decode** (2.93 ms against 0.73 ms). Across 24
+  layers, that is 70 ms per decoded token spent in attention alone, where 17 ms
+  would do. The cost is the same with or without paging, so it belongs to this
+  decision, and it does not change a single bit of output. The remedy is
+  still open. The angle depends only on position and frequency, not on layer
+  or head, so its cos and sin can be tabulated once per position in fp32 and
+  shared by every layer. For the 0.5B model that is 256 bytes a position,
+  against 12 KiB of cache. A per-layer table of rotated biases would also
+  remove the arithmetic, but it would be as large as the cache it completes.
 - **The quantised tiers inherit this.** INT8, INT4 and INT2 (#16, #17) quantise
   the bias-free key. ADR-0005's per-channel key quantisation keeps a zero point
   per channel, and the bias would have been most of that zero point. Removing

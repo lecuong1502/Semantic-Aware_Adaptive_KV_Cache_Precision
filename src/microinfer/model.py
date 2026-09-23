@@ -78,13 +78,14 @@ class Weights:
         return cls(embed=embed, layers=layers, norm=tensors["model.norm.weight"], head=head)
 
 
-class KVCache:
-    """Contiguous FP16 keys and values, one buffer each per layer.
+class ContiguousCache:
+    """Contiguous FP16 keys and values, one buffer each per layer, sized for the
+    whole sequence up front: the Milestone 0 cache (#12). The engine runs the
+    paged cache; this one stays as the reference it is proven against (#14).
 
     Row t of a layer's buffer is token t's keys (or values) for every KV head,
     which is the layout attention reads: the first `length` rows are exactly its
-    `(seq_k, kv_heads, head_dim)` operand. Row t is also position t, which
-    attention relies on to rotate the key bias it adds back (ADR-0009).
+    `(seq_k, kv_heads, head_dim)` operand.
     """
 
     def __init__(self, cfg: ModelConfig, capacity: int):
@@ -98,18 +99,61 @@ class KVCache:
     def nbytes(self) -> int:
         return sum(t.nbytes for t in self.keys + self.values)
 
-    def key_rows(self, layer: int, start: int, count: int):
-        """Where `count` tokens' keys go, from row `start`."""
-        return self._rows(self.keys[layer], start, count)
+    def reserve(self, tokens: int) -> None:
+        if tokens > self.capacity:
+            raise ValueError(f"the cache holds {self.capacity} tokens; {tokens} were asked for")
 
-    def value_rows(self, layer: int, start: int, count: int):
-        return self._rows(self.values[layer], start, count)
+    def store(self, layer: int, keys, values, start: int, n: int) -> None:
+        for source, buffers in ((keys, self.keys), (values, self.values)):
+            device.copy(source, device.view(buffers[layer], start * self.row, n * self.row),
+                        n * self.row)
 
-    def _rows(self, buffer, start: int, count: int):
-        if start + count > self.capacity:
-            raise ValueError(f"the cache holds {self.capacity} tokens; "
-                             f"writing {count} at {start} would pass its end")
-        return device.view(buffer, start * self.row, count * self.row)
+    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int, cfg: ModelConfig) -> None:
+        device.attention(q, self.keys[layer], self.values[layer], k_bias, out, seq_q, seq_k,
+                         cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+                         cfg.rope_theta)
+
+
+class PagedCache:
+    """FP16 keys and values on pages of P positions (ADR-0004), allocated from
+    the VMM allocator (ADR-0007) as the sequence grows (#14).
+
+    Page i of layer l is the page table entry (l, i). Attention reads keys and
+    values through the page table, resolved afresh for every launch, so the
+    allocator may move a page at any moment between launches without harm.
+
+    The allocator reserves address space for the model's whole context window
+    and takes device memory only as pages are allocated. `nbytes` is therefore
+    what the driver actually holds for the cache: whole granules.
+    """
+
+    def __init__(self, cfg: ModelConfig, allocator: _microinfer.PagedKVCache | None = None):
+        page_tokens = device.page_tokens
+        self.row = cfg.num_key_value_heads * cfg.head_dim
+        page_bytes = 2 * page_tokens * self.row * 2  # keys then values, fp16
+        if allocator is None:
+            pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
+            # The quantised tiers hold nothing until #16; they reserve nothing.
+            allocator = _microinfer.PagedKVCache(
+                [page_bytes] * 4, [cfg.num_hidden_layers * pages_per_layer, 0, 0, 0])
+        self.allocator = allocator
+        self.pages = device.KVPages(allocator, cfg.num_hidden_layers, page_tokens, self.row,
+                                    _microinfer.Tier.FP16)
+        self.length = 0
+
+    @property
+    def nbytes(self) -> int:
+        return self.allocator.mapped_bytes(_microinfer.Tier.FP16)
+
+    def reserve(self, tokens: int) -> None:
+        self.pages.reserve(tokens)
+
+    def store(self, layer: int, keys, values, start: int, n: int) -> None:
+        self.pages.store(layer, keys, values, start, n)
+
+    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int, cfg: ModelConfig) -> None:
+        self.pages.attention(layer, q, k_bias, out, seq_q, seq_k, cfg.num_attention_heads,
+                             cfg.num_key_value_heads, cfg.head_dim, cfg.rope_theta)
 
 
 class Workspace:
@@ -129,6 +173,8 @@ class Workspace:
         self.q_raw = device.empty(rows * q_width)
         self.q = device.empty(rows * q_width)
         self.k_raw = device.empty(rows * kv_width)
+        self.k = device.empty(rows * kv_width)
+        self.v = device.empty(rows * kv_width)
         self.attended = device.empty(rows * q_width)
         self.projected = device.empty(rows * hidden)
         self.gate = device.empty(rows * intermediate)
@@ -149,12 +195,13 @@ class Model:
     cfg: ModelConfig
     weights: Weights
 
-    def run(self, ws: Workspace, cache: KVCache, token_ids: np.ndarray,
+    def run(self, ws: Workspace, cache: ContiguousCache | PagedCache, token_ids: np.ndarray,
             hidden_states: list | None = None) -> None:
         """Feed `token_ids` through the model after the cache's current contents.
 
         Leaves the final-normed hidden states for these tokens in `ws.normed`,
-        and extends the cache by them. With `hidden_states`, appends each
+        and extends the cache by them, reserving room first: a paged cache
+        takes the pages these positions need and no more. With `hidden_states`, appends each
         layer's residual stream to it as a host array, in HuggingFace's
         `output_hidden_states` order: the embedding output, the output of every
         layer but the last, and then the last layer's output *after the final
@@ -169,6 +216,7 @@ class Model:
 
         ids = device.index(token_ids)
         positions = device.index(np.arange(start, start + n, dtype=np.int32))
+        cache.reserve(start + n)
 
         def capture_state(tensor):
             if hidden_states is not None:
@@ -178,8 +226,9 @@ class Model:
         capture_state(ws.residual)
 
         for i, w in enumerate(self.weights.layers):
-            # Attention block. K is rotated straight into the cache, and V
-            # projected straight into it: neither needs a buffer of its own.
+            # Attention block. The step's keys and values are formed in the
+            # workspace and stored into the cache in one launch, whichever
+            # layout the cache has.
             #
             # K goes into the cache *without* its bias (ADR-0009). Qwen2.5's key
             # bias reaches 147 against an input-dependent part of 5 to 11, and
@@ -190,12 +239,11 @@ class Model:
                           ws.q_raw, n, hidden, q_width)
             device.linear(ws.normed, w.self_attn_k_proj_weight, None, ws.k_raw, n, hidden, kv_width)
             device.linear(ws.normed, w.self_attn_v_proj_weight, w.self_attn_v_proj_bias,
-                          cache.value_rows(i, start, n), n, hidden, kv_width)
+                          ws.v, n, hidden, kv_width)
             device.rope(ws.q_raw, positions, ws.q, n, heads, head_dim, cfg.rope_theta)
-            device.rope(ws.k_raw, positions, cache.key_rows(i, start, n), n, kv_heads, head_dim,
-                        cfg.rope_theta)
-            device.attention(ws.q, cache.keys[i], cache.values[i], w.self_attn_k_proj_bias,
-                             ws.attended, n, start + n, heads, kv_heads, head_dim, cfg.rope_theta)
+            device.rope(ws.k_raw, positions, ws.k, n, kv_heads, head_dim, cfg.rope_theta)
+            cache.store(i, ws.k, ws.v, start, n)
+            cache.attend(i, ws.q, w.self_attn_k_proj_bias, ws.attended, n, start + n, cfg)
             device.linear(ws.attended, w.self_attn_o_proj_weight, None, ws.projected,
                           n, q_width, hidden)
             device.add(ws.residual, ws.projected, ws.residual, n * hidden)

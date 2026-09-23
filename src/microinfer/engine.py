@@ -68,7 +68,15 @@ def kv_cache_bytes(cfg: ModelConfig, context_length: int,
 class Engine:
     """Seam A. Everything a test or a caller touches goes through here."""
 
-    def __init__(self, model_dir: str | Path, *, verify: bool = True):
+    #: The KV cache layouts: "paged", the engine's own (#14), and "contiguous",
+    #: the Milestone 0 cache it replaced, kept as the reference the paged one
+    #: is proven bit-identical to.
+    KV_CACHES = ("paged", "contiguous")
+
+    def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged"):
+        if kv_cache not in self.KV_CACHES:
+            raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
+        self.kv_cache = kv_cache
         self.model_dir = Path(model_dir)
         self.config = ModelConfig.from_model_dir(self.model_dir)
 
@@ -85,7 +93,7 @@ class Engine:
         self._tensors: dict[str, _microinfer.DeviceTensor] = {}
         self._model: model.Model | None = None
         self._workspace_bytes = 0
-        self._kv_cache_bytes = 0
+        self._cache = None
         self._peak: Footprint | None = None
 
     # -- loading ------------------------------------------------------------
@@ -166,7 +174,7 @@ class Engine:
         """
         ids = self._check_ids(token_ids)
         n = len(ids)
-        cache = model.KVCache(self.config, capacity=n)
+        cache = self._new_cache(capacity=n)
         ws = model.Workspace(self.config, rows=n)
         captured: list | None = [] if capture_hidden_states else None
         with self._holding(cache, ws):
@@ -192,7 +200,7 @@ class Engine:
 
         # The last new token is never fed back, so the cache needs one row less
         # than prompt plus output.
-        cache = model.KVCache(self.config, capacity=len(ids) + max_new_tokens - 1)
+        cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
         prefill = model.Workspace(self.config, rows=len(ids))
         out: list[int] = []
         with self._holding(cache, prefill):
@@ -224,8 +232,16 @@ class Engine:
                              f"got [{ids.min()}, {ids.max()}]")
         return ids.astype(np.int32)
 
+    def _new_cache(self, capacity: int):
+        """A cache for one sequence. The contiguous one is sized for `capacity`
+        up front; the paged one ignores it and takes pages as positions arrive,
+        so a generation that stops early never held room for the rest."""
+        if self.kv_cache == "contiguous":
+            return model.ContiguousCache(self.config, capacity)
+        return model.PagedCache(self.config)
+
     @contextmanager
-    def _holding(self, cache: model.KVCache, ws: model.Workspace):
+    def _holding(self, cache, ws: model.Workspace):
         """Account for a cache and a workspace while they are alive, and note
         the peak: the footprint at the moment the engine held the most.
 
@@ -234,7 +250,7 @@ class Engine:
         token ids and positions, then shows in the device reading. It shows as
         `unaccounted`, since the engine did not allocate it, but it is not
         missed."""
-        self._kv_cache_bytes = cache.nbytes
+        self._cache = cache
         self._workspace_bytes = ws.nbytes
         try:
             yield
@@ -244,7 +260,7 @@ class Engine:
                     and now.device_free < self._peak.device_free):
                 self._peak = now
         finally:
-            self._kv_cache_bytes = 0
+            self._cache = None
             self._workspace_bytes = 0
 
     def peak_footprint(self) -> Footprint | None:
@@ -271,7 +287,8 @@ class Engine:
         info = _microinfer.device_memory_info()
         return Footprint(
             weights=sum(t.nbytes for t in self._tensors.values()),
-            kv_cache=self._kv_cache_bytes,
+            # Read now, not when the cache was made: a paged cache grows.
+            kv_cache=self._cache.nbytes if self._cache is not None else 0,
             workspace=self._workspace_bytes,
             device_free=info["free"],
             device_total=info["total"],

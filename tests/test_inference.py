@@ -25,11 +25,11 @@ import numpy as np
 import pytest
 
 from conftest import require_model, stable_free_bytes
-from microinfer import Engine
+from microinfer import Engine, _microinfer
 from microinfer.gate import (KL_MAX, LAYER_COSINE_MIN, TOP1_MIN, kl_divergence,
                              layer_report, run_gate)
 from microinfer.golden import GoldenError, GoldenSet, load_prompts
-from microinfer.model import KVCache, Workspace
+from microinfer.model import ContiguousCache, PagedCache, Workspace
 
 REPO = Path(__file__).resolve().parent.parent
 MODEL = "qwen2.5-0.5b-instruct"
@@ -219,7 +219,8 @@ def test_there_is_no_batch_dimension(engine):
         engine.forward(np.zeros((2, 4), np.int32))
     with pytest.raises(ValueError, match="one sequence"):
         engine.generate(np.zeros((2, 4), np.int32))
-    for method in (Engine.forward, Engine.generate, KVCache.__init__, Workspace.__init__):
+    for method in (Engine.forward, Engine.generate, ContiguousCache.__init__,
+                   PagedCache.__init__, Workspace.__init__):
         assert not any("batch" in p for p in inspect.signature(method).parameters)
 
 
@@ -272,8 +273,13 @@ def test_peak_memory_is_reported_and_matches_what_the_driver_saw(engine):
     peak = engine.peak_footprint()
     print("\n" + peak.render())
 
-    row = cfg.num_key_value_heads * cfg.head_dim * 2  # fp16
-    assert peak.kv_cache == 2 * cfg.num_hidden_layers * (prompt + new - 1) * row
+    # The paged cache holds whole granules for the pages its positions need
+    # (ADR-0007): that, not the positions' own bytes, is what the driver lost.
+    page_tokens = _microinfer.device.page_tokens
+    page_bytes = 2 * page_tokens * cfg.num_key_value_heads * cfg.head_dim * 2
+    pages = cfg.num_hidden_layers * -(-(prompt + new - 1) // page_tokens)
+    granule = _microinfer.PagedKVCache([1] * 4, [0] * 4).granule_bytes
+    assert peak.kv_cache == -(-pages * page_bytes // granule) * granule
     assert peak.workspace == Workspace(cfg, rows=prompt).nbytes
     assert peak.weights == sum(t.nbytes for t in engine.tensors.values())
     assert peak.engine_total == peak.weights + peak.kv_cache + peak.workspace
