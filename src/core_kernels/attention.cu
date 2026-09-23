@@ -80,9 +80,45 @@ namespace microinfer
       return static_cast<float>(d < half ? b1 * c - b2 * s : b2 * c + b1 * s);
     }
 
-    __global__ void attention_kernel(const __half *__restrict__ q,
-                                     const __half *__restrict__ k,
-                                     const __half *__restrict__ v,
+    // Where key j's row is, and its value's. Two layouts, one kernel: the
+    // arithmetic is shared, so only addressing can differ between them, and
+    // the paged path gives bit-identical output to the contiguous one (#14).
+    //
+    // Contiguous: rows (tokens, kv_heads, head_dim), one after another.
+    struct ContiguousKV
+    {
+      const __half *k;
+      const __half *v;
+      size_t row;
+
+      __device__ const __half *key(int j) const { return k + j * row; }
+      __device__ const __half *value(int j) const { return v + j * row; }
+    };
+
+    // Paged (ADR-0004, ADR-0007): key j is in page j / page_tokens at row
+    // j % page_tokens. A page holds page_tokens rows of keys, then as many of
+    // values. `pages` is the page table for this layer, resolved on the host
+    // for this launch alone, so no launch reads an address an allocator
+    // operation may since have moved.
+    struct PagedKV
+    {
+      const unsigned long long *pages;
+      int page_tokens;
+      size_t row;
+
+      __device__ const __half *key(int j) const
+      {
+        return reinterpret_cast<const __half *>(pages[j / page_tokens]) +
+               (j % page_tokens) * row;
+      }
+      __device__ const __half *value(int j) const
+      {
+        return key(j) + static_cast<size_t>(page_tokens) * row;
+      }
+    };
+
+    template <typename KV>
+    __global__ void attention_kernel(const __half *__restrict__ q, KV kv,
                                      const __half *__restrict__ k_bias,
                                      __half *__restrict__ out, int seq_q,
                                      int seq_k, int heads, int kv_heads,
@@ -109,7 +145,6 @@ namespace microinfer
       const size_t token_stride = static_cast<size_t>(heads) * head_dim;
       const size_t head_offset = static_cast<size_t>(head) * head_dim;
       const int group = heads / kv_heads;
-      const size_t kv_token_stride = static_cast<size_t>(kv_heads) * head_dim;
       const size_t kv_head_offset =
           static_cast<size_t>(head / group) * head_dim;
 
@@ -147,16 +182,15 @@ namespace microinfer
           const int c = i / head_dim;
           const int d = i % head_dim;
           const bool in_range = k_first + c < seq_k;
-          const size_t at =
-              (k_first + c) * kv_token_stride + kv_head_offset + d;
-          float key = in_range ? __half2float(k[at]) : 0.0f;
+          const size_t at = kv_head_offset + d;
+          float key = in_range ? __half2float(kv.key(k_first + c)[at]) : 0.0f;
           if (k_bias != nullptr && in_range)
           {
             key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
                                 head_dim, theta);
           }
           k_s[i] = key;
-          v_s[i] = in_range ? v[at] : __float2half(0.0f);
+          v_s[i] = in_range ? kv.value(k_first + c)[at] : __float2half(0.0f);
         }
         __syncthreads();
 
@@ -268,41 +302,72 @@ namespace microinfer
 
   } // namespace
 
+  namespace
+  {
+
+    template <typename KV>
+    void launch(const __half *q, KV kv, const __half *k_bias, __half *out,
+                int seq_q, int seq_k, int heads, int kv_heads, int head_dim,
+                double theta)
+    {
+      check_grouping(heads, kv_heads);
+      if (seq_q <= 0 || heads == 0 || head_dim <= 0)
+      {
+        return;
+      }
+
+      // Past 48 KiB of dynamic shared memory a kernel must opt in. head_dim
+      // 128 stays under it; 256 does not, and head_dim is a parameter. The
+      // opt-in is a driver call, so it is made only when a launch needs more
+      // than any before it, not once per layer per step; one record per
+      // layout, since each is its own kernel. Atomic because the NumPy binding
+      // releases the GIL: two threads may both make the call, which is
+      // harmless, but not race on the variable.
+      const size_t smem = shared_bytes(head_dim);
+      static std::atomic<size_t> opted_in{0};
+      if (smem > opted_in.load())
+      {
+        cuda_check(
+            cudaFuncSetAttribute(attention_kernel<KV>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(smem)),
+            "cudaFuncSetAttribute attention shared memory");
+        opted_in = smem;
+      }
+
+      const dim3 grid((seq_q + kAttentionTileQ - 1) / kAttentionTileQ, heads);
+      const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+      attention_kernel<KV><<<grid, kBlockThreads, smem>>>(
+          q, kv, k_bias, out, seq_q, seq_k, heads, kv_heads, head_dim, scale,
+          theta);
+      cuda_check(cudaGetLastError(), "attention kernel launch");
+    }
+
+  } // namespace
+
   void device::attention(const __half *q, const __half *k, const __half *v,
                          const __half *k_bias, __half *out, int seq_q,
                          int seq_k, int heads, int kv_heads, int head_dim,
                          double theta)
   {
-    check_grouping(heads, kv_heads);
-    if (seq_q <= 0 || heads == 0 || head_dim <= 0)
-    {
-      return;
-    }
+    const size_t row = static_cast<size_t>(kv_heads) * head_dim;
+    launch(q, ContiguousKV{k, v, row}, k_bias, out, seq_q, seq_k, heads,
+           kv_heads, head_dim, theta);
+  }
 
-    // Past 48 KiB of dynamic shared memory a kernel must opt in. head_dim 128
-    // stays under it; 256 does not, and head_dim is a parameter. The opt-in is
-    // a driver call, so it is made only when a launch needs more than any
-    // before it, not once per layer per step.
-    const size_t smem = shared_bytes(head_dim);
-    // Atomic because the NumPy binding releases the GIL: two threads may both
-    // make the call, which is harmless, but not race on the variable.
-    static std::atomic<size_t> opted_in{0};
-    if (smem > opted_in.load())
+  void device::attention_paged(const __half *q, const unsigned long long *pages,
+                               int page_tokens, const __half *k_bias,
+                               __half *out, int seq_q, int seq_k, int heads,
+                               int kv_heads, int head_dim, double theta)
+  {
+    if (page_tokens <= 0)
     {
-      cuda_check(
-          cudaFuncSetAttribute(attention_kernel,
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(smem)),
-          "cudaFuncSetAttribute attention shared memory");
-      opted_in = smem;
+      throw std::invalid_argument("page_tokens must be positive, got " +
+                                  std::to_string(page_tokens));
     }
-
-    const dim3 grid((seq_q + kAttentionTileQ - 1) / kAttentionTileQ, heads);
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    attention_kernel<<<grid, kBlockThreads, smem>>>(q, k, v, k_bias, out, seq_q,
-                                                    seq_k, heads, kv_heads,
-                                                    head_dim, scale, theta);
-    cuda_check(cudaGetLastError(), "attention kernel launch");
+    const size_t row = static_cast<size_t>(kv_heads) * head_dim;
+    launch(q, PagedKV{pages, page_tokens, row}, k_bias, out, seq_q, seq_k,
+           heads, kv_heads, head_dim, theta);
   }
 
   void attention(const float *q, const float *k, const float *v,

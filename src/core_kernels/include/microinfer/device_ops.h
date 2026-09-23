@@ -52,6 +52,23 @@ namespace microinfer
                    const __half *k_bias, __half *out, int seq_q, int seq_k,
                    int heads, int kv_heads, int head_dim, double theta);
 
+    // The same attention, reading keys and values through a page table
+    // (#14). `pages` is on the device: one page's address per page_tokens
+    // positions, for this layer, resolved for this launch alone. A page
+    // holds page_tokens rows of keys, (kv_heads, head_dim) each, then as many
+    // rows of values. Only addressing differs from attention() above, so the
+    // two give bit-identical output on the same keys and values.
+    void attention_paged(const __half *q, const unsigned long long *pages,
+                         int page_tokens, const __half *k_bias, __half *out,
+                         int seq_q, int seq_k, int heads, int kv_heads,
+                         int head_dim, double theta);
+
+    // Writes n tokens' key and value rows into their pages, token t at
+    // position start + t. `pages` as for attention_paged.
+    void store_pages(const __half *keys, const __half *values,
+                     const unsigned long long *pages, int page_tokens,
+                     size_t row, int start, int n);
+
     // out[i] = table[ids[i]], a row of `hidden` each. ids is on the device.
     void embed(const int32_t *ids, const __half *table, __half *out, int count,
                int hidden, int vocab);

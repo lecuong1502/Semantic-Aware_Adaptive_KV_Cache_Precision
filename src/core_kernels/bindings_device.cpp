@@ -22,6 +22,7 @@
 #include "microinfer/check.h"
 #include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
+#include "microinfer/kv_pages.h"
 
 namespace py = pybind11;
 
@@ -332,6 +333,82 @@ void bind_device(py::module_ &parent)
         microinfer::device::swiglu(gate.ptr, up.ptr, out.ptr, count);
       },
       py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("count"));
+
+  m.def(
+      "copy",
+      [](const Span &source, const Span &target, size_t count)
+      {
+        need(source, count, "source");
+        need(target, count, "target");
+        microinfer::cuda_check(cudaMemcpy(target.ptr, source.ptr,
+                                          count * sizeof(__half),
+                                          cudaMemcpyDeviceToDevice),
+                               "cudaMemcpy device-to-device");
+      },
+      py::arg("source"), py::arg("target"), py::arg("count"),
+      "Copy count fp16 elements, device to device.");
+
+  m.attr("page_tokens") = microinfer::kPageTokens;
+
+  using microinfer::KVPages;
+  py::class_<KVPages>(
+      m, "KVPages",
+      "The engine's KV cache on pages (#14): page i of layer l holds positions "
+      "[i*P, (i+1)*P), keys then values. Pages come from a PagedKVCache as the "
+      "sequence grows, and every launch resolves the page table afresh, so "
+      "the allocator may move pages between launches (ADR-0007).")
+      .def(py::init<microinfer::PagedKVCache &, int, int, size_t,
+                    microinfer::Tier>(),
+           py::arg("allocator"), py::arg("layers"), py::arg("page_tokens"),
+           py::arg("row"), py::arg("tier"), py::keep_alive<1, 2>(),
+           "row is kv_heads * head_dim. The allocator's page size at `tier` "
+           "must be 2 * page_tokens * row fp16 elements.")
+      .def("reserve", &KVPages::reserve, py::arg("tokens"),
+           "Pages for positions [0, tokens) in every layer, allocating only "
+           "those not yet held.")
+      .def(
+          "store",
+          [](KVPages &c, int layer, const Span &keys, const Span &values,
+             int start, int n)
+          {
+            non_negative(n, "n");
+            const size_t row =
+                c.page_bytes() / (2 * c.page_tokens() * sizeof(__half));
+            need(keys, n * row, "keys");
+            need(values, n * row, "values");
+            c.store(layer, keys.ptr, values.ptr, start, n);
+          },
+          py::arg("layer"), py::arg("keys"), py::arg("values"),
+          py::arg("start"), py::arg("n"))
+      .def(
+          "attention",
+          [](KVPages &c, int layer, const Span &q, std::optional<Span> k_bias,
+             const Span &out, int seq_q, int seq_k, int heads, int kv_heads,
+             int head_dim, double theta)
+          {
+            if (seq_q > seq_k)
+            {
+              throw std::invalid_argument("seq_q " + std::to_string(seq_q) +
+                                          " exceeds seq_k " +
+                                          std::to_string(seq_k));
+            }
+            non_negative(seq_q, "seq_q");
+            need(q, product(seq_q, heads, head_dim), "q");
+            need(out, product(seq_q, heads, head_dim), "out");
+            if (k_bias)
+            {
+              need(*k_bias, product(kv_heads, head_dim), "k_bias");
+            }
+            c.attention(layer, q.ptr, k_bias ? k_bias->ptr : nullptr, out.ptr,
+                        seq_q, seq_k, heads, kv_heads, head_dim, theta);
+          },
+          py::arg("layer"), py::arg("q"), py::arg("k_bias"), py::arg("out"),
+          py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
+          py::arg("kv_heads"), py::arg("head_dim"), py::arg("theta"))
+      .def_property_readonly("page_tokens", &KVPages::page_tokens)
+      .def_property_readonly("pages_per_layer", &KVPages::pages_per_layer)
+      .def_property_readonly("capacity_tokens", &KVPages::capacity_tokens)
+      .def_property_readonly("page_bytes", &KVPages::page_bytes);
 
   m.def("scratch_elements", &scratch_elements, py::arg("rows"),
         py::arg("vocab"),

@@ -117,6 +117,10 @@ namespace microinfer
     std::size_t granule_bytes() const { return granule_; }
 
   private:
+    // The engine's KV cache resolves page addresses for a launch, and only it
+    // may: it uses them for that launch and keeps none (kv_pages.h).
+    friend class KVPages;
+
     struct Range
     {
       CUdeviceptr base = 0;
