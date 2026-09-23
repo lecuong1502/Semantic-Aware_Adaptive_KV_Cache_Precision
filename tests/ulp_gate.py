@@ -45,6 +45,15 @@ def floor_from_bound(bound: np.ndarray) -> np.ndarray:
     return bound / MAX_REL
 
 
+def fp32_accumulation_bound(terms: np.ndarray, n: int) -> np.ndarray:
+    """The absolute error of an fp32 sum of `n` terms whose magnitudes add up
+    to `terms`: sqrt(n) * u32 * terms, the probabilistic bound of Higham &
+    Mary (2019). The floor below spends the whole max budget on it; an fp32
+    output with no fp16 store after it, the LM head's logits, is held to it
+    directly."""
+    return np.sqrt(n) * FP32_REL_ULP * terms
+
+
 def accumulation_floor(terms: np.ndarray, n: int) -> np.ndarray:
     """For fp16-exact inputs: the error an fp32 sum of `n` terms incurs.
 
@@ -64,7 +73,7 @@ def accumulation_floor(terms: np.ndarray, n: int) -> np.ndarray:
     Deliberately not `terms` itself. A dot product's terms outweigh its result
     by ~sqrt(n), so measuring against them would forgive an fp16 accumulator;
     test_linear.py shows this floor does not."""
-    return floor_from_bound(np.sqrt(n) * FP32_REL_ULP * terms)
+    return floor_from_bound(fp32_accumulation_bound(terms, n))
 
 
 def input_rounding_floor(terms: np.ndarray) -> np.ndarray:

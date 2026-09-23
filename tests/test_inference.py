@@ -113,7 +113,9 @@ def test_the_diagnostic_reports_every_state_and_names_the_first_below(engine, go
         states[corrupted] = -states[corrupted]
         fake = SimpleNamespace(prompt_id=item.prompt_id, token_ids=item.token_ids,
                                logit_positions=item.logit_positions, hidden_states=states)
-        assert layer_report(engine, fake).first_below == corrupted
+        report = layer_report(engine, fake)
+        assert report.first_below == corrupted
+        assert f"layer {corrupted - 1}" in report.render().splitlines()[-1]
 
 
 def test_layer_0_matches_the_reference(engine, golden):
@@ -246,8 +248,14 @@ def test_peak_memory_is_reported_and_matches_what_the_driver_saw(engine):
     """The peak footprint names what the engine held at its most: the weights,
     the contiguous cache for prompt plus output, and one step's workspace. What
     the driver lost over the same run agrees with the cache and workspace to
-    within the noise other processes put on the reading (ADR-0007, note from
-    #10: up to 6 MiB).
+    within 8 MiB: the 6 MiB other processes put on the reading (ADR-0007, note
+    from #10), and a 2 MiB granule besides.
+
+    The run is made once before it is measured. The first time a GEMM shape is
+    used, the driver loads cuBLAS kernels for it and keeps about 16 MiB,
+    measured here, for the rest of the process. That is the driver's memory,
+    not the engine's; the peak reading, taken after the work, shows it under
+    `unaccounted`, and a warm run shows the engine's own share alone.
 
     The weights are not in that comparison, and the reason is known: 290
     allocations take the driver's granularity overhead on top of the 942 MiB
@@ -256,9 +264,11 @@ def test_peak_memory_is_reported_and_matches_what_the_driver_saw(engine):
     pretending the weights are exact."""
     cfg = engine.config
     prompt, new = 600, 16
+    ids = np.arange(100, 100 + prompt, dtype=np.int32)
+    engine.generate(ids, new, stop_at_eos=False)  # warm: see the docstring
     engine.reset_peak()
     before = stable_free_bytes()
-    engine.generate(np.arange(100, 100 + prompt, dtype=np.int32), new, stop_at_eos=False)
+    engine.generate(ids, new, stop_at_eos=False)
     peak = engine.peak_footprint()
     print("\n" + peak.render())
 

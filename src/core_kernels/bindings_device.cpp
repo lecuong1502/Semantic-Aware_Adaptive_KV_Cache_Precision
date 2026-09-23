@@ -39,7 +39,9 @@ namespace
   {
     py::object owner;
     __half *ptr;
-    size_t count;
+    size_t elements;
+
+    size_t count() const { return elements; }
   };
 
   Span whole(py::object tensor)
@@ -48,23 +50,31 @@ namespace
     return Span{tensor, static_cast<__half *>(t.data()), t.numel()};
   }
 
-  void need(const Span &s, size_t elements, const char *what)
+  // Every operand's size is checked against what the operation will touch.
+  // Span counts elements and DeviceIndex counts indices; both call it count.
+  template <typename Operand>
+  void need(const Operand &operand, size_t elements, const char *what)
   {
-    if (s.count < elements)
+    if (operand.count() < elements)
     {
       throw std::invalid_argument(
-          std::string(what) + " holds " + std::to_string(s.count) +
-          " elements; the operation needs " + std::to_string(elements));
+          std::string(what) + " holds " + std::to_string(operand.count()) +
+          ", and the operation needs " + std::to_string(elements));
     }
   }
 
-  void need(const DeviceIndex &i, size_t elements, const char *what)
+  // Sizes arrive as Python ints and are multiplied as size_t, where a negative
+  // one wraps to something enormous. That would fail `need`, but an offset
+  // computed from it would not: it would wrap to a pointer anywhere. So every
+  // row count and offset is checked for sign before it is used.
+  void non_negative(int value, const char *what)
   {
-    if (i.count() < elements)
+    if (value < 0)
     {
-      throw std::invalid_argument(
-          std::string(what) + " holds " + std::to_string(i.count()) +
-          " indices; the operation needs " + std::to_string(elements));
+      throw std::invalid_argument(std::string(what) +
+                                  " must not be negative, "
+                                  "got " +
+                                  std::to_string(value));
     }
   }
 
@@ -84,6 +94,8 @@ namespace
   float *logits_into(const Span &x, const Span &head, const Span &scratch,
                      int first_row, int rows, int hidden, int vocab)
   {
+    non_negative(first_row, "first_row");
+    non_negative(rows, "rows");
     need(x, product(first_row + rows, hidden), "x");
     need(head, product(vocab, hidden), "head");
     need(scratch, scratch_elements(rows, vocab), "scratch");
@@ -134,6 +146,20 @@ namespace
                                       rows * sizeof(int32_t),
                                       cudaMemcpyDeviceToHost),
                            "cudaMemcpy ids device-to-host");
+    // A row with no finite logit has no argmax: the kernel reports one past
+    // the vocabulary. Handing that on as a token would put an id the model
+    // does not have into the output, and embed would quietly read it as zero.
+    const int32_t *chosen = out.data();
+    for (int r = 0; r < rows; ++r)
+    {
+      if (chosen[r] >= vocab)
+      {
+        throw std::runtime_error(
+            "row " + std::to_string(first_row + r) +
+            " has no finite logit, so there is no greedy choice; the forward "
+            "pass produced NaN or -inf throughout");
+      }
+    }
     return out;
   }
 
@@ -147,7 +173,7 @@ void bind_device(py::module_ &parent)
 
   py::class_<Span>(m, "Span", "A run of fp16 elements in a DeviceTensor.")
       .def(py::init(&whole), py::arg("tensor"))
-      .def_readonly("count", &Span::count);
+      .def_property_readonly("count", &Span::count);
   py::implicitly_convertible<DeviceTensor, Span>();
 
   m.def(
@@ -155,12 +181,12 @@ void bind_device(py::module_ &parent)
       [](py::object tensor, size_t offset, size_t count)
       {
         Span s = whole(tensor);
-        if (offset > s.count || count > s.count - offset)
+        if (offset > s.count() || count > s.count() - offset)
         {
           throw std::invalid_argument("view [" + std::to_string(offset) + ", " +
                                       std::to_string(offset + count) +
                                       ") of a tensor of " +
-                                      std::to_string(s.count) + " elements");
+                                      std::to_string(s.count()) + " elements");
         }
         return Span{tensor, s.ptr + offset, count};
       },
@@ -321,13 +347,4 @@ void bind_device(py::module_ &parent)
         py::arg("first_row"), py::arg("rows"), py::arg("hidden"),
         py::arg("vocab"),
         "The argmax token of each row's logits, computed on the device.");
-
-  m.def(
-      "synchronize",
-      []
-      {
-        microinfer::cuda_check(cudaDeviceSynchronize(),
-                               "cudaDeviceSynchronize");
-      },
-      "Wait for every enqueued launch; surfaces any execution fault.");
 }

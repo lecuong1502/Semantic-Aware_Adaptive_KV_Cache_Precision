@@ -83,7 +83,7 @@ class Engine:
             self.config.verify(expected)
 
         self._tensors: dict[str, _microinfer.DeviceTensor] = {}
-        self._weights: model.Weights | None = None
+        self._model: model.Model | None = None
         self._workspace_bytes = 0
         self._kv_cache_bytes = 0
         self._peak: Footprint | None = None
@@ -124,7 +124,7 @@ class Engine:
             )
 
         self._tensors = loaded
-        self._weights = model.Weights.from_tensors(self.config, loaded)
+        self._model = model.Model(self.config, model.Weights.from_tensors(self.config, loaded))
 
     @property
     def tensors(self) -> dict[str, _microinfer.DeviceTensor]:
@@ -170,8 +170,8 @@ class Engine:
         ws = model.Workspace(self.config, rows=n)
         captured: list | None = [] if capture_hidden_states else None
         with self._holding(cache, ws):
-            model.run(self.config, self._weights, ws, cache, ids, captured)
-            logits = model.logits(self.config, self._weights, ws, n)
+            self._model.run(ws, cache, ids, captured)
+            logits = self._model.logits(ws, n)
         if capture_hidden_states:
             return logits, np.stack(captured)
         return logits
@@ -196,19 +196,19 @@ class Engine:
         prefill = model.Workspace(self.config, rows=len(ids))
         out: list[int] = []
         with self._holding(cache, prefill):
-            model.run(self.config, self._weights, prefill, cache, ids)
-            out.append(model.greedy_last(self.config, self._weights, prefill, len(ids)))
+            self._model.run(prefill, cache, ids)
+            out.append(self._model.greedy_last(prefill, len(ids)))
         del prefill
 
         step = model.Workspace(self.config, rows=1)
         with self._holding(cache, step):
             while len(out) < max_new_tokens and not (stop_at_eos and out[-1] in self.eos_token_ids):
-                model.run(self.config, self._weights, step, cache, np.array(out[-1:], np.int32))
-                out.append(model.greedy_last(self.config, self._weights, step, 1))
+                self._model.run(step, cache, np.array(out[-1:], np.int32))
+                out.append(self._model.greedy_last(step, 1))
         return np.asarray(out, dtype=np.int32)
 
     def _check_ids(self, token_ids) -> np.ndarray:
-        if self._weights is None:
+        if self._model is None:
             raise RuntimeError("no weights on the device; call load_weights() first")
         ids = np.asarray(token_ids)
         if ids.ndim != 1:
@@ -227,22 +227,30 @@ class Engine:
     @contextmanager
     def _holding(self, cache: model.KVCache, ws: model.Workspace):
         """Account for a cache and a workspace while they are alive, and note
-        the peak: the footprint at the moment the engine held the most."""
+        the peak: the footprint at the moment the engine held the most.
+
+        Read after the work, not before it. Memory taken lazily while the work
+        runs, such as cuBLAS's workspace on first use and the device copies of
+        token ids and positions, then shows in the device reading. It shows as
+        `unaccounted`, since the engine did not allocate it, but it is not
+        missed."""
         self._kv_cache_bytes = cache.nbytes
         self._workspace_bytes = ws.nbytes
-        now = self.footprint()
-        if self._peak is None or now.engine_total > self._peak.engine_total:
-            self._peak = now
         try:
             yield
+            now = self.footprint()
+            if self._peak is None or now.engine_total > self._peak.engine_total or (
+                    now.engine_total == self._peak.engine_total
+                    and now.device_free < self._peak.device_free):
+                self._peak = now
         finally:
             self._kv_cache_bytes = 0
             self._workspace_bytes = 0
 
     def peak_footprint(self) -> Footprint | None:
-        """The footprint when the engine last held the most device memory, or
-        None if nothing has run. Read when a cache and workspace had just been
-        allocated, which is when a forward pass holds the most."""
+        """The footprint when the engine held the most device memory, or None
+        if nothing has run: the reading taken after the largest cache and
+        workspace had done their work."""
         return self._peak
 
     def reset_peak(self) -> None:

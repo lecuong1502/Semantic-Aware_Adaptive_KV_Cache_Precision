@@ -47,9 +47,17 @@ about 1,700. Keeping it in fp32 changed nothing that matters: 0.846 against
 
 With keys cached without their bias, the engine passes the gate: **99.81%
 top-1 agreement over 5,761 positions, and a mean KL of 8.0e-4 over 334 sampled
-positions.** `adversarial-00` rises from 73% to 96% agreement. It is still the
-prompt furthest from the reference, and it accounts for most of the mean KL
-that remains, which is why the margin under 1e-3 is only about 20%.
+positions.** `adversarial-00` rises from 73% to 96% agreement.
+
+**This does not close the case of `adversarial-00`.** It is still the prompt
+furthest from the reference. Its own mean KL is 1.28e-2, about 6.1e-4 of the
+set's 8.0e-4, which is why the margin under 1e-3 is only about 20%. Its lowest
+cosine similarity is 0.981, and the diagnostic still names layer 3's output as
+the first below 0.999. The float64 model puts the bias-free engine at 0.9991
+there, so something else is lost as well, and it has not been isolated. The
+bisection above points at the next candidates: the attention output
+projection (0.99793) and the query, which carries a bias of its own. A change
+that moves this prompt should be expected to move the gate.
 
 ## Considered Options
 

@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cmath>
 #include <optional>
 #include <stdexcept>
@@ -10,6 +11,7 @@
 #include "microinfer/device_buffer.h"
 #include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
+#include "microinfer/rope_angle.cuh"
 #include "microinfer/staging.h"
 
 namespace microinfer
@@ -68,14 +70,11 @@ namespace microinfer
     __device__ float rotated_bias(const __half *__restrict__ bias, int position,
                                   int d, int head_dim, double theta)
     {
-      // Rotate-half pairing, as the RoPE kernel: dimension j with j + half.
-      // The angle is formed in fp64, as there, and for the same reason.
+      // Rotate-half pairing: dimension j with j + half (rope_angle.cuh).
       const int half = head_dim / 2;
       const int j = d < half ? d : d - half;
-      const double inv_freq =
-          pow(theta, -2.0 * static_cast<double>(j) / head_dim);
       double s, c;
-      sincos(static_cast<double>(position) * inv_freq, &s, &c);
+      rope_sincos(static_cast<double>(position), j, head_dim, theta, &s, &c);
       const double b1 = __half2float(bias[j]);
       const double b2 = __half2float(bias[j + half]);
       return static_cast<float>(d < half ? b1 * c - b2 * s : b2 * c + b1 * s);
@@ -281,12 +280,22 @@ namespace microinfer
     }
 
     // Past 48 KiB of dynamic shared memory a kernel must opt in. head_dim 128
-    // stays under it; 256 does not, and head_dim is a parameter.
+    // stays under it; 256 does not, and head_dim is a parameter. The opt-in is
+    // a driver call, so it is made only when a launch needs more than any
+    // before it, not once per layer per step.
     const size_t smem = shared_bytes(head_dim);
-    cuda_check(cudaFuncSetAttribute(attention_kernel,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(smem)),
-               "cudaFuncSetAttribute attention shared memory");
+    // Atomic because the NumPy binding releases the GIL: two threads may both
+    // make the call, which is harmless, but not race on the variable.
+    static std::atomic<size_t> opted_in{0};
+    if (smem > opted_in.load())
+    {
+      cuda_check(
+          cudaFuncSetAttribute(attention_kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(smem)),
+          "cudaFuncSetAttribute attention shared memory");
+      opted_in = smem;
+    }
 
     const dim3 grid((seq_q + kAttentionTileQ - 1) / kAttentionTileQ, heads);
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));

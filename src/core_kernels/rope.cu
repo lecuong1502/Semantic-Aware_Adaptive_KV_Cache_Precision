@@ -7,6 +7,7 @@
 #include "microinfer/device_buffer.h"
 #include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
+#include "microinfer/rope_angle.cuh"
 #include "microinfer/staging.h"
 
 namespace microinfer
@@ -40,10 +41,8 @@ namespace microinfer
 
       for (int j = threadIdx.x; j < half; j += blockDim.x)
       {
-        const double inv_freq =
-            pow(theta, -2.0 * static_cast<double>(j) / head_dim);
         double s, c;
-        sincos(pos * inv_freq, &s, &c);
+        rope_sincos(pos, j, head_dim, theta, &s, &c);
         const float sf = static_cast<float>(s);
         const float cf = static_cast<float>(c);
 

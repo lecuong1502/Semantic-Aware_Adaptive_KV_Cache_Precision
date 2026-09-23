@@ -11,7 +11,8 @@ position of every prompt. KL is a sample mean over the positions at which the
 reference keeps whole distributions, and the report carries that count.
 
 This is measurement, not inference, so it computes in NumPy on the host. The
-rule that Python does no arithmetic is about the forward pass.
+rule that Python does no arithmetic is about the forward pass (ADR-0002,
+amendment on its scope).
 """
 
 from __future__ import annotations
@@ -120,18 +121,24 @@ class LayerReport:
         below = np.flatnonzero(self.cosines < LAYER_COSINE_MIN)
         return int(below[0]) if below.size else None
 
+    def state_name(self, index: int) -> str:
+        """What hidden state `index` is: the embedding output, a decoder
+        layer's output, or the last layer's output after the final norm."""
+        if index == 0:
+            return "embedding"
+        name = f"layer {index - 1}"
+        return name + " + final norm" if index == len(self.cosines) - 1 else name
+
     def render(self) -> str:
         rows = [f"{'state':<22} {'min cosine':>10}"]
         for i, c in enumerate(self.cosines):
-            name = "embedding" if i == 0 else f"layer {i - 1}"
-            if i == len(self.cosines) - 1:
-                name += " + final norm"
             mark = "  <-- first below" if i == self.first_below else ""
-            rows.append(f"{name:<22} {c:>10.6f}{mark}")
+            rows.append(f"{self.state_name(i):<22} {c:>10.6f}{mark}")
         first = self.first_below
         rows.append(f"\n{self.prompt_id}: " + (
-            "every state at or above {:.3f}".format(LAYER_COSINE_MIN) if first is None
-            else f"first below {LAYER_COSINE_MIN} is state {first}"))
+            f"every state at or above {LAYER_COSINE_MIN}" if first is None
+            else f"the first below {LAYER_COSINE_MIN} is {self.state_name(first)} "
+                 f"(hidden state {first})"))
         return "\n".join(rows)
 
 
