@@ -67,8 +67,13 @@ namespace microinfer
   // head h / (heads / kv_heads), HuggingFace's repeat_kv order. kv_heads ==
   // heads is ordinary multi-head attention. A head count that does not group,
   // or zero heads on one side only, throws std::invalid_argument.
-  void attention(const float *q, const float *k, const float *v, float *out,
-                 int seq_q, int seq_k, int heads, int kv_heads, int head_dim);
+  //
+  // k_bias, if non-null, is (kv_heads, head_dim): the keys were stored
+  // without their projection's bias, and key row j is completed as
+  // k + RoPE(k_bias, j) with theta before use (ADR-0009).
+  void attention(const float *q, const float *k, const float *v,
+                 const float *k_bias, float *out, int seq_q, int seq_k,
+                 int heads, int kv_heads, int head_dim, double theta);
 
   // Device memory as the *driver* sees it, from cudaMemGetInfo. This is the
   // same quantity NVML reports and the one RQ2 turns on, so the engine reads it
@@ -87,6 +92,9 @@ namespace microinfer
   {
   public:
     DeviceTensor(const float *host, size_t count);
+    // Uninitialised storage: activations and the KV cache, which the forward
+    // pass writes before it reads.
+    explicit DeviceTensor(size_t count);
     ~DeviceTensor();
     DeviceTensor(const DeviceTensor &) = delete;
     DeviceTensor &operator=(const DeviceTensor &) = delete;
@@ -97,9 +105,28 @@ namespace microinfer
     size_t nbytes() const;
     void download(float *out) const;
     const void *data() const { return ptr_; }
+    void *data() { return ptr_; }
 
   private:
     void *ptr_ = nullptr;
+    size_t count_ = 0;
+  };
+
+  // int32 on the device, uploaded from the host: token ids and positions, which
+  // the forward pass needs on the device and which are never fp16.
+  class DeviceIndex
+  {
+  public:
+    DeviceIndex(const int32_t *host, size_t count);
+    ~DeviceIndex();
+    DeviceIndex(const DeviceIndex &) = delete;
+    DeviceIndex &operator=(const DeviceIndex &) = delete;
+
+    size_t count() const { return count_; }
+    const int32_t *data() const { return ptr_; }
+
+  private:
+    int32_t *ptr_ = nullptr;
     size_t count_ = 0;
   };
 

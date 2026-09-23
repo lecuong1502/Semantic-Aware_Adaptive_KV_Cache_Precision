@@ -2,8 +2,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <optional>
+
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
+#include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
 #include "microinfer/launch.h"
 #include "microinfer/staging.h"
@@ -67,6 +70,64 @@ namespace microinfer
 
   } // namespace
 
+  namespace
+  {
+
+    // HuggingFace stores a projection as W (out_features, in_features) and
+    // computes y = x W^T, all row-major. cuBLAS is column-major, where a
+    // row-major matrix reads as its own transpose. So the call computes
+    //
+    //   y^T (out, rows) = op(W) (out, in) * x^T (in, rows)
+    //
+    // where W, read column-major, is (in, out) and needs OP_T, and x, read
+    // column-major, is already x^T and needs OP_N. The result y^T in
+    // column-major is y in row-major, which is what the caller gets back.
+    void gemm(const __half *x, const __half *weight, void *out,
+              cudaDataType_t out_type, float beta, int rows, int in_features,
+              int out_features)
+    {
+      const float alpha = 1.0f;
+      cublas_check(cublasGemmEx(handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                                out_features, rows, in_features, &alpha, weight,
+                                CUDA_R_16F, in_features, x, CUDA_R_16F,
+                                in_features, &beta, out, out_type, out_features,
+                                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                   "cublasGemmEx");
+    }
+
+  } // namespace
+
+  void device::linear(const __half *x, const __half *weight, const __half *bias,
+                      __half *out, int rows, int in_features, int out_features)
+  {
+    if (rows <= 0 || out_features <= 0)
+    {
+      return;
+    }
+    float beta = 0.0f;
+    if (bias != nullptr)
+    {
+      const size_t out_count = static_cast<size_t>(rows) * out_features;
+      const int grid = grid_stride_blocks(out_count, kBlockThreads);
+      broadcast_rows_kernel<<<grid, kBlockThreads>>>(bias, out, out_features,
+                                                     out_count);
+      cuda_check(cudaGetLastError(), "bias broadcast launch");
+      beta = 1.0f;
+    }
+    gemm(x, weight, out, CUDA_R_16F, beta, rows, in_features, out_features);
+  }
+
+  void device::linear_fp32_out(const __half *x, const __half *weight,
+                               float *out, int rows, int in_features,
+                               int out_features)
+  {
+    if (rows <= 0 || out_features <= 0)
+    {
+      return;
+    }
+    gemm(x, weight, out, CUDA_R_32F, 0.0f, rows, in_features, out_features);
+  }
+
   void linear(const float *x, const float *weight, const float *bias,
               float *out, int rows, int in_features, int out_features)
   {
@@ -82,44 +143,24 @@ namespace microinfer
     DeviceBuffer dev_x(x_count * sizeof(__half));
     DeviceBuffer dev_w(w_count * sizeof(__half));
     DeviceBuffer dev_out(out_count * sizeof(__half));
+    std::optional<DeviceBuffer> dev_bias;
 
     upload_fp16(dev_x, x, x_count, "cudaMemcpy x host-to-device");
     upload_fp16(dev_w, weight, w_count, "cudaMemcpy weight host-to-device");
-
-    float beta = 0.0f;
     if (bias != nullptr)
     {
-      DeviceBuffer dev_bias(static_cast<size_t>(out_features) * sizeof(__half));
-      upload_fp16(dev_bias, bias, out_features,
+      dev_bias.emplace(static_cast<size_t>(out_features) * sizeof(__half));
+      upload_fp16(*dev_bias, bias, out_features,
                   "cudaMemcpy bias host-to-device");
-
-      const int grid = grid_stride_blocks(out_count, kBlockThreads);
-      broadcast_rows_kernel<<<grid, kBlockThreads>>>(
-          dev_bias.as<const __half>(), dev_out.as<__half>(), out_features,
-          out_count);
-      cuda_check(cudaGetLastError(), "bias broadcast launch");
-      // Synchronised before dev_bias goes out of scope and is freed.
-      cuda_check(cudaDeviceSynchronize(), "bias broadcast execution");
-      beta = 1.0f;
     }
 
-    // HuggingFace stores a projection as W (out_features, in_features) and
-    // computes y = x W^T, all row-major. cuBLAS is column-major, where a
-    // row-major matrix reads as its own transpose. So the call computes
-    //
-    //   y^T (out, rows) = op(W) (out, in) * x^T (in, rows)
-    //
-    // where W, read column-major, is (in, out) and needs OP_T, and x, read
-    // column-major, is already x^T and needs OP_N. The result y^T in
-    // column-major is y in row-major, which is what the caller gets back.
-    const float alpha = 1.0f;
-    cublas_check(cublasGemmEx(handle(), CUBLAS_OP_T, CUBLAS_OP_N, out_features,
-                              rows, in_features, &alpha, dev_w.raw(),
-                              CUDA_R_16F, in_features, dev_x.raw(), CUDA_R_16F,
-                              in_features, &beta, dev_out.raw(), CUDA_R_16F,
-                              out_features, CUBLAS_COMPUTE_32F,
-                              CUBLAS_GEMM_DEFAULT),
-                 "cublasGemmEx");
+    // With a bias, the output is seeded with it and the GEMM adds onto it
+    // with beta = 1, so the sum is formed in fp32 inside cuBLAS and rounded to
+    // fp16 once, rather than rounded after the GEMM and again after an add.
+    device::linear(dev_x.as<const __half>(), dev_w.as<const __half>(),
+                   dev_bias ? dev_bias->as<const __half>() : nullptr,
+                   dev_out.as<__half>(), rows, in_features, out_features);
+    // Synchronised before dev_bias and the rest go out of scope and are freed.
     cuda_check(cudaDeviceSynchronize(), "cublasGemmEx execution");
 
     download_fp16(out, dev_out, out_count, "cudaMemcpy output device-to-host");

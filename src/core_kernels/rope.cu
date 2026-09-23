@@ -5,6 +5,7 @@
 
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
+#include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
 #include "microinfer/staging.h"
 
@@ -55,6 +56,18 @@ namespace microinfer
 
   } // namespace
 
+  void device::rope(const __half *x, const int32_t *positions, __half *out,
+                    int seq, int heads, int head_dim, double theta)
+  {
+    if (seq <= 0 || heads <= 0 || head_dim <= 0)
+    {
+      return;
+    }
+    rope_kernel<<<seq * heads, kBlockThreads>>>(x, positions, out, heads,
+                                                head_dim, theta);
+    cuda_check(cudaGetLastError(), "rope kernel launch");
+  }
+
   void rope(const float *x, const int32_t *positions, float *out, int seq,
             int heads, int head_dim, double theta)
   {
@@ -75,10 +88,8 @@ namespace microinfer
         cudaMemcpy(dev_pos.raw(), positions, pos_bytes, cudaMemcpyHostToDevice),
         "cudaMemcpy positions host-to-device");
 
-    rope_kernel<<<seq * heads, kBlockThreads>>>(
-        dev_x.as<const __half>(), dev_pos.as<const int32_t>(),
-        dev_out.as<__half>(), heads, head_dim, theta);
-    cuda_check(cudaGetLastError(), "rope kernel launch");
+    device::rope(dev_x.as<const __half>(), dev_pos.as<const int32_t>(),
+                 dev_out.as<__half>(), seq, heads, head_dim, theta);
     cuda_check(cudaDeviceSynchronize(), "rope kernel execution");
 
     download_fp16(out, dev_out, count, "cudaMemcpy output device-to-host");

@@ -2,11 +2,13 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
+#include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
 #include "microinfer/staging.h"
 
@@ -55,12 +57,37 @@ namespace microinfer
     // Each query head's block loads its KV tile for itself, so a group's
     // blocks load the same tile `group` times. Sharing one load across the
     // group is an optimisation for later; it changes no arithmetic.
+    //
+    // Keys may be stored without their projection's bias (ADR-0009). Then
+    // k_bias is non-null, and each key is completed as it is loaded:
+    // k = stored + RoPE(k_bias, j), where j, the key's row, is its position.
+    // The addition is in fp32, so the stored part, not the bias, sets the
+    // precision of a key. A tile's keys are held as fp32 in shared memory for
+    // that reason. Without k_bias, widening fp16 to fp32 is exact, and the
+    // arithmetic is what it always was.
+    __device__ float rotated_bias(const __half *__restrict__ bias, int position,
+                                  int d, int head_dim, double theta)
+    {
+      // Rotate-half pairing, as the RoPE kernel: dimension j with j + half.
+      // The angle is formed in fp64, as there, and for the same reason.
+      const int half = head_dim / 2;
+      const int j = d < half ? d : d - half;
+      const double inv_freq =
+          pow(theta, -2.0 * static_cast<double>(j) / head_dim);
+      double s, c;
+      sincos(static_cast<double>(position) * inv_freq, &s, &c);
+      const double b1 = __half2float(bias[j]);
+      const double b2 = __half2float(bias[j + half]);
+      return static_cast<float>(d < half ? b1 * c - b2 * s : b2 * c + b1 * s);
+    }
+
     __global__ void attention_kernel(const __half *__restrict__ q,
                                      const __half *__restrict__ k,
                                      const __half *__restrict__ v,
+                                     const __half *__restrict__ k_bias,
                                      __half *__restrict__ out, int seq_q,
                                      int seq_k, int heads, int kv_heads,
-                                     int head_dim, float scale)
+                                     int head_dim, float scale, double theta)
     {
       extern __shared__ float smem[];
       float *q_s = smem; // kAttentionTileQ x head_dim
@@ -71,9 +98,9 @@ namespace microinfer
       float *m_s = s_s + kAttentionTileQ * kAttentionTileK; // kAttentionTileQ
       float *l_s = m_s + kAttentionTileQ;                   // kAttentionTileQ
       float *rescale_s = l_s + kAttentionTileQ;             // kAttentionTileQ
-      __half *k_s = reinterpret_cast<__half *>(rescale_s + kAttentionTileQ);
-      __half *v_s =
-          k_s + kAttentionTileK * head_dim; // kAttentionTileK x head_dim
+      float *k_s = rescale_s + kAttentionTileQ; // kAttentionTileK x head_dim
+      __half *v_s = reinterpret_cast<__half *>(
+          k_s + kAttentionTileK * head_dim); // kAttentionTileK x head_dim
 
       const int head = blockIdx.y;
       const int q_first = blockIdx.x * kAttentionTileQ;
@@ -123,7 +150,13 @@ namespace microinfer
           const bool in_range = k_first + c < seq_k;
           const size_t at =
               (k_first + c) * kv_token_stride + kv_head_offset + d;
-          k_s[i] = in_range ? k[at] : __float2half(0.0f);
+          float key = in_range ? __half2float(k[at]) : 0.0f;
+          if (k_bias != nullptr && in_range)
+          {
+            key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
+                                head_dim, theta);
+          }
+          k_s[i] = key;
           v_s[i] = in_range ? v[at] : __float2half(0.0f);
         }
         __syncthreads();
@@ -136,7 +169,7 @@ namespace microinfer
           float dot = 0.0f;
           for (int d = 0; d < head_dim; ++d)
           {
-            dot += q_s[r * head_dim + d] * __half2float(k_s[c * head_dim + d]);
+            dot += q_s[r * head_dim + d] * k_s[c * head_dim + d];
           }
           // Keys past seq_k are covered too: a valid query's position is at
           // most seq_k - 1, and a padding row's output is never stored.
@@ -201,34 +234,73 @@ namespace microinfer
     {
       const size_t floats =
           2 * static_cast<size_t>(kAttentionTileQ) * head_dim +
-          kAttentionTileQ * kAttentionTileK + 3 * kAttentionTileQ;
-      const size_t halves = 2 * static_cast<size_t>(kAttentionTileK) * head_dim;
+          kAttentionTileQ * kAttentionTileK + 3 * kAttentionTileQ +
+          static_cast<size_t>(kAttentionTileK) * head_dim;
+      const size_t halves = static_cast<size_t>(kAttentionTileK) * head_dim;
       return floats * sizeof(float) + halves * sizeof(__half);
     }
 
   } // namespace
 
-  void attention(const float *q, const float *k, const float *v, float *out,
-                 int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
+  namespace
   {
-    // Checked here rather than only at the binding: the kernel divides by
-    // heads / kv_heads, so a count that does not group is a division by zero
-    // or a silently wrong KV head, whoever the caller is.
-    if (heads < 0 || kv_heads < 0 || (heads == 0) != (kv_heads == 0))
+
+    // Checked in both entry points rather than only at the binding: the kernel
+    // divides by heads / kv_heads, so a count that does not group is a division
+    // by zero or a silently wrong KV head, whoever the caller is.
+    void check_grouping(int heads, int kv_heads)
     {
-      throw std::invalid_argument(
-          std::to_string(heads) + " query heads and " +
-          std::to_string(kv_heads) +
-          " KV heads: either both are zero or neither is");
+      if (heads < 0 || kv_heads < 0 || (heads == 0) != (kv_heads == 0))
+      {
+        throw std::invalid_argument(
+            std::to_string(heads) + " query heads and " +
+            std::to_string(kv_heads) +
+            " KV heads: either both are zero or neither is");
+      }
+      if (kv_heads > 0 && heads % kv_heads != 0)
+      {
+        throw std::invalid_argument(
+            std::to_string(heads) + " query heads and " +
+            std::to_string(kv_heads) +
+            " KV heads: the KV head count must divide the query head count, "
+            "so that every KV head serves the same number of query heads");
+      }
     }
-    if (kv_heads > 0 && heads % kv_heads != 0)
+
+  } // namespace
+
+  void device::attention(const __half *q, const __half *k, const __half *v,
+                         const __half *k_bias, __half *out, int seq_q,
+                         int seq_k, int heads, int kv_heads, int head_dim,
+                         double theta)
+  {
+    check_grouping(heads, kv_heads);
+    if (seq_q <= 0 || heads == 0 || head_dim <= 0)
     {
-      throw std::invalid_argument(
-          std::to_string(heads) + " query heads and " +
-          std::to_string(kv_heads) +
-          " KV heads: the KV head count must divide the query head count, so "
-          "that every KV head serves the same number of query heads");
+      return;
     }
+
+    // Past 48 KiB of dynamic shared memory a kernel must opt in. head_dim 128
+    // stays under it; 256 does not, and head_dim is a parameter.
+    const size_t smem = shared_bytes(head_dim);
+    cuda_check(cudaFuncSetAttribute(attention_kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(smem)),
+               "cudaFuncSetAttribute attention shared memory");
+
+    const dim3 grid((seq_q + kAttentionTileQ - 1) / kAttentionTileQ, heads);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    attention_kernel<<<grid, kBlockThreads, smem>>>(q, k, v, k_bias, out, seq_q,
+                                                    seq_k, heads, kv_heads,
+                                                    head_dim, scale, theta);
+    cuda_check(cudaGetLastError(), "attention kernel launch");
+  }
+
+  void attention(const float *q, const float *k, const float *v,
+                 const float *k_bias, float *out, int seq_q, int seq_k,
+                 int heads, int kv_heads, int head_dim, double theta)
+  {
+    check_grouping(heads, kv_heads);
     if (seq_q <= 0 || heads == 0 || head_dim <= 0)
     {
       return; // No elements exist, so there is nothing to write.
@@ -245,22 +317,20 @@ namespace microinfer
     upload_fp16(dev_q, q, q_count, "cudaMemcpy q host-to-device");
     upload_fp16(dev_k, k, kv_count, "cudaMemcpy k host-to-device");
     upload_fp16(dev_v, v, kv_count, "cudaMemcpy v host-to-device");
+    std::optional<DeviceBuffer> dev_bias;
+    if (k_bias != nullptr)
+    {
+      const size_t bias_count = static_cast<size_t>(kv_heads) * head_dim;
+      dev_bias.emplace(bias_count * sizeof(__half));
+      upload_fp16(*dev_bias, k_bias, bias_count,
+                  "cudaMemcpy k_bias host-to-device");
+    }
 
-    // Past 48 KiB of dynamic shared memory a kernel must opt in. head_dim 128
-    // stays under it; 256 does not, and head_dim is a parameter.
-    const size_t smem = shared_bytes(head_dim);
-    cuda_check(cudaFuncSetAttribute(attention_kernel,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(smem)),
-               "cudaFuncSetAttribute attention shared memory");
-
-    const dim3 grid((seq_q + kAttentionTileQ - 1) / kAttentionTileQ, heads);
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    attention_kernel<<<grid, kBlockThreads, smem>>>(
-        dev_q.as<const __half>(), dev_k.as<const __half>(),
-        dev_v.as<const __half>(), dev_out.as<__half>(), seq_q, seq_k, heads,
-        kv_heads, head_dim, scale);
-    cuda_check(cudaGetLastError(), "attention kernel launch");
+    device::attention(dev_q.as<const __half>(), dev_k.as<const __half>(),
+                      dev_v.as<const __half>(),
+                      dev_bias ? dev_bias->as<const __half>() : nullptr,
+                      dev_out.as<__half>(), seq_q, seq_k, heads, kv_heads,
+                      head_dim, theta);
     cuda_check(cudaDeviceSynchronize(), "attention kernel execution");
 
     download_fp16(out, dev_out, q_count, "cudaMemcpy output device-to-host");

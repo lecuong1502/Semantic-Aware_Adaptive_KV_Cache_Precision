@@ -1,0 +1,69 @@
+#pragma once
+
+#include <cuda_fp16.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace microinfer
+{
+
+  // The kernels, on device memory: what the engine's forward pass runs.
+  //
+  // kernels.h is the same arithmetic behind a host-memory surface, for tests
+  // (Seam B): each of its functions uploads, calls the launcher declared here,
+  // and downloads. So the per-kernel tests exercise exactly the code the engine
+  // runs, and nothing here needs a numerics test of its own beyond showing it
+  // is that code.
+  //
+  // Every launcher enqueues on the default stream and returns without
+  // synchronising. A forward pass is a long chain of these and a sync after
+  // each would serialise the host against every launch. Launch errors are
+  // checked at once; execution errors surface at the next synchronising call,
+  // which the engine makes when it reads a result back.
+  namespace device
+  {
+
+    void rmsnorm(const __half *x, const __half *weight, __half *out, int rows,
+                 int hidden, float eps);
+
+    // positions is on the device: one int32 per token.
+    void rope(const __half *x, const int32_t *positions, __half *out, int seq,
+              int heads, int head_dim, double theta);
+
+    void swiglu(const __half *gate, const __half *up, __half *out,
+                size_t count);
+
+    // bias may be null.
+    void linear(const __half *x, const __half *weight, const __half *bias,
+                __half *out, int rows, int in_features, int out_features);
+
+    // The same projection with an fp32 output: for the LM head, whose logits
+    // feed a softmax that the gate compares against an fp32 reference.
+    // Rounding 151,936 logits to fp16 would cost up to 2^-11 relative on each
+    // before a single comparison was made.
+    void linear_fp32_out(const __half *x, const __half *weight, float *out,
+                         int rows, int in_features, int out_features);
+
+    // k_bias, when non-null, is the key projection's bias, (kv_heads,
+    // head_dim), which k was stored without (ADR-0009): each key is completed
+    // as k + RoPE(k_bias, j) at its row j, with theta. Null means k is whole.
+    void attention(const __half *q, const __half *k, const __half *v,
+                   const __half *k_bias, __half *out, int seq_q, int seq_k,
+                   int heads, int kv_heads, int head_dim, double theta);
+
+    // out[i] = table[ids[i]], a row of `hidden` each. ids is on the device.
+    void embed(const int32_t *ids, const __half *table, __half *out, int count,
+               int hidden, int vocab);
+
+    // out = a + b, in fp32, rounded once. out may alias a or b: the residual
+    // stream is updated in place.
+    void add(const __half *a, const __half *b, __half *out, size_t count);
+
+    // out[r] = the index of the largest of cols values in row r, the lowest
+    // index among ties, as argmax conventionally breaks them.
+    void argmax_rows(const float *x, int rows, int cols, int32_t *out);
+
+  } // namespace device
+
+} // namespace microinfer

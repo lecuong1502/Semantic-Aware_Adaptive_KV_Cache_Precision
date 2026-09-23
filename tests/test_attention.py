@@ -421,3 +421,68 @@ def test_rejects_mismatched_head_dim():
     _, k, v = make_qkv(4, 4, 2, 128)
     with pytest.raises(ValueError, match="head_dim"):
         _microinfer.attention(q, k, v)
+
+
+# --- keys stored without their bias (ADR-0009) -------------------------------
+
+
+def rotated_bias(bias, seq_k, theta):
+    """float64 RoPE of the key bias at every key position 0..seq_k-1, in the
+    rotate-half pairing: (seq_k, kv_heads, head_dim). Written as complex
+    multiplication, as test_rope's reference is, rather than in the kernel's
+    cos/sin shape."""
+    half = bias.shape[-1] // 2
+    inv_freq = theta ** (-np.arange(half, dtype=np.float64) * 2.0 / bias.shape[-1])
+    rot = np.exp(1j * np.arange(seq_k)[:, None] * inv_freq)[:, None, :]  # (seq_k, 1, half)
+    b = bias.astype(np.float64)
+    z = (b[..., :half] + 1j * b[..., half:])[None] * rot
+    return np.concatenate([z.real, z.imag], axis=-1)
+
+
+def qwen_like_keys(cfg, seq, seed):
+    """Keys shaped as Qwen2.5's are: a small input-dependent part under a large
+    per-channel bias. Measured on the 0.5B's first layers, the bias reaches 147
+    while the rest stays within about 5-11, and queries reach 80."""
+    rng = np.random.default_rng(seed)
+    kv_heads, hd = cfg.num_key_value_heads, cfg.head_dim
+    q = fp16_exact(8 * rng.standard_normal((seq, cfg.num_attention_heads, hd)))
+    k_part = fp16_exact(0.3 * rng.standard_normal((seq, kv_heads, hd)))
+    v = fp16_exact(rng.standard_normal((seq, kv_heads, hd)))
+    bias = fp16_exact(60 * rng.standard_normal((kv_heads, hd)))
+    return q, k_part, v, bias
+
+
+@pytest.mark.parametrize("name", MODELS)
+@pytest.mark.parametrize("seq_q,seq_k", [(TILE_K + 7, TILE_K + 7), (1, 3 * TILE_K + 2)])
+def test_keys_completed_by_their_bias_match_the_reference(name, seq_q, seq_k):
+    """k_bias completes each stored key as k + RoPE(bias, j) at its row j. The
+    reference forms the whole key in float64; the kernel forms it in fp32 from
+    an fp16 part and an fp16 bias, so it is held to the same gate as ever."""
+    cfg = ModelConfig.from_card(name)
+    q, k_part, v, bias = qwen_like_keys(cfg, seq_k, seed=seq_q)
+    q = q[-seq_q:]
+    k_whole = k_part.astype(np.float64) + rotated_bias(bias, seq_k, cfg.rope_theta)
+    got = _microinfer.attention(q, k_part, v, k_bias=bias, theta=cfg.rope_theta)
+    check(q, k_whole, v, got=got)
+
+
+@pytest.mark.parametrize("name", MODELS)
+def test_a_large_bias_costs_whole_fp16_keys_what_bias_free_keys_keep(name):
+    """ADR-0009's reason, at the kernel. Storing the whole key in fp16 rounds it
+    at the bias's magnitude, where fp16's ulp is as large as what tells one key
+    from another; storing it without the bias rounds only the small part. On
+    the same keys, the first fails the gate and the second passes."""
+    cfg = ModelConfig.from_card(name)
+    seq = 2 * TILE_K + 3
+    q, k_part, v, bias = qwen_like_keys(cfg, seq, seed=9)
+    k_whole = k_part.astype(np.float64) + rotated_bias(bias, seq, cfg.rope_theta)
+
+    check(q, k_whole, v, got=_microinfer.attention(q, k_part, v, k_bias=bias, theta=cfg.rope_theta))
+    with pytest.raises(AssertionError):
+        check(q, k_whole, v, got=_microinfer.attention(q, fp16_exact(k_whole), v))
+
+
+def test_k_bias_must_be_one_row_per_kv_head():
+    q, k, v = make_qkv(4, 4, 4, 64, kv_heads=2)
+    with pytest.raises(ValueError, match="k_bias"):
+        _microinfer.attention(q, k, v, k_bias=np.zeros((4, 64), np.float32), theta=1e4)
