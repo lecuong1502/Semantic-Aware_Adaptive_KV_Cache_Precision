@@ -25,6 +25,7 @@ ask for this log from the first working version, not retrofitted afterwards.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -38,6 +39,14 @@ from . import nvml
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_LOG = REPO / "experiments" / "logs" / "benchmark.jsonl"
+
+#: The precision tiers of ADR-0008 and CONTEXT.md: the only names a tier
+#: configuration may use.
+TIERS = frozenset({"FP16", "INT8", "INT4", "INT2"})
+
+#: Tail read per step when finding the last entry. Entries run from under 1 KB
+#: to about 50 KB (an ncu summary), so this usually takes one or two reads.
+_TAIL_BLOCK = 64 * 1024
 
 
 class LogTampered(RuntimeError):
@@ -65,10 +74,16 @@ def _executable(name: str | None) -> str | None:
     return os.path.basename(name.split()[0]) if name else None
 
 
-def environment() -> dict[str, Any]:
-    """Everything about the machine that a result depends on, read now."""
+def environment(log: str | Path = DEFAULT_LOG) -> dict[str, Any]:
+    """Everything about the machine that a result depends on, read now.
+
+    `git_dirty` means tracked files other than `log` itself have uncommitted
+    changes. The log is tracked, so every append makes it differ from the last
+    commit, and counting that would mark every entry after the first in a run
+    as dirty, which says nothing about the code that produced it."""
     others = nvml.other_processes()
-    status = _git("status", "--porcelain", "--untracked-files=no")
+    status = _git("status", "--porcelain", "--untracked-files=no", "--", ".",
+                  *_exclude(Path(log)))
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "git_commit": _git("rev-parse", "HEAD"),
@@ -86,20 +101,40 @@ def environment() -> dict[str, Any]:
     }
 
 
-def _last_hash(log: Path) -> str | None:
-    if not log.exists() or log.stat().st_size == 0:
+def _exclude(log: Path) -> list[str]:
+    """A git pathspec excluding the log, when it lies inside the repository."""
+    try:
+        return [f":(exclude){log.resolve().relative_to(REPO).as_posix()}"]
+    except ValueError:
+        return []
+
+
+def _last_hash(f) -> str | None:
+    """The hash of the last entry in an open log, read from its tail in blocks
+    rather than from the start of a file that only grows.
+
+    A log that does not end in a newline is refused, not appended to: the next
+    line would run straight on from the last, and in a file that is never
+    rewritten that damage could not be repaired."""
+    f.seek(0, os.SEEK_END)
+    size = f.tell()
+    if size == 0:
         return None
-    with open(log, "rb") as f:
-        # The last line, without reading a log that only grows.
-        f.seek(0, os.SEEK_END)
-        pos = f.tell() - 1
-        while pos > 0:
-            f.seek(pos - 1)
-            if f.read(1) == b"\n":
-                break
-            pos -= 1
-        f.seek(max(pos, 0))
-        return json.loads(f.readline())["sha256"]
+    f.seek(size - 1)
+    if f.read(1) != b"\n":
+        raise LogTampered(f"{f.name} does not end with a newline; the last entry is "
+                          f"incomplete, and appending would join the next one to it")
+    tail, pos = b"", size
+    while pos > 0:
+        step = min(_TAIL_BLOCK, pos)
+        pos -= step
+        f.seek(pos)
+        tail = f.read(step) + tail
+        lines = [line for line in tail.split(b"\n") if line.strip()]
+        # The first piece may be a partial line unless the whole file is read.
+        if len(lines) > 1 or (pos == 0 and lines):
+            return json.loads(lines[-1])["sha256"]
+    return None
 
 
 def append(kind: str, *, results: dict, model: str | list[str] | None,
@@ -119,22 +154,28 @@ def append(kind: str, *, results: dict, model: str | list[str] | None,
     are not JSON leave the log untouched.
     """
     log = Path(log)
-    entry = {
-        **environment(),
-        "kind": kind,
-        "model": model,
-        "context_length": context_length,
-        "precision_tiers": precision_tiers,
-        "config": config or {},
-        "results": results,
-        "previous": _last_hash(log),
-    }
-    entry["sha256"] = hashlib.sha256(_canonical(entry)).hexdigest()
-    line = json.dumps(entry) + "\n"  # raises TypeError before anything is written
+    if precision_tiers is not None and not set(precision_tiers) <= TIERS:
+        raise ValueError(f"precision tiers are {sorted(TIERS)}; got {sorted(precision_tiers)}")
+    fields = {**environment(log), "kind": kind, "model": model,
+              "context_length": context_length, "precision_tiers": precision_tiers,
+              "config": config or {}, "results": results}
+    json.dumps(fields)  # raises TypeError before the log is touched
 
     log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "a", encoding="utf-8") as f:
-        f.write(line)
+    with open(log, "a+b") as f:
+        # Held from reading the last hash to writing the new line. Without it,
+        # two processes appending at once could both chain to the same entry,
+        # and a fork in a log that is never rewritten cannot be mended.
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            entry = {**fields, "previous": _last_hash(f)}
+            entry["sha256"] = hashlib.sha256(_canonical(entry)).hexdigest()
+            f.seek(0, os.SEEK_END)
+            f.write((json.dumps(entry) + "\n").encode())
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
     return entry
 
 
@@ -161,19 +202,46 @@ def verify(log: str | Path = DEFAULT_LOG) -> int:
     return len(entries)
 
 
+def commit_label(entry: dict) -> str:
+    """The short commit an entry names, starred if tracked files were dirty."""
+    return (entry.get("git_commit") or "")[:7] + ("*" if entry.get("git_dirty") else "")
+
+
 def _models(model) -> str:
     return "+".join(model) if isinstance(model, list) else str(model)
 
 
+def _shown(value) -> str:
+    if isinstance(value, list):
+        return f"[{len(value)} items]"
+    if isinstance(value, dict):
+        return f"{{{len(value)} keys}}"
+    return str(value)
+
+
+def corrections(entries: list[dict]) -> dict[str, int]:
+    """Which entries a later `correction` entry qualifies: sha256 -> the
+    number of the correction. A correction is itself an entry, since nothing
+    already written may be changed."""
+    out = {}
+    for number, e in enumerate(entries, start=1):
+        if e["kind"] == "correction":
+            for sha in e["results"].get("corrects", []):
+                out[sha] = number
+    return out
+
+
 def render(entries: list[dict]) -> str:
-    """A summary table, one row per entry."""
+    """A summary table, one row per entry. Nested results show as a count, and
+    an entry a later correction qualifies is marked with its number."""
+    corrected = corrections(entries)
     rows = [f"{'#':>3}  {'timestamp':<25} {'commit':<8} {'kind':<18} {'model':<44} "
             f"{'excl.':<5} results"]
     for number, e in enumerate(entries, start=1):
-        commit = (e.get("git_commit") or "")[:7] + ("*" if e.get("git_dirty") else "")
-        shown = ", ".join(f"{k}={v}" for k, v in e["results"].items()
-                          if isinstance(v, (int, float, str)))
-        rows.append(f"{number:>3}  {e['timestamp']:<25} {commit:<8} {e['kind']:<18} "
+        shown = ", ".join(f"{k}={_shown(v)}" for k, v in e["results"].items())
+        if e["sha256"] in corrected:
+            shown = f"(see correction {corrected[e['sha256']]}) {shown}"
+        rows.append(f"{number:>3}  {e['timestamp']:<25} {commit_label(e):<8} {e['kind']:<18} "
                     f"{_models(e['model']):<44} {'yes' if e['exclusive_gpu'] else 'no':<5} {shown}")
     return "\n".join(rows)
 

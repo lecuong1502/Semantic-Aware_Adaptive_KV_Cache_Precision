@@ -152,7 +152,7 @@ def record(kind: str, config: dict, results: dict) -> None:
     entry = benchlog.append(kind, model=sorted(VERIFIED), context_length=None,
                             precision_tiers=None, config=config, results=results)
     print(f"appended {kind} to {benchlog.DEFAULT_LOG.relative_to(REPO)} "
-          f"at {entry['git_commit'][:7]}{'*' if entry['git_dirty'] else ''}")
+          f"at {benchlog.commit_label(entry)}")
 
 
 def cmd_time() -> None:

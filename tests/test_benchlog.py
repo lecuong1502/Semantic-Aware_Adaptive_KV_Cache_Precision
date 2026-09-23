@@ -15,6 +15,8 @@ Two guarantees are tested, at two levels:
 """
 
 import json
+import multiprocessing
+import os
 import subprocess
 from pathlib import Path
 
@@ -23,7 +25,7 @@ import pytest
 from microinfer import benchlog
 
 REPO = Path(__file__).resolve().parent.parent
-LOG = REPO / "experiments" / "logs" / "benchmark.jsonl"
+LOG = benchlog.DEFAULT_LOG
 
 
 def entry(log, kind="test", **overrides):
@@ -65,7 +67,7 @@ def test_exclusive_use_is_recorded_with_what_shared_the_gpu(tmp_path):
     written = entry(tmp_path / "log.jsonl")
     others = written["other_gpu_processes"]
     assert written["exclusive_gpu"] == (len(others) == 0)
-    assert all(p["pid"] != __import__("os").getpid() for p in others)
+    assert all(p["pid"] != os.getpid() for p in others)
     for p in others:
         assert set(p) == {"pid", "name", "kind", "used_bytes"}
 
@@ -88,6 +90,46 @@ def test_the_format_reads_by_hand_and_parses_for_plotting(tmp_path):
     assert [r["results"]["latency_ms"] for r in rows] == [3.0, 4.0]
     table = benchlog.render(rows)
     assert "alpha" in table and "beta" in table
+
+
+def test_tier_names_are_the_project_s_own(tmp_path):
+    """A tier configuration names tiers from CONTEXT.md and ADR-0008, so that
+    a plot grouping by tier cannot split one tier across two spellings."""
+    with pytest.raises(ValueError, match="precision tiers"):
+        entry(tmp_path / "log.jsonl", precision_tiers={"fp16": 1.0})
+
+
+def test_a_tracked_log_does_not_make_its_own_entries_dirty(tmp_path, monkeypatch):
+    """The repository's log is tracked, so appending changes a tracked file.
+    That must not mark the next entry dirty, or git_dirty would be true for
+    every entry after the first in a run and say nothing about the code. Any
+    other tracked change still does."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run = lambda *a: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)  # noqa: E731
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    log = repo / "logs" / "benchmark.jsonl"
+    (repo / "code.py").write_text("x = 1\n")
+    monkeypatch.setattr(benchlog, "REPO", repo)
+    entry(log)
+    run("add", "-A")
+    run("commit", "-q", "-m", "start")
+
+    assert entry(log)["git_dirty"] is False
+    assert entry(log)["git_dirty"] is False
+    (repo / "code.py").write_text("x = 2\n")
+    assert entry(log)["git_dirty"] is True
+
+
+def test_the_summary_shows_nested_results_and_corrections(tmp_path):
+    log = tmp_path / "log.jsonl"
+    first = entry(log, results={"timings": [1, 2, 3], "passed": True})
+    entry(log, kind="correction", results={"corrects": [first["sha256"]]})
+    table = benchlog.render(benchlog.read(log))
+    assert "timings=[3 items]" in table
+    assert "(see correction 2)" in table
 
 
 # -- append-only ----------------------------------------------------------------
@@ -127,6 +169,46 @@ def test_an_edited_log_fails_verification_where_it_was_edited(tmp_path, tamper, 
     log.write_text("\n".join(lines) + "\n")
     with pytest.raises(benchlog.LogTampered, match=f"entry {at}"):
         benchlog.verify(log)
+
+
+def test_a_log_without_a_final_newline_is_refused_not_joined(tmp_path):
+    """Appending would run the new entry on from the last, and a log that is
+    never rewritten could not be repaired."""
+    log = tmp_path / "log.jsonl"
+    entry(log)
+    log.write_bytes(log.read_bytes().rstrip(b"\n"))
+    before = log.read_bytes()
+    with pytest.raises(benchlog.LogTampered, match="newline"):
+        entry(log)
+    assert log.read_bytes() == before
+
+
+def test_trailing_blank_lines_do_not_hide_the_last_entry(tmp_path):
+    log = tmp_path / "log.jsonl"
+    first = entry(log)
+    with open(log, "a") as f:
+        f.write("\n\n")
+    assert entry(log)["previous"] == first["sha256"]
+    benchlog.verify(log)
+
+
+def _append_many(log, count):
+    for i in range(count):
+        entry(Path(log), results={"pid": os.getpid(), "i": i})
+
+
+def test_concurrent_appends_keep_one_chain(tmp_path):
+    """Two processes appending at once must not both chain to the same entry:
+    a fork in a log that is never rewritten could not be mended."""
+    log = tmp_path / "log.jsonl"
+    ctx = multiprocessing.get_context("spawn")
+    workers = [ctx.Process(target=_append_many, args=(str(log), 40)) for _ in range(2)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+        assert w.exitcode == 0
+    assert benchlog.verify(log) == 80
 
 
 def git(*args: str) -> str:
