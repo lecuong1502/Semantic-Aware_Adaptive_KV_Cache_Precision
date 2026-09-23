@@ -117,6 +117,10 @@ namespace microinfer
     std::size_t granule_bytes() const { return granule_; }
 
   private:
+    // The engine's KV cache resolves page addresses for a launch, and only it
+    // may: it uses them for that launch and keeps none (kv_pages.h).
+    friend class KVPages;
+
     struct Range
     {
       CUdeviceptr base = 0;
@@ -139,6 +143,10 @@ namespace microinfer
     // Maps or releases granules until exactly those the slots reach remain.
     void fit_granules(Range &r);
     void release_everything() noexcept;
+
+    // Counts every allocate and free. A page may move on any of them, so an
+    // address resolved before the count last changed may be stale.
+    std::uint64_t generation_ = 0;
 
     CUdevice device_ = 0;
     CUcontext ctx_ = nullptr;

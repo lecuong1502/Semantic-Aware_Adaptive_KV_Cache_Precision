@@ -108,7 +108,7 @@ def test_attention_reads_the_first_seq_k_rows_of_a_larger_cache(cfg):
     pad = np.full((capacity - seq_k, kv_heads, hd), np.nan, np.float32)
     out = device.empty(q.size)
     device.attention(put(q), put(np.concatenate([k, pad])), put(np.concatenate([v, pad])),
-                     None, out, seq_q, seq_k, heads, kv_heads, hd, 0.0)
+                     None, None, out, seq_q, seq_k, heads, kv_heads, hd)
     np.testing.assert_array_equal(get(out, q.shape), _microinfer.attention(q, k, v))
 
 
@@ -241,4 +241,4 @@ def test_attention_refuses_more_queries_than_keys():
     q = put(normal(3, 1, 8))
     kv = put(normal(2, 1, 8))
     with pytest.raises(ValueError, match="seq_q"):
-        device.attention(q, kv, kv, None, device.empty(24), 3, 2, 1, 1, 8, 0.0)
+        device.attention(q, kv, kv, None, None, device.empty(24), 3, 2, 1, 1, 8)

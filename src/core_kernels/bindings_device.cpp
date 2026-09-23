@@ -22,6 +22,8 @@
 #include "microinfer/check.h"
 #include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
+#include "microinfer/kv_pages.h"
+#include "microinfer/rope_table.h"
 
 namespace py = pybind11;
 
@@ -278,8 +280,9 @@ void bind_device(py::module_ &parent)
   m.def(
       "attention",
       [](const Span &q, const Span &k, const Span &v,
-         std::optional<Span> k_bias, const Span &out, int seq_q, int seq_k,
-         int heads, int kv_heads, int head_dim, double theta)
+         std::optional<Span> k_bias, const microinfer::RopeTable *rope,
+         const Span &out, int seq_q, int seq_k, int heads, int kv_heads,
+         int head_dim)
       {
         if (seq_q > seq_k)
         {
@@ -296,14 +299,43 @@ void bind_device(py::module_ &parent)
         }
         need(out, product(seq_q, heads, head_dim), "out");
         microinfer::device::attention(
-            q.ptr, k.ptr, v.ptr, k_bias ? k_bias->ptr : nullptr, out.ptr, seq_q,
-            seq_k, heads, kv_heads, head_dim, theta);
+            q.ptr, k.ptr, v.ptr, k_bias ? k_bias->ptr : nullptr, rope, out.ptr,
+            seq_q, seq_k, heads, kv_heads, head_dim);
       },
       py::arg("q"), py::arg("k"), py::arg("v"), py::arg("k_bias"),
-      py::arg("out"), py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
-      py::arg("kv_heads"), py::arg("head_dim"), py::arg("theta"),
+      py::arg("rope"), py::arg("out"), py::arg("seq_q"), py::arg("seq_k"),
+      py::arg("heads"), py::arg("kv_heads"), py::arg("head_dim"),
       "Keys may be stored without their bias, which k_bias then completes "
-      "(ADR-0009).");
+      "with cos and sin from `rope`, a RopeTable covering seq_k positions "
+      "(ADR-0009). rope may be None when k_bias is.");
+
+  py::class_<microinfer::RopeTable>(
+      m, "RopeTable",
+      "cos and sin of every RoPE angle per position, fp32 on the device, "
+      "formed once in fp64 and read by every layer's attention (ADR-0009, "
+      "note from #14).")
+      .def(py::init<int, double>(), py::arg("head_dim"), py::arg("theta"))
+      .def("cover", &microinfer::RopeTable::cover, py::arg("positions"),
+           "Make positions [0, positions) present, growing if needed.")
+      .def_property_readonly("positions", &microinfer::RopeTable::positions)
+      .def_property_readonly("nbytes", &microinfer::RopeTable::nbytes)
+      .def(
+          "to_numpy",
+          [](const microinfer::RopeTable &t)
+          {
+            const int half = t.head_dim() / 2;
+            py::array_t<float> out({t.positions(), half, 2});
+            if (t.positions() > 0)
+            {
+              microinfer::cuda_check(cudaMemcpy(out.mutable_data(), t.data(),
+                                                t.nbytes(),
+                                                cudaMemcpyDeviceToHost),
+                                     "cudaMemcpy rope table device-to-host");
+            }
+            return out;
+          },
+          "(positions, head_dim / 2, 2): {cos, sin} per position and "
+          "frequency. For tests.");
 
   m.def(
       "add",
@@ -332,6 +364,86 @@ void bind_device(py::module_ &parent)
         microinfer::device::swiglu(gate.ptr, up.ptr, out.ptr, count);
       },
       py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("count"));
+
+  m.def(
+      "copy",
+      [](const Span &source, const Span &target, size_t count)
+      {
+        need(source, count, "source");
+        need(target, count, "target");
+        microinfer::cuda_check(cudaMemcpy(target.ptr, source.ptr,
+                                          count * sizeof(__half),
+                                          cudaMemcpyDeviceToDevice),
+                               "cudaMemcpy device-to-device");
+      },
+      py::arg("source"), py::arg("target"), py::arg("count"),
+      "Copy count fp16 elements, device to device.");
+
+  m.attr("page_tokens") = microinfer::kPageTokens;
+
+  using microinfer::KVPages;
+  py::class_<KVPages>(
+      m, "KVPages",
+      "The engine's KV cache on pages (#14): page i of layer l holds positions "
+      "[i*P, (i+1)*P), keys then values. Pages come from a PagedKVCache as the "
+      "sequence grows, and every launch resolves the page table afresh, so "
+      "the allocator may move pages between launches (ADR-0007).")
+      .def(py::init<microinfer::PagedKVCache &, int, int, size_t,
+                    microinfer::Tier>(),
+           py::arg("allocator"), py::arg("layers"), py::arg("page_tokens"),
+           py::arg("kv_width"), py::arg("tier"), py::keep_alive<1, 2>(),
+           "kv_width is kv_heads * head_dim. The allocator's page size at "
+           "`tier` must be page_bytes(page_tokens, kv_width).")
+      .def("reserve", &KVPages::reserve, py::arg("tokens"),
+           "Pages for positions [0, tokens) in every layer, allocating only "
+           "those not yet held.")
+      .def(
+          "store",
+          [](KVPages &c, int layer, const Span &keys, const Span &values,
+             int start, int n)
+          {
+            non_negative(n, "n");
+            need(keys, n * c.kv_width(), "keys");
+            need(values, n * c.kv_width(), "values");
+            c.store(layer, keys.ptr, values.ptr, start, n);
+          },
+          py::arg("layer"), py::arg("keys"), py::arg("values"),
+          py::arg("start"), py::arg("n"))
+      .def(
+          "attention",
+          [](KVPages &c, int layer, const Span &q, std::optional<Span> k_bias,
+             const microinfer::RopeTable *rope, const Span &out, int seq_q,
+             int seq_k, int heads, int kv_heads, int head_dim)
+          {
+            if (seq_q > seq_k)
+            {
+              throw std::invalid_argument("seq_q " + std::to_string(seq_q) +
+                                          " exceeds seq_k " +
+                                          std::to_string(seq_k));
+            }
+            non_negative(seq_q, "seq_q");
+            need(q, product(seq_q, heads, head_dim), "q");
+            need(out, product(seq_q, heads, head_dim), "out");
+            if (k_bias)
+            {
+              need(*k_bias, product(kv_heads, head_dim), "k_bias");
+            }
+            c.attention(layer, q.ptr, k_bias ? k_bias->ptr : nullptr, rope,
+                        out.ptr, seq_q, seq_k, heads, kv_heads, head_dim);
+          },
+          py::arg("layer"), py::arg("q"), py::arg("k_bias"), py::arg("rope"),
+          py::arg("out"), py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
+          py::arg("kv_heads"), py::arg("head_dim"))
+      .def_property_readonly("page_tokens", &KVPages::page_tokens)
+      .def_property_readonly("pages_per_layer", &KVPages::pages_per_layer)
+      .def_property_readonly("capacity_tokens", &KVPages::capacity_tokens)
+      .def_property_readonly("page_bytes", &KVPages::page_bytes)
+      .def_property_readonly("kv_width", &KVPages::kv_width);
+
+  m.def("page_bytes", &KVPages::page_bytes_for, py::arg("page_tokens"),
+        py::arg("kv_width"),
+        "Bytes in one page: page_tokens rows of keys, then as many of values, "
+        "kv_width fp16 elements each.");
 
   m.def("scratch_elements", &scratch_elements, py::arg("rows"),
         py::arg("vocab"),

@@ -11,7 +11,7 @@
 #include "microinfer/device_buffer.h"
 #include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
-#include "microinfer/rope_angle.cuh"
+#include "microinfer/rope_table.h"
 #include "microinfer/staging.h"
 
 namespace microinfer
@@ -68,25 +68,63 @@ namespace microinfer
     // that reason. Without k_bias, widening fp16 to fp32 is exact, and the
     // arithmetic is what it always was.
     __device__ float rotated_bias(const __half *__restrict__ bias, int position,
-                                  int d, int head_dim, double theta)
+                                  int d, int head_dim,
+                                  const float *__restrict__ rope)
     {
-      // Rotate-half pairing: dimension j with j + half (rope_angle.cuh).
+      // Rotate-half pairing: dimension j with j + half. cos and sin come from
+      // the table (rope_table.h), formed once per position in fp64.
       const int half = head_dim / 2;
       const int j = d < half ? d : d - half;
-      double s, c;
-      rope_sincos(static_cast<double>(position), j, head_dim, theta, &s, &c);
-      const double b1 = __half2float(bias[j]);
-      const double b2 = __half2float(bias[j + half]);
-      return static_cast<float>(d < half ? b1 * c - b2 * s : b2 * c + b1 * s);
+      const float *cs = rope + 2 * (static_cast<size_t>(position) * half + j);
+      const float b1 = __half2float(bias[j]);
+      const float b2 = __half2float(bias[j + half]);
+      return d < half ? b1 * cs[0] - b2 * cs[1] : b2 * cs[0] + b1 * cs[1];
     }
 
-    __global__ void attention_kernel(const __half *__restrict__ q,
-                                     const __half *__restrict__ k,
-                                     const __half *__restrict__ v,
+    // Where key j's row is, and its value's. Two layouts, one kernel: the
+    // arithmetic is shared, so only addressing can differ between them, and
+    // the paged path gives bit-identical output to the contiguous one (#14).
+    //
+    // Contiguous: rows (tokens, kv_heads, head_dim), one after another.
+    struct ContiguousKV
+    {
+      const __half *k;
+      const __half *v;
+      size_t row;
+
+      __device__ const __half *key(int j) const { return k + j * row; }
+      __device__ const __half *value(int j) const { return v + j * row; }
+    };
+
+    // Paged (ADR-0004, ADR-0007): key j is in page j / page_tokens at row
+    // j % page_tokens. A page holds page_tokens rows of keys, then as many of
+    // values. `pages` is the page table for this layer, resolved on the host
+    // for this launch alone, so no launch reads an address an allocator
+    // operation may since have moved.
+    struct PagedKV
+    {
+      const unsigned long long *pages;
+      int page_tokens;
+      size_t row;
+
+      __device__ const __half *key(int j) const
+      {
+        return reinterpret_cast<const __half *>(pages[j / page_tokens]) +
+               (j % page_tokens) * row;
+      }
+      __device__ const __half *value(int j) const
+      {
+        return key(j) + static_cast<size_t>(page_tokens) * row;
+      }
+    };
+
+    template <typename KV>
+    __global__ void attention_kernel(const __half *__restrict__ q, KV kv,
                                      const __half *__restrict__ k_bias,
                                      __half *__restrict__ out, int seq_q,
                                      int seq_k, int heads, int kv_heads,
-                                     int head_dim, float scale, double theta)
+                                     int head_dim, float scale,
+                                     const float *__restrict__ rope)
     {
       extern __shared__ float smem[];
       float *q_s = smem; // kAttentionTileQ x head_dim
@@ -109,7 +147,6 @@ namespace microinfer
       const size_t token_stride = static_cast<size_t>(heads) * head_dim;
       const size_t head_offset = static_cast<size_t>(head) * head_dim;
       const int group = heads / kv_heads;
-      const size_t kv_token_stride = static_cast<size_t>(kv_heads) * head_dim;
       const size_t kv_head_offset =
           static_cast<size_t>(head / group) * head_dim;
 
@@ -147,16 +184,15 @@ namespace microinfer
           const int c = i / head_dim;
           const int d = i % head_dim;
           const bool in_range = k_first + c < seq_k;
-          const size_t at =
-              (k_first + c) * kv_token_stride + kv_head_offset + d;
-          float key = in_range ? __half2float(k[at]) : 0.0f;
+          const size_t at = kv_head_offset + d;
+          float key = in_range ? __half2float(kv.key(k_first + c)[at]) : 0.0f;
           if (k_bias != nullptr && in_range)
           {
             key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
-                                head_dim, theta);
+                                head_dim, rope);
           }
           k_s[i] = key;
-          v_s[i] = in_range ? v[at] : __float2half(0.0f);
+          v_s[i] = in_range ? kv.value(k_first + c)[at] : __float2half(0.0f);
         }
         __syncthreads();
 
@@ -268,41 +304,82 @@ namespace microinfer
 
   } // namespace
 
-  void device::attention(const __half *q, const __half *k, const __half *v,
-                         const __half *k_bias, __half *out, int seq_q,
-                         int seq_k, int heads, int kv_heads, int head_dim,
-                         double theta)
+  namespace
   {
-    check_grouping(heads, kv_heads);
-    if (seq_q <= 0 || heads == 0 || head_dim <= 0)
+
+    template <typename KV>
+    void launch(const __half *q, KV kv, const __half *k_bias,
+                const RopeTable *rope, __half *out, int seq_q, int seq_k,
+                int heads, int kv_heads, int head_dim)
     {
-      return;
+      check_grouping(heads, kv_heads);
+      if (seq_q <= 0 || heads == 0 || head_dim <= 0)
+      {
+        return;
+      }
+      // A bias is completed from the table, which must reach every key.
+      if (k_bias != nullptr &&
+          (rope == nullptr || rope->head_dim() != head_dim ||
+           rope->positions() < seq_k))
+      {
+        throw std::invalid_argument(
+            "a key bias needs a RoPE table for head_dim " +
+            std::to_string(head_dim) + " covering " + std::to_string(seq_k) +
+            " positions");
+      }
+
+      // Past 48 KiB of dynamic shared memory a kernel must opt in. head_dim
+      // 128 stays under it; 256 does not, and head_dim is a parameter. The
+      // opt-in is a driver call, so it is made only when a launch needs more
+      // than any before it, not once per layer per step; one record per
+      // layout, since each is its own kernel. Atomic because the NumPy binding
+      // releases the GIL: two threads may both make the call, which is
+      // harmless, but not race on the variable.
+      const size_t smem = shared_bytes(head_dim);
+      static std::atomic<size_t> opted_in{0};
+      if (smem > opted_in.load())
+      {
+        cuda_check(
+            cudaFuncSetAttribute(attention_kernel<KV>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(smem)),
+            "cudaFuncSetAttribute attention shared memory");
+        opted_in = smem;
+      }
+
+      const dim3 grid((seq_q + kAttentionTileQ - 1) / kAttentionTileQ, heads);
+      const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+      attention_kernel<KV><<<grid, kBlockThreads, smem>>>(
+          q, kv, k_bias, out, seq_q, seq_k, heads, kv_heads, head_dim, scale,
+          k_bias != nullptr ? rope->data() : nullptr);
+      cuda_check(cudaGetLastError(), "attention kernel launch");
     }
 
-    // Past 48 KiB of dynamic shared memory a kernel must opt in. head_dim 128
-    // stays under it; 256 does not, and head_dim is a parameter. The opt-in is
-    // a driver call, so it is made only when a launch needs more than any
-    // before it, not once per layer per step.
-    const size_t smem = shared_bytes(head_dim);
-    // Atomic because the NumPy binding releases the GIL: two threads may both
-    // make the call, which is harmless, but not race on the variable.
-    static std::atomic<size_t> opted_in{0};
-    if (smem > opted_in.load())
-    {
-      cuda_check(
-          cudaFuncSetAttribute(attention_kernel,
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(smem)),
-          "cudaFuncSetAttribute attention shared memory");
-      opted_in = smem;
-    }
+  } // namespace
 
-    const dim3 grid((seq_q + kAttentionTileQ - 1) / kAttentionTileQ, heads);
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    attention_kernel<<<grid, kBlockThreads, smem>>>(q, k, v, k_bias, out, seq_q,
-                                                    seq_k, heads, kv_heads,
-                                                    head_dim, scale, theta);
-    cuda_check(cudaGetLastError(), "attention kernel launch");
+  void device::attention(const __half *q, const __half *k, const __half *v,
+                         const __half *k_bias, const RopeTable *rope,
+                         __half *out, int seq_q, int seq_k, int heads,
+                         int kv_heads, int head_dim)
+  {
+    const size_t row = static_cast<size_t>(kv_heads) * head_dim;
+    launch(q, ContiguousKV{k, v, row}, k_bias, rope, out, seq_q, seq_k, heads,
+           kv_heads, head_dim);
+  }
+
+  void device::attention_paged(const __half *q, const unsigned long long *pages,
+                               int page_tokens, const __half *k_bias,
+                               const RopeTable *rope, __half *out, int seq_q,
+                               int seq_k, int heads, int kv_heads, int head_dim)
+  {
+    if (page_tokens <= 0)
+    {
+      throw std::invalid_argument("page_tokens must be positive, got " +
+                                  std::to_string(page_tokens));
+    }
+    const size_t row = static_cast<size_t>(kv_heads) * head_dim;
+    launch(q, PagedKV{pages, page_tokens, row}, k_bias, rope, out, seq_q, seq_k,
+           heads, kv_heads, head_dim);
   }
 
   void attention(const float *q, const float *k, const float *v,
@@ -327,8 +404,11 @@ namespace microinfer
     upload_fp16(dev_k, k, kv_count, "cudaMemcpy k host-to-device");
     upload_fp16(dev_v, v, kv_count, "cudaMemcpy v host-to-device");
     std::optional<DeviceBuffer> dev_bias;
+    std::optional<RopeTable> rope;
     if (k_bias != nullptr)
     {
+      rope.emplace(head_dim, theta);
+      rope->cover(seq_k);
       const size_t bias_count = static_cast<size_t>(kv_heads) * head_dim;
       dev_bias.emplace(bias_count * sizeof(__half));
       upload_fp16(*dev_bias, k_bias, bias_count,
@@ -338,8 +418,8 @@ namespace microinfer
     device::attention(dev_q.as<const __half>(), dev_k.as<const __half>(),
                       dev_v.as<const __half>(),
                       dev_bias ? dev_bias->as<const __half>() : nullptr,
-                      dev_out.as<__half>(), seq_q, seq_k, heads, kv_heads,
-                      head_dim, theta);
+                      rope ? &*rope : nullptr, dev_out.as<__half>(), seq_q,
+                      seq_k, heads, kv_heads, head_dim);
     cuda_check(cudaDeviceSynchronize(), "attention kernel execution");
 
     download_fp16(out, dev_out, q_count, "cudaMemcpy output device-to-host");

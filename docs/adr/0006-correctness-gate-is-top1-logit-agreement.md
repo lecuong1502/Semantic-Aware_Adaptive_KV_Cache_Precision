@@ -144,6 +144,30 @@ estimate that can only become more lenient. `test_inference.py` asserts both
 halves: the sample never understates the dense mean, and without position 0 it
 agrees with it to within a factor of two.
 
+### Correction from #14: the sample errs both ways
+
+The section above says the sample "errs high, never low". #14 showed that is
+false. It changed how attention completes each key's bias, reading cos and sin
+from a table rounded to fp32 as HuggingFace's are (ADR-0009, note from #14).
+That moved adversarial-00's sampled positions closer to the reference more
+than it moved the prompt as a whole:
+
+| prompt | dense mean KL | sampled mean KL | sampled / dense |
+|---|---:|---:|---:|
+| long-03 | 6.2e-6 | 1.0e-4 | 16 |
+| adversarial-00 | 1.10e-2 | 5.3e-3 | **0.48** |
+
+Where the divergence concentrates at positions the sample misses, the sample
+understates it by half. Neither direction is guaranteed. What the gate needs
+is narrower: the sample must not *decide* it. Putting both prompts' dense means
+in place of their samples moves the gate's KL from 4.4e-4 to 7.1e-4, still
+under 1e-3, so the verdict is unchanged. `test_inference.py` now asserts exactly
+that, instead of a one-sided bound.
+
+A KL figure against this gate is therefore a sample mean that may be off by a
+factor of two for a prompt like adversarial-00. The gate's margin should be
+read with that in mind. At 7.1e-4 on the dense estimate, it is about 30%.
+
 ### Consequences
 
 - A gate report states both terms separately. The top-1 figure is exact; the KL

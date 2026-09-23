@@ -35,15 +35,24 @@ pybind11_add_module(_microinfer
   src/core_kernels/device.cu
   src/core_kernels/device_tensor.cu
   src/core_kernels/embed.cu
+  src/core_kernels/kv_pages.cu
   src/core_kernels/linear.cu
   src/core_kernels/paged_kv_cache.cu
   src/core_kernels/residual.cu
   src/core_kernels/rmsnorm.cu
   src/core_kernels/rope.cu
+  src/core_kernels/rope_table.cu
   src/core_kernels/swiglu.cu
 )
 
 target_include_directories(_microinfer PRIVATE src/core_kernels/include)
+
+# P, token positions per page (ADR-0004). A build-time parameter, and the only
+# place it is set: Milestone 3 ablates it over 16, 32 and 64 by rebuilding with
+# -DMICROINFER_PAGE_TOKENS=<P>.
+set(MICROINFER_PAGE_TOKENS 32 CACHE STRING "Token positions per KV cache page")
+target_compile_definitions(_microinfer PRIVATE
+  MICROINFER_PAGE_TOKENS=${MICROINFER_PAGE_TOKENS})
 
 # CUDA::cuda_driver is libcuda, the driver API. It is NOT the same as
 # CUDA::cudart, and ADR-0007's allocator needs it: cuMemAddressReserve,
