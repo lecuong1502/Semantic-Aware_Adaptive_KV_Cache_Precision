@@ -45,6 +45,17 @@ position, so one span of text may be held at different tiers in different
 layers.
 _Avoid_: precision level, quantisation level, bit-width
 
+### Inference
+
+**Prefill chunk**:
+A span of consecutive token positions of a prompt that one step of prefill
+runs through the model together, `prefill_chunk` of them at a time. It is a
+unit of work, not of memory: it sizes the workspace, never the cache, and its
+boundaries bear no relation to pages or granules. The bare word "chunk" means
+this and nothing else.
+_Avoid_: batch (there is one sequence), block, window (that is the model's
+context window)
+
 ### The control loop
 
 **Pressure level**:

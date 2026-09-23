@@ -257,8 +257,8 @@ def test_peak_memory_is_reported_and_matches_what_the_driver_saw(engine):
     # The paged cache holds whole granules for the pages its positions need
     # (ADR-0007), and the RoPE table that completes its keys: that, not the
     # positions' own bytes, is what the driver lost.
-    # The peak is at the end of prefill, while the whole prompt's workspace is
-    # alive, so the cache then holds the prompt's positions.
+    # The peak is at the end of prefill, while one prefill chunk's workspace
+    # is alive, so the cache then holds the prompt's positions.
     assert_cache_holds(peak.kv_cache, cfg, prompt)
     assert peak.workspace == Workspace(cfg, rows=min(prompt, engine.prefill_chunk)).nbytes
     assert peak.weights == sum(t.nbytes for t in engine.tensors.values())

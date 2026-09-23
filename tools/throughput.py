@@ -60,9 +60,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--lengths", type=int, nargs="+", default=[512, 2048, 8192])
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
 
-    if benchlog.environment()["git_dirty"]:
+    if benchlog.environment(args.log)["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first")
 
     engine = Engine(REPO / "models" / args.model)
@@ -84,12 +85,13 @@ def main(argv: list[str]) -> int:
         peak = engine.peak_footprint()
         prefill = {"tokens": length, "seconds": seconds, "tokens_per_second": length / seconds,
                    "peak": {"weights": peak.weights, "kv_cache": peak.kv_cache,
-                            "workspace": peak.workspace, "device_free": peak.device_free,
+                            "workspace": peak.workspace, "engine_total": peak.engine_total,
+                            "unaccounted": peak.unaccounted, "device_free": peak.device_free,
                             "device_total": peak.device_total}}
         print(f"prefill {length:6} tokens: {seconds:8.2f} s, {length / seconds:9.1f} tok/s, "
               f"free at peak {peak.device_free / 2**20:.0f} MiB")
         benchlog.append("prefill-throughput", model=args.model, context_length=length,
-                        precision_tiers=tiers, config=method, results=prefill)
+                        precision_tiers=tiers, config=method, results=prefill, log=args.log)
 
         # Decode: generation of one token (prefill and its greedy choice)
         # and of DECODE_STEPS more are both timed; the difference is the
@@ -108,7 +110,7 @@ def main(argv: list[str]) -> int:
         benchlog.append("decode-throughput", model=args.model,
                         context_length=len(prompt) + DECODE_STEPS,
                         precision_tiers=tiers, config={**method, "steps": DECODE_STEPS},
-                        results=decode)
+                        results=decode, log=args.log)
     return 0
 
 

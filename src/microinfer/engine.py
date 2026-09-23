@@ -190,10 +190,11 @@ class Engine:
         self._check_window(len(ids))
         cache = self._new_cache(capacity=len(ids))
         logits, states = [], []
-        for chunk, ws in self._prefill(cache, ids, hidden_states=capture_hidden_states):
+        chunks = self._prefill(cache, ids, hidden_states=capture_hidden_states)
+        for chunk, ws, captured, _ in chunks:
             logits.append(self._model.logits(ws, len(chunk)))
             if capture_hidden_states:
-                states.append(np.stack(ws.captured))
+                states.append(np.stack(captured))
         logits = np.concatenate(logits)
         if capture_hidden_states:
             # Each chunk captured every state for its own positions.
@@ -219,8 +220,8 @@ class Engine:
         self._check_window(len(ids) + max_new_tokens - 1)
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
         out: list[int] = []
-        for chunk, ws in self._prefill(cache, ids):
-            if cache.length == len(ids):  # the last chunk: its last row decides
+        for chunk, ws, _, last in self._prefill(cache, ids):
+            if last:  # the prompt's last row decides the first new token
                 out.append(self._model.greedy_last(ws, len(chunk)))
 
         step = model.Workspace(self.config, rows=1)
@@ -257,9 +258,10 @@ class Engine:
                              f"{window}: shorten the prompt or ask for fewer new tokens")
 
     def _prefill(self, cache, ids: np.ndarray, *, hidden_states: bool = False):
-        """Run `ids` into `cache` a chunk at a time, yielding each chunk and
-        the workspace holding its final-normed states, which the next chunk
-        overwrites.
+        """Run `ids` into `cache` a chunk at a time. Yields, per chunk: the
+        chunk's ids; the workspace holding its final-normed states, which the
+        next chunk overwrites; the hidden states it captured, if asked for,
+        else None; and whether it is the prompt's last chunk.
 
         One workspace serves every chunk, sized to the chunk rather than to the
         prompt (#15). The cache already continues a sequence from its length:
@@ -271,9 +273,9 @@ class Engine:
         with self._holding(cache, ws):
             for start in range(0, n, size):
                 chunk = ids[start:start + size]
-                ws.captured = [] if hidden_states else None
-                self._model.run(ws, cache, chunk, ws.captured)
-                yield chunk, ws
+                captured = [] if hidden_states else None
+                self._model.run(ws, cache, chunk, captured)
+                yield chunk, ws, captured, start + size >= n
 
     def _new_cache(self, capacity: int):
         """A cache for one sequence. The contiguous one is sized for `capacity`
