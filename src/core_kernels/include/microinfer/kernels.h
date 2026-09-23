@@ -64,9 +64,9 @@ namespace microinfer
   // (seq_q == 1) are the same rule.
   //
   // Grouped-query attention: kv_heads divides heads, and query head h reads KV
-  // head h / (heads / kv_heads), HuggingFace's repeat_kv order. Both Qwen2.5
-  // models use kv_heads = 2; kv_heads == heads is ordinary multi-head
-  // attention.
+  // head h / (heads / kv_heads), HuggingFace's repeat_kv order. kv_heads ==
+  // heads is ordinary multi-head attention. A head count that does not group,
+  // or zero heads on one side only, throws std::invalid_argument.
   void attention(const float *q, const float *k, const float *v, float *out,
                  int seq_q, int seq_k, int heads, int kv_heads, int head_dim);
 

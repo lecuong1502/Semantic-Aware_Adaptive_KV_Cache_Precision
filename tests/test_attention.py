@@ -224,11 +224,16 @@ def test_grouped_decode_one_query_sees_every_key(name):
                     kv_heads=cfg.num_key_value_heads))
 
 
+@pytest.mark.parametrize("name", MODELS)
 @pytest.mark.parametrize("heads,kv_heads", [(8, 1), (8, 2), (8, 4), (6, 3), (7, 1), (12, 12)])
-def test_grouping_factor_is_a_parameter(heads, kv_heads):
+def test_grouping_factor_is_a_parameter(name, heads, kv_heads):
     """Group sizes the models do not use, including one KV head for all (MQA)
-    and none shared at all, so nothing can quietly assume 7 or 6."""
-    check(*make_qkv(TILE_K + 5, TILE_K + 5, heads, 64, seed=heads * 10 + kv_heads,
+    and none shared at all, so nothing can quietly assume 7 or 6.
+
+    The head counts are literals because not being the cards' is the point.
+    head_dim is not: it comes from each card, as in every other numerics test."""
+    head_dim = ModelConfig.from_card(name).head_dim
+    check(*make_qkv(TILE_K + 5, TILE_K + 5, heads, head_dim, seed=heads * 10 + kv_heads,
                     kv_heads=kv_heads))
 
 
@@ -391,6 +396,18 @@ def test_rejects_head_counts_that_do_not_group(heads, kv_heads):
     q, k, v = make_qkv(4, 4, heads, 64, kv_heads=kv_heads)
     with pytest.raises(ValueError, match="head"):
         _microinfer.attention(q, k, v)
+
+
+def test_zero_heads_is_empty_only_when_both_sides_have_none():
+    """No heads on either side is an empty computation, as zero tokens is. No
+    heads on one side only has no grouping: 0 query heads over 2 KV heads would
+    make every group empty, and 2 over 0 would divide by zero in the kernel."""
+    q, k, v = make_qkv(4, 4, 0, 64, kv_heads=0)
+    assert _microinfer.attention(q, k, v).shape == (4, 0, 64)
+    for heads, kv_heads in [(0, 2), (2, 0)]:
+        q, k, v = make_qkv(4, 4, heads, 64, kv_heads=kv_heads)
+        with pytest.raises(ValueError, match="both are zero or neither"):
+            _microinfer.attention(q, k, v)
 
 
 def test_rejects_mismatched_key_and_value_shapes():

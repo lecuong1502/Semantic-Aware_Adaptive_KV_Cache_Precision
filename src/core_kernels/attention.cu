@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
@@ -209,7 +211,25 @@ namespace microinfer
   void attention(const float *q, const float *k, const float *v, float *out,
                  int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
   {
-    if (seq_q <= 0 || heads <= 0 || kv_heads <= 0 || head_dim <= 0)
+    // Checked here rather than only at the binding: the kernel divides by
+    // heads / kv_heads, so a count that does not group is a division by zero
+    // or a silently wrong KV head, whoever the caller is.
+    if (heads < 0 || kv_heads < 0 || (heads == 0) != (kv_heads == 0))
+    {
+      throw std::invalid_argument(
+          std::to_string(heads) + " query heads and " +
+          std::to_string(kv_heads) +
+          " KV heads: either both are zero or neither is");
+    }
+    if (kv_heads > 0 && heads % kv_heads != 0)
+    {
+      throw std::invalid_argument(
+          std::to_string(heads) + " query heads and " +
+          std::to_string(kv_heads) +
+          " KV heads: the KV head count must divide the query head count, so "
+          "that every KV head serves the same number of query heads");
+    }
+    if (seq_q <= 0 || heads == 0 || head_dim <= 0)
     {
       return; // No elements exist, so there is nothing to write.
     }
