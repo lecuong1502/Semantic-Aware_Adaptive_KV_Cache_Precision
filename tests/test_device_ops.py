@@ -20,7 +20,7 @@ because what they check is a shape the model never has.
 
 import numpy as np
 import pytest
-from ulp_gate import fp16_exact, fp32_accumulation_bound
+from ulp_gate import assert_within_gate, fp16_exact, fp32_accumulation_bound
 
 from microinfer import _microinfer
 from microinfer.config import ModelConfig
@@ -182,6 +182,63 @@ def test_greedy_breaks_ties_to_the_lowest_index(cfg):
         tied[late] = head[best]
         first = min(best, late)
         assert device.greedy(put(x), put(tied), scratch(1, vocab), 0, 1, hidden, vocab)[0] == first
+
+
+# -- the fp32 residual stream (ADR-0010) ----------------------------------
+
+
+def test_the_embedding_widens_exactly_to_fp32(cfg):
+    vocab, hidden = VOCAB_SLICE, cfg.hidden_size
+    table = normal(vocab, hidden)
+    ids = np.array([3, 0, vocab - 1], np.int32)
+    out = device.empty_f32(len(ids) * hidden)
+    device.embed_f32(device.index(ids), put(table), out, hidden, vocab)
+    np.testing.assert_array_equal(out.to_numpy().reshape(len(ids), hidden), table[ids])
+
+
+def test_rmsnorm_of_fp32_is_the_tested_kernel_on_fp16_exact_input(cfg):
+    """Every element is widened to fp32 on read, so an fp16-exact input gives
+    the fp16 path's bits exactly."""
+    rows, hidden = 5, cfg.hidden_size
+    x, w = normal(rows, hidden), normal(hidden)
+    x32 = device.upload_f32(x)
+    out = device.empty(x.size)
+    device.rmsnorm_f32(x32, put(w), out, rows, hidden, cfg.rms_norm_eps)
+    np.testing.assert_array_equal(get(out, x.shape), _microinfer.rmsnorm(x, w, cfg.rms_norm_eps))
+
+
+def test_rmsnorm_of_fp32_meets_the_gate_on_input_fp16_cannot_hold(cfg):
+    """The point of the fp32 residual: inputs with more precision than fp16,
+    normalised without being rounded to fp16 first. Held to ADR-0006's gate
+    against float64, as a product-shaped kernel, with no floor."""
+    rows, hidden = 4, cfg.hidden_size
+    x = (RNG.standard_normal((rows, hidden)) * 300).astype(np.float32)
+    x[:, 0] += 1700  # a massive activation, as the residual carries from layer 3 on
+    w = normal(hidden)
+    x32 = device.upload_f32(x)
+    out = device.empty(x.size)
+    device.rmsnorm_f32(x32, put(w), out, rows, hidden, cfg.rms_norm_eps)
+    x64 = x.astype(np.float64)
+    ref = x64 / np.sqrt((x64 * x64).mean(-1, keepdims=True) + cfg.rms_norm_eps) * w
+    assert_within_gate(get(out, x.shape), ref)
+
+
+def test_a_projection_accumulates_into_fp32_without_rounding(cfg):
+    """out += x W^T in fp32, twice, as the o_proj and down_proj updates of one
+    layer do; within fp32 accumulation of float64, with the terms of both the
+    sums and the residual they are added to."""
+    rows, n_in, n_out = 3, cfg.intermediate_size, cfg.hidden_size
+    x, w = normal(rows, n_in), normal(n_out, n_in, scale=n_in**-0.5)
+    r = (RNG.standard_normal((rows, n_out)) * 500).astype(np.float32)
+    out = device.upload_f32(r)
+    device.linear_accumulate(put(x), put(w), out, rows, n_in, n_out)
+    device.linear_accumulate(put(x), put(w), out, rows, n_in, n_out)
+    x64, w64 = x.astype(np.float64), w.astype(np.float64)
+    ref = r + 2 * (x64 @ w64.T)
+    terms = np.abs(r) + 2 * (np.abs(x64) @ np.abs(w64).T)
+    bound = fp32_accumulation_bound(terms, 2 * n_in + 1)
+    got = out.to_numpy().reshape(rows, n_out)
+    assert np.all(np.abs(got - ref) <= bound), np.max(np.abs(got - ref) / bound)
 
 
 # -- bounds -----------------------------------------------------------------

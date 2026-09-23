@@ -200,6 +200,84 @@ void bind_device(py::module_ &parent)
       [](size_t count) { return std::make_unique<DeviceTensor>(count); },
       py::arg("count"), "Uninitialised fp16 storage on the device.");
 
+  using microinfer::DeviceFloats;
+  py::class_<DeviceFloats>(m, "FloatTensor",
+                           "fp32 on the device: the residual stream "
+                           "(ADR-0010).")
+      .def_property_readonly("numel", &DeviceFloats::count)
+      .def_property_readonly("nbytes", &DeviceFloats::nbytes)
+      .def("to_numpy",
+           [](const DeviceFloats &t)
+           {
+             py::array_t<float> out(static_cast<py::ssize_t>(t.count()));
+             t.download(out.mutable_data());
+             return out;
+           });
+  m.def(
+      "empty_f32",
+      [](size_t count) { return std::make_unique<DeviceFloats>(count); },
+      py::arg("count"), "Uninitialised fp32 storage on the device.");
+
+  m.def(
+      "upload_f32",
+      [](py::array_t<float, py::array::c_style | py::array::forcecast> host)
+      {
+        auto t =
+            std::make_unique<DeviceFloats>(static_cast<size_t>(host.size()));
+        if (t->count() > 0)
+        {
+          microinfer::cuda_check(cudaMemcpy(t->data(), host.data(), t->nbytes(),
+                                            cudaMemcpyHostToDevice),
+                                 "cudaMemcpy fp32 host-to-device");
+        }
+        return t;
+      },
+      py::arg("host"), "fp32 values to the device, unrounded.");
+
+  m.def(
+      "embed_f32",
+      [](const DeviceIndex &ids, const Span &table, DeviceFloats &out,
+         int hidden, int vocab)
+      {
+        const int count = static_cast<int>(ids.count());
+        need(table, product(vocab, hidden), "table");
+        need(out, product(count, hidden), "out");
+        microinfer::device::embed_f32(ids.data(), table.ptr, out.data(), count,
+                                      hidden, vocab);
+      },
+      py::arg("ids"), py::arg("table"), py::arg("out"), py::arg("hidden"),
+      py::arg("vocab"), "The embedding gather, widened exactly to fp32.");
+
+  m.def(
+      "rmsnorm_f32",
+      [](const DeviceFloats &x, const Span &weight, const Span &out, int rows,
+         int hidden, float eps)
+      {
+        need(x, product(rows, hidden), "x");
+        need(weight, hidden, "weight");
+        need(out, product(rows, hidden), "out");
+        microinfer::device::rmsnorm_f32(x.data(), weight.ptr, out.ptr, rows,
+                                        hidden, eps);
+      },
+      py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("rows"),
+      py::arg("hidden"), py::arg("eps"), "RMSNorm of an fp32 input to fp16.");
+
+  m.def(
+      "linear_accumulate",
+      [](const Span &x, const Span &weight, DeviceFloats &out, int rows,
+         int in_features, int out_features)
+      {
+        need(x, product(rows, in_features), "x");
+        need(weight, product(out_features, in_features), "weight");
+        need(out, product(rows, out_features), "out");
+        microinfer::device::linear_accumulate(x.ptr, weight.ptr, out.data(),
+                                              rows, in_features, out_features);
+      },
+      py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("rows"),
+      py::arg("in_features"), py::arg("out_features"),
+      "out += x @ weight.T in fp32: a projection added into the residual "
+      "stream with no fp16 rounding (ADR-0010).");
+
   py::class_<DeviceIndex>(m, "DeviceIndex", "int32 on the device.")
       .def_property_readonly("count", &DeviceIndex::count);
   m.def(

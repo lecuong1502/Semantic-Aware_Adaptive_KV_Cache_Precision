@@ -112,4 +112,29 @@ namespace microinfer
     }
   }
 
+  DeviceFloats::DeviceFloats(size_t count) : count_(count)
+  {
+    if (count > 0)
+    {
+      cuda_check(cudaMalloc(&ptr_, count * sizeof(float)), "cudaMalloc");
+    }
+  }
+
+  DeviceFloats::~DeviceFloats()
+  {
+    if (ptr_ != nullptr)
+    {
+      cudaFree(ptr_);
+    }
+  }
+
+  void DeviceFloats::download(float *out) const
+  {
+    if (count_ > 0)
+    {
+      cuda_check(cudaMemcpy(out, ptr_, nbytes(), cudaMemcpyDeviceToHost),
+                 "cudaMemcpy fp32 device-to-host");
+    }
+  }
+
 } // namespace microinfer

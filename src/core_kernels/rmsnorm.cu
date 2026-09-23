@@ -24,10 +24,16 @@ namespace microinfer
     // One block per row. Accumulation is fp32 throughout; only the store is
     // fp16, so the error is a single rounding at the end rather than a drift
     // accumulated across `hidden` additions.
-    __global__ void rmsnorm_kernel(const __half *__restrict__ x,
-                                   const __half *__restrict__ weight,
-                                   __half *__restrict__ out, int hidden,
-                                   float eps)
+    // Reads fp16 or fp32. The residual stream is fp32 (ADR-0010), and is
+    // normalised from there without passing through fp16 first; the arithmetic
+    // is the same either way, since every element is widened to fp32 on read.
+    __device__ inline float widen(__half v) { return __half2float(v); }
+    __device__ inline float widen(float v) { return v; }
+
+    template <typename In>
+    __global__ void
+    rmsnorm_kernel(const In *__restrict__ x, const __half *__restrict__ weight,
+                   __half *__restrict__ out, int hidden, float eps)
     {
       __shared__ float partials[kMaxWarpsPerBlock];
       __shared__ float scale;
@@ -37,7 +43,7 @@ namespace microinfer
       float acc = 0.0f;
       for (int i = threadIdx.x; i < hidden; i += blockDim.x)
       {
-        const float v = __half2float(x[row + i]);
+        const float v = widen(x[row + i]);
         acc += v * v;
       }
 
@@ -72,13 +78,23 @@ namespace microinfer
 
       for (int i = threadIdx.x; i < hidden; i += blockDim.x)
       {
-        const float v =
-            __half2float(x[row + i]) * scale * __half2float(weight[i]);
+        const float v = widen(x[row + i]) * scale * __half2float(weight[i]);
         out[row + i] = __float2half(v);
       }
     }
 
   } // namespace
+
+  void device::rmsnorm_f32(const float *x, const __half *weight, __half *out,
+                           int rows, int hidden, float eps)
+  {
+    if (rows <= 0 || hidden <= 0)
+    {
+      return;
+    }
+    rmsnorm_kernel<<<rows, kBlockThreads>>>(x, weight, out, hidden, eps);
+    cuda_check(cudaGetLastError(), "rmsnorm kernel launch");
+  }
 
   void device::rmsnorm(const __half *x, const __half *weight, __half *out,
                        int rows, int hidden, float eps)

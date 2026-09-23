@@ -29,6 +29,10 @@ namespace microinfer
     void rmsnorm(const __half *x, const __half *weight, __half *out, int rows,
                  int hidden, float eps);
 
+    // The same RMSNorm reading an fp32 input: the residual stream (ADR-0010).
+    void rmsnorm_f32(const float *x, const __half *weight, __half *out,
+                     int rows, int hidden, float eps);
+
     // positions is on the device: one int32 per token.
     void rope(const __half *x, const int32_t *positions, __half *out, int seq,
               int heads, int head_dim, double theta);
@@ -46,6 +50,11 @@ namespace microinfer
     // before a single comparison was made.
     void linear_fp32_out(const __half *x, const __half *weight, float *out,
                          int rows, int in_features, int out_features);
+
+    // out += x W^T, with out in fp32: a projection added into the fp32
+    // residual stream inside the GEMM, never rounded to fp16 (ADR-0010).
+    void linear_accumulate(const __half *x, const __half *weight, float *out,
+                           int rows, int in_features, int out_features);
 
     // k_bias, when non-null, is the key projection's bias, (kv_heads,
     // head_dim), which k was stored without (ADR-0009): each key is completed
@@ -76,6 +85,9 @@ namespace microinfer
     // out[i] = table[ids[i]], a row of `hidden` each. ids is on the device.
     void embed(const int32_t *ids, const __half *table, __half *out, int count,
                int hidden, int vocab);
+    // The same gather, widened to fp32: the start of the residual stream.
+    void embed_f32(const int32_t *ids, const __half *table, float *out,
+                   int count, int hidden, int vocab);
 
     // out = a + b, in fp32, rounded once. out may alias a or b: the residual
     // stream is updated in place.
