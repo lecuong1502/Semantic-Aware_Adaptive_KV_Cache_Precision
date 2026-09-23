@@ -118,6 +118,32 @@ at least one prompt, and either confirm 16 or change it. Until that is done, a
 KL figure quoted against this gate should say it is a sample mean over 16
 positions per prompt.
 
+### Validated by #12: 16 is kept, and the sample errs high
+
+#12 had the reference keep logits at every position for two prompts, and
+compared the 16-position sample mean of KL against the dense mean with the
+engine producing logits:
+
+| prompt | positions | dense mean KL | sampled mean KL | position 0's share of the total | sampled / dense, position 0 excluded |
+|---|---:|---:|---:|---:|---:|
+| long-03 | 441 | 6.3e-6 | 1.0e-4 | 56% | 1.5 |
+| adversarial-00 | 207 | 1.31e-2 | 1.28e-2 | 0.1% | 1.02 |
+
+**The sample errs high, never low.** It always includes position 0, and on an
+ordinary prompt the first position carries most of the KL there is. At a
+weight of 1/16 rather than 1/441, it makes long-03's sample mean sixteen times
+its dense one. Where the engine and the reference really differ, as on
+adversarial-00, the difference is spread along the sequence, and the sample
+lands within 3% of the dense mean.
+
+So a KL figure against this gate is an **over**-estimate for ordinary prompts:
+conservative, and in the direction that fails a good engine rather than passing
+a bad one. Sixteen positions are kept, and so is position 0. Removing it would
+make the estimate fairer, but it would change every stored reference to buy an
+estimate that can only become more lenient. `test_inference.py` asserts both
+halves: the sample never understates the dense mean, and without position 0 it
+agrees with it to within a factor of two.
+
 ### Consequences
 
 - A gate report states both terms separately. The top-1 figure is exact; the KL

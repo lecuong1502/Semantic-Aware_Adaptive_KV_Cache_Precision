@@ -27,6 +27,11 @@
 
 # Runtime
 numpy==2.5.3
+# The engine's tokeniser (#12): HuggingFace's Rust library, reading the
+# checkpoint's own tokenizer.json. No torch and no CUDA, so it may share the
+# engine's process. The same version as the golden environment's, so both
+# sides tokenise identically; test_inference.py checks they do.
+tokenizers==0.23.2
 
 # Build. Needed explicitly only for `pip install -e . --no-build-isolation`;
 # an isolated build resolves these from pyproject.toml's build-system.requires.
@@ -43,3 +48,19 @@ packaging==26.3
 pathspec==1.1.1
 pluggy==1.6.0
 Pygments==2.21.0
+# Through tokenizers, which depends on huggingface_hub even when, as here,
+# nothing is ever downloaded: the tokeniser is read from models/.
+huggingface_hub==1.32.0
+anyio==4.15.1
+certifi==2026.7.22
+click==8.5.0
+filelock==3.32.7
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+PyYAML==6.0.3
+tqdm==4.70.1
+typing_extensions==4.16.0

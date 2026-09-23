@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Semantic-aware adaptive KV cache precision for single-user LLM inference under VRAM contention"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-dependencies = ["numpy>=1.26"]
+dependencies = ["numpy>=1.26", "tokenizers>=0.23"]
 
 # PyTorch is deliberately absent, and must stay absent. ADR-0002: its caching
 # allocator retains freed device memory, so NVML would report that reservation

@@ -49,6 +49,14 @@ namespace microinfer
     }
   }
 
+  DeviceTensor::DeviceTensor(size_t count) : count_(count)
+  {
+    if (count > 0)
+    {
+      cuda_check(cudaMalloc(&ptr_, count * sizeof(__half)), "cudaMalloc");
+    }
+  }
+
   DeviceTensor::~DeviceTensor()
   {
     if (ptr_ != nullptr)
@@ -70,6 +78,37 @@ namespace microinfer
     for (size_t i = 0; i < count_; ++i)
     {
       out[i] = __half2float(staged[i]);
+    }
+  }
+
+  DeviceIndex::DeviceIndex(const int32_t *host, size_t count) : count_(count)
+  {
+    if (count == 0)
+    {
+      return;
+    }
+    cuda_check(cudaMalloc(&ptr_, count * sizeof(int32_t)), "cudaMalloc");
+    // As in DeviceTensor: a throw after the allocation would otherwise leak it.
+    try
+    {
+      cuda_check(cudaMemcpy(ptr_, host, count * sizeof(int32_t),
+                            cudaMemcpyHostToDevice),
+                 "cudaMemcpy indices host-to-device");
+    }
+    catch (...)
+    {
+      cudaFree(ptr_);
+      ptr_ = nullptr;
+      count_ = 0;
+      throw;
+    }
+  }
+
+  DeviceIndex::~DeviceIndex()
+  {
+    if (ptr_ != nullptr)
+    {
+      cudaFree(ptr_);
     }
   }
 

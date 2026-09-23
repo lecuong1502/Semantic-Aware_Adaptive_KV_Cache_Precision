@@ -6,9 +6,10 @@ A from-scratch inference engine — `MicroInfer` — that reallocates KV cache
 precision at runtime, guided by attention-derived importance, when another
 application on the same GPU takes video memory away.
 
-> **Status: Milestone 0, in progress. There is no working engine yet.**
-> The repository currently holds research notes, architectural decisions and a
-> ticketed plan. See [Status](#status).
+> **Status: Milestone 0, in progress.** The non-paged FP16 engine runs
+> Qwen2.5-0.5B-Instruct end to end and passes the correctness gate against
+> HuggingFace: 99.81% top-1 agreement and a mean KL of 8.0e-4 (#12). Paging
+> and the quantised tiers come next. See [Status](#status).
 
 ---
 

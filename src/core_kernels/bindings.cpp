@@ -13,6 +13,9 @@
 
 namespace py = pybind11;
 
+// bindings_device.cpp: the engine's forward pass, on device memory.
+void bind_device(py::module_ &parent);
+
 namespace
 {
 
@@ -197,7 +200,8 @@ namespace
     return out;
   }
 
-  py::array_t<float> attention(FloatArray q, FloatArray k, FloatArray v)
+  py::array_t<float> attention(FloatArray q, FloatArray k, FloatArray v,
+                               std::optional<FloatArray> k_bias, double theta)
   {
     for (const auto *a : {&q, &k, &v})
     {
@@ -230,11 +234,26 @@ namespace
           ": queries align to the last keys, so there must be at least as "
           "many keys as queries");
     }
+    if (k_bias && (k_bias->ndim() != 2 || k_bias->shape(0) != k.shape(1) ||
+                   k_bias->shape(1) != k.shape(2)))
+    {
+      throw std::invalid_argument("k_bias must be (kv_heads, head_dim) = (" +
+                                  std::to_string(k.shape(1)) + ", " +
+                                  std::to_string(k.shape(2)) + "), got " +
+                                  shape_of(*k_bias));
+    }
+    if (k_bias && !(theta > 0.0))
+    {
+      throw std::invalid_argument(
+          "theta must be positive when k_bias is given, got " +
+          std::to_string(theta));
+    }
 
     py::array_t<float> out({q.shape(0), q.shape(1), q.shape(2)});
     const float *q_ptr = q.data();
     const float *k_ptr = k.data();
     const float *v_ptr = v.data();
+    const float *bias_ptr = k_bias ? k_bias->data() : nullptr;
     float *out_ptr = out.mutable_data();
     const int seq_q = static_cast<int>(q.shape(0));
     const int seq_k = static_cast<int>(k.shape(0));
@@ -243,8 +262,8 @@ namespace
     const int head_dim = static_cast<int>(q.shape(2));
     {
       py::gil_scoped_release release;
-      microinfer::attention(q_ptr, k_ptr, v_ptr, out_ptr, seq_q, seq_k, heads,
-                            kv_heads, head_dim);
+      microinfer::attention(q_ptr, k_ptr, v_ptr, bias_ptr, out_ptr, seq_q,
+                            seq_k, heads, kv_heads, head_dim, theta);
     }
     return out;
   }
@@ -376,16 +395,21 @@ PYBIND11_MODULE(_microinfer, m)
         "fp16 operands, fp32 accumulation, one fp16 rounding on store.");
 
   m.def("attention", &attention, py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("k_bias") = py::none(), py::arg("theta") = 0.0,
         "Causal attention with online softmax over q (seq_q, heads, head_dim) "
         "and k, v (seq_k, kv_heads, head_dim), seq_q <= seq_k;\n"
         "kv_heads must divide heads (grouped-query attention). Queries align "
         "to the last keys. No score matrix or mask is "
-        "materialised.");
+        "materialised.\n"
+        "k_bias (kv_heads, head_dim), if given, completes keys stored without "
+        "their bias: key row j is k + RoPE(k_bias, j) with theta (ADR-0009).");
 
   py::dict tiles;
   tiles["query"] = microinfer::kAttentionTileQ;
   tiles["key"] = microinfer::kAttentionTileK;
   m.attr("attention_tiles") = tiles;
+
+  bind_device(m);
 
   using microinfer::PagedKVCache;
   using microinfer::PageKey;

@@ -95,6 +95,25 @@ LOGIT_SAMPLES = 16
 #: a red gate on a long one with nothing to localise it.
 HIDDEN_GROUPS = {"short", "adversarial"}
 
+#: ADR-0006's smoke test: greedy continuations of this many tokens, for this
+#: many prompts spread evenly over the set so that every group is represented.
+SMOKE_PROMPTS = 10
+SMOKE_TOKENS = 64
+
+#: Prompts whose logits are kept at *every* position, in a file of their own.
+#: ADR-0006's second amendment makes #12 validate the 16-position KL sample
+#: against a dense mean for at least one prompt. adversarial-00 is the prompt
+#: on which the engine and the reference differ most, so it is where a sample
+#: is most likely to mislead; long-03 is an ordinary long prompt beside it.
+DENSE_PROMPTS = ("adversarial-00", "long-03")
+
+#: Greedy means greedy. The instruct checkpoints' generation_config.json sets
+#: do_sample, temperature, top_p, top_k and a repetition_penalty of 1.1, and
+#: HuggingFace applies the penalty even when sampling is off. Each is overridden
+#: explicitly, so the reference is argmax at every step and nothing else.
+GREEDY = {"do_sample": False, "num_beams": 1, "repetition_penalty": 1.0,
+          "temperature": None, "top_p": None, "top_k": None}
+
 
 def sample_positions(length: int, count: int) -> np.ndarray:
     """Positions to keep full logits for: deterministic, evenly spaced, and
@@ -108,6 +127,12 @@ def sample_positions(length: int, count: int) -> np.ndarray:
     return positions
 
 
+def smoke_ids(prompts: list[dict]) -> set[str]:
+    """SMOKE_PROMPTS prompts, evenly spaced over the set, first and last included."""
+    picks = np.linspace(0, len(prompts) - 1, min(SMOKE_PROMPTS, len(prompts))).round().astype(int)
+    return {prompts[i]["id"] for i in picks}
+
+
 def generate(model_dir: Path, prompts_path: Path, out_dir: Path, seed: int) -> None:
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(True)
@@ -118,6 +143,7 @@ def generate(model_dir: Path, prompts_path: Path, out_dir: Path, seed: int) -> N
     model.eval()
 
     prompts = load_prompts(prompts_path)
+    smoke = smoke_ids(prompts)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = {
@@ -132,6 +158,9 @@ def generate(model_dir: Path, prompts_path: Path, out_dir: Path, seed: int) -> N
         "transformers": transformers.__version__,
         "logit_samples": LOGIT_SAMPLES,
         "hidden_groups": sorted(HIDDEN_GROUPS),
+        "smoke_tokens": SMOKE_TOKENS,
+        "greedy": {k: v for k, v in GREEDY.items() if v is not None},
+        "dense_prompts": list(DENSE_PROMPTS),
         "prompts": [],
     }
 
@@ -162,14 +191,27 @@ def generate(model_dir: Path, prompts_path: Path, out_dir: Path, seed: int) -> N
             stacked = torch.stack(out.hidden_states)[:, 0]
             arrays["hidden_states"] = stacked[:, positions].numpy().astype(np.float32)
 
+        if prompt["id"] in smoke:
+            with torch.no_grad():
+                continued = model.generate(ids, attention_mask=torch.ones_like(ids),
+                                           max_new_tokens=SMOKE_TOKENS, **GREEDY)
+            # New tokens only, ending at an end-of-sequence token if one came
+            # first; generate includes it, and so does the engine.
+            arrays["generated"] = continued[0, ids.shape[1]:].numpy().astype(np.int32)
+
         path = out_dir / f"{prompt['id']}.npz"
         np.savez(path, **arrays)
+
+        if prompt["id"] in DENSE_PROMPTS:
+            np.savez(out_dir / f"{prompt['id']}.dense.npz", logits=logits.numpy().astype(np.float32))
 
         manifest["prompts"].append({
             "id": prompt["id"],
             "group": prompt["group"],
             "tokens": int(length),
             "has_hidden_states": "hidden_states" in arrays,
+            "has_generated": "generated" in arrays,
+            "has_dense_logits": prompt["id"] in DENSE_PROMPTS,
             "bytes": path.stat().st_size,
         })
         print(f"  {prompt['id']:<16} {length:>5} tokens  {path.stat().st_size / 2**20:>7.1f} MiB")

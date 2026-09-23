@@ -111,3 +111,25 @@ reference is caught rather than mistaken for a kernel bug.
   give the same answer.
 - If a result in the thesis ever turns on a specific reference, that reference
   must be archived deliberately and outside git, with its manifest.
+
+---
+
+## Amendment: "Python performs no arithmetic" is about the engine, not about measuring it
+
+The Consequences say Python performs no arithmetic and every tensor operation
+happens in CUDA. #12 is the first ticket to have Python code on both sides of
+that line, so the line needs drawing.
+
+**The rule binds the forward pass.** `microinfer/model.py` sequences device
+kernels and computes nothing but sizes and offsets. Greedy selection runs on
+the device as well: `device.greedy` returns only the chosen ids.
+
+**It does not bind code that judges the engine.** `microinfer/gate.py`
+computes top-1 agreement, KL divergence and cosine similarity in NumPy, on the
+host, from logits the engine has already returned. That is measurement, like
+the tests' float64 references. Doing it in CUDA would put the judge inside the
+thing it judges.
+
+What would break the rule is arithmetic *between* kernels that the next
+kernel depends on. That is what the ADR was written against, because it is
+where a host round-trip would quietly become part of every latency figure.

@@ -3,6 +3,7 @@
 
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
+#include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
 #include "microinfer/launch.h"
 #include "microinfer/staging.h"
@@ -38,6 +39,18 @@ namespace microinfer
 
   } // namespace
 
+  void device::swiglu(const __half *gate, const __half *up, __half *out,
+                      size_t count)
+  {
+    if (count == 0)
+    {
+      return;
+    }
+    const int grid = grid_stride_blocks(count, kBlockThreads);
+    swiglu_kernel<<<grid, kBlockThreads>>>(gate, up, out, count);
+    cuda_check(cudaGetLastError(), "swiglu kernel launch");
+  }
+
   void swiglu(const float *gate, const float *up, float *out, size_t count)
   {
     if (count == 0)
@@ -53,11 +66,8 @@ namespace microinfer
     upload_fp16(dev_gate, gate, count, "cudaMemcpy gate host-to-device");
     upload_fp16(dev_up, up, count, "cudaMemcpy up host-to-device");
 
-    const int grid = grid_stride_blocks(count, kBlockThreads);
-    swiglu_kernel<<<grid, kBlockThreads>>>(dev_gate.as<const __half>(),
-                                           dev_up.as<const __half>(),
-                                           dev_out.as<__half>(), count);
-    cuda_check(cudaGetLastError(), "swiglu kernel launch");
+    device::swiglu(dev_gate.as<const __half>(), dev_up.as<const __half>(),
+                   dev_out.as<__half>(), count);
     cuda_check(cudaDeviceSynchronize(), "swiglu kernel execution");
 
     download_fp16(out, dev_out, count, "cudaMemcpy output device-to-host");

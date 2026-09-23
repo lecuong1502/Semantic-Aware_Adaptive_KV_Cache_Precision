@@ -3,6 +3,7 @@
 
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
+#include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
 #include "microinfer/staging.h"
 
@@ -79,6 +80,17 @@ namespace microinfer
 
   } // namespace
 
+  void device::rmsnorm(const __half *x, const __half *weight, __half *out,
+                       int rows, int hidden, float eps)
+  {
+    if (rows <= 0 || hidden <= 0)
+    {
+      return;
+    }
+    rmsnorm_kernel<<<rows, kBlockThreads>>>(x, weight, out, hidden, eps);
+    cuda_check(cudaGetLastError(), "rmsnorm kernel launch");
+  }
+
   void rmsnorm(const float *x, const float *weight, float *out, int rows,
                int hidden, float eps)
   {
@@ -100,10 +112,8 @@ namespace microinfer
     upload_fp16(dev_x, x, count, "cudaMemcpy x host-to-device");
     upload_fp16(dev_w, weight, hidden, "cudaMemcpy weight host-to-device");
 
-    rmsnorm_kernel<<<rows, kBlockThreads>>>(dev_x.as<const __half>(),
-                                            dev_w.as<const __half>(),
-                                            dev_out.as<__half>(), hidden, eps);
-    cuda_check(cudaGetLastError(), "rmsnorm kernel launch");
+    device::rmsnorm(dev_x.as<const __half>(), dev_w.as<const __half>(),
+                    dev_out.as<__half>(), rows, hidden, eps);
     // Without this, an execution fault surfaces under the next cudaMemcpy and
     // is reported against the wrong operation.
     cuda_check(cudaDeviceSynchronize(), "rmsnorm kernel execution");
