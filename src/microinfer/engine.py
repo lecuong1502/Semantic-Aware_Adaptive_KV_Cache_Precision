@@ -1,17 +1,22 @@
-"""The engine's Seam A: load a model, know what it costs.
+"""The engine's Seam A: load a model, run it, and know what it costs.
 
-Milestone 0 stops well short of generating anything. What exists here is the
-part every later ticket stands on — a verified configuration, weights on the
-device in the format the kernels read, and an honest account of the memory.
+`forward` and `generate` are the Milestone 0 checkpoint (#12): a from-scratch
+FP16 inference path over a simple contiguous KV cache, one sequence at a time.
+There is no batch dimension anywhere, by design; the thesis is about a single
+user's cache under contention, and batching machinery would be code with no
+experiment behind it.
 """
 
 from __future__ import annotations
 
+import json
+from contextlib import contextmanager
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
 
-from . import _microinfer, weights
+from . import _microinfer, model, weights
 from .config import ConfigMismatch, ModelConfig
 from .footprint import Footprint
 from .models import VERIFIED
@@ -78,8 +83,10 @@ class Engine:
             self.config.verify(expected)
 
         self._tensors: dict[str, _microinfer.DeviceTensor] = {}
+        self._weights: model.Weights | None = None
         self._workspace_bytes = 0
-        self._kv_cache_bytes = 0  # nothing allocates a cache yet; #14 will
+        self._kv_cache_bytes = 0
+        self._peak: Footprint | None = None
 
     # -- loading ------------------------------------------------------------
 
@@ -117,10 +124,129 @@ class Engine:
             )
 
         self._tensors = loaded
+        self._weights = model.Weights.from_tensors(self.config, loaded)
 
     @property
     def tensors(self) -> dict[str, _microinfer.DeviceTensor]:
         return dict(self._tensors)
+
+    # -- text ---------------------------------------------------------------
+
+    @cached_property
+    def tokenizer(self):
+        """The checkpoint's own tokenizer.json, through HuggingFace's
+        `tokenizers`: a Rust library with no torch and no CUDA, so it can sit
+        in the engine's process (ADR-0002)."""
+        from tokenizers import Tokenizer
+
+        return Tokenizer.from_file(str(self.model_dir / "tokenizer.json"))
+
+    def encode(self, text: str) -> np.ndarray:
+        return np.asarray(self.tokenizer.encode(text).ids, dtype=np.int32)
+
+    def decode(self, token_ids) -> str:
+        return self.tokenizer.decode([int(t) for t in token_ids])
+
+    @cached_property
+    def eos_token_ids(self) -> frozenset[int]:
+        """Where generation stops: generation_config.json's eos_token_id, which
+        for the instruct models is both <|im_end|> and <|endoftext|>."""
+        eos = json.loads((self.model_dir / "generation_config.json").read_text())["eos_token_id"]
+        return frozenset(eos if isinstance(eos, list) else [eos])
+
+    # -- inference ----------------------------------------------------------
+
+    def forward(self, token_ids, *, capture_hidden_states: bool = False):
+        """Logits for every position of one sequence, as fp32 (seq, vocab).
+
+        With `capture_hidden_states=True`, returns `(logits, hidden_states)`,
+        where hidden_states is (layers + 1, seq, hidden) in HuggingFace's
+        `output_hidden_states` order: the per-layer diagnostic ADR-0006 runs
+        when the gate goes red.
+        """
+        ids = self._check_ids(token_ids)
+        n = len(ids)
+        cache = model.KVCache(self.config, capacity=n)
+        ws = model.Workspace(self.config, rows=n)
+        captured: list | None = [] if capture_hidden_states else None
+        with self._holding(cache, ws):
+            model.run(self.config, self._weights, ws, cache, ids, captured)
+            logits = model.logits(self.config, self._weights, ws, n)
+        if capture_hidden_states:
+            return logits, np.stack(captured)
+        return logits
+
+    def generate(self, prompt, max_new_tokens: int = 64, *, stop_at_eos: bool = True) -> np.ndarray:
+        """Greedy continuation of one prompt: the new token ids only.
+
+        `prompt` is text, which is tokenised, or token ids. The prompt is
+        prefilled in one step, then each new token is decoded against the
+        cache. Stops after `max_new_tokens`, or at an end-of-sequence token,
+        which is included, as HuggingFace's generate includes it.
+        """
+        ids = self.encode(prompt) if isinstance(prompt, str) else self._check_ids(prompt)
+        if max_new_tokens < 0:
+            raise ValueError(f"max_new_tokens must not be negative, got {max_new_tokens}")
+        if max_new_tokens == 0:
+            return np.empty(0, dtype=np.int32)
+
+        # The last new token is never fed back, so the cache needs one row less
+        # than prompt plus output.
+        cache = model.KVCache(self.config, capacity=len(ids) + max_new_tokens - 1)
+        prefill = model.Workspace(self.config, rows=len(ids))
+        out: list[int] = []
+        with self._holding(cache, prefill):
+            model.run(self.config, self._weights, prefill, cache, ids)
+            out.append(model.greedy_last(self.config, self._weights, prefill, len(ids)))
+        del prefill
+
+        step = model.Workspace(self.config, rows=1)
+        with self._holding(cache, step):
+            while len(out) < max_new_tokens and not (stop_at_eos and out[-1] in self.eos_token_ids):
+                model.run(self.config, self._weights, step, cache, np.array(out[-1:], np.int32))
+                out.append(model.greedy_last(self.config, self._weights, step, 1))
+        return np.asarray(out, dtype=np.int32)
+
+    def _check_ids(self, token_ids) -> np.ndarray:
+        if self._weights is None:
+            raise RuntimeError("no weights on the device; call load_weights() first")
+        ids = np.asarray(token_ids)
+        if ids.ndim != 1:
+            raise ValueError(
+                f"token_ids must be one sequence, 1-D; got shape {ids.shape}. The engine "
+                f"runs a single sequence at a time and has no batch dimension.")
+        if ids.size == 0:
+            raise ValueError("token_ids is empty")
+        if not np.issubdtype(ids.dtype, np.integer):
+            raise ValueError(f"token_ids must be integers, got {ids.dtype}")
+        if ids.min() < 0 or ids.max() >= self.config.vocab_size:
+            raise ValueError(f"token ids must lie in [0, {self.config.vocab_size}); "
+                             f"got [{ids.min()}, {ids.max()}]")
+        return ids.astype(np.int32)
+
+    @contextmanager
+    def _holding(self, cache: model.KVCache, ws: model.Workspace):
+        """Account for a cache and a workspace while they are alive, and note
+        the peak: the footprint at the moment the engine held the most."""
+        self._kv_cache_bytes = cache.nbytes
+        self._workspace_bytes = ws.nbytes
+        now = self.footprint()
+        if self._peak is None or now.engine_total > self._peak.engine_total:
+            self._peak = now
+        try:
+            yield
+        finally:
+            self._kv_cache_bytes = 0
+            self._workspace_bytes = 0
+
+    def peak_footprint(self) -> Footprint | None:
+        """The footprint when the engine last held the most device memory, or
+        None if nothing has run. Read when a cache and workspace had just been
+        allocated, which is when a forward pass holds the most."""
+        return self._peak
+
+    def reset_peak(self) -> None:
+        self._peak = None
 
     # -- accounting ---------------------------------------------------------
 

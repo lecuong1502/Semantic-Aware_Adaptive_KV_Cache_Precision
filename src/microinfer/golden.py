@@ -84,6 +84,24 @@ class Golden:
         the gate is already red."""
         return self._data.get("hidden_states")
 
+    @property
+    def generated(self) -> np.ndarray | None:
+        """HuggingFace's greedy continuation, new tokens only, for the smoke
+        test's prompts; None for the rest. Ends at an end-of-sequence token if
+        one came before the length limit."""
+        return self._data.get("generated")
+
+    @property
+    def dense_logits(self) -> np.ndarray | None:
+        """Logits at every position, for the few prompts kept densely to
+        validate the gate's KL sample (ADR-0006). In a file of their own, so
+        that reading any other field never loads them."""
+        path = self.path.with_suffix(".dense.npz")
+        if not path.is_file():
+            return None
+        with np.load(path) as handle:
+            return handle["logits"]
+
     def __len__(self) -> int:
         return len(self.token_ids)
 

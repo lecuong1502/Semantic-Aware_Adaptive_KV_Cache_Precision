@@ -181,3 +181,43 @@ def test_hidden_states_reach_the_long_prompts():
         p["group"] for p in golden.manifest["prompts"] if p["has_hidden_states"]
     }
     assert "adversarial" in groups, "only short prompts carry the diagnostic"
+
+
+def test_ten_prompts_carry_a_greedy_continuation():
+    """ADR-0006's smoke test: 64 greedy tokens on 10 prompts, spread over the
+    groups. A continuation may end early, but only at an end-of-sequence token."""
+    golden = require_golden()
+    eos = set(json.loads((REPO / "models" / golden.model / "generation_config.json").read_text())
+              ["eos_token_id"])
+    continued = [item for item in golden if item.generated is not None]
+    assert len(continued) == 10
+    assert {i.prompt_id.split("-")[0] for i in continued} >= {"short", "medium", "long"}
+    for item in continued:
+        assert item.generated.dtype == np.int32
+        assert 0 < len(item.generated) <= golden.manifest["smoke_tokens"]
+        if len(item.generated) < golden.manifest["smoke_tokens"]:
+            assert item.generated[-1] in eos, f"{item.prompt_id} stopped early without an end token"
+
+
+def test_the_reference_greedy_is_plain_argmax():
+    """The instruct checkpoints ship a repetition penalty of 1.1, and
+    HuggingFace applies it even when sampling is off. The reference overrides
+    it, so that it and the engine run the same algorithm."""
+    tree = ast.parse(GENERATOR.read_text())
+    greedy = next(node.value for node in ast.walk(tree)
+                  if isinstance(node, ast.Assign)
+                  and any(getattr(t, "id", None) == "GREEDY" for t in node.targets))
+    settings = ast.literal_eval(greedy)
+    assert settings["do_sample"] is False
+    assert settings["repetition_penalty"] == 1.0
+    assert require_golden().manifest["greedy"]["repetition_penalty"] == 1.0
+
+
+def test_dense_logits_cover_every_position():
+    golden = require_golden()
+    cfg = ModelConfig.from_card(golden.model)
+    dense = [item for item in golden if item.dense_logits is not None]
+    assert {item.prompt_id for item in dense} == set(golden.manifest["dense_prompts"])
+    for item in dense:
+        assert item.dense_logits.shape == (len(item), cfg.vocab_size)
+        np.testing.assert_array_equal(item.dense_logits[item.logit_positions], item.logits)
