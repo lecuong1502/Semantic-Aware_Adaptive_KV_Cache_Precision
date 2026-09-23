@@ -21,8 +21,9 @@ namespace microinfer
     // maximum m, a running denominator l and an unnormalised output o. When a
     // tile raises the maximum, what has been accumulated so far is rescaled by
     // exp(m_old - m_new) before the tile's own contribution is added. The full
-    // (seq_q, seq_k) score matrix never exists; a tile's (TILE_Q, TILE_K) slice
-    // of it does, in shared memory, and is overwritten by the next.
+    // (seq_q, seq_k) score matrix never exists; a tile's (kAttentionTileQ,
+    // kAttentionTileK) slice of it does, in shared memory, and is overwritten
+    // by the next.
     //
     // Causal masking, and why it costs no divergence:
     //
@@ -30,8 +31,9 @@ namespace microinfer
     //     the last key the block's *last* query can see, which is uniform
     //     across the block.
     //   - Within the tiles that are visited, each score is replaced by -inf
-    //     with a select, not a branch. The compiler emits a predicated SEL, so
-    //     every lane executes the same instructions whatever its position.
+    //     with a select, not a branch. Checked in the sm_89 SASS, it compiles
+    //     to `FSEL R, R, -INF, !P0`, so every lane executes the same
+    //     instructions whatever its position.
     //     A select also discards what it replaces, so a NaN in a masked key
     //     cannot leak — as multiplying by zero, or adding a large negative,
     //     would let it.
@@ -46,14 +48,17 @@ namespace microinfer
                      int seq_q, int seq_k, int heads, int head_dim, float scale)
     {
       extern __shared__ float smem[];
-      float *q_s = smem;                                    // TILE_Q x head_dim
-      float *o_s = q_s + kAttentionTileQ * head_dim;        // TILE_Q x head_dim
-      float *s_s = o_s + kAttentionTileQ * head_dim;        // TILE_Q x TILE_K
-      float *m_s = s_s + kAttentionTileQ * kAttentionTileK; // TILE_Q
-      float *l_s = m_s + kAttentionTileQ;                   // TILE_Q
-      float *rescale_s = l_s + kAttentionTileQ;             // TILE_Q
+      float *q_s = smem; // kAttentionTileQ x head_dim
+      float *o_s =
+          q_s + kAttentionTileQ * head_dim; // kAttentionTileQ x head_dim
+      float *s_s =
+          o_s + kAttentionTileQ * head_dim; // kAttentionTileQ x kAttentionTileK
+      float *m_s = s_s + kAttentionTileQ * kAttentionTileK; // kAttentionTileQ
+      float *l_s = m_s + kAttentionTileQ;                   // kAttentionTileQ
+      float *rescale_s = l_s + kAttentionTileQ;             // kAttentionTileQ
       __half *k_s = reinterpret_cast<__half *>(rescale_s + kAttentionTileQ);
-      __half *v_s = k_s + kAttentionTileK * head_dim; // TILE_K x head_dim
+      __half *v_s =
+          k_s + kAttentionTileK * head_dim; // kAttentionTileK x head_dim
 
       const int head = blockIdx.y;
       const int q_first = blockIdx.x * kAttentionTileQ;

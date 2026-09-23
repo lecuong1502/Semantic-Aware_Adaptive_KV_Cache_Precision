@@ -18,15 +18,14 @@ cancellation). Attention's floor admits two error sources, not one:
   terms, where terms = sum_j p_j |v_j|;
 - the fp32 *scores*. A score is itself a dot product over head_dim, and its
   rounding, sqrt(d) * u32 * sum_d |q_d k_d| / sqrt(d), becomes a relative error
-  in every softmax weight, which then weighs `terms`. It is counted twice,
-  because each weight is also divided by a denominator carrying the same
-  error.
+  in every softmax weight, which then weighs `terms`.
 
-Measured against that bound the observed error is at most 0.83 of it, the floor
-judges 1.6% of outputs at head_dim 64 and 2.7% at 128, and the worst error
-under it is 1.03 ulp — the fp16 store. The score term is not optional: without
-it the kernel reads 5-7 ulp at head_dim 128 on outputs whose weights are
-correct to fp32 precision.
+With that bound the floor judges 0.8% of outputs at head_dim 64 and 1.4% at
+128, and the worst error is 1.04 ulp: the fp16 store. The score term is
+needed. Without it the kernel reads 5-7 ulp at head_dim 128, and a simulation
+in which only the scores are fp32 already reads 5.4 ulp. It is also not
+generous. That simulation uses about a fifth of the term, the same slack the
+accumulation term has.
 
 The reference materialises the whole score matrix and an explicit mask, which
 the kernel is forbidden to do. That is the point of it being a reference.
@@ -52,6 +51,22 @@ def query_positions(seq_q: int, seq_k: int) -> np.ndarray:
     return np.arange(seq_q) + (seq_k - seq_q)
 
 
+def reference_weights(q, k, positions=None):
+    """float64 causal softmax weights, (heads, seq_q, seq_k), and the mask used.
+
+    `positions` are the queries' absolute positions, bottom-right aligned by
+    default."""
+    seq_q, _, head_dim = q.shape
+    seq_k = k.shape[0]
+    if positions is None:
+        positions = query_positions(seq_q, seq_k)
+    scores = np.einsum("qhd,khd->hqk", q.astype(np.float64), k.astype(np.float64)) / np.sqrt(head_dim)
+    masked = np.arange(seq_k)[None, :] > positions[:, None]  # (seq_q, seq_k)
+    scores[:, masked] = -np.inf
+    p = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    return p / p.sum(axis=-1, keepdims=True), masked
+
+
 def reference_attention(q, k, v, positions=None):
     """float64 softmax(q k^T / sqrt(d) + mask) v, per head.
 
@@ -60,30 +75,22 @@ def reference_attention(q, k, v, positions=None):
     too long to materialise whole. Returns the output and, per element, the
     absolute error bound the floor is built from (module docstring)."""
     seq_q, _, head_dim = q.shape
-    seq_k = k.shape[0]
     if positions is None:
-        positions = query_positions(seq_q, seq_k)
+        positions = query_positions(seq_q, k.shape[0])
+    p, masked = reference_weights(q, k, positions)
     q64, k64, v64 = (a.astype(np.float64) for a in (q, k, v))
-    scale = 1.0 / np.sqrt(head_dim)
-
-    scores = np.einsum("qhd,khd->hqk", q64, k64) * scale
-    masked = np.arange(seq_k)[None, :] > positions[:, None]  # (seq_q, seq_k)
-    scores[:, masked] = -np.inf
-    scores -= scores.max(axis=-1, keepdims=True)
-    p = np.exp(scores)
-    p /= p.sum(axis=-1, keepdims=True)
 
     out = np.einsum("hqk,khd->qhd", p, v64)
     terms = np.einsum("hqk,khd->qhd", p, np.abs(v64))
 
     # The largest score magnitude-of-terms each query computes: bounds the
     # fp32 rounding of its scores.
-    score_terms = np.einsum("qhd,khd->hqk", np.abs(q64), np.abs(k64)) * scale
+    score_terms = np.einsum("qhd,khd->hqk", np.abs(q64), np.abs(k64)) / np.sqrt(head_dim)
     score_terms[:, masked] = 0.0
     score_terms = score_terms.max(axis=-1).T[..., None]  # (seq_q, heads, 1)
 
     visible = (positions + 1)[:, None, None]
-    bound = (np.sqrt(visible) + 2 * np.sqrt(head_dim) * score_terms) * FP32_REL_ULP * terms
+    bound = (np.sqrt(visible) + np.sqrt(head_dim) * score_terms) * FP32_REL_ULP * terms
     return out, bound
 
 
@@ -101,6 +108,12 @@ def make_qkv(seq_q, seq_k, heads, head_dim, seed=0):
     k = fp16_exact(rng.standard_normal((seq_k, heads, head_dim)))
     v = fp16_exact(rng.standard_normal((seq_k, heads, head_dim)))
     return q, k, v
+
+
+def model_with_head_dim(head_dim: int) -> ModelConfig:
+    """Selected by the property a test needs, not by position in a sorted list."""
+    (cfg,) = [c for c in map(ModelConfig.from_card, MODELS) if c.head_dim == head_dim]
+    return cfg
 
 
 def sequence_lengths():
@@ -166,15 +179,11 @@ def test_the_gate_would_reject_fp16_softmax_weights():
     for the P @ V product, as tensor-core kernels do — is simulated in NumPy
     and checked to fail. It is a legitimate trade for a later ticket to make,
     but it would have to be made through ADR-0006, not past it."""
-    cfg = ModelConfig.from_card(MODELS[1])
+    cfg = model_with_head_dim(128)
     seq = 3 * TILE_K
     q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=10)
-    q64, k64, v64 = (a.astype(np.float64) for a in (q, k, v))
-    scores = np.einsum("qhd,khd->hqk", q64, k64) / np.sqrt(cfg.head_dim)
-    scores[:, np.triu(np.ones((seq, seq), dtype=bool), 1)] = -np.inf
-    p = np.exp(scores - scores.max(axis=-1, keepdims=True))
-    p16 = (p / p.sum(axis=-1, keepdims=True)).astype(np.float16).astype(np.float64)
-    fp16_weights = fp16_exact(np.einsum("hqk,khd->qhd", p16, v64))
+    p16 = fp16_exact(reference_weights(q, k)[0]).astype(np.float64)
+    fp16_weights = fp16_exact(np.einsum("hqk,khd->qhd", p16, v.astype(np.float64)))
     with pytest.raises(AssertionError, match="relative error"):
         check(q, k, v, got=fp16_weights)
 
@@ -238,7 +247,7 @@ def test_a_large_common_score_offset_changes_nothing(name):
     fp32 score near 1000 carries an ulp of 6e-5, so the floor — which is honest
     about that — judges most outputs against their terms. The precision claim
     at large scores is test_the_maximum_can_arrive_late's, where the floor
-    judges 0.1% of outputs."""
+    judges under 1% of outputs."""
     cfg = ModelConfig.from_card(name)
     seq = 3 * TILE_K + 5
     q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=7)
@@ -250,12 +259,13 @@ def test_a_large_common_score_offset_changes_nothing(name):
     check(q, k, v, got=got)
 
 
-def test_the_maximum_can_arrive_late():
+@pytest.mark.parametrize("name", MODELS)
+def test_the_maximum_can_arrive_late(name):
     """A running maximum that is only ever set from the first tile passes the
     offset test, because every key shares the offset. Here one late key towers
     over everything before it, so the maximum changes after tiles have been
     accumulated, and their contribution has to be rescaled correctly."""
-    cfg = ModelConfig.from_card(MODELS[0])
+    cfg = ModelConfig.from_card(name)
     seq = 4 * TILE_K
     q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=8)
     q[..., -1] = 16.0

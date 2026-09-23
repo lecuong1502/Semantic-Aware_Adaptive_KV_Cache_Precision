@@ -64,7 +64,7 @@ namespace microinfer
   // (seq_q == 1) are the same rule.
   //
   // Every query head has its own KV head here. Grouped-query attention, where
-  // several query heads share one, is the following ticket.
+  // several query heads share one, is #9.
   void attention(const float *q, const float *k, const float *v, float *out,
                  int seq_q, int seq_k, int heads, int head_dim);
 

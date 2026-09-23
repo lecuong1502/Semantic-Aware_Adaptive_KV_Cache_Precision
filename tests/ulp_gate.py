@@ -45,7 +45,7 @@ def floor_from_bound(bound: np.ndarray) -> np.ndarray:
     return bound / MAX_REL
 
 
-def accumulation_floor(terms: np.ndarray, n) -> np.ndarray:
+def accumulation_floor(terms: np.ndarray, n: int) -> np.ndarray:
     """For fp16-exact inputs: the error an fp32 sum of `n` terms incurs.
 
     `terms` is, per output, the sum of the absolute values of what was added.
