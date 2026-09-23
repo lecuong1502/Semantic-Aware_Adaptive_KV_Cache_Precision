@@ -99,30 +99,23 @@ def test_tier_names_are_the_project_s_own(tmp_path):
         entry(tmp_path / "log.jsonl", precision_tiers={"fp16": 1.0})
 
 
-@pytest.mark.parametrize("kind,ok", [("gate", True), ("gemm-study-timing", True),
-                                     ("peak_memory", True), ("Peak Memory", False),
-                                     ("new_kind", False), ("trailing-", False)])
-def test_kinds_are_kebab_case_except_the_one_written_before_the_rule(tmp_path, kind, ok):
+def test_kinds_are_kebab_case_except_the_one_written_before_the_rule(tmp_path):
     """A plot groups by kind. peak_memory stays, because its entries already
     exist and every entry of one measurement must share a kind."""
     log = tmp_path / "log.jsonl"
-    if ok:
+    for kind in ("gate", "gemm-study-timing", "peak_memory"):
         entry(log, kind=kind)
-    else:
+    for kind in ("Peak Memory", "new_kind", "trailing-"):
         with pytest.raises(ValueError, match="kebab-case"):
             entry(log, kind=kind)
 
 
-@pytest.mark.parametrize("context_length,ok", [
-    (None, True), (0, True), (4096, True),
-    ({"min": 4, "max": 1090, "prompts": 24}, True),
-    ({"prompts": 10, "new_tokens": 64}, False),  # a range a plot cannot read
-    ({"min": 9, "max": 4}, False), (-1, False), ("long", False)])
-def test_a_context_length_is_a_count_or_a_readable_range(tmp_path, context_length, ok):
+def test_a_context_length_is_a_count_or_a_readable_range(tmp_path):
     log = tmp_path / "log.jsonl"
-    if ok:
+    for context_length in (None, 0, 4096, {"min": 4, "max": 1090, "prompts": 24}):
         entry(log, context_length=context_length)
-    else:
+    for context_length in ({"prompts": 10, "new_tokens": 64},  # a range a plot cannot read
+                           {"min": 9, "max": 4}, -1, "long"):
         with pytest.raises(ValueError, match="context_length"):
             entry(log, context_length=context_length)
 
@@ -179,24 +172,31 @@ def test_each_entry_chains_to_the_one_before(tmp_path):
     benchlog.verify(log)
 
 
-@pytest.mark.parametrize("tamper,at", [("edit", 2), ("edit last", 4), ("delete", 2),
-                                       ("reorder", 2)])
-def test_an_edited_log_fails_verification_where_it_was_edited(tmp_path, tamper, at):
+def test_an_edited_log_fails_verification_where_it_was_edited(tmp_path):
+    """An edit, even to the last entry; a deletion; a reordering."""
     log = tmp_path / "log.jsonl"
     for i in range(4):
         entry(log, results={"i": i})
-    lines = log.read_text().splitlines()
-    if tamper == "edit":
+    original = log.read_text().splitlines()
+
+    def edit(lines):
         lines[1] = lines[1].replace('"i": 1', '"i": 7')
-    elif tamper == "edit last":
+
+    def edit_last(lines):
         lines[3] = lines[3].replace('"i": 3', '"i": 7')
-    elif tamper == "delete":
+
+    def delete(lines):
         del lines[1]
-    else:
+
+    def reorder(lines):
         lines[1], lines[2] = lines[2], lines[1]
-    log.write_text("\n".join(lines) + "\n")
-    with pytest.raises(benchlog.LogTampered, match=f"entry {at}"):
-        benchlog.verify(log)
+
+    for tamper, at in ((edit, 2), (edit_last, 4), (delete, 2), (reorder, 2)):
+        lines = list(original)
+        tamper(lines)
+        log.write_text("\n".join(lines) + "\n")
+        with pytest.raises(benchlog.LogTampered, match=f"entry {at}"):
+            benchlog.verify(log)
 
 
 def test_a_log_without_a_final_newline_is_refused_not_joined(tmp_path):

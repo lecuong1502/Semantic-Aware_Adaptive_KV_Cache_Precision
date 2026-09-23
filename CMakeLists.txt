@@ -41,6 +41,7 @@ pybind11_add_module(_microinfer
   src/core_kernels/residual.cu
   src/core_kernels/rmsnorm.cu
   src/core_kernels/rope.cu
+  src/core_kernels/rope_table.cu
   src/core_kernels/swiglu.cu
 )
 

@@ -46,23 +46,28 @@ def study():
 
 KERNELS = ["naive", "tiled"]
 
+#: Every distinct projection shape, per model. v_proj, up_proj and o_proj have
+#: the shapes of k_proj, gate_proj and q_proj, so running them again would test
+#: nothing new.
+SHAPES = sorted({(name, proj) for name, proj in CASES
+                 if proj in ("q_proj", "k_proj", "gate_proj", "down_proj")})
 
-@pytest.mark.parametrize("kernel", KERNELS)
-@pytest.mark.parametrize("name,proj", CASES)
-@pytest.mark.parametrize("rows", [1, 37])
-def test_matches_the_reference_at_every_model_projection(study, kernel, name, proj, rows):
+
+@pytest.mark.parametrize("name,proj", SHAPES)
+def test_both_kernels_match_the_reference_at_every_model_shape(study, name, proj):
     """Decode (one row) and a prefill length that is not a multiple of any
-    tile, at every projection of both models."""
+    tile, at every distinct projection shape of both models."""
     in_features, out_features, _ = projections(ModelConfig.from_card(name))[proj]
-    x, w, _ = make_case(rows, in_features, out_features, bias=False, seed=rows)
-    ref, terms = reference_linear(x, w)
-    got = getattr(study, kernel)(x, w)
-    assert got.shape == ref.shape
-    assert_within_gate(got, ref, accumulation_floor(terms, term_count(x, None)))
+    for rows in (1, 37):
+        x, w, _ = make_case(rows, in_features, out_features, bias=False, seed=rows)
+        ref, terms = reference_linear(x, w)
+        for kernel in KERNELS:
+            got = getattr(study, kernel)(x, w)
+            assert got.shape == ref.shape
+            assert_within_gate(got, ref, accumulation_floor(terms, term_count(x, None)))
 
 
-@pytest.mark.parametrize("kernel", KERNELS)
-def test_ragged_edges_on_every_side(study, kernel):
+def test_ragged_edges_on_every_side(study):
     """Every dimension one past a tile multiple, so each kernel's bounds checks
     are exercised on rows, output features and the reduction at once. The
     numbers are deliberately not the models': the models' shapes are all
@@ -70,8 +75,9 @@ def test_ragged_edges_on_every_side(study, kernel):
     tile = study.tile
     x, w, _ = make_case(2 * tile + 1, 3 * tile + 1, 5 * tile + 1, bias=False, seed=5)
     ref, terms = reference_linear(x, w)
-    assert_within_gate(getattr(study, kernel)(x, w), ref,
-                       accumulation_floor(terms, term_count(x, None)))
+    for kernel in KERNELS:
+        assert_within_gate(getattr(study, kernel)(x, w), ref,
+                           accumulation_floor(terms, term_count(x, None)))
 
 
 def test_cublas_baseline_agrees_with_the_engine_projection(study):
@@ -85,7 +91,7 @@ def test_cublas_baseline_agrees_with_the_engine_projection(study):
     np.testing.assert_array_equal(study.cublas(x, w), _microinfer.linear(x, w))
 
 
-@pytest.mark.parametrize("kernel", KERNELS + ["cublas"])
-def test_rejects_mismatched_reduction(study, kernel):
-    with pytest.raises(ValueError, match="in_features"):
-        getattr(study, kernel)(np.zeros((2, 8), np.float32), np.zeros((4, 9), np.float32))
+def test_every_implementation_rejects_a_mismatched_reduction(study):
+    for kernel in KERNELS + ["cublas"]:
+        with pytest.raises(ValueError, match="in_features"):
+            getattr(study, kernel)(np.zeros((2, 8), np.float32), np.zeros((4, 9), np.float32))

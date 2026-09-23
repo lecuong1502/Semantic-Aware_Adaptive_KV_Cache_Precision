@@ -3,7 +3,7 @@
 The project claims a from-scratch inference engine (`MicroInfer`), but "from
 scratch" has to stop somewhere. We hand-write every kernel that the research
 contribution touches — attention (online softmax, causal masking, GQA), the
-paged KV cache and its block table, INT8/INT4 quantize-dequantize, RoPE and
+paged KV cache and its page table, INT8/INT4 quantize-dequantize, RoPE and
 RMSNorm — and call cuBLAS for the dense projections (Q/K/V, MLP). No external
 inference engine (vLLM, llama.cpp, TensorRT-LLM) is used at any point.
 

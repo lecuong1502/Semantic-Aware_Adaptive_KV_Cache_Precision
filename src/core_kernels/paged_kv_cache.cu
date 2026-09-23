@@ -148,6 +148,7 @@ namespace microinfer
       throw;
     }
     table_[key] = PageLocation{tier, r.slots.size() - 1};
+    ++generation_;
   }
 
   void PagedKVCache::free(PageKey key)
@@ -168,6 +169,7 @@ namespace microinfer
     }
     r.slots.pop_back();
     table_.erase(key);
+    ++generation_;
 
     // The copy must land before the granule it read from can be unmapped.
     driver_check(cuCtxSynchronize(), "cuCtxSynchronize");

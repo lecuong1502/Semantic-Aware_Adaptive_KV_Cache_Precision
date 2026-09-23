@@ -60,6 +60,10 @@ def kv_cache_bytes(cfg: ModelConfig, context_length: int,
     INT2 — hence the float. **Scale metadata is excluded.** ADR-0005 keeps that
     with the quantiser, where its size is known, and reminds anyone quoting a
     compression ratio to count it: INT4 is 4.63 effective bits, not 4.
+
+    It is also the raw bytes, not what the paged cache takes from the driver.
+    That is whole granules for whole pages (ADR-0007, #14), plus the RoPE
+    table that completes the keys (ADR-0009); `Engine.footprint` reports it.
     """
     per_token = cfg.kv_bytes_per_token // 2  # kv_bytes_per_token is at fp16
     return int(per_token * context_length * bytes_per_element)

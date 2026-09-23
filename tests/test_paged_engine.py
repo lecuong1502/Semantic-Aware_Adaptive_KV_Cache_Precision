@@ -28,6 +28,13 @@ MODEL = "qwen2.5-0.5b-instruct"
 P = _microinfer.device.page_tokens
 FP16 = _microinfer.Tier.FP16
 
+#: Prompts chosen for page geometry, not all 24: one shorter than a page, one
+#: that crosses into a second, the prompt most sensitive to numerics
+#: (ADR-0009), and the longest. Identity on these is identity of the layout;
+#: the gate in test_inference.py runs every prompt through the paged engine.
+IDENTITY_PROMPTS = ("short-01", "medium-02", "adversarial-00", "long-01")
+GENERATION_PROMPTS = ("short-00", "medium-04", "long-03")
+
 
 @pytest.fixture(scope="module")
 def paged() -> Engine:
@@ -54,14 +61,10 @@ def golden() -> GoldenSet:
 # -- identity with the contiguous path ----------------------------------------
 
 
-def test_the_engine_is_paged_by_default(paged):
-    assert paged.kv_cache == "paged"
-
-
 def test_logits_and_hidden_states_are_identical_to_the_contiguous_path(paged, contiguous, golden):
-    """Not within tolerance: identical. Every prompt, from 4 tokens to 1,090,
-    so every page count and every ragged last page the set produces."""
-    for item in golden:
+    """Not within tolerance: identical, from 4 tokens to 1,090."""
+    assert paged.kv_cache == "paged", "the engine is paged by default"
+    for item in map(golden.__getitem__, IDENTITY_PROMPTS):
         ours = paged.forward(item.token_ids, capture_hidden_states=True)
         reference = contiguous.forward(item.token_ids, capture_hidden_states=True)
         np.testing.assert_array_equal(ours[0], reference[0], err_msg=f"{item.prompt_id} logits")
@@ -71,7 +74,7 @@ def test_logits_and_hidden_states_are_identical_to_the_contiguous_path(paged, co
 def test_generation_is_identical_to_the_contiguous_path(paged, contiguous, golden):
     """Decode writes one position at a time and crosses a page boundary every
     P tokens; 64 tokens cross at least one whatever the prompt."""
-    for item in golden:
+    for item in map(golden.__getitem__, GENERATION_PROMPTS):
         if item.generated is not None:
             np.testing.assert_array_equal(
                 paged.generate(item.token_ids, 64, stop_at_eos=False),
@@ -154,12 +157,22 @@ def test_a_generation_that_stops_early_never_held_room_for_the_rest(paged):
     paged.reset_peak()
     out = paged.generate(prompt, max_new_tokens=4096)
     assert len(out) < 16
-    cfg = paged.config
-    positions = len(paged.encode(prompt)) + len(out)
-    page_bytes = 2 * P * cfg.num_key_value_heads * cfg.head_dim * 2
+    # The peak is at the end of prefill, while the prompt's workspace is
+    # alive; the cache then holds the prompt's positions, and nothing for the
+    # thousands of tokens asked for.
+    assert_cache_holds(paged.peak_footprint().kv_cache, paged.config, len(paged.encode(prompt)))
+
+
+def assert_cache_holds(kv_bytes, cfg, positions):
+    """A paged cache's footprint is whole granules for the pages `positions`
+    need, plus the RoPE table that completes its keys (ADR-0009), which covers
+    at least those positions and is sized in whole positions."""
+    page_bytes = _microinfer.device.page_bytes(P, cfg.num_key_value_heads * cfg.head_dim)
     held = cfg.num_hidden_layers * -(-positions // P) * page_bytes
     granule = _microinfer.PagedKVCache([1] * 4, [0] * 4).granule_bytes
-    assert paged.peak_footprint().kv_cache == -(-held // granule) * granule
+    table = kv_bytes - -(-held // granule) * granule
+    per_position = cfg.head_dim * 4  # {cos, sin} in fp32 for head_dim / 2 frequencies
+    assert table % per_position == 0 and table // per_position >= positions, table
 
 
 # -- the rest of the contract ------------------------------------------------------

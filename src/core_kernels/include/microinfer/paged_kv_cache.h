@@ -144,6 +144,10 @@ namespace microinfer
     void fit_granules(Range &r);
     void release_everything() noexcept;
 
+    // Counts every allocate and free. A page may move on any of them, so an
+    // address resolved before the count last changed may be stale.
+    std::uint64_t generation_ = 0;
+
     CUdevice device_ = 0;
     CUcontext ctx_ = nullptr;
     CUmemAllocationProp prop_{};

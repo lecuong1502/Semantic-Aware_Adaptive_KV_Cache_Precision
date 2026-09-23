@@ -78,7 +78,21 @@ class Weights:
         return cls(embed=embed, layers=layers, norm=tensors["model.norm.weight"], head=head)
 
 
-class ContiguousCache:
+class _Cache:
+    """What both caches share: the shape of the attention they serve, and the
+    RoPE table that completes keys cached without their bias (ADR-0009).
+    The table covers every position the cache holds, and is counted in its
+    size, since it exists only because of how the keys are stored."""
+
+    def __init__(self, cfg: ModelConfig):
+        self.heads, self.kv_heads = cfg.num_attention_heads, cfg.num_key_value_heads
+        self.head_dim = cfg.head_dim
+        self.kv_width = self.kv_heads * self.head_dim
+        self.rope = device.RopeTable(cfg.head_dim, cfg.rope_theta)
+        self.length = 0
+
+
+class ContiguousCache(_Cache):
     """Contiguous FP16 keys and values, one buffer each per layer, sized for the
     whole sequence up front: the Milestone 0 cache (#12). The engine runs the
     paged cache; this one stays as the reference it is proven against (#14).
@@ -89,71 +103,69 @@ class ContiguousCache:
     """
 
     def __init__(self, cfg: ModelConfig, capacity: int):
+        super().__init__(cfg)
         self.capacity = capacity
-        self.row = cfg.num_key_value_heads * cfg.head_dim
-        self.keys = [device.empty(capacity * self.row) for _ in range(cfg.num_hidden_layers)]
-        self.values = [device.empty(capacity * self.row) for _ in range(cfg.num_hidden_layers)]
-        self.length = 0
+        self.keys = [device.empty(capacity * self.kv_width) for _ in range(cfg.num_hidden_layers)]
+        self.values = [device.empty(capacity * self.kv_width) for _ in range(cfg.num_hidden_layers)]
+        self.rope.cover(capacity)
 
     @property
     def nbytes(self) -> int:
-        return sum(t.nbytes for t in self.keys + self.values)
+        return sum(t.nbytes for t in self.keys + self.values) + self.rope.nbytes
 
     def reserve(self, tokens: int) -> None:
         if tokens > self.capacity:
             raise ValueError(f"the cache holds {self.capacity} tokens; {tokens} were asked for")
 
     def store(self, layer: int, keys, values, start: int, n: int) -> None:
+        width = self.kv_width
         for source, buffers in ((keys, self.keys), (values, self.values)):
-            device.copy(source, device.view(buffers[layer], start * self.row, n * self.row),
-                        n * self.row)
+            device.copy(source, device.view(buffers[layer], start * width, n * width), n * width)
 
-    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int, cfg: ModelConfig) -> None:
-        device.attention(q, self.keys[layer], self.values[layer], k_bias, out, seq_q, seq_k,
-                         cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
-                         cfg.rope_theta)
+    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int) -> None:
+        device.attention(q, self.keys[layer], self.values[layer], k_bias, self.rope, out,
+                         seq_q, seq_k, self.heads, self.kv_heads, self.head_dim)
 
 
-class PagedCache:
+class PagedCache(_Cache):
     """FP16 keys and values on pages of P positions (ADR-0004), allocated from
     the VMM allocator (ADR-0007) as the sequence grows (#14).
 
     Page i of layer l is the page table entry (l, i). Attention reads keys and
-    values through the page table, resolved afresh for every launch, so the
-    allocator may move a page at any moment between launches without harm.
+    values through the page table, resolved again after any allocator
+    operation, so the allocator may move a page between launches without harm.
 
     The allocator reserves address space for the model's whole context window
     and takes device memory only as pages are allocated. `nbytes` is therefore
-    what the driver actually holds for the cache: whole granules.
+    what the driver actually holds for the cache: whole granules, and the RoPE
+    table beside them.
     """
 
-    def __init__(self, cfg: ModelConfig, allocator: _microinfer.PagedKVCache | None = None):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__(cfg)
         page_tokens = device.page_tokens
-        self.row = cfg.num_key_value_heads * cfg.head_dim
-        page_bytes = 2 * page_tokens * self.row * 2  # keys then values, fp16
-        if allocator is None:
-            pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
-            # The quantised tiers hold nothing until #16; they reserve nothing.
-            allocator = _microinfer.PagedKVCache(
-                [page_bytes] * 4, [cfg.num_hidden_layers * pages_per_layer, 0, 0, 0])
-        self.allocator = allocator
-        self.pages = device.KVPages(allocator, cfg.num_hidden_layers, page_tokens, self.row,
-                                    _microinfer.Tier.FP16)
-        self.length = 0
+        pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
+        # The quantised tiers hold nothing until #16; they reserve nothing.
+        self.allocator = _microinfer.PagedKVCache(
+            [device.page_bytes(page_tokens, self.kv_width)] * 4,
+            [cfg.num_hidden_layers * pages_per_layer, 0, 0, 0])
+        self.pages = device.KVPages(self.allocator, cfg.num_hidden_layers, page_tokens,
+                                    self.kv_width, _microinfer.Tier.FP16)
 
     @property
     def nbytes(self) -> int:
-        return self.allocator.mapped_bytes(_microinfer.Tier.FP16)
+        return self.allocator.mapped_bytes(_microinfer.Tier.FP16) + self.rope.nbytes
 
     def reserve(self, tokens: int) -> None:
         self.pages.reserve(tokens)
+        self.rope.cover(tokens)
 
     def store(self, layer: int, keys, values, start: int, n: int) -> None:
         self.pages.store(layer, keys, values, start, n)
 
-    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int, cfg: ModelConfig) -> None:
-        self.pages.attention(layer, q, k_bias, out, seq_q, seq_k, cfg.num_attention_heads,
-                             cfg.num_key_value_heads, cfg.head_dim, cfg.rope_theta)
+    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int) -> None:
+        self.pages.attention(layer, q, k_bias, self.rope, out, seq_q, seq_k,
+                             self.heads, self.kv_heads, self.head_dim)
 
 
 class Workspace:
@@ -243,7 +255,7 @@ class Model:
             device.rope(ws.q_raw, positions, ws.q, n, heads, head_dim, cfg.rope_theta)
             device.rope(ws.k_raw, positions, ws.k, n, kv_heads, head_dim, cfg.rope_theta)
             cache.store(i, ws.k, ws.v, start, n)
-            cache.attend(i, ws.q, w.self_attn_k_proj_bias, ws.attended, n, start + n, cfg)
+            cache.attend(i, ws.q, w.self_attn_k_proj_bias, ws.attended, n, start + n)
             device.linear(ws.attended, w.self_attn_o_proj_weight, None, ws.projected,
                           n, q_width, hidden)
             device.add(ws.residual, ws.projected, ws.residual, n * hidden)

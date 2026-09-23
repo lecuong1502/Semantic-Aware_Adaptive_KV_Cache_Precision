@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "microinfer/rope_table.h"
+
 namespace microinfer
 {
 
@@ -47,10 +49,12 @@ namespace microinfer
 
     // k_bias, when non-null, is the key projection's bias, (kv_heads,
     // head_dim), which k was stored without (ADR-0009): each key is completed
-    // as k + RoPE(k_bias, j) at its row j, with theta. Null means k is whole.
+    // as k + RoPE(k_bias, j) at its position j, with cos and sin read from
+    // `rope`, which must cover seq_k positions. Null k_bias means k is whole,
+    // and rope is then not read.
     void attention(const __half *q, const __half *k, const __half *v,
-                   const __half *k_bias, __half *out, int seq_q, int seq_k,
-                   int heads, int kv_heads, int head_dim, double theta);
+                   const __half *k_bias, const RopeTable *rope, __half *out,
+                   int seq_q, int seq_k, int heads, int kv_heads, int head_dim);
 
     // The same attention, reading keys and values through a page table
     // (#14). `pages` is on the device: one page's address per page_tokens
@@ -59,9 +63,9 @@ namespace microinfer
     // rows of values. Only addressing differs from attention() above, so the
     // two give bit-identical output on the same keys and values.
     void attention_paged(const __half *q, const unsigned long long *pages,
-                         int page_tokens, const __half *k_bias, __half *out,
-                         int seq_q, int seq_k, int heads, int kv_heads,
-                         int head_dim, double theta);
+                         int page_tokens, const __half *k_bias,
+                         const RopeTable *rope, __half *out, int seq_q,
+                         int seq_k, int heads, int kv_heads, int head_dim);
 
     // Writes n tokens' key and value rows into their pages, token t at
     // position start + t. `pages` as for attention_paged.
