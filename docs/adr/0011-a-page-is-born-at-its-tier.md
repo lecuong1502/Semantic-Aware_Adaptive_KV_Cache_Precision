@@ -87,3 +87,82 @@ uses this unless asked (`Engine.kv_halves`).
 - The first code that changes a page's tier will be Milestone 2's. This
   layout leaves it room: a page could be requantised into a new allocation at
   another tier and the old one freed, with the open pages untouched.
+
+---
+
+## What the static tiers cost, measured
+
+At 1c175f5, with the tree clean. Every figure is in the benchmark log.
+
+**Footprint** (`kv-footprint`, Qwen2.5-1.5B, whole 32K window). This is what
+the driver reports for this process alone, and it equals `paged_cache_bytes`
+at every tier:
+
+| tier | measured | effective bits, open pages counted | vs FP16 |
+|---|---:|---:|---:|
+| FP16 | 896 MiB | 16.000 | 1.00x |
+| INT8 | 486 MiB | 8.656 | 1.85x |
+| INT4 | 262 MiB | 4.656 | 3.44x |
+| INT2 | 150 MiB | 2.656 | 6.02x |
+
+**Perplexity** (`perplexity`, WikiText-2 test split, all 146 windows of 2048
+tokens, causal as above):
+
+| tier | Qwen2.5-0.5B | | Qwen2.5-1.5B | |
+|---|---:|---:|---:|---:|
+| FP16 | 14.319 | | 9.640 | |
+| INT8 | 14.319 | +0.00% | 9.641 | +0.007% |
+| INT4 | 14.429 | +0.77% | 9.698 | +0.59% |
+| INT2 | 18.148 | +26.8% | 11.541 | +19.7% |
+
+**Against published expectations.** KVQuant (arXiv:2401.18079, Tables 1 and 9)
+reports relative increases on LLaMA-7B on WikiText-2 at 2K:
+
+- 4-bit: +5.3% for uniform per-token int4, +0.9% for FlexGen's grouped 4-bit.
+- 3-bit, keys per-channel and values per-token: +24.1%.
+- 2-bit: +27.3% for KVQuant, +95.2% for FlexGen.
+
+INT4 here sits with the grouped methods, and INT2 with KVQuant-2bit. Neither
+is the large divergence #18 asks to investigate. Two differences keep this
+from being a like-for-like comparison. The models differ. And every query
+here reads up to P - 1 positions of its own page at FP16, where KVQuant reads
+none.
+
+The investigation was needed all the same. The first design's prefill read
+INT2 at +113% on a trial of four windows of the 0.5B model, which *was* a
+large divergence. It came from the measurement, not the quantiser: every
+query read its own page quantised, through scales that looked ahead. The
+causal design above removed it.
+
+**Where INT2 loses it** (the Halves diagnostic, 0.5B). Quantising the keys
+alone costs +0.32% at INT4 and **+15.9% at INT2**. Quantising the values
+alone costs +0.42% and +5.5%. At INT2 the keys cost three times what the
+values do. That reverses what the round trip's signal-to-noise ratios
+suggested (ADR-0005, note from #17). The whole-head value groups, kept over
+KIVI's 32 channels (ADR-0005, note before #18), are therefore not the main
+cause; +5.5% bounds what smaller value groups could recover. The two errors
+compound: +15.9% and +5.5% together would be +22.3%, where both halves at
+once cost +26.8%.
+
+**Generation, read** (`generation-sample`, entries `eb0bac0e` to `1d6bb55e`
+for 1.5B and `d93d4c23` to `f8d2fba9` for 0.5B). The prompts are four
+retrieval prompts and three WikiText articles to summarise.
+
+- FP16 and INT8 give the same text on both models.
+- INT4 on 1.5B is coherent: every retrieval right, every summary faithful,
+  with one name repeated. INT4 on 0.5B is coherent in most places but falls
+  into one repetition loop and inverts one answer.
+- **INT2 is not coherent.** On 1.5B the sentences stay grammatical, but it
+  invents facts ("married a woman named Li Bai"), answers once in the user's
+  voice, and falls into one loop, repeating a sentence eight times. On 0.5B
+  it degenerates: two of the three summaries are "= = = =" to the end.
+- INT2, as the tier of a whole cache, fails #18's coherence criterion. Its
+  case in ADR-0008 is as a tier for the least important pages, which static
+  operation cannot test.
+
+**32K on Qwen2.5-1.5B** (`prefill-throughput`, with the opt-in test passing
+at every tier). The whole window prefills at every tier: 45.8, 45.4 and 44.0
+tokens per second at INT8, INT4 and INT2, against 45.8 at FP16. The cache at
+the peak is 502, 278 and 166 MiB, that is, the footprint above plus the
+16 MiB RoPE table. Dequantising inside attention costs about 4% of prefill
+time, at INT2.

@@ -170,3 +170,21 @@ effective bits from 8.63 / 4.63 / 2.63 to 9.0 / 5.0 / 3.0.
   The layout's value metadata region is `P * kv_heads` entries only because a
   group is a head; smaller groups would widen that region and change nothing
   else in it.
+
+---
+
+## Note from #18: the keys, not the whole-head value groups, cost most at INT2
+
+The note before #18 asked that a larger degradation than KIVI's at INT2 be
+put down to the whole-head value groups only once the implementation was
+ruled out. It was: attention over a quantised cache is proven bit-exact
+against attention over what the pages hold (tests/test_quantised_pages.py).
+Then #18's diagnostic split the cost (ADR-0011, measurements). On
+Qwen2.5-0.5B's WikiText-2 perplexity, keys alone at INT2 cost +15.9% and
+values alone +5.5%. The value groups are not the main cause, and +5.5% bounds
+what KIVI's 32-channel groups could recover.
+
+The keys are quantised after RoPE, because ADR-0009 caches them rotated.
+KVQuant found quantising keys *before* RoPE worth 0.82 perplexity on LLaMA-7B
+at 3 bits. That, not the value groups, is the first thing to revisit if the
+low tiers must improve.
