@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from test_chunked_prefill import LOGIT_BOUND
 from test_paged_engine import decode
 
 from conftest import require_model
@@ -91,11 +92,34 @@ def test_every_tier_runs_and_each_narrower_one_costs_more(engine, golden):
     assert all(a >= b for a, b in zip(top1, top1[1:])), top1
 
 
+@pytest.mark.parametrize("tier", TIERS)
+def test_decoding_continues_as_a_full_prefill_would_at_every_tier(engine, golden, tier):
+    """Attention at a quantised tier is causal as decode is (ADR-0011): a
+    query reads its own page at FP16 and every page before it sealed, however
+    many positions came with it. So a prompt decoded one token at a time and
+    the same tokens prefilled at once read the same cache, and choose the same
+    tokens. They may differ only where cuBLAS rounds a key differently in a
+    one-row GEMM than in a long one (ADR-0006, note from #15), which can flip
+    an argmax at a near-tie and every token after it: the first difference,
+    if any, is where the prefill's top two logits are within LOGIT_BOUND."""
+    for prompt_id in ("short-00", "medium-01", "adversarial-04", "long-03"):
+        ids = golden[prompt_id].token_ids
+        with at_tier(engine, tier):
+            out = engine.generate(ids, 40, stop_at_eos=False)
+            full = engine.forward(np.concatenate([ids, out[:-1]]))[len(ids) - 1:]
+        differ = np.flatnonzero(full.argmax(-1) != out)
+        if differ.size:
+            top_two = np.sort(full[differ[0]])[-2:]
+            assert top_two[1] - top_two[0] < LOGIT_BOUND, (
+                f"{tier} {prompt_id}: decode left the prefill's choice at step {differ[0]}, "
+                f"away from a near-tie")
+
+
 @pytest.mark.parametrize("tier", TIERS[1:])
 def test_no_page_changes_tier_during_a_generation(engine, golden, tier):
     """A real prefill and decode at a quantised tier, with the allocator read
     after every step: every page of positions is at the cache's tier, the only
-    FP16 pages are the open pages, one per layer, and no page once seen is ever
+    FP16 pages are the open pages, two per layer, and no page once seen is ever
     at another tier."""
     cfg = engine.config
     cache = model.PagedCache(cfg, getattr(_microinfer.Tier, tier))
@@ -110,8 +134,9 @@ def test_no_page_changes_tier_during_a_generation(engine, golden, tier):
         seen.update(now)
         full = cache.length // P
         assert len(allocator.pages(cache.tier)) == cfg.num_hidden_layers * full
-        assert sorted(allocator.pages(_microinfer.Tier.FP16)) == [
-            (layer, _microinfer.device.open_page) for layer in range(cfg.num_hidden_layers)]
+        assert sorted(allocator.pages(_microinfer.Tier.FP16)) == sorted(
+            (layer, p) for layer in range(cfg.num_hidden_layers)
+            for p in _microinfer.device.open_pages)
 
     decode(engine, ids, 3 * P, cache, between_steps=check)
     check("end")

@@ -52,6 +52,11 @@ namespace microinfer
     std::size_t slot;
   };
 
+  // The driver's minimum allocation granularity for device memory on device
+  // 0, from cuMemGetAllocationGranularity: the unit a PagedKVCache's ranges
+  // are backed in. Never assumed.
+  std::size_t allocation_granularity();
+
   // The KV cache allocator of ADR-0007, built on the CUDA virtual memory
   // management API so that emptied memory returns to the *driver*, where
   // nvmlDeviceGetMemoryInfo can see it. A page recycled inside a pool the

@@ -63,6 +63,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--kv-tier", default="FP16", choices=Engine.KV_TIERS,
                         help="the static tier the cache is held at (#18)")
+    parser.add_argument("--prefill-only", action="store_true",
+                        help="log prefill alone; at 32K each decode timing costs two "
+                             "more prefills")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
 
@@ -95,6 +98,9 @@ def main(argv: list[str]) -> int:
               f"free at peak {peak.device_free / 2**20:.0f} MiB")
         benchlog.append("prefill-throughput", model=args.model, context_length=length,
                         precision_tiers=tiers, config=method, results=prefill, log=args.log)
+
+        if args.prefill_only:
+            continue
 
         # Decode: generation of one token (prefill and its greedy choice)
         # and of DECODE_STEPS more are both timed; the difference is the

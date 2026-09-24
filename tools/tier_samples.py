@@ -8,10 +8,16 @@ the output and not only by metrics. A reader can only judge what they can
 see again, so the generations are logged as well as printed: one entry per
 tier, holding every prompt's output as text.
 
-The prompts are the golden set's long ones, each wrapped in the chat template
-as a request to summarise it, so that most of what the model reads sits in
-quantised pages, not in the FP16 open page (ADR-0005): a short prompt would
-test almost nothing but its last page. Refuses a dirty tree.
+Two kinds of prompt, each long, so that most of what the model reads sits in
+sealed pages and not in the FP16 page its queries are on (ADR-0011); a short
+prompt would test almost nothing but that page:
+
+- the golden set's long prompts, which bury one fact in filler and end with a
+  question about it: a test of retrieval;
+- the first articles of WikiText-2's test split, the text tools/perplexity.py
+  scores, asked for a summary: a test of real prose.
+
+Each is wrapped in the chat template. Refuses a dirty tree.
 """
 
 from __future__ import annotations
@@ -25,9 +31,32 @@ sys.path.insert(0, str(REPO / "src"))
 
 from microinfer import Engine, benchlog  # noqa: E402
 from microinfer.golden import load_prompts  # noqa: E402
+from perplexity import held_out_text  # noqa: E402
 
 TEMPLATE = ("<|im_start|>user\nSummarise the following text in three sentences.\n\n{text}"
             "<|im_end|>\n<|im_start|>assistant\n")
+ARTICLES = 3
+#: About 1,500 tokens of an article: long enough that nearly all of it is
+#: sealed, short enough that the prompt fits any window.
+ARTICLE_CHARS = 6000
+
+
+def articles(n: int) -> dict[str, str]:
+    """The first n articles of WikiText-2's test split, each cut at a line
+    ending near ARTICLE_CHARS. An article begins at a top-level heading,
+    ' = Title = ', alone on its line."""
+    lines = held_out_text().split("\n")
+    starts = [i for i, line in enumerate(lines)
+              if line.startswith(" = ") and not line.startswith(" = = ")]
+    found = {}
+    for a, b in zip(starts, starts[1:] + [len(lines)]):
+        text = "\n".join(lines[a:b]).strip()
+        if len(text) > ARTICLE_CHARS:
+            text = text[:text.rfind("\n", 0, ARTICLE_CHARS)]
+        found[f"wikitext-{len(found):02d}"] = text
+        if len(found) == n:
+            break
+    return found
 
 
 def main(argv: list[str]) -> int:
@@ -47,8 +76,10 @@ def main(argv: list[str]) -> int:
 
     engine = Engine(REPO / "models" / args.model)
     engine.load_weights()
-    prompts = [p for p in load_prompts(REPO / "tools" / "prompts.jsonl") if p["group"] == "long"]
-    wrapped = {p["id"]: engine.encode(TEMPLATE.format(text=p["text"])) for p in prompts}
+    texts = {p["id"]: p["text"] for p in load_prompts(REPO / "tools" / "prompts.jsonl")
+             if p["group"] == "long"}
+    texts.update(articles(ARTICLES))
+    wrapped = {pid: engine.encode(TEMPLATE.format(text=text)) for pid, text in texts.items()}
 
     for tier in args.tiers:
         engine.kv_tier = tier
@@ -61,8 +92,11 @@ def main(argv: list[str]) -> int:
         benchlog.append(
             "generation-sample", model=args.model, precision_tiers={tier: 1.0},
             context_length={"min": min(lengths), "max": max(lengths), "prompts": len(lengths)},
-            config={"prompts": "the golden set's long prompts, as a request to summarise",
+            config={"prompts": "the golden set's long prompts and the first WikiText-2 test "
+                               "articles, each as a request to summarise",
                     "template": TEMPLATE, "new_tokens": args.new_tokens, "greedy": True,
+                    "kv_cache": engine.kv_cache, "prefill_chunk": engine.prefill_chunk,
+                    "attention": "causal: a query's own page at FP16 (ADR-0011)",
                     "issue": args.issue},
             results={"samples": samples}, log=args.log)
     return 0

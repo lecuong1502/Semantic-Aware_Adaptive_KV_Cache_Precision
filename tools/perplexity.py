@@ -2,7 +2,7 @@
 """Perplexity on held-out text at each static KV tier (#18).
 
     .venv/bin/python tools/perplexity.py --issue 18 [--model qwen2.5-0.5b-instruct] \\
-        [--tiers FP16 INT8 INT4 INT2] [--window 2048] [--windows N]
+        [--tiers FP16 INT8 INT4 INT2] [--kv-halves both] [--window 2048] [--windows N]
 
 The held-out set is WikiText-2's test split, raw, the set KVQuant reports
 perplexity on (Hooper et al., arXiv:2401.18079, Table 1). The archive is
@@ -16,11 +16,16 @@ the token that follows it: teacher forcing over all input tokens, as KVQuant
 measures it. Perplexity is exp of the mean negative log-likelihood over every
 scored token of every window.
 
-The cache is held at one tier for the whole run (Engine.kv_tier), so the
-forward pass attends over quantised pages for every full span of P positions
-and over the FP16 open page for the rest (ADR-0005). That is the same
-condition KVQuant's perplexity measures: keys and values quantised as they
-are attended to, with no full-precision prompt.
+The cache is held at one tier for the whole run (Engine.kv_tier). Attention
+is causal as decode is (ADR-0011): each position reads every page before its
+own quantised and its own page at FP16, so a window scores what generating it
+token by token would, with at most P - 1 positions of FP16 behind each query.
+KVQuant quantises every position it attends to; this is kinder by that page,
+and KIVI, which keeps 128 positions at full precision, kinder still.
+
+`--kv-halves keys` or `values` is the diagnostic that splits a tier's cost
+(kv_pages.h): only that half of each sealed page goes through the tier's
+round trip, and the other stays FP16.
 
 One engine serves every tier; one entry per tier goes to the benchmark log,
 each carrying the FP16 figure if FP16 was run too. Refuses a dirty tree, as
@@ -87,6 +92,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--model", default="qwen2.5-0.5b-instruct")
     parser.add_argument("--tiers", nargs="+", default=list(Engine.KV_TIERS),
                         choices=Engine.KV_TIERS)
+    parser.add_argument("--kv-halves", default="both", choices=Engine.KV_HALVES)
     parser.add_argument("--window", type=int, default=2048)
     parser.add_argument("--windows", type=int, default=None,
                         help="score only the first N windows (default: all)")
@@ -99,6 +105,7 @@ def main(argv: list[str]) -> int:
 
     engine = Engine(REPO / "models" / args.model)
     engine.load_weights()
+    engine.kv_halves = args.kv_halves
     ids = engine.encode(held_out_text())
     windows = len(ids) // args.window
     if args.windows is not None:
@@ -107,6 +114,8 @@ def main(argv: list[str]) -> int:
 
     results = {}
     for tier in args.tiers:
+        if tier == "FP16" and args.kv_halves != "both":
+            continue  # nothing to split
         engine.kv_tier = tier
         nll, scored, start = 0.0, 0, time.perf_counter()
         for w in range(windows):
@@ -129,7 +138,9 @@ def main(argv: list[str]) -> int:
             config={"dataset": "WikiText-2 raw, test split", "source": URL, "sha256": SHA256,
                     "window": args.window, "stride": args.window,
                     "scoring": "teacher forcing, every position but each window's first",
-                    "kv_cache": engine.kv_cache, "prefill_chunk": engine.prefill_chunk,
+                    "kv_cache": engine.kv_cache, "kv_halves": args.kv_halves,
+                    "prefill_chunk": engine.prefill_chunk,
+                    "attention": "causal: a query's own page at FP16 (ADR-0011)",
                     "issue": args.issue},
             results=results[tier], log=args.log)
     return 0

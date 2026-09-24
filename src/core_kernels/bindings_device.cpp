@@ -459,6 +459,15 @@ void bind_device(py::module_ &parent)
 
   m.attr("page_tokens") = microinfer::kPageTokens;
 
+  py::enum_<microinfer::Halves>(
+      m, "Halves",
+      "Which halves of a page a quantised tier quantises. Keys and Values are "
+      "a diagnostic: pages stored at FP16, one half replaced by the tier's "
+      "round trip when sealed (#18).")
+      .value("Both", microinfer::Halves::Both)
+      .value("Keys", microinfer::Halves::Keys)
+      .value("Values", microinfer::Halves::Values);
+
   using microinfer::KVPages;
   py::class_<KVPages>(
       m, "KVPages",
@@ -466,14 +475,15 @@ void bind_device(py::module_ &parent)
       "[i*P, (i+1)*P), keys then values. Pages come from a PagedKVCache as the "
       "sequence grows, and every launch resolves the page table afresh, so "
       "the allocator may move pages between launches (ADR-0007).\n"
-      "At a quantised tier (#18) a page is allocated at that tier and written "
-      "once, when full; until then its positions are in the layer's FP16 "
-      "open page, (layer, open_page). No page changes tier.")
+      "At a quantised tier (#18, ADR-0011) a page is allocated at that tier "
+      "and sealed once, when full; until then its positions are in one of "
+      "the layer's two FP16 open pages, (layer, p) for p in open_pages. No "
+      "page changes tier, and attention reads a query's own page at FP16.")
       .def(py::init<microinfer::PagedKVCache &, int, int, int, int,
-                    microinfer::Tier>(),
+                    microinfer::Tier, microinfer::Halves>(),
            py::arg("allocator"), py::arg("layers"), py::arg("page_tokens"),
            py::arg("kv_heads"), py::arg("head_dim"), py::arg("tier"),
-           py::keep_alive<1, 2>(),
+           py::arg("halves") = microinfer::Halves::Both, py::keep_alive<1, 2>(),
            "The allocator's page size at `tier` must be a page's at that tier: "
            "page_bytes(page_tokens, kv_heads * head_dim) at FP16, else "
            "quantised_page_layout(...)['page_bytes']; at a quantised tier its "
@@ -497,7 +507,8 @@ void bind_device(py::module_ &parent)
           "attention",
           [](KVPages &c, int layer, const Span &q, std::optional<Span> k_bias,
              const microinfer::RopeTable *rope, const Span &out, int seq_q,
-             int seq_k, int heads, int kv_heads, int head_dim)
+             int seq_k, int heads, int kv_heads, int head_dim,
+             std::optional<Span> keys, std::optional<Span> values)
           {
             if (seq_q > seq_k)
             {
@@ -512,20 +523,36 @@ void bind_device(py::module_ &parent)
             {
               need(*k_bias, product(kv_heads, head_dim), "k_bias");
             }
+            if (keys)
+            {
+              need(*keys, product(seq_q, kv_heads, head_dim), "keys");
+            }
+            if (values)
+            {
+              need(*values, product(seq_q, kv_heads, head_dim), "values");
+            }
             c.attention(layer, q.ptr, k_bias ? k_bias->ptr : nullptr, rope,
-                        out.ptr, seq_q, seq_k, heads, kv_heads, head_dim);
+                        out.ptr, seq_q, seq_k, heads, kv_heads, head_dim,
+                        keys ? keys->ptr : nullptr,
+                        values ? values->ptr : nullptr);
           },
           py::arg("layer"), py::arg("q"), py::arg("k_bias"), py::arg("rope"),
           py::arg("out"), py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
-          py::arg("kv_heads"), py::arg("head_dim"))
+          py::arg("kv_heads"), py::arg("head_dim"),
+          py::arg("keys") = py::none(), py::arg("values") = py::none(),
+          "At a quantised tier, keys and values are the rows the queries "
+          "stored, from which each query reads its own page.")
       .def_property_readonly("page_tokens", &KVPages::page_tokens)
       .def_property_readonly("pages_per_layer", &KVPages::pages_per_layer)
       .def_property_readonly("capacity_tokens", &KVPages::capacity_tokens)
       .def_property_readonly("page_bytes", &KVPages::page_bytes)
       .def_property_readonly("kv_width", &KVPages::kv_width)
-      .def_property_readonly("tier", &KVPages::tier);
+      .def_property_readonly("tier", &KVPages::tier)
+      .def_property_readonly("halves", &KVPages::halves)
+      .def_property_readonly("storage_tier", &KVPages::storage_tier);
 
-  m.attr("open_page") = microinfer::kOpenPage;
+  m.attr("open_pages") =
+      py::make_tuple(microinfer::kOpenPages[0], microinfer::kOpenPages[1]);
 
   m.def("page_bytes", &KVPages::page_bytes_for, py::arg("page_tokens"),
         py::arg("kv_width"),

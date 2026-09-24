@@ -105,6 +105,9 @@ namespace microinfer
       {
         return v[j * row + at];
       }
+      // What a query tile starting at `position` reads: the same for every
+      // tile here. Only the causal layout below depends on it.
+      __device__ ContiguousKV view_for(int) const { return *this; }
     };
 
     // Paged (ADR-0004, ADR-0007): key j is in page j / page_tokens at row
@@ -131,67 +134,126 @@ namespace microinfer
       {
         return key_row(j)[static_cast<size_t>(page_tokens) * row + at];
       }
+      __device__ PagedKV view_for(int) const { return *this; }
     };
 
-    // Quantised pages (ADR-0005, #18): the first `sealed` pages of the table
-    // are at a quantised tier, in quant.h's layout, and the one after them is
-    // the layer's open page, still FP16 and laid out as PagedKV's. A code is
-    // dequantised exactly as dequantise_page does it, one fp32 fused
-    // multiply-add rounded once to fp16, so attention here is attention over
-    // the FP16 pages dequantise_page would give.
-    template <int Bits> struct QuantisedPagedKV
+    // How a sealed page's rows are read: a quantised page in quant.h's
+    // layout, each code dequantised exactly as dequantise_page does it, one
+    // fp32 fused multiply-add rounded once to fp16 ...
+    template <int Bits> struct QuantisedFormat
     {
       static constexpr int kPerByte = 8 / Bits;
       static constexpr unsigned kMask = (1u << Bits) - 1;
 
-      const unsigned long long *pages;
-      int page_tokens;
-      int sealed;
+      QuantisedPageLayout layout;
       size_t row;
       int kv_heads;
       int head_dim;
-      QuantisedPageLayout layout;
 
-      __device__ const std::uint8_t *page(int j) const
+      __device__ __half decode(const std::uint8_t *page, size_t codes, size_t e,
+                               const __half *scales, const __half *zeros,
+                               size_t group) const
       {
-        return reinterpret_cast<const std::uint8_t *>(pages[j / page_tokens]);
-      }
-      __device__ const __half *halves(int j, size_t offset) const
-      {
-        return reinterpret_cast<const __half *>(page(j) + offset);
-      }
-      __device__ __half decode(int j, size_t codes, size_t e, float scale,
-                               float zero) const
-      {
-        const unsigned byte = page(j)[codes + e / kPerByte];
+        const unsigned byte = page[codes + e / kPerByte];
         const float q =
             static_cast<float>((byte >> ((e % kPerByte) * Bits)) & kMask);
-        return __float2half_rn(fmaf(q, scale, zero));
+        return __float2half_rn(
+            fmaf(q, __half2float(scales[group]), __half2float(zeros[group])));
+      }
+      __device__ float key(const std::uint8_t *page, int t, size_t at) const
+      {
+        return __half2float(decode(
+            page, layout.key_codes, t * row + at,
+            reinterpret_cast<const __half *>(page + layout.key_scales),
+            reinterpret_cast<const __half *>(page + layout.key_zeros), at));
+      }
+      __device__ __half value(const std::uint8_t *page, int t, size_t at) const
+      {
+        return decode(
+            page, layout.value_codes, t * row + at,
+            reinterpret_cast<const __half *>(page + layout.value_scales),
+            reinterpret_cast<const __half *>(page + layout.value_zeros),
+            static_cast<size_t>(t) * kv_heads + at / head_dim);
+      }
+    };
+
+    // ... or an FP16 page, keys then values, as PagedKV reads it: the
+    // diagnostic pages of KVPages' Halves::Keys and Halves::Values, whose
+    // other half was quantised and dequantised when the page was sealed.
+    struct Fp16Format
+    {
+      size_t row;
+      int page_tokens;
+
+      __device__ float key(const std::uint8_t *page, int t, size_t at) const
+      {
+        return __half2float(
+            reinterpret_cast<const __half *>(page)[t * row + at]);
+      }
+      __device__ __half value(const std::uint8_t *page, int t, size_t at) const
+      {
+        return reinterpret_cast<const __half *>(
+            page)[(static_cast<size_t>(page_tokens) + t) * row + at];
+      }
+    };
+
+    // A cache at a quantised tier, read causally (ADR-0011): a query reads
+    // every page before its own as sealed, and its own page at FP16, as
+    // decode does, whatever else arrived in the same launch. Of its own
+    // page, the positions before `start`, the first query's, are in the open
+    // page they were written to; the rest are the rows this launch's queries
+    // brought, `chunk_k` and `chunk_v`. The kernel's query tiles are aligned
+    // so that no tile spans two pages, and view_for binds a tile's page.
+    template <typename Format> struct CausalPagedKV
+    {
+      const unsigned long long *sealed;
+      const __half *open;
+      const __half *chunk_k;
+      const __half *chunk_v;
+      int page_tokens;
+      int start;
+      size_t row;
+      Format format;
+      int own = 0;
+
+      __device__ CausalPagedKV view_for(int position) const
+      {
+        CausalPagedKV view = *this;
+        view.own = position / page_tokens;
+        return view;
+      }
+      __device__ const std::uint8_t *page(int p) const
+      {
+        return reinterpret_cast<const std::uint8_t *>(sealed[p]);
       }
       __device__ float key(int j, size_t at) const
       {
-        const size_t e = (j % page_tokens) * row + at;
-        if (j / page_tokens >= sealed)
+        const int p = j / page_tokens;
+        const int t = j % page_tokens;
+        if (p < own)
         {
-          return __half2float(halves(j, 0)[e]);
+          return format.key(page(p), t, at);
         }
-        return __half2float(
-            decode(j, layout.key_codes, e,
-                   __half2float(halves(j, layout.key_scales)[at]),
-                   __half2float(halves(j, layout.key_zeros)[at])));
+        if (j >= start)
+        {
+          return __half2float(
+              chunk_k[static_cast<size_t>(j - start) * row + at]);
+        }
+        return __half2float(open[t * row + at]);
       }
       __device__ __half value(int j, size_t at) const
       {
+        const int p = j / page_tokens;
         const int t = j % page_tokens;
-        const size_t e = t * row + at;
-        if (j / page_tokens >= sealed)
+        if (p < own)
         {
-          return halves(j, 0)[static_cast<size_t>(page_tokens) * row + e];
+          return format.value(page(p), t, at);
         }
-        const size_t group = static_cast<size_t>(t) * kv_heads + at / head_dim;
-        return decode(j, layout.value_codes, e,
-                      __half2float(halves(j, layout.value_scales)[group]),
-                      __half2float(halves(j, layout.value_zeros)[group]));
+        if (j >= start)
+        {
+          return chunk_v[static_cast<size_t>(j - start) * row + at];
+        }
+        return open[(static_cast<size_t>(page_tokens) + t) * row + at];
       }
     };
 
@@ -201,7 +263,7 @@ namespace microinfer
                                      __half *__restrict__ out, int seq_q,
                                      int seq_k, int heads, int kv_heads,
                                      int head_dim, float scale,
-                                     const float *__restrict__ rope)
+                                     const float *__restrict__ rope, int lead)
     {
       extern __shared__ float smem[];
       float *q_s = smem; // kAttentionTileQ x head_dim
@@ -217,10 +279,15 @@ namespace microinfer
           k_s + kAttentionTileK * head_dim); // kAttentionTileK x head_dim
 
       const int head = blockIdx.y;
-      const int q_first = blockIdx.x * kAttentionTileQ;
-      const int rows = min(kAttentionTileQ, seq_q - q_first);
+      // Tiles start `lead` rows before the first query, so that a layout
+      // can align them to absolute positions; rows outside [0, seq_q) are
+      // padding, computed on and never stored. Each query's output depends
+      // on no other row, so where the tiles fall changes no bit of it.
+      const int q_first = blockIdx.x * kAttentionTileQ - lead;
+      const int q_last = min(q_first + kAttentionTileQ, seq_q) - 1;
       // Bottom-right alignment: query i is at absolute position i + shift.
       const int shift = seq_k - seq_q;
+      const KV view = kv.view_for(q_first + shift);
       const size_t token_stride = static_cast<size_t>(heads) * head_dim;
       const size_t head_offset = static_cast<size_t>(head) * head_dim;
       const int group = heads / kv_heads;
@@ -232,7 +299,7 @@ namespace microinfer
       {
         const int r = i / head_dim;
         const int d = i % head_dim;
-        q_s[i] = r < rows
+        q_s[i] = q_first + r >= 0 && q_first + r <= q_last
                      ? __half2float(
                            q[(q_first + r) * token_stride + head_offset + d]) *
                            scale
@@ -248,7 +315,7 @@ namespace microinfer
 
       // The last key the block's last query can see. Uniform across the block,
       // so every thread runs the same number of iterations.
-      const int last_key = q_first + rows - 1 + shift;
+      const int last_key = q_last + shift;
       const int key_tiles = last_key / kAttentionTileK + 1;
 
       for (int tile = 0; tile < key_tiles; ++tile)
@@ -262,14 +329,14 @@ namespace microinfer
           const int d = i % head_dim;
           const bool in_range = k_first + c < seq_k;
           const size_t at = kv_head_offset + d;
-          float key = in_range ? kv.key(k_first + c, at) : 0.0f;
+          float key = in_range ? view.key(k_first + c, at) : 0.0f;
           if (k_bias != nullptr && in_range)
           {
             key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
                                 head_dim, rope);
           }
           k_s[i] = key;
-          v_s[i] = in_range ? kv.value(k_first + c, at) : __float2half(0.0f);
+          v_s[i] = in_range ? view.value(k_first + c, at) : __float2half(0.0f);
         }
         __syncthreads();
 
@@ -333,12 +400,15 @@ namespace microinfer
         __syncthreads();
       }
 
-      for (int i = threadIdx.x; i < rows * head_dim; i += blockDim.x)
+      for (int i = threadIdx.x; i < kAttentionTileQ * head_dim; i += blockDim.x)
       {
         const int r = i / head_dim;
         const int d = i % head_dim;
-        out[(q_first + r) * token_stride + head_offset + d] =
-            __float2half(o_s[i] / l_s[r]);
+        if (q_first + r >= 0 && q_first + r <= q_last)
+        {
+          out[(q_first + r) * token_stride + head_offset + d] =
+              __float2half(o_s[i] / l_s[r]);
+        }
       }
     }
 
@@ -387,7 +457,7 @@ namespace microinfer
     template <typename KV>
     void launch(const __half *q, KV kv, const __half *k_bias,
                 const RopeTable *rope, __half *out, int seq_q, int seq_k,
-                int heads, int kv_heads, int head_dim)
+                int heads, int kv_heads, int head_dim, int lead = 0)
     {
       check_grouping(heads, kv_heads);
       if (seq_q <= 0 || heads == 0 || head_dim <= 0)
@@ -424,11 +494,12 @@ namespace microinfer
         opted_in = smem;
       }
 
-      const dim3 grid((seq_q + kAttentionTileQ - 1) / kAttentionTileQ, heads);
+      const dim3 grid((lead + seq_q + kAttentionTileQ - 1) / kAttentionTileQ,
+                      heads);
       const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
       attention_kernel<KV><<<grid, kBlockThreads, smem>>>(
           q, kv, k_bias, out, seq_q, seq_k, heads, kv_heads, head_dim, scale,
-          k_bias != nullptr ? rope->data() : nullptr);
+          k_bias != nullptr ? rope->data() : nullptr, lead);
       cuda_check(cudaGetLastError(), "attention kernel launch");
     }
 
@@ -459,23 +530,48 @@ namespace microinfer
            heads, kv_heads, head_dim);
   }
 
-  void device::attention_paged_quantised(
-      const __half *q, const unsigned long long *pages, int sealed,
-      int page_tokens, Tier tier, const __half *k_bias, const RopeTable *rope,
-      __half *out, int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
+  void device::attention_paged_causal(
+      const __half *q, const unsigned long long *sealed, const __half *open,
+      const __half *chunk_k, const __half *chunk_v, int page_tokens, Tier tier,
+      bool fp16_pages, const __half *k_bias, const RopeTable *rope, __half *out,
+      int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
   {
+    if (page_tokens <= 0 || page_tokens % kAttentionTileQ != 0)
+    {
+      throw std::invalid_argument(
+          "causal paged attention aligns query tiles of " +
+          std::to_string(kAttentionTileQ) +
+          " to pages, so page_tokens must be a positive multiple of it; got " +
+          std::to_string(page_tokens));
+    }
+    const size_t row = static_cast<size_t>(kv_heads) * head_dim;
+    const int start = seq_k - seq_q;
+    // The first tile begins at the last multiple of the tile size at or
+    // before `start`, so every tile lies within one page.
+    const int lead = start % kAttentionTileQ;
+    if (fp16_pages)
+    {
+      launch(q,
+             CausalPagedKV<Fp16Format>{sealed, open, chunk_k, chunk_v,
+                                       page_tokens, start, row,
+                                       Fp16Format{row, page_tokens}},
+             k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim, lead);
+      return;
+    }
     const QuantisedPageLayout layout =
         quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
-    const size_t row = static_cast<size_t>(kv_heads) * head_dim;
     with_code_width(
         tier,
         [&](auto width)
         {
           constexpr int kBits = decltype(width)::value;
+          using Format = QuantisedFormat<kBits>;
           launch(q,
-                 QuantisedPagedKV<kBits>{pages, page_tokens, sealed, row,
-                                         kv_heads, head_dim, layout},
-                 k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim);
+                 CausalPagedKV<Format>{sealed, open, chunk_k, chunk_v,
+                                       page_tokens, start, row,
+                                       Format{layout, row, kv_heads, head_dim}},
+                 k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim,
+                 lead);
         });
   }
 

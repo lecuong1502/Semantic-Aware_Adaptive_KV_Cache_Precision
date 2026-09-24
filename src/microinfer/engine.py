@@ -75,25 +75,26 @@ def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16")
 
     At FP16 that is a page for every started span of P positions in every
     layer. At a quantised tier it is a page for every *full* span, at the
-    tier's page size with its scale metadata, plus one FP16 open page per
-    layer for the rest (ADR-0005, kv_pages.h). Each tier's pages sit in their
+    tier's page size with its scale metadata, plus two FP16 open pages per
+    layer for the rest (ADR-0005, ADR-0011). Each tier's pages sit in their
     own address range and the driver backs a range in whole granules
     (ADR-0007), so each range is rounded up to one. The RoPE table beside the
     pages is not included; it is the same at every tier.
     """
     Tier = _microinfer.Tier
     page_tokens = _microinfer.device.page_tokens
-    kv_heads, head_dim, layers = cfg.num_key_value_heads, cfg.head_dim, cfg.num_hidden_layers
-    granule = _microinfer.PagedKVCache([1] * 4, [0] * 4).granule_bytes
-    fp16_page = _microinfer.device.page_bytes(page_tokens, kv_heads * head_dim)
+    layers = cfg.num_hidden_layers
+    granule = _microinfer.granule_bytes()
+    page_bytes = model.tier_page_bytes(cfg)
 
     def whole_granules(n: int) -> int:
         return -(-n // granule) * granule
 
+    fp16 = page_bytes[int(Tier.FP16)]
     if tier == "FP16":
-        return whole_granules(layers * -(-context_length // page_tokens) * fp16_page)
-    page = _microinfer.quantised_page_layout(getattr(Tier, tier), kv_heads, head_dim)["page_bytes"]
-    open_pages = layers * fp16_page if context_length > 0 else 0
+        return whole_granules(layers * -(-context_length // page_tokens) * fp16)
+    page = page_bytes[int(getattr(Tier, tier))]
+    open_pages = layers * len(_microinfer.device.open_pages) * fp16 if context_length > 0 else 0
     return (whole_granules(layers * (context_length // page_tokens) * page)
             + whole_granules(open_pages))
 
@@ -116,20 +117,20 @@ class Engine:
     #: page at one tier for the life of a cache (#18, ADR-0008).
     KV_TIERS = ("FP16", "INT8", "INT4", "INT2")
 
+    #: Which halves of a page a quantised tier quantises. "both" is the tier;
+    #: "keys" and "values" are a diagnostic that splits its cost (kv_pages.h).
+    KV_HALVES = ("both", "keys", "values")
+
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
-                 kv_tier: str = "FP16", prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
+                 kv_tier: str = "FP16", kv_halves: str = "both",
+                 prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
-        if kv_tier not in self.KV_TIERS:
-            raise ValueError(f"kv_tier is one of {self.KV_TIERS}, got {kv_tier!r}")
-        if kv_cache == "contiguous" and kv_tier != "FP16":
-            raise ValueError("the contiguous cache holds FP16 only; quantised tiers are on pages")
         if prefill_chunk is not None and prefill_chunk < 1:
             raise ValueError(f"prefill_chunk must be positive or None, got {prefill_chunk}")
         self.kv_cache = kv_cache
-        #: The tier every page of a cache is held at (#18). Static: nothing
-        #: changes a page's tier after it is allocated.
         self.kv_tier = kv_tier
+        self.kv_halves = kv_halves
         #: None prefills a prompt in one step, with a workspace for all of it.
         self.prefill_chunk = prefill_chunk
         self.model_dir = Path(model_dir)
@@ -188,6 +189,34 @@ class Engine:
 
         self._tensors = loaded
         self._model = model.Model(self.config, model.Weights.from_tensors(self.config, loaded))
+
+    @property
+    def kv_tier(self) -> str:
+        """The tier every page of a cache is held at (#18). Static within a
+        cache: nothing changes a page's tier after it is allocated. Setting it
+        applies to the next cache, and is checked as the constructor checks
+        it."""
+        return self._kv_tier
+
+    @kv_tier.setter
+    def kv_tier(self, tier: str) -> None:
+        if tier not in self.KV_TIERS:
+            raise ValueError(f"kv_tier is one of {self.KV_TIERS}, got {tier!r}")
+        if self.kv_cache == "contiguous" and tier != "FP16":
+            raise ValueError("the contiguous cache holds FP16 only; quantised tiers are on pages")
+        self._kv_tier = tier
+
+    @property
+    def kv_halves(self) -> str:
+        """Which halves of a page the tier quantises: "both", or, as a
+        diagnostic, "keys" or "values" alone (kv_pages.h)."""
+        return self._kv_halves
+
+    @kv_halves.setter
+    def kv_halves(self, halves: str) -> None:
+        if halves not in self.KV_HALVES:
+            raise ValueError(f"kv_halves is one of {self.KV_HALVES}, got {halves!r}")
+        self._kv_halves = halves
 
     @property
     def tensors(self) -> dict[str, _microinfer.DeviceTensor]:
@@ -341,7 +370,13 @@ class Engine:
         so a generation that stops early never held room for the rest."""
         if self.kv_cache == "contiguous":
             return model.ContiguousCache(self.config, capacity)
-        return model.PagedCache(self.config, getattr(_microinfer.Tier, self.kv_tier))
+        tier = getattr(_microinfer.Tier, self.kv_tier)
+        if self.kv_halves == "both":
+            return model.PagedCache(self.config, tier)
+        if tier == _microinfer.Tier.FP16:
+            raise ValueError("kv_halves splits a quantised tier; FP16 has nothing to split")
+        return model.PagedCache(self.config, tier,
+                                getattr(_microinfer.device.Halves, self.kv_halves.title()))
 
     @contextmanager
     def _holding(self, cache, ws: model.Workspace):

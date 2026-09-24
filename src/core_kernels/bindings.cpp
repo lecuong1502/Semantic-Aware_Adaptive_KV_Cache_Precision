@@ -338,8 +338,9 @@ namespace
   }
 
   // A quantised page crosses Seam B as its bytes; keys and values as fp32
-  // (P, kv_heads, head_dim), rounded to fp16 on the way up. P is the build's
-  // (ADR-0004), so a caller cannot quantise a page of any other size.
+  // (P, kv_heads, head_dim), rounded to fp16 on the way up. P is the
+  // build's (ADR-0004) unless the caller names another, as the tests of
+  // KVPages at other page sizes must.
   py::array_t<uint8_t> quantise_page(FloatArray keys, FloatArray values,
                                      microinfer::Tier tier, int page_tokens)
   {
@@ -506,6 +507,10 @@ PYBIND11_MODULE(_microinfer, m)
       .value("INT8", Tier::INT8)
       .value("INT4", Tier::INT4)
       .value("INT2", Tier::INT2);
+
+  m.def("granule_bytes", &microinfer::allocation_granularity,
+        "The driver's allocation granularity for device memory, the unit a "
+        "PagedKVCache's ranges are backed in (ADR-0007).");
 
   py::register_exception<microinfer::PageNotFound>(m, "PageNotFound",
                                                    PyExc_KeyError);
