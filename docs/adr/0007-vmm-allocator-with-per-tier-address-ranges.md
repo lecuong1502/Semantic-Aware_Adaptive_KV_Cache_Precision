@@ -69,6 +69,19 @@ roughly 40% of what requantising the whole cache to INT4 would reclaim. Weight
 loading should use one arena with offsets rather than an allocation per tensor.
 That is not this ticket's work and is filed separately.
 
+**Done in #23.** The weights now load into one arena, sized from config.json,
+with every tensor at a 256-byte-aligned offset. Measured by the driver's own
+account of this process (entries `fa3a1009` and `3a0cb9d9`, at 48ba05f):
+
+| model | tensors | claimed | taken | overhead | left after freeing |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 290 | 942.3 MiB | 944.0 MiB | 0.18% | 0 |
+| Qwen2.5-1.5B | 338 | 2944.4 MiB | 2946.0 MiB | 0.05% | 0 |
+
+The 136 MiB the 0.5B model lost to its 290 allocations is back, in the budget
+the cache competes for. As here, what the driver took is the figure that
+counts.
+
 ---
 
 ## Note from #6: how to measure the contract, and how not to
