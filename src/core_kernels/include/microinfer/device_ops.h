@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "microinfer/paged_kv_cache.h"
 #include "microinfer/rope_table.h"
 
 namespace microinfer
@@ -75,6 +76,19 @@ namespace microinfer
                          int page_tokens, const __half *k_bias,
                          const RopeTable *rope, __half *out, int seq_q,
                          int seq_k, int heads, int kv_heads, int head_dim);
+
+    // The same attention over pages at a quantised tier (#18). The first
+    // `sealed` entries of `pages` are pages at `tier`, in quant.h's layout;
+    // the entry after them is the layer's open page, FP16 and laid out as
+    // attention_paged's. Each code is dequantised as dequantise_page does it,
+    // so the output is attention_paged's over the pages dequantise_page
+    // would give, to the bit.
+    void attention_paged_quantised(const __half *q,
+                                   const unsigned long long *pages, int sealed,
+                                   int page_tokens, Tier tier,
+                                   const __half *k_bias, const RopeTable *rope,
+                                   __half *out, int seq_q, int seq_k, int heads,
+                                   int kv_heads, int head_dim);
 
     // Writes n tokens' key and value rows into their pages, token t at
     // position start + t. `pages` as for attention_paged.

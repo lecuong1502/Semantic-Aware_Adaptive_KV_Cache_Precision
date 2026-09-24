@@ -341,7 +341,7 @@ namespace
   // (P, kv_heads, head_dim), rounded to fp16 on the way up. P is the build's
   // (ADR-0004), so a caller cannot quantise a page of any other size.
   py::array_t<uint8_t> quantise_page(FloatArray keys, FloatArray values,
-                                     microinfer::Tier tier)
+                                     microinfer::Tier tier, int page_tokens)
   {
     if (keys.ndim() != 3)
     {
@@ -359,8 +359,8 @@ namespace
     const int filled = static_cast<int>(keys.shape(0));
     const int kv_heads = static_cast<int>(keys.shape(1));
     const int head_dim = static_cast<int>(keys.shape(2));
-    const auto layout = microinfer::quantised_page_layout(
-        tier, microinfer::kPageTokens, kv_heads, head_dim);
+    const auto layout = microinfer::quantised_page_layout(tier, page_tokens,
+                                                          kv_heads, head_dim);
 
     py::array_t<uint8_t> page(static_cast<py::ssize_t>(layout.page_bytes));
     const float *k = keys.data();
@@ -368,18 +368,18 @@ namespace
     uint8_t *out = page.mutable_data();
     {
       py::gil_scoped_release release;
-      microinfer::quantise_page(k, v, out, tier, microinfer::kPageTokens,
-                                filled, kv_heads, head_dim);
+      microinfer::quantise_page(k, v, out, tier, page_tokens, filled, kv_heads,
+                                head_dim);
     }
     return page;
   }
 
   py::tuple dequantise_page(
       py::array_t<uint8_t, py::array::c_style | py::array::forcecast> page,
-      microinfer::Tier tier, int kv_heads, int head_dim)
+      microinfer::Tier tier, int kv_heads, int head_dim, int page_tokens)
   {
-    const auto layout = microinfer::quantised_page_layout(
-        tier, microinfer::kPageTokens, kv_heads, head_dim);
+    const auto layout = microinfer::quantised_page_layout(tier, page_tokens,
+                                                          kv_heads, head_dim);
     if (page.ndim() != 1 ||
         static_cast<std::size_t>(page.shape(0)) != layout.page_bytes)
     {
@@ -387,8 +387,7 @@ namespace
                                   std::to_string(layout.page_bytes) +
                                   " bytes, got shape " + shape_of(page));
     }
-    const std::vector<py::ssize_t> shape{microinfer::kPageTokens, kv_heads,
-                                         head_dim};
+    const std::vector<py::ssize_t> shape{page_tokens, kv_heads, head_dim};
     py::array_t<float> keys(shape);
     py::array_t<float> values(shape);
     const uint8_t *in = page.data();
@@ -396,16 +395,17 @@ namespace
     float *v = values.mutable_data();
     {
       py::gil_scoped_release release;
-      microinfer::dequantise_page(in, k, v, tier, microinfer::kPageTokens,
-                                  kv_heads, head_dim);
+      microinfer::dequantise_page(in, k, v, tier, page_tokens, kv_heads,
+                                  head_dim);
     }
     return py::make_tuple(keys, values);
   }
 
-  py::dict page_layout(microinfer::Tier tier, int kv_heads, int head_dim)
+  py::dict page_layout(microinfer::Tier tier, int kv_heads, int head_dim,
+                       int page_tokens)
   {
-    const auto layout = microinfer::quantised_page_layout(
-        tier, microinfer::kPageTokens, kv_heads, head_dim);
+    const auto layout = microinfer::quantised_page_layout(tier, page_tokens,
+                                                          kv_heads, head_dim);
     py::dict d;
     d["bits"] = layout.bits;
     d["key_codes"] = layout.key_codes;
@@ -513,13 +513,14 @@ PYBIND11_MODULE(_microinfer, m)
 
   m.def("quantised_page_layout", &page_layout, py::arg("tier"),
         py::arg("kv_heads"), py::arg("head_dim"),
+        py::arg("page_tokens") = microinfer::kPageTokens,
         "Byte offsets of a quantised page's regions (key codes, value codes, "
         "key scales, key zeros, value scales, value zeros), its metadata and "
         "page bytes, and the effective bits per element with the metadata "
         "counted. Shared by every quantised tier (quant.h).");
 
   m.def("quantise_page", &quantise_page, py::arg("keys"), py::arg("values"),
-        py::arg("tier"),
+        py::arg("tier"), py::arg("page_tokens") = microinfer::kPageTokens,
         "One page's keys and values, each (P, kv_heads, head_dim), to the "
         "tier's bytes: keys per (head, channel) across the page, values per "
         "(head, token), both asymmetric (ADR-0005). Fewer than P positions "
@@ -527,6 +528,7 @@ PYBIND11_MODULE(_microinfer, m)
 
   m.def("dequantise_page", &dequantise_page, py::arg("page"), py::arg("tier"),
         py::arg("kv_heads"), py::arg("head_dim"),
+        py::arg("page_tokens") = microinfer::kPageTokens,
         "(keys, values), each (P, kv_heads, head_dim): code * scale + zero in "
         "one fp32 fused multiply-add, rounded once to fp16.");
 

@@ -83,13 +83,24 @@ class Engine:
     #: 6 GiB card (benchmark log, prefill-throughput at 32768 tokens).
     DEFAULT_PREFILL_CHUNK = 512
 
+    #: The precision tiers the paged cache can be held at, statically: every
+    #: page at one tier for the life of a cache (#18, ADR-0008).
+    KV_TIERS = ("FP16", "INT8", "INT4", "INT2")
+
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
-                 prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
+                 kv_tier: str = "FP16", prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
+        if kv_tier not in self.KV_TIERS:
+            raise ValueError(f"kv_tier is one of {self.KV_TIERS}, got {kv_tier!r}")
+        if kv_cache == "contiguous" and kv_tier != "FP16":
+            raise ValueError("the contiguous cache holds FP16 only; quantised tiers are on pages")
         if prefill_chunk is not None and prefill_chunk < 1:
             raise ValueError(f"prefill_chunk must be positive or None, got {prefill_chunk}")
         self.kv_cache = kv_cache
+        #: The tier every page of a cache is held at (#18). Static: nothing
+        #: changes a page's tier after it is allocated.
+        self.kv_tier = kv_tier
         #: None prefills a prompt in one step, with a workspace for all of it.
         self.prefill_chunk = prefill_chunk
         self.model_dir = Path(model_dir)
@@ -301,7 +312,7 @@ class Engine:
         so a generation that stops early never held room for the rest."""
         if self.kv_cache == "contiguous":
             return model.ContiguousCache(self.config, capacity)
-        return model.PagedCache(self.config)
+        return model.PagedCache(self.config, getattr(_microinfer.Tier, self.kv_tier))
 
     @contextmanager
     def _holding(self, cache, ws: model.Workspace):

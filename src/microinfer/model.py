@@ -128,33 +128,49 @@ class ContiguousCache(_Cache):
 
 
 class PagedCache(_Cache):
-    """FP16 keys and values on pages of P positions (ADR-0004), allocated from
-    the VMM allocator (ADR-0007) as the sequence grows (#14).
+    """Keys and values on pages of P positions (ADR-0004), allocated from the
+    VMM allocator (ADR-0007) as the sequence grows (#14), at one precision
+    tier chosen when the cache is made (#18).
 
     Page i of layer l is the page table entry (l, i). Attention reads keys and
     values through the page table, resolved again after any allocator
     operation, so the allocator may move a page between launches without harm.
 
+    At a quantised tier every page is allocated at that tier and written once,
+    when its last position arrives; until then its positions are in the
+    layer's FP16 open page (ADR-0005, kv_pages.h). The tier never changes: this
+    is Milestone 0's static operation, and moving a page between tiers is
+    Milestone 2's.
+
     The allocator reserves address space for the model's whole context window
-    and takes device memory only as pages are allocated. `nbytes` is therefore
-    what the driver actually holds for the cache: whole granules, and the RoPE
-    table beside them.
+    at the cache's tier, and for the open pages at FP16, and takes device
+    memory only as pages are allocated. `nbytes` is therefore what the driver
+    actually holds for the cache: whole granules in each tier's range, and the
+    RoPE table beside them.
     """
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, tier=None):
         super().__init__(cfg)
+        Tier = _microinfer.Tier
+        self.tier = Tier.FP16 if tier is None else tier
         page_tokens = device.page_tokens
+        layers = cfg.num_hidden_layers
         pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
-        # The quantised tiers hold nothing until #16; they reserve nothing.
-        self.allocator = _microinfer.PagedKVCache(
-            [device.page_bytes(page_tokens, self.kv_width)] * 4,
-            [cfg.num_hidden_layers * pages_per_layer, 0, 0, 0])
-        self.pages = device.KVPages(self.allocator, cfg.num_hidden_layers, page_tokens,
-                                    self.kv_width, _microinfer.Tier.FP16)
+        page_bytes = [device.page_bytes(page_tokens, self.kv_width)] + [
+            _microinfer.quantised_page_layout(t, self.kv_heads, self.head_dim)["page_bytes"]
+            for t in (Tier.INT8, Tier.INT4, Tier.INT2)]
+        capacity = [0] * 4
+        capacity[int(self.tier)] = layers * pages_per_layer
+        if self.tier != Tier.FP16:
+            capacity[int(Tier.FP16)] = layers  # the open pages
+        self.allocator = _microinfer.PagedKVCache(page_bytes, capacity)
+        self.pages = device.KVPages(self.allocator, layers, page_tokens, self.kv_heads,
+                                    self.head_dim, self.tier)
 
     @property
     def nbytes(self) -> int:
-        return self.allocator.mapped_bytes(_microinfer.Tier.FP16) + self.rope.nbytes
+        return (sum(self.allocator.mapped_bytes(t) for t in _microinfer.Tier.__members__.values())
+                + self.rope.nbytes)
 
     def reserve(self, tokens: int) -> None:
         self.pages.reserve(tokens)

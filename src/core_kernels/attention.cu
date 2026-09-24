@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,7 @@
 #include "microinfer/device_buffer.h"
 #include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
+#include "microinfer/quant.h"
 #include "microinfer/rope_table.h"
 #include "microinfer/staging.h"
 
@@ -81,9 +83,12 @@ namespace microinfer
       return d < half ? b1 * cs[0] - b2 * cs[1] : b2 * cs[0] + b1 * cs[1];
     }
 
-    // Where key j's row is, and its value's. Two layouts, one kernel: the
-    // arithmetic is shared, so only addressing can differ between them, and
-    // the paged path gives bit-identical output to the contiguous one (#14).
+    // Element `at` of key j's row, widened to fp32, and of its value's row.
+    // Three layouts, one kernel: the arithmetic is shared, so only addressing
+    // and dequantisation differ between them. The paged path gives
+    // bit-identical output to the contiguous one (#14), and the quantised
+    // one gives what either gives over the pages dequantise_page would
+    // return (#18).
     //
     // Contiguous: rows (tokens, kv_heads, head_dim), one after another.
     struct ContiguousKV
@@ -92,8 +97,14 @@ namespace microinfer
       const __half *v;
       size_t row;
 
-      __device__ const __half *key(int j) const { return k + j * row; }
-      __device__ const __half *value(int j) const { return v + j * row; }
+      __device__ float key(int j, size_t at) const
+      {
+        return __half2float(k[j * row + at]);
+      }
+      __device__ __half value(int j, size_t at) const
+      {
+        return v[j * row + at];
+      }
     };
 
     // Paged (ADR-0004, ADR-0007): key j is in page j / page_tokens at row
@@ -107,14 +118,80 @@ namespace microinfer
       int page_tokens;
       size_t row;
 
-      __device__ const __half *key(int j) const
+      __device__ const __half *key_row(int j) const
       {
         return reinterpret_cast<const __half *>(pages[j / page_tokens]) +
                (j % page_tokens) * row;
       }
-      __device__ const __half *value(int j) const
+      __device__ float key(int j, size_t at) const
       {
-        return key(j) + static_cast<size_t>(page_tokens) * row;
+        return __half2float(key_row(j)[at]);
+      }
+      __device__ __half value(int j, size_t at) const
+      {
+        return key_row(j)[static_cast<size_t>(page_tokens) * row + at];
+      }
+    };
+
+    // Quantised pages (ADR-0005, #18): the first `sealed` pages of the table
+    // are at a quantised tier, in quant.h's layout, and the one after them is
+    // the layer's open page, still FP16 and laid out as PagedKV's. A code is
+    // dequantised exactly as dequantise_page does it, one fp32 fused
+    // multiply-add rounded once to fp16, so attention here is attention over
+    // the FP16 pages dequantise_page would give.
+    template <int Bits> struct QuantisedPagedKV
+    {
+      static constexpr int kPerByte = 8 / Bits;
+      static constexpr unsigned kMask = (1u << Bits) - 1;
+
+      const unsigned long long *pages;
+      int page_tokens;
+      int sealed;
+      size_t row;
+      int kv_heads;
+      int head_dim;
+      QuantisedPageLayout layout;
+
+      __device__ const std::uint8_t *page(int j) const
+      {
+        return reinterpret_cast<const std::uint8_t *>(pages[j / page_tokens]);
+      }
+      __device__ const __half *halves(int j, size_t offset) const
+      {
+        return reinterpret_cast<const __half *>(page(j) + offset);
+      }
+      __device__ __half decode(int j, size_t codes, size_t e, float scale,
+                               float zero) const
+      {
+        const unsigned byte = page(j)[codes + e / kPerByte];
+        const float q =
+            static_cast<float>((byte >> ((e % kPerByte) * Bits)) & kMask);
+        return __float2half_rn(fmaf(q, scale, zero));
+      }
+      __device__ float key(int j, size_t at) const
+      {
+        const size_t e = (j % page_tokens) * row + at;
+        if (j / page_tokens >= sealed)
+        {
+          return __half2float(halves(j, 0)[e]);
+        }
+        return __half2float(
+            decode(j, layout.key_codes, e,
+                   __half2float(halves(j, layout.key_scales)[at]),
+                   __half2float(halves(j, layout.key_zeros)[at])));
+      }
+      __device__ __half value(int j, size_t at) const
+      {
+        const int t = j % page_tokens;
+        const size_t e = t * row + at;
+        if (j / page_tokens >= sealed)
+        {
+          return halves(j, 0)[static_cast<size_t>(page_tokens) * row + e];
+        }
+        const size_t group = static_cast<size_t>(t) * kv_heads + at / head_dim;
+        return decode(j, layout.value_codes, e,
+                      __half2float(halves(j, layout.value_scales)[group]),
+                      __half2float(halves(j, layout.value_zeros)[group]));
       }
     };
 
@@ -185,14 +262,14 @@ namespace microinfer
           const int d = i % head_dim;
           const bool in_range = k_first + c < seq_k;
           const size_t at = kv_head_offset + d;
-          float key = in_range ? __half2float(kv.key(k_first + c)[at]) : 0.0f;
+          float key = in_range ? kv.key(k_first + c, at) : 0.0f;
           if (k_bias != nullptr && in_range)
           {
             key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
                                 head_dim, rope);
           }
           k_s[i] = key;
-          v_s[i] = in_range ? kv.value(k_first + c)[at] : __float2half(0.0f);
+          v_s[i] = in_range ? kv.value(k_first + c, at) : __float2half(0.0f);
         }
         __syncthreads();
 
@@ -380,6 +457,26 @@ namespace microinfer
     const size_t row = static_cast<size_t>(kv_heads) * head_dim;
     launch(q, PagedKV{pages, page_tokens, row}, k_bias, rope, out, seq_q, seq_k,
            heads, kv_heads, head_dim);
+  }
+
+  void device::attention_paged_quantised(
+      const __half *q, const unsigned long long *pages, int sealed,
+      int page_tokens, Tier tier, const __half *k_bias, const RopeTable *rope,
+      __half *out, int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
+  {
+    const QuantisedPageLayout layout =
+        quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
+    const size_t row = static_cast<size_t>(kv_heads) * head_dim;
+    with_code_width(
+        tier,
+        [&](auto width)
+        {
+          constexpr int kBits = decltype(width)::value;
+          launch(q,
+                 QuantisedPagedKV<kBits>{pages, page_tokens, sealed, row,
+                                         kv_heads, head_dim, layout},
+                 k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim);
+        });
   }
 
   void attention(const float *q, const float *k, const float *v,

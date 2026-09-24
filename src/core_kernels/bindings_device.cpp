@@ -465,13 +465,19 @@ void bind_device(py::module_ &parent)
       "The engine's KV cache on pages (#14): page i of layer l holds positions "
       "[i*P, (i+1)*P), keys then values. Pages come from a PagedKVCache as the "
       "sequence grows, and every launch resolves the page table afresh, so "
-      "the allocator may move pages between launches (ADR-0007).")
-      .def(py::init<microinfer::PagedKVCache &, int, int, size_t,
+      "the allocator may move pages between launches (ADR-0007).\n"
+      "At a quantised tier (#18) a page is allocated at that tier and written "
+      "once, when full; until then its positions are in the layer's FP16 "
+      "open page, (layer, open_page). No page changes tier.")
+      .def(py::init<microinfer::PagedKVCache &, int, int, int, int,
                     microinfer::Tier>(),
            py::arg("allocator"), py::arg("layers"), py::arg("page_tokens"),
-           py::arg("kv_width"), py::arg("tier"), py::keep_alive<1, 2>(),
-           "kv_width is kv_heads * head_dim. The allocator's page size at "
-           "`tier` must be page_bytes(page_tokens, kv_width).")
+           py::arg("kv_heads"), py::arg("head_dim"), py::arg("tier"),
+           py::keep_alive<1, 2>(),
+           "The allocator's page size at `tier` must be a page's at that tier: "
+           "page_bytes(page_tokens, kv_heads * head_dim) at FP16, else "
+           "quantised_page_layout(...)['page_bytes']; at a quantised tier its "
+           "FP16 pages hold the open pages.")
       .def("reserve", &KVPages::reserve, py::arg("tokens"),
            "Pages for positions [0, tokens) in every layer, allocating only "
            "those not yet held.")
@@ -516,7 +522,10 @@ void bind_device(py::module_ &parent)
       .def_property_readonly("pages_per_layer", &KVPages::pages_per_layer)
       .def_property_readonly("capacity_tokens", &KVPages::capacity_tokens)
       .def_property_readonly("page_bytes", &KVPages::page_bytes)
-      .def_property_readonly("kv_width", &KVPages::kv_width);
+      .def_property_readonly("kv_width", &KVPages::kv_width)
+      .def_property_readonly("tier", &KVPages::tier);
+
+  m.attr("open_page") = microinfer::kOpenPage;
 
   m.def("page_bytes", &KVPages::page_bytes_for, py::arg("page_tokens"),
         py::arg("kv_width"),

@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "microinfer/device_ops.h"
 #include "microinfer/kv_pages.h"
 #include "microinfer/launch.h"
+#include "microinfer/quant.h"
 
 namespace microinfer
 {
@@ -60,24 +62,38 @@ namespace microinfer
   }
 
   KVPages::KVPages(PagedKVCache &allocator, int layers, int page_tokens,
-                   std::size_t kv_width, Tier tier)
+                   int kv_heads, int head_dim, Tier tier)
       : allocator_(allocator), layers_(layers), page_tokens_(page_tokens),
-        kv_width_(kv_width), tier_(tier),
-        page_bytes_(page_bytes_for(page_tokens, kv_width))
+        kv_heads_(kv_heads), head_dim_(head_dim),
+        kv_width_(static_cast<std::size_t>(kv_heads) * head_dim), tier_(tier)
   {
-    if (layers <= 0 || page_tokens <= 0 || kv_width == 0)
+    if (layers <= 0 || page_tokens <= 0 || kv_heads <= 0 || head_dim <= 0)
     {
       throw std::invalid_argument(
-          "layers, page_tokens and kv_width must be positive");
+          "layers, page_tokens, kv_heads and head_dim must be positive");
     }
-    if (allocator.page_bytes(tier) != page_bytes_)
+    const std::size_t fp16_bytes = page_bytes_for(page_tokens, kv_width_);
+    page_bytes_ = quantised() ? quantised_page_layout(tier, page_tokens,
+                                                      kv_heads, head_dim)
+                                    .page_bytes
+                              : fp16_bytes;
+    const auto check = [&](Tier t, std::size_t needed, const char *what)
     {
-      throw std::invalid_argument(
-          "the allocator's pages at this tier hold " +
-          std::to_string(allocator.page_bytes(tier)) + " bytes; " +
-          std::to_string(page_tokens) + " positions of keys and values at " +
-          std::to_string(kv_width) + " fp16 each need " +
-          std::to_string(page_bytes_));
+      if (allocator.page_bytes(t) != needed)
+      {
+        throw std::invalid_argument(
+            "the allocator's pages at tier " +
+            std::to_string(static_cast<int>(t)) + " hold " +
+            std::to_string(allocator.page_bytes(t)) + " bytes; " + what +
+            " of " + std::to_string(page_tokens) + " positions at " +
+            std::to_string(kv_width_) + " elements need " +
+            std::to_string(needed));
+      }
+    };
+    check(tier, page_bytes_, "a page at this cache's tier");
+    if (quantised())
+    {
+      check(Tier::FP16, fp16_bytes, "an open page");
     }
   }
 
@@ -94,15 +110,50 @@ namespace microinfer
           allocator_.free({layer, page});
         }
       }
+      if (open_pages_)
+      {
+        for (int layer = layers_ - 1; layer >= 0; --layer)
+        {
+          allocator_.free({layer, kOpenPage});
+        }
+      }
     }
     catch (...)
     {
     }
   }
 
+  void KVPages::allocate_open_pages()
+  {
+    int allocated = 0;
+    try
+    {
+      for (; allocated < layers_; ++allocated)
+      {
+        allocator_.allocate({allocated, kOpenPage}, Tier::FP16);
+      }
+    }
+    catch (...)
+    {
+      while (allocated > 0)
+      {
+        allocator_.free({--allocated, kOpenPage});
+      }
+      throw;
+    }
+    open_pages_ = true;
+  }
+
   void KVPages::reserve(int tokens)
   {
-    const int needed = (tokens + page_tokens_ - 1) / page_tokens_;
+    if (quantised() && !open_pages_ && tokens > 0)
+    {
+      allocate_open_pages();
+    }
+    // At a quantised tier a page is taken only once all its positions are
+    // coming: until then they are the open page's.
+    const int needed = quantised() ? tokens / page_tokens_
+                                   : (tokens + page_tokens_ - 1) / page_tokens_;
     for (; pages_ < needed; ++pages_)
     {
       int allocated = 0;
@@ -136,11 +187,14 @@ namespace microinfer
     if (resolved_pages_ != pages_ ||
         resolved_generation_ != allocator_.generation_)
     {
-      if (pages_ > table_stride_)
+      // At a quantised tier the open page's entry follows the tier's pages.
+      const int entries = pages_ + (open_pages_ ? 1 : 0);
+      if (entries > table_stride_)
       {
         // Room to grow before the next reallocation. Freeing the old buffer
         // waits for launches that may still read it, as cudaFree does.
-        table_stride_ = pages_ > 2 * table_stride_ ? pages_ : 2 * table_stride_;
+        table_stride_ =
+            entries > 2 * table_stride_ ? entries : 2 * table_stride_;
         tables_ = std::make_unique<DeviceBuffer>(static_cast<size_t>(layers_) *
                                                  table_stride_ *
                                                  sizeof(unsigned long long));
@@ -153,6 +207,12 @@ namespace microinfer
         {
           host[static_cast<size_t>(l) * table_stride_ + page] =
               allocator_.address({l, page}, page_bytes_);
+        }
+        if (open_pages_)
+        {
+          host[static_cast<size_t>(l) * table_stride_ + pages_] =
+              allocator_.address({l, kOpenPage},
+                                 page_bytes_for(page_tokens_, kv_width_));
         }
       }
       // On the legacy default stream, so ordered after every launch already
@@ -183,8 +243,60 @@ namespace microinfer
     {
       return;
     }
+    if (quantised())
+    {
+      store_quantised(layer, keys, values, start, n);
+      return;
+    }
     device::store_pages(keys, values, resolve(layer), page_tokens_, kv_width_,
                         start, n);
+  }
+
+  void KVPages::store_quantised(int layer, const __half *keys,
+                                const __half *values, int start, int n)
+  {
+    const std::size_t fp16_bytes = page_bytes_for(page_tokens_, kv_width_);
+    // Addresses are resolved here, between allocator operations, and used at
+    // once: nothing below allocates or frees.
+    auto *open = reinterpret_cast<__half *>(
+        allocator_.address({layer, kOpenPage}, fp16_bytes));
+    const std::size_t half = static_cast<std::size_t>(page_tokens_) * kv_width_;
+    const auto seal = [&](int span, const __half *k, const __half *v)
+    {
+      auto *page = reinterpret_cast<std::uint8_t *>(
+          allocator_.address({layer, span}, page_bytes_));
+      device::quantise_page(k, v, page, tier_, page_tokens_, page_tokens_,
+                            kv_heads_, head_dim_);
+    };
+
+    const int end = start + n;
+    for (int at = start; at < end;)
+    {
+      const int span = at / page_tokens_;
+      const int span_start = span * page_tokens_;
+      const int take = std::min(end, span_start + page_tokens_) - at;
+      const std::size_t from = static_cast<std::size_t>(at - start) * kv_width_;
+      if (take == page_tokens_)
+      {
+        seal(span, keys + from, values + from);
+      }
+      else
+      {
+        const std::size_t row = static_cast<std::size_t>(at - span_start);
+        const std::size_t bytes = take * kv_width_ * sizeof(__half);
+        cuda_check(cudaMemcpy(open + row * kv_width_, keys + from, bytes,
+                              cudaMemcpyDeviceToDevice),
+                   "cudaMemcpy keys into the open page");
+        cuda_check(cudaMemcpy(open + half + row * kv_width_, values + from,
+                              bytes, cudaMemcpyDeviceToDevice),
+                   "cudaMemcpy values into the open page");
+        if (at + take == span_start + page_tokens_)
+        {
+          seal(span, open, open + half);
+        }
+      }
+      at += take;
+    }
   }
 
   void KVPages::attention(int layer, const __half *q, const __half *k_bias,
@@ -205,6 +317,13 @@ namespace microinfer
     }
     if (seq_q <= 0)
     {
+      return;
+    }
+    if (quantised())
+    {
+      device::attention_paged_quantised(q, resolve(layer), pages_, page_tokens_,
+                                        tier_, k_bias, rope, out, seq_q, seq_k,
+                                        heads, kv_heads, head_dim);
       return;
     }
     device::attention_paged(q, resolve(layer), page_tokens_, k_bias, rope, out,

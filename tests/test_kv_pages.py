@@ -46,7 +46,8 @@ def pages_for(cfg, page_tokens, capacity_pages=4096):
     kv_width = cfg.num_key_value_heads * cfg.head_dim
     allocator = PagedKVCache([device.page_bytes(page_tokens, kv_width)] * 4,
                              [capacity_pages, 0, 0, 0])
-    return allocator, device.KVPages(allocator, LAYERS, page_tokens, kv_width, Tier.FP16)
+    return allocator, device.KVPages(allocator, LAYERS, page_tokens, cfg.num_key_value_heads,
+                                     cfg.head_dim, Tier.FP16)
 
 
 def attend_both(cfg, cache, layer, q, k, v, bias, seq_k):
@@ -196,7 +197,7 @@ def test_misuse_is_refused():
                         1, 17, CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim)
     wrong = PagedKVCache([device.page_bytes(16, kv_width)] * 4, [8, 0, 0, 0])
     with pytest.raises(ValueError, match="page"):
-        device.KVPages(wrong, LAYERS, 32, kv_width, Tier.FP16)
+        device.KVPages(wrong, LAYERS, 32, CFG.num_key_value_heads, CFG.head_dim, Tier.FP16)
 
 
 # -- the RoPE table -------------------------------------------------------------
