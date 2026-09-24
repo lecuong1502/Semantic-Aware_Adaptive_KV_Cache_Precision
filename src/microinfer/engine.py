@@ -69,6 +69,35 @@ def kv_cache_bytes(cfg: ModelConfig, context_length: int,
     return int(per_token * context_length * bytes_per_element)
 
 
+def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16") -> int:
+    """What the paged cache's pages take from the driver for `context_length`
+    positions at a static tier (#18): computed from the layout, not measured.
+
+    At FP16 that is a page for every started span of P positions in every
+    layer. At a quantised tier it is a page for every *full* span, at the
+    tier's page size with its scale metadata, plus one FP16 open page per
+    layer for the rest (ADR-0005, kv_pages.h). Each tier's pages sit in their
+    own address range and the driver backs a range in whole granules
+    (ADR-0007), so each range is rounded up to one. The RoPE table beside the
+    pages is not included; it is the same at every tier.
+    """
+    Tier = _microinfer.Tier
+    page_tokens = _microinfer.device.page_tokens
+    kv_heads, head_dim, layers = cfg.num_key_value_heads, cfg.head_dim, cfg.num_hidden_layers
+    granule = _microinfer.PagedKVCache([1] * 4, [0] * 4).granule_bytes
+    fp16_page = _microinfer.device.page_bytes(page_tokens, kv_heads * head_dim)
+
+    def whole_granules(n: int) -> int:
+        return -(-n // granule) * granule
+
+    if tier == "FP16":
+        return whole_granules(layers * -(-context_length // page_tokens) * fp16_page)
+    page = _microinfer.quantised_page_layout(getattr(Tier, tier), kv_heads, head_dim)["page_bytes"]
+    open_pages = layers * fp16_page if context_length > 0 else 0
+    return (whole_granules(layers * (context_length // page_tokens) * page)
+            + whole_granules(open_pages))
+
+
 class Engine:
     """Seam A. Everything a test or a caller touches goes through here."""
 

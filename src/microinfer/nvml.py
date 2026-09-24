@@ -151,3 +151,16 @@ def other_processes() -> list[GpuProcess]:
     """processes(), without this one."""
     own = os.getpid()
     return [p for p in processes() if p.pid != own]
+
+
+def own_used_bytes() -> int:
+    """Device memory this process holds, as the driver reports it for this
+    process alone. Unlike device free memory, no other process moves it, so a
+    change in it is this process's own allocations to the granule (#18)."""
+    own = os.getpid()
+    for p in processes():
+        if p.pid == own:
+            if p.used_bytes is None:
+                raise NvmlUnavailable("the driver does not report this process's memory")
+            return p.used_bytes
+    return 0

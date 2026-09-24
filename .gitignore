@@ -25,3 +25,7 @@ tests/golden/
 # command (studies/gemm/profile.py ncu-command). The JSON summarised from each,
 # with its commit and hardware, is what is committed.
 *.ncu-rep
+
+# Held-out evaluation text, fetched by the tool that uses it and checked
+# against a pinned hash there (tools/perplexity.py). Not ours to redistribute.
+data/
