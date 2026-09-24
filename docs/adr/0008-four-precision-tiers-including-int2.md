@@ -37,18 +37,21 @@ one to give.
 
 ---
 
-## Note from #17: what INT2 costs, measured
+## Note from #17: what INT2 costs in quality, measured
 
 INT2 is built. Its effective bits are 2.625 on Qwen2.5-1.5B, as stated above,
 with the metadata 23.8% of a 5376-byte page. What it loses of the cache is
-now measured too (ADR-0005, note from #17). Over every full page of the
-golden prompts on the 1.5B model, keys come back with 20.9% relative RMS
-error and values with 59.5%: a value's signal-to-noise ratio is 4.5 dB.
+now measured (ADR-0005, note from #17). Over every full page of the golden
+prompts on the 1.5B model, keys come back with 20.9% relative RMS error and
+values with 59.5%: a value's signal-to-noise ratio is 4.5 dB.
 
-That is a second cost to set beside the 112 MiB above, and a larger one. The
-answer recorded here, that the tier earns its place through the allocator's
-freedom and not through bytes, assumed a page at INT2 still carries
-something. Whether it does, for the pages an importance score would send
-there, is a question about the model's output and not about the cache. It is
-answered by #18's perplexity per tier, and by the allocation experiments
-after it, not by this measurement.
+That is INT2's quality cost, the other side of its 112 MiB. It is no
+surprise: the same note shows each tier's error following its step exactly,
+and INT2's step is 5 times INT4's and 85 times INT8's. It was implied when
+this decision was taken; it is now a number.
+
+It does not answer the objection above, nor change the answer to it. The
+tier earns its place, if it does, through the allocator's freedom to send the
+least important pages there. Whether a page at INT2 still carries what the
+model needs from it is a question about the model's output, not about the
+cache, and #18's perplexity per tier is where it is first measured.
