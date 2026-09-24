@@ -101,3 +101,39 @@ Keys and values are about as many steps out on average, so values' larger
 relative error means their steps are larger relative to their size: a value
 group's range is wider, for the size of what is in it, than a key channel's.
 Why has not been measured.
+
+---
+
+## Note from #17: INT4 and INT2, in the same layout
+
+INT4 and INT2 use #16's layout and kernels unchanged. The kernels are
+templated on the code width, and a tier picks its width in one place,
+`with_code_width` in `quant.cu`. INT4 packs two codes to a byte and INT2
+four, the first in the lowest bits, with no padding: a page's code regions
+are exactly `P * W * bits / 8` bytes each. Every quantiser test runs at all
+three tiers, with nothing special-cased.
+
+**What each tier loses**, measured as #16's was, at f0b2bd2 (entries
+`a5bb87e7`, `df5b22ef`, `c69dff48` for 0.5B and `de213b3e`, `a6037e4e`,
+`dc93ca25` for 1.5B):
+
+| model | tier | effective bits | keys: relative RMS, SNR | values: relative RMS, SNR |
+|---|---|---:|---:|---:|
+| Qwen2.5-0.5B | INT8 | 8.750 | 0.24%, 52.4 dB | 0.62%, 44.1 dB |
+| | INT4 | 4.750 | 4.0%, 27.9 dB | 10.5%, 19.5 dB |
+| | INT2 | 2.750 | 20.1%, 13.9 dB | 53.1%, 5.5 dB |
+| Qwen2.5-1.5B | INT8 | 8.625 | 0.25%, 52.1 dB | 0.70%, 43.1 dB |
+| | INT4 | 4.625 | 4.2%, 27.6 dB | 11.9%, 18.5 dB |
+| | INT2 | 2.625 | 20.9%, 13.6 dB | 59.5%, 4.5 dB |
+
+The error grows as the tiers narrow, INT8 < INT4 < INT2, for keys and values
+on both models, and by exactly as much as the step does. From INT8 to INT4 the
+step grows 255/15 = 17 times, 24.6 dB, and the SNR falls 24.5 to 24.6 dB; from
+INT4 to INT2 it grows 5 times, 14.0 dB, and the SNR falls by 14.0 dB. The
+mean error stays at a quarter of a step at every tier. So nothing is lost to
+the implementation as the codes narrow: each tier costs what its step costs. Every element of every page
+of the golden prompts is within the bound tests/test_quant.py derives: half a
+step, plus the fp16 output's own rounding.
+
+What this does to the model's output is not measured here. That is #18's
+perplexity per tier.

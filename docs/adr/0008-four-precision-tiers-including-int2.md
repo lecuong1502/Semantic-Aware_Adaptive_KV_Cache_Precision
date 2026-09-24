@@ -34,3 +34,21 @@ one to give.
   INT8 and INT4.
 - Compression ratios must be reported with metadata counted. INT2 is 2.63
   effective bits here, and claiming "8x" would be false.
+
+---
+
+## Note from #17: what INT2 costs, measured
+
+INT2 is built. Its effective bits are 2.625 on Qwen2.5-1.5B, as stated above,
+with the metadata 23.8% of a 5376-byte page. What it loses of the cache is
+now measured too (ADR-0005, note from #17). Over every full page of the
+golden prompts on the 1.5B model, keys come back with 20.9% relative RMS
+error and values with 59.5%: a value's signal-to-noise ratio is 4.5 dB.
+
+That is a second cost to set beside the 112 MiB above, and a larger one. The
+answer recorded here, that the tier earns its place through the allocator's
+freedom and not through bytes, assumed a page at INT2 still carries
+something. Whether it does, for the pages an importance score would send
+there, is a question about the model's output and not about the cache. It is
+answered by #18's perplexity per tier, and by the allocation experiments
+after it, not by this measurement.
