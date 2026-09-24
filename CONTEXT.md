@@ -45,6 +45,26 @@ position, so one span of text may be held at different tiers in different
 layers.
 _Avoid_: precision level, quantisation level, bit-width
 
+**Open page**:
+A layer's last page while its `P` positions are still being written. A key
+channel's scale spans the whole page, so the open page has none and stays at
+`FP16`: a mechanical requirement, independent of the recency floor, though the
+two agree (ADR-0005).
+_Avoid_: partial page, current block, tail page (the tail is the allocator's
+last slot, ADR-0007)
+
+**Scale metadata**:
+A quantised page's scales and zero-points: one of each per `(head, channel)`
+for its keys and per `(head, token)` for its values, in fp16. The same size at
+every quantised tier, 1280 bytes on Qwen2.5-1.5B.
+_Avoid_: quantisation parameters, header
+
+**Effective bits**:
+The bits a quantised tier spends per cached element once its scale metadata
+is counted: 8.63 for INT8 on Qwen2.5-1.5B, not 8. The only figure a
+compression ratio may be quoted from.
+_Avoid_: bit-width (that is the nominal code width)
+
 ### Inference
 
 **Prefill chunk**:

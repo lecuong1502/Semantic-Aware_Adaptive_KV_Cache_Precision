@@ -103,22 +103,13 @@ def test_a_boundary_mid_sentence_leaves_positions_and_masking_alone(engine):
             "discussion about the costs of the new building they agreed to delay it.")
     ids = engine.encode(text)
     boundary = len(ids) // 2  # mid-sentence, by construction of the text
-    cfg = engine.config
 
     def cached_keys(chunk):
-        """The engine's own chunk loop, into the contiguous cache, whose keys
-        can be read back as they are; the paged cache is bit-identical to it
-        (test_paged_engine.py)."""
-        before = engine.kv_cache, engine.prefill_chunk
-        engine.kv_cache, engine.prefill_chunk = "contiguous", chunk
+        before, engine.prefill_chunk = engine.prefill_chunk, chunk
         try:
-            cache = engine._new_cache(capacity=len(ids))
-            for _ in engine._prefill(cache, ids):
-                pass
+            return engine.cached_kv(ids)[0]
         finally:
-            engine.kv_cache, engine.prefill_chunk = before
-        keys = np.stack([k.to_numpy() for k in cache.keys])
-        return keys.reshape(cfg.num_hidden_layers, len(ids), -1)
+            engine.prefill_chunk = before
 
     single, chunked = cached_keys(len(ids)), cached_keys(boundary)
     after = slice(boundary, len(ids))

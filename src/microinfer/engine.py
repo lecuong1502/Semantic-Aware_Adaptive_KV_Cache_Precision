@@ -232,6 +232,23 @@ class Engine:
                 out.append(self._model.greedy_last(step, 1))
         return np.asarray(out, dtype=np.int32)
 
+    def cached_kv(self, token_ids) -> tuple[np.ndarray, np.ndarray]:
+        """What the cache holds after prefilling one sequence: keys and values,
+        each fp32 (layers, seq, kv_heads, head_dim). The keys are as stored,
+        rotated and without their projection's bias (ADR-0009), which is what
+        a precision tier rounds (#16).
+
+        Prefilled through the contiguous cache, whose buffers read back as
+        they are; the paged cache holds the same bits (#14)."""
+        ids = self._check_ids(token_ids)
+        self._check_window(len(ids))
+        cache = model.ContiguousCache(self.config, capacity=len(ids))
+        for _ in self._prefill(cache, ids):
+            pass
+        shape = (len(ids), self.config.num_key_value_heads, self.config.head_dim)
+        return tuple(np.stack([t.to_numpy().reshape(shape) for t in buffers])
+                     for buffers in (cache.keys, cache.values))
+
     def _check_ids(self, token_ids) -> np.ndarray:
         if self._model is None:
             raise RuntimeError("no weights on the device; call load_weights() first")

@@ -7,9 +7,12 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "microinfer/kernels.h"
+#include "microinfer/kv_pages.h"
 #include "microinfer/paged_kv_cache.h"
+#include "microinfer/quant.h"
 
 namespace py = pybind11;
 
@@ -334,6 +337,89 @@ namespace
     return out;
   }
 
+  // A quantised page crosses Seam B as its bytes; keys and values as fp32
+  // (P, kv_heads, head_dim), rounded to fp16 on the way up. P is the build's
+  // (ADR-0004), so a caller cannot quantise a page of any other size.
+  py::array_t<uint8_t> quantise_page(FloatArray keys, FloatArray values,
+                                     microinfer::Tier tier)
+  {
+    if (keys.ndim() != 3)
+    {
+      throw std::invalid_argument(
+          "keys must be 3-D (positions, kv_heads, head_dim), got shape " +
+          shape_of(keys));
+    }
+    if (values.ndim() != 3 || values.shape(0) != keys.shape(0) ||
+        values.shape(1) != keys.shape(1) || values.shape(2) != keys.shape(2))
+    {
+      throw std::invalid_argument("values must have the keys' shape " +
+                                  shape_of(keys) + ", got shape " +
+                                  shape_of(values));
+    }
+    const int filled = static_cast<int>(keys.shape(0));
+    const int kv_heads = static_cast<int>(keys.shape(1));
+    const int head_dim = static_cast<int>(keys.shape(2));
+    const auto layout = microinfer::quantised_page_layout(
+        tier, microinfer::kPageTokens, kv_heads, head_dim);
+
+    py::array_t<uint8_t> page(static_cast<py::ssize_t>(layout.page_bytes));
+    const float *k = keys.data();
+    const float *v = values.data();
+    uint8_t *out = page.mutable_data();
+    {
+      py::gil_scoped_release release;
+      microinfer::quantise_page(k, v, out, tier, microinfer::kPageTokens,
+                                filled, kv_heads, head_dim);
+    }
+    return page;
+  }
+
+  py::tuple dequantise_page(
+      py::array_t<uint8_t, py::array::c_style | py::array::forcecast> page,
+      microinfer::Tier tier, int kv_heads, int head_dim)
+  {
+    const auto layout = microinfer::quantised_page_layout(
+        tier, microinfer::kPageTokens, kv_heads, head_dim);
+    if (page.ndim() != 1 ||
+        static_cast<std::size_t>(page.shape(0)) != layout.page_bytes)
+    {
+      throw std::invalid_argument("a page at this tier and shape is " +
+                                  std::to_string(layout.page_bytes) +
+                                  " bytes, got shape " + shape_of(page));
+    }
+    const std::vector<py::ssize_t> shape{microinfer::kPageTokens, kv_heads,
+                                         head_dim};
+    py::array_t<float> keys(shape);
+    py::array_t<float> values(shape);
+    const uint8_t *in = page.data();
+    float *k = keys.mutable_data();
+    float *v = values.mutable_data();
+    {
+      py::gil_scoped_release release;
+      microinfer::dequantise_page(in, k, v, tier, microinfer::kPageTokens,
+                                  kv_heads, head_dim);
+    }
+    return py::make_tuple(keys, values);
+  }
+
+  py::dict page_layout(microinfer::Tier tier, int kv_heads, int head_dim)
+  {
+    const auto layout = microinfer::quantised_page_layout(
+        tier, microinfer::kPageTokens, kv_heads, head_dim);
+    py::dict d;
+    d["bits"] = layout.bits;
+    d["key_codes"] = layout.key_codes;
+    d["value_codes"] = layout.value_codes;
+    d["key_scales"] = layout.key_scales;
+    d["key_zeros"] = layout.key_zeros;
+    d["value_scales"] = layout.value_scales;
+    d["value_zeros"] = layout.value_zeros;
+    d["metadata_bytes"] = layout.metadata_bytes;
+    d["page_bytes"] = layout.page_bytes;
+    d["effective_bits"] = layout.effective_bits;
+    return d;
+  }
+
 } // namespace
 
 PYBIND11_MODULE(_microinfer, m)
@@ -423,6 +509,26 @@ PYBIND11_MODULE(_microinfer, m)
 
   py::register_exception<microinfer::PageNotFound>(m, "PageNotFound",
                                                    PyExc_KeyError);
+  py::register_exception<microinfer::OpenPage>(m, "OpenPage", PyExc_ValueError);
+
+  m.def("quantised_page_layout", &page_layout, py::arg("tier"),
+        py::arg("kv_heads"), py::arg("head_dim"),
+        "Byte offsets of a quantised page's regions (key codes, value codes, "
+        "key scales, key zeros, value scales, value zeros), its metadata and "
+        "page bytes, and the effective bits per element with the metadata "
+        "counted. Shared by every quantised tier (quant.h).");
+
+  m.def("quantise_page", &quantise_page, py::arg("keys"), py::arg("values"),
+        py::arg("tier"),
+        "One page's keys and values, each (P, kv_heads, head_dim), to the "
+        "tier's bytes: keys per (head, channel) across the page, values per "
+        "(head, token), both asymmetric (ADR-0005). Fewer than P positions "
+        "raises OpenPage: the page being filled stays at FP16.");
+
+  m.def("dequantise_page", &dequantise_page, py::arg("page"), py::arg("tier"),
+        py::arg("kv_heads"), py::arg("head_dim"),
+        "(keys, values), each (P, kv_heads, head_dim): code * scale + zero in "
+        "one fp32 fused multiply-add, rounded once to fp16.");
 
   // No method returns a device address, and none may: a page moves whenever
   // its tier's tail is retracted (ADR-0007).
