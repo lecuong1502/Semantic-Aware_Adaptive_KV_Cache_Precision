@@ -433,15 +433,49 @@ PYBIND11_MODULE(_microinfer, m)
 
   m.def("device_name", &microinfer::device_name, "Name of CUDA device 0.");
 
-  py::class_<microinfer::DeviceTensor>(m, "DeviceTensor",
-                                       "Owned fp16 storage on the device.")
+  py::class_<microinfer::DeviceTensor>(
+      m, "DeviceTensor",
+      "fp16 on the device: in an arena of its own, or at an offset into a "
+      "shared one, the engine's weights' (#23). It keeps its arena alive.")
       .def_property_readonly("numel", &microinfer::DeviceTensor::numel)
+      .def_property_readonly(
+          "address", [](const microinfer::DeviceTensor &t)
+          { return reinterpret_cast<std::uintptr_t>(t.data()); },
+          "The tensor's device address, for checking where it lies.")
       .def_property_readonly("nbytes", &microinfer::DeviceTensor::nbytes,
                              "Bytes occupied on the device. fp16, so two per "
                              "element — not the size of the host array it came "
                              "from.")
       .def("to_numpy", &tensor_to_numpy,
            "Copy back to the host as fp32. For tests; not a hot path.");
+
+  py::class_<microinfer::DeviceArena, std::shared_ptr<microinfer::DeviceArena>>(
+      m, "DeviceArena",
+      "One device allocation that many DeviceTensors refer into: the "
+      "engine's weights, in one piece (#23).")
+      .def(py::init<std::size_t>(), py::arg("nbytes"))
+      .def_property_readonly("nbytes", &microinfer::DeviceArena::nbytes)
+      .def_property_readonly(
+          "address", [](const microinfer::DeviceArena &a)
+          { return reinterpret_cast<std::uintptr_t>(a.base()); },
+          "The arena's device address, for checking what lies in it.")
+      .def(
+          "put",
+          [](std::shared_ptr<microinfer::DeviceArena> arena, std::size_t offset,
+             FloatArray host)
+          {
+            const auto count = static_cast<std::size_t>(host.size());
+            const float *ptr = host.data();
+            py::gil_scoped_release release;
+            return std::make_unique<microinfer::DeviceTensor>(
+                std::move(arena), offset, ptr, count);
+          },
+          py::arg("offset"), py::arg("host"),
+          "Upload a float32 array as fp16 into the arena from byte `offset`, "
+          "a multiple of weight_alignment, and return the tensor there. The "
+          "tensor keeps the arena alive.");
+
+  m.attr("weight_alignment") = microinfer::kWeightAlignment;
 
   m.def("upload_fp16", &upload_fp16, py::arg("host"),
         "Upload a float32 array to the device as fp16. The conversion happens "

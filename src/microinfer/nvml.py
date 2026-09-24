@@ -164,3 +164,27 @@ def own_used_bytes() -> int:
                 raise NvmlUnavailable("the driver does not report this process's memory")
             return p.used_bytes
     return 0
+
+
+def settled_own_used_bytes() -> int:
+    """own_used_bytes(), ready to be the first of two readings: the CUDA
+    context made first, and this process's pending frees collected.
+
+    The context is a process's first device memory, some 80 MiB, made on its
+    first CUDA call. Read before it exists, this process holds nothing, and
+    whatever comes next is charged for the context (#23). A tensor dropped
+    but not yet collected would be charged to the next reading instead."""
+    import gc
+
+    from . import _microinfer
+
+    _microinfer.device_memory_info()
+    gc.collect()
+    return own_used_bytes()
+
+
+def others_used_bytes() -> int:
+    """What every other process holds, by the driver's account of each, where
+    it reports it. Device free memory moves by this as well as by this
+    process, so a reading of free memory can be corrected for it."""
+    return sum(p.used_bytes or 0 for p in other_processes())

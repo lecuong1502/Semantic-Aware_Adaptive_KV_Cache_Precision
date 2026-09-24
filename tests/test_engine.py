@@ -5,13 +5,18 @@ ADR-0003 was argued from can be re-derived from config.json alone. The tests
 against a real checkpoint skip when it is absent.
 """
 
+import gc
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
+from test_weights import write_safetensors
 
-from conftest import require_model
-from microinfer import ConfigMismatch, Engine, ModelConfig, expected_weight_bytes, kv_cache_bytes
+from conftest import require_model, stable_free_bytes
+from microinfer import (ConfigMismatch, Engine, ModelConfig, _microinfer, expected_weight_bytes,
+                        expected_weight_shapes, kv_cache_bytes, nvml, weight_layout)
+from microinfer.weights import WeightError, describe
 
 MIB = 1024 * 1024
 
@@ -137,34 +142,96 @@ def test_reported_weights_match_what_the_driver_says_was_taken():
     """Turns a self-report into a measurement.
 
     `footprint.weights` sums what the engine believes it uploaded. This checks
-    that belief against cudaMemGetInfo across the load — the same reading
-    ADR-0007's allocator will be judged by.
+    that belief against what the driver took for this process across the
+    load: its own account (nvml.own_used_bytes), which no other process moves,
+    where device free memory drifts by more than the bound checked here.
+
+    The driver may round up and never down, so the claim can only understate.
+    It understated by several per cent while each of the 290 tensors had an
+    allocation of its own, because the driver's overhead tracks the number of
+    allocations rather than their size (ADR-0007, notes from #5 and #23). In
+    one arena it is one allocation, rounded to the driver's granularity:
+    under 2%.
     """
-    from conftest import stable_free_bytes
-
     engine = Engine(require_model("qwen2.5-0.5b-instruct"))
-    free_before = stable_free_bytes()
+    before = nvml.settled_own_used_bytes()
     engine.load_weights()
-    free_after = stable_free_bytes()
-
-    taken = free_before - free_after
+    taken = nvml.own_used_bytes() - before
     claimed = engine.footprint().weights
 
-    # The driver may round up and never down, so the claim can only understate.
     assert taken >= claimed
-
-    # It understates by a lot, and the reason is the number of allocations
-    # rather than their size: one tensor per parameter group means ~290 separate
-    # cudaMalloc calls, each rounded up. Measured on this machine, overhead runs
-    # 0.5% at ten allocations, 9% at a hundred and 27% at 290. The bound here is
-    # loose on purpose — it is there to catch a factor-of-two accounting bug,
-    # not to pin down an allocator's granularity. The waste itself is filed
-    # separately; see the note in ADR-0007.
-    assert taken < claimed * 1.5, (
+    assert taken < claimed * 1.02, (
         f"driver took {taken / MIB:.1f} MiB against a claim of "
-        f"{claimed / MIB:.1f} MiB — more overhead than allocation granularity "
-        f"explains"
-    )
+        f"{claimed / MIB:.1f} MiB: more overhead than one allocation's granularity "
+        f"explains")
+
+
+@pytest.mark.parametrize("name", ["qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct"])
+def test_config_implies_exactly_the_checkpoints_tensors(name):
+    """The arena is laid out from config.json before the checkpoint is read, so
+    config.json must name every tensor the checkpoint holds, with its shape,
+    and nothing else."""
+    path = require_model(name) / "model.safetensors"
+    assert expected_weight_shapes(cfg(name)) == {i.name: i.shape for i in describe(path)}
+
+
+def test_weights_occupy_one_allocation_sized_from_config():
+    """One arena, of the size weight_layout computes from config.json; every
+    weight inside it, at the offset the layout gave it, on a multiple of
+    weight_alignment."""
+    engine = Engine(require_model("qwen2.5-0.5b-instruct"))
+    engine.load_weights()
+    arena = engine.weight_arena
+    layout = weight_layout(engine.config)
+    assert arena.nbytes == layout.nbytes
+    for name, tensor in engine.tensors.items():
+        at = tensor.address - arena.address
+        assert at == layout.offsets[name], name
+        assert at % _microinfer.weight_alignment == 0 and at + tensor.nbytes <= layout.nbytes, name
+    assert engine.footprint().weights == sum(t.nbytes for t in engine.tensors.values())
+
+
+def test_freeing_the_engine_returns_the_whole_arena():
+    """Two readings of the same release. This process's own account, which
+    nothing else moves, returns exactly to where it was. And device free
+    memory, cudaMemGetInfo's reading, as ADR-0007's reclaim is judged by,
+    returns with it once what other processes took or gave back meanwhile is
+    taken out: a browser's GPU process alone moves it by more than any bound
+    on the raw reading could allow and still mean anything (#15). The 2% left
+    covers what the driver reports of others at a moment's skew from
+    cudaMemGetInfo."""
+    own_before = nvml.settled_own_used_bytes()
+    free_before, others_before = stable_free_bytes(), nvml.others_used_bytes()
+    engine = Engine(require_model("qwen2.5-0.5b-instruct"))
+    engine.load_weights()
+    held = engine.weight_arena.nbytes
+    assert nvml.own_used_bytes() - own_before >= held
+    del engine
+    gc.collect()
+    assert nvml.own_used_bytes() == own_before
+    moved = (free_before - stable_free_bytes()) - (nvml.others_used_bytes() - others_before)
+    assert abs(moved) < 0.02 * held, f"{moved / MIB:.1f} MiB not returned"
+
+
+def test_a_checkpoint_config_does_not_describe_is_refused_before_anything_is_allocated(tmp_path):
+    """A tensor config.json does not imply, one it implies that is missing, and
+    one of the wrong shape, all named; and no arena taken."""
+    staged = stage_config(tmp_path)
+    write_safetensors(staged / "model.safetensors", {
+        "model.norm.weight": ("F32", np.ones(3, np.float32)),
+        "model.rotary_emb.inv_freq": ("F32", np.ones(4, np.float32)),
+    })
+    engine = Engine(staged, verify=False)
+    gc.collect()
+    before = nvml.own_used_bytes()
+    with pytest.raises(WeightError) as caught:
+        engine.load_weights()
+    message = str(caught.value)
+    assert "model.embed_tokens.weight: missing" in message
+    assert "model.rotary_emb.inv_freq: not implied by config.json" in message
+    assert "model.norm.weight: shape (3,)" in message
+    assert "nothing was allocated" in message
+    assert nvml.own_used_bytes() == before and engine.weight_arena is None
 
 
 def test_torch_is_absent_after_loading_a_model():

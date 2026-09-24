@@ -69,6 +69,23 @@ roughly 40% of what requantising the whole cache to INT4 would reclaim. Weight
 loading should use one arena with offsets rather than an allocation per tensor.
 That is not this ticket's work and is filed separately.
 
+**Done in #23.** The weights now load into one arena, sized from config.json,
+with every tensor at a 256-byte-aligned offset. `tools/weight_overhead.py`
+loads each checkpoint both ways, one allocation per tensor as before and one
+arena, and reads what the driver took for this process each time, from a
+settled start (entries `eac852ca` and `9e956bbf`, at 09adeda):
+
+| model | tensors | claimed | one per tensor | one arena | saved |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 290 | 942.3 MiB | 1076.0 MiB, +14.2% | 944.0 MiB, +0.18% | 132 MiB |
+| Qwen2.5-1.5B | 338 | 2944.4 MiB | 3190.0 MiB, +8.3% | 2946.0 MiB, +0.05% | 244 MiB |
+
+Both ways, everything is back once the tensors are dropped. The 1080 MiB above
+came from device free memory, read in a process whose CUDA context may not
+yet have existed. The table is the like-for-like figure: 132 MiB back for
+the 0.5B model, 244 MiB for the 1.5B, in the budget the cache competes for.
+As here, what the driver took is the figure that counts.
+
 ---
 
 ## Note from #6: how to measure the contract, and how not to

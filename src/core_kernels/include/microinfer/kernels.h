@@ -1,7 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
+
+#include "microinfer/device_buffer.h"
 
 namespace microinfer
 {
@@ -86,30 +90,81 @@ namespace microinfer
 
   MemoryInfo device_memory_info();
 
-  // An owned block of fp16 on the device. Weights arrive as fp32 from the host
-  // and are stored fp16, which is what every kernel reads.
+  // Every weight begins on a multiple of this many bytes of its arena (#23).
+  // It is what cudaMalloc guaranteed each weight when each had its own
+  // allocation, so every kernel that reads a weight sees the alignment it
+  // always saw. What each needs:
+  //
+  //   linear()     projection weights and biases, through cublasGemmEx.
+  //                cuBLAS chooses its algorithm partly from its operands'
+  //                alignment, and its vectorised paths want 16 bytes; at
+  //                256 it chooses exactly as before, so no output moves.
+  //   embed()      the embedding table, one __half at a time: 2 bytes.
+  //   rmsnorm()    the norm weights, one __half at a time: 2 bytes.
+  //   attention()  the key bias, one __half at a time: 2 bytes.
+  //   logits(),    the LM head, or the embedding table where it is tied,
+  //   greedy()     through cublasGemmEx, as linear().
+  constexpr std::size_t kWeightAlignment = 256;
+
+  // One device allocation that DeviceTensors refer into (#23). The driver's
+  // overhead grows with the number of allocations, not their size; one per
+  // weight cost Qwen2.5-0.5B several per cent of its weights' size (ADR-0007,
+  // note from #23).
+  //
+  // A DeviceBuffer underneath, cudaMalloc and not the VMM allocator: weights
+  // are held for the life of the engine and never reclaimed piecemeal, so
+  // nothing about them needs ADR-0007's ranges.
+  class DeviceArena
+  {
+  public:
+    explicit DeviceArena(std::size_t bytes) : buffer_(bytes), bytes_(bytes) {}
+
+    void *base() const { return buffer_.raw(); }
+    std::size_t nbytes() const { return bytes_; }
+
+  private:
+    DeviceBuffer buffer_;
+    std::size_t bytes_;
+  };
+
+  // A block of fp16 on the device. Weights arrive as fp32 from the host and
+  // are stored fp16, which is what every kernel reads.
+  //
+  // A tensor either has an arena to itself, when it is made alone, or is one
+  // of many in a shared arena, at an offset (#23). Either way it holds the
+  // arena, and the arena is returned to the driver when the last tensor in it
+  // goes; a tensor can never be read from memory already given back.
   class DeviceTensor
   {
   public:
-    DeviceTensor(const float *host, size_t count);
+    DeviceTensor(const float *host, std::size_t count);
     // Uninitialised storage: activations and the KV cache, which the forward
     // pass writes before it reads.
-    explicit DeviceTensor(size_t count);
-    ~DeviceTensor();
+    explicit DeviceTensor(std::size_t count);
+    // `count` elements of `arena` from byte `offset`, filled from `host`.
+    // `offset` must be a multiple of kWeightAlignment and the elements must
+    // lie inside the arena; std::invalid_argument otherwise.
+    DeviceTensor(std::shared_ptr<DeviceArena> arena, std::size_t offset,
+                 const float *host, std::size_t count);
     DeviceTensor(const DeviceTensor &) = delete;
     DeviceTensor &operator=(const DeviceTensor &) = delete;
 
-    size_t numel() const { return count_; }
+    std::size_t numel() const { return count_; }
     // Out of line so it can say sizeof(__half) rather than a literal 2. This
     // is the number Footprint.weights reports; it should not be a guess.
-    size_t nbytes() const;
+    std::size_t nbytes() const;
     void download(float *out) const;
     const void *data() const { return ptr_; }
     void *data() { return ptr_; }
 
   private:
+    // Converts `host` to fp16 on the host, so the device never holds an
+    // fp32 copy, and copies it into this tensor's elements.
+    void fill(const float *host);
+
+    std::shared_ptr<DeviceArena> storage_;
     void *ptr_ = nullptr;
-    size_t count_ = 0;
+    std::size_t count_ = 0;
   };
 
   // fp32 on the device, uninitialised: the residual stream, which ADR-0010
