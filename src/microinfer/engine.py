@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 
@@ -58,22 +59,39 @@ def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
     return shapes
 
 
+FP16_BYTES = np.dtype(np.float16).itemsize
+
+
 def expected_weight_bytes(cfg: ModelConfig) -> int:
     """Parameter bytes implied by config.json alone, at fp16."""
-    return 2 * sum(int(np.prod(shape)) for shape in expected_weight_shapes(cfg).values())
+    return FP16_BYTES * sum(int(np.prod(shape)) for shape in expected_weight_shapes(cfg).values())
 
 
-def weight_layout(cfg: ModelConfig) -> tuple[dict[str, int], int]:
-    """Where each weight goes in the engine's one weight arena (#23): its
-    byte offset, each a multiple of the alignment every weight is given
-    (weight_alignment, kernels.h), and the arena's size. From config.json
-    alone, so the arena is sized before anything is read or uploaded."""
+@dataclass(frozen=True)
+class WeightLayout:
+    """Where each weight goes in the engine's one weight arena (#23), and how
+    big the arena is."""
+
+    offsets: dict[str, int]
+    nbytes: int
+
+
+def weight_layout(cfg: ModelConfig) -> WeightLayout:
+    """Each weight's byte offset in the arena, in expected_weight_shapes'
+    order, each a multiple of the alignment every weight is given
+    (weight_alignment, kernels.h); and the arena's size, rounded up to it too.
+    From config.json alone, so the arena is sized before anything is read or
+    uploaded."""
     align = _microinfer.weight_alignment
+
+    def aligned(n: int) -> int:
+        return -(-n // align) * align
+
     offsets, end = {}, 0
     for name, shape in expected_weight_shapes(cfg).items():
-        offsets[name] = -(-end // align) * align
-        end = offsets[name] + 2 * int(np.prod(shape))
-    return offsets, -(-end // align) * align
+        offsets[name] = aligned(end)
+        end = offsets[name] + FP16_BYTES * int(np.prod(shape))
+    return WeightLayout(offsets, aligned(end))
 
 
 def kv_cache_bytes(cfg: ModelConfig, context_length: int,
@@ -191,27 +209,18 @@ class Engine:
         implies, by name and shape, before anything is allocated. Then one
         arena is allocated, sized from config.json (weight_layout), and each
         tensor is uploaded into it at its offset (#23): one allocation, where
-        one per tensor cost 1080 MiB of the driver's memory for 942 MiB of
-        Qwen2.5-0.5B's weights.
+        one per tensor cost several per cent of the weights' size (ADR-0007,
+        note from #23).
 
         Every tensor is range-checked on the way. bf16 carries float32's
         exponent and reaches far past fp16's 65504; a weight over that line
         would become an infinity and poison everything downstream in silence.
         """
         path = self.model_dir / "model.safetensors"
-        expected = expected_weight_shapes(self.config)
-        found = {info.name: info.shape for info in weights.describe(path)}
-        wrong = [f"    {n}: missing" for n in expected if n not in found]
-        wrong += [f"    {n}: not implied by config.json" for n in found if n not in expected]
-        wrong += [f"    {n}: shape {found[n]}, config.json implies {expected[n]}"
-                  for n in expected if n in found and found[n] != expected[n]]
-        if wrong:
-            raise weights.WeightError(
-                f"{path} does not hold what {self.model_dir / 'config.json'} describes; "
-                f"nothing was allocated:\n" + "\n".join(wrong))
+        weights.check_shapes(path, expected_weight_shapes(self.config), "config.json")
 
-        offsets, size = weight_layout(self.config)
-        arena = _microinfer.DeviceArena(size)
+        layout = weight_layout(self.config)
+        arena = _microinfer.DeviceArena(layout.nbytes)
         rejected: dict[str, str] = {}
 
         # Built locally and committed only on success. Uploading into
@@ -226,7 +235,7 @@ class Engine:
                 rejected[name] = reason
                 continue
             flat = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
-            loaded[name] = arena.put(offsets[name], flat)
+            loaded[name] = arena.put(layout.offsets[name], flat)
 
         if rejected:
             detail = "\n".join(f"    {n}: {why}" for n, why in rejected.items())

@@ -11,22 +11,6 @@
 namespace microinfer
 {
 
-  DeviceArena::DeviceArena(std::size_t bytes) : bytes_(bytes)
-  {
-    if (bytes > 0)
-    {
-      cuda_check(cudaMalloc(&ptr_, bytes), "cudaMalloc");
-    }
-  }
-
-  DeviceArena::~DeviceArena()
-  {
-    if (ptr_ != nullptr)
-    {
-      cudaFree(ptr_);
-    }
-  }
-
   size_t DeviceTensor::nbytes() const { return count_ * sizeof(__half); }
 
   void DeviceTensor::fill(const float *host)
@@ -82,8 +66,9 @@ namespace microinfer
           std::to_string(kWeightAlignment) +
           " bytes, the alignment every weight is given (kernels.h)");
     }
+    // Divided rather than multiplied, so that no count overflows the test.
     if (offset > storage_->nbytes() ||
-        count * sizeof(__half) > storage_->nbytes() - offset)
+        count > (storage_->nbytes() - offset) / sizeof(__half))
     {
       throw std::invalid_argument(
           std::to_string(count) + " elements from byte " +

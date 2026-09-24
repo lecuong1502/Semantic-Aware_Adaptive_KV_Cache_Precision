@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 
+#include "microinfer/device_buffer.h"
+
 namespace microinfer
 {
 
@@ -91,34 +93,38 @@ namespace microinfer
   // Every weight begins on a multiple of this many bytes of its arena (#23).
   // It is what cudaMalloc guaranteed each weight when each had its own
   // allocation, so every kernel that reads a weight sees the alignment it
-  // always saw. The hand-written kernels need only a __half's two bytes: they
-  // read weights one element at a time. cuBLAS, behind linear(), chooses its
-  // algorithm partly from its operands' alignment, and its vectorised paths
-  // want 16 bytes; at 256 it chooses exactly as before, so no output moves.
+  // always saw. What each needs:
+  //
+  //   linear()     projection weights and biases, through cublasGemmEx.
+  //                cuBLAS chooses its algorithm partly from its operands'
+  //                alignment, and its vectorised paths want 16 bytes; at
+  //                256 it chooses exactly as before, so no output moves.
+  //   embed()      the embedding table, one __half at a time: 2 bytes.
+  //   rmsnorm()    the norm weights, one __half at a time: 2 bytes.
+  //   attention()  the key bias, one __half at a time: 2 bytes.
+  //   logits(),    the LM head, or the embedding table where it is tied,
+  //   greedy()     through cublasGemmEx, as linear().
   constexpr std::size_t kWeightAlignment = 256;
 
   // One device allocation that DeviceTensors refer into (#23). The driver's
-  // overhead grows with the number of allocations, not their size: 290
-  // allocations for Qwen2.5-0.5B's weights took 1080 MiB for 942 MiB of
-  // them. One arena takes what it holds, to the driver's granularity.
+  // overhead grows with the number of allocations, not their size; one per
+  // weight cost Qwen2.5-0.5B several per cent of its weights' size (ADR-0007,
+  // note from #23).
   //
-  // cudaMalloc, as DeviceBuffer's, and not the VMM allocator: weights are
-  // held for the life of the engine and never reclaimed piecemeal, so
+  // A DeviceBuffer underneath, cudaMalloc and not the VMM allocator: weights
+  // are held for the life of the engine and never reclaimed piecemeal, so
   // nothing about them needs ADR-0007's ranges.
   class DeviceArena
   {
   public:
-    explicit DeviceArena(std::size_t bytes);
-    ~DeviceArena();
-    DeviceArena(const DeviceArena &) = delete;
-    DeviceArena &operator=(const DeviceArena &) = delete;
+    explicit DeviceArena(std::size_t bytes) : buffer_(bytes), bytes_(bytes) {}
 
-    void *base() const { return ptr_; }
+    void *base() const { return buffer_.raw(); }
     std::size_t nbytes() const { return bytes_; }
 
   private:
-    void *ptr_ = nullptr;
-    std::size_t bytes_ = 0;
+    DeviceBuffer buffer_;
+    std::size_t bytes_;
   };
 
   // A block of fp16 on the device. Weights arrive as fp32 from the host and

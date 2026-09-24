@@ -147,19 +147,14 @@ def test_reported_weights_match_what_the_driver_says_was_taken():
     where device free memory drifts by more than the bound checked here.
 
     The driver may round up and never down, so the claim can only understate.
-    It understated by 27% while each of the 290 tensors had an allocation of
-    its own (#5), because the driver's overhead tracks the number of
-    allocations rather than their size. In one arena (#23) it is one
-    allocation, rounded to the driver's granularity: under 2%.
-
-    The CUDA context is this process's first device memory, some 80 MiB of
-    it, so it is made before the first reading; run first in a process, the
-    load would otherwise be charged for it.
+    It understated by several per cent while each of the 290 tensors had an
+    allocation of its own, because the driver's overhead tracks the number of
+    allocations rather than their size (ADR-0007, notes from #5 and #23). In
+    one arena it is one allocation, rounded to the driver's granularity:
+    under 2%.
     """
     engine = Engine(require_model("qwen2.5-0.5b-instruct"))
-    _microinfer.device_memory_info()  # the CUDA context first: see below
-    gc.collect()
-    before = nvml.own_used_bytes()
+    before = nvml.settled_own_used_bytes()
     engine.load_weights()
     taken = nvml.own_used_bytes() - before
     claimed = engine.footprint().weights
@@ -187,30 +182,35 @@ def test_weights_occupy_one_allocation_sized_from_config():
     engine = Engine(require_model("qwen2.5-0.5b-instruct"))
     engine.load_weights()
     arena = engine.weight_arena
-    offsets, size = weight_layout(engine.config)
-    assert arena.nbytes == size
+    layout = weight_layout(engine.config)
+    assert arena.nbytes == layout.nbytes
     for name, tensor in engine.tensors.items():
         at = tensor.address - arena.address
-        assert at == offsets[name], name
-        assert at % _microinfer.weight_alignment == 0 and at + tensor.nbytes <= size, name
+        assert at == layout.offsets[name], name
+        assert at % _microinfer.weight_alignment == 0 and at + tensor.nbytes <= layout.nbytes, name
     assert engine.footprint().weights == sum(t.nbytes for t in engine.tensors.values())
 
 
 def test_freeing_the_engine_returns_the_whole_arena():
-    """Asserted against cudaMemGetInfo, as ADR-0007's reclaim is, within what
-    other processes move it by; and against this process's own account,
-    exactly."""
-    gc.collect()
-    free_before = stable_free_bytes()  # makes the CUDA context, if it is not yet
-    own_before = nvml.own_used_bytes()
+    """Two readings of the same release. This process's own account, which
+    nothing else moves, returns exactly to where it was. And device free
+    memory, cudaMemGetInfo's reading, as ADR-0007's reclaim is judged by,
+    returns with it once what other processes took or gave back meanwhile is
+    taken out: a browser's GPU process alone moves it by more than any bound
+    on the raw reading could allow and still mean anything (#15). The 2% left
+    covers what the driver reports of others at a moment's skew from
+    cudaMemGetInfo."""
+    own_before = nvml.settled_own_used_bytes()
+    free_before, others_before = stable_free_bytes(), nvml.others_used_bytes()
     engine = Engine(require_model("qwen2.5-0.5b-instruct"))
     engine.load_weights()
     held = engine.weight_arena.nbytes
-    assert free_before - stable_free_bytes() > 0.95 * held
+    assert nvml.own_used_bytes() - own_before >= held
     del engine
     gc.collect()
-    assert abs(free_before - stable_free_bytes()) < 0.02 * held
     assert nvml.own_used_bytes() == own_before
+    moved = (free_before - stable_free_bytes()) - (nvml.others_used_bytes() - others_before)
+    assert abs(moved) < 0.02 * held, f"{moved / MIB:.1f} MiB not returned"
 
 
 def test_a_checkpoint_config_does_not_describe_is_refused_before_anything_is_allocated(tmp_path):

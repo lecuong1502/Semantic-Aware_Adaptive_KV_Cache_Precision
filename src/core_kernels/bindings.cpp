@@ -433,8 +433,10 @@ PYBIND11_MODULE(_microinfer, m)
 
   m.def("device_name", &microinfer::device_name, "Name of CUDA device 0.");
 
-  py::class_<microinfer::DeviceTensor>(m, "DeviceTensor",
-                                       "Owned fp16 storage on the device.")
+  py::class_<microinfer::DeviceTensor>(
+      m, "DeviceTensor",
+      "fp16 on the device: in an arena of its own, or at an offset into a "
+      "shared one, the engine's weights' (#23). It keeps its arena alive.")
       .def_property_readonly("numel", &microinfer::DeviceTensor::numel)
       .def_property_readonly(
           "address", [](const microinfer::DeviceTensor &t)

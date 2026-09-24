@@ -2,7 +2,7 @@
 
 Weights used to be uploaded one cudaMalloc per tensor, 290 of them for
 Qwen2.5-0.5B, and the driver's overhead tracks the number of allocations,
-not their size: 1080 MiB taken for 942 MiB of weights. A DeviceArena is one
+not their size (ADR-0007, notes from #5 and #23). A DeviceArena is one
 allocation; each weight is a DeviceTensor that refers into it at an offset,
 and owns nothing. The arena goes back to the driver when the last tensor
 referring into it goes.
@@ -13,7 +13,8 @@ weight sees the alignment it always saw, cuBLAS included, which chooses its
 algorithm partly from its operands' alignment (kernels.h).
 
 Memory is read from the driver's account of this process alone
-(nvml.own_used_bytes), which no other process moves.
+(nvml.own_used_bytes), which no other process moves, starting from
+nvml.settled_own_used_bytes, so the CUDA context is never charged to it.
 """
 
 import gc
@@ -57,8 +58,7 @@ def test_a_tensor_must_start_aligned_and_end_inside():
 def test_the_arena_is_one_allocation_and_putting_takes_nothing_more():
     """What the driver takes for this process is the arena, rounded to its
     granularity, at creation; putting tensors into it takes nothing more."""
-    gc.collect()
-    before = nvml.own_used_bytes()
+    before = nvml.settled_own_used_bytes()
     arena = _microinfer.DeviceArena(64 * MIB)
     created = nvml.own_used_bytes() - before
     for i in range(64):
@@ -71,8 +71,7 @@ def test_the_arena_lives_until_its_last_tensor_goes():
     """A tensor keeps its arena alive after the arena's own handle is gone, so
     a weight can never be read from memory already returned; the last one to
     go returns all of it to the driver."""
-    gc.collect()
-    before = nvml.own_used_bytes()
+    before = nvml.settled_own_used_bytes()
     arena = _microinfer.DeviceArena(32 * MIB)
     values = np.arange(10, dtype=np.float32)
     kept = arena.put(ALIGN, values)
@@ -86,8 +85,8 @@ def test_the_arena_lives_until_its_last_tensor_goes():
 
 
 def test_a_tensor_in_the_arena_is_an_operand_like_any_other():
-    """A view into the arena goes wherever a weight goes: here the copy op and
-    RMSNorm, reading it as its weight."""
+    """A tensor in the arena goes wherever a weight goes, and is read as one
+    that owns its storage is: here as RMSNorm's weight, to the bit."""
     device = _microinfer.device
     arena = _microinfer.DeviceArena(MIB)
     hidden = 64

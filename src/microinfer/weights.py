@@ -136,6 +136,20 @@ def describe(path: Path) -> list[TensorInfo]:
     ]
 
 
+def check_shapes(path: Path, expected: dict[str, tuple[int, ...]], source: str) -> None:
+    """Raise WeightError, naming every difference, unless the checkpoint holds
+    exactly the tensors `expected` names, each of its shape. `source` says
+    where `expected` came from. Reads only the header."""
+    found = {info.name: info.shape for info in describe(path)}
+    wrong = [f"    {n}: missing" for n in expected if n not in found]
+    wrong += [f"    {n}: not implied by {source}" for n in found if n not in expected]
+    wrong += [f"    {n}: shape {found[n]}, {source} implies {expected[n]}"
+              for n in expected if n in found and found[n] != expected[n]]
+    if wrong:
+        raise WeightError(f"{path} does not hold what {source} describes; nothing was "
+                          f"allocated:\n" + "\n".join(wrong))
+
+
 def check_fp16_range(name: str, values: np.ndarray) -> str | None:
     """Return why this tensor will not survive conversion to fp16, or None.
 
