@@ -46,10 +46,13 @@ layers.
 _Avoid_: precision level, quantisation level, bit-width
 
 **Open page**:
-A layer's last page while its `P` positions are still being written. A key
-channel's scale spans the whole page, so the open page has none and stays at
-`FP16`: a mechanical requirement, independent of the recency floor, though the
-two agree (ADR-0005).
+Where a layer's positions wait while their page's `P` positions are still
+being written. A key channel's scale spans the whole page, so they cannot be
+quantised yet and stay at `FP16`: a mechanical requirement, independent of the
+recency floor, though the two agree (ADR-0005). At `FP16` it is simply the
+layer's last page; at a quantised tier it is a page of its own, `(layer, -1)`,
+reused for each span in turn, so that every other page is written once, at its
+tier (ADR-0011).
 _Avoid_: partial page, current block, tail page (the tail is the allocator's
 last slot, ADR-0007)
 

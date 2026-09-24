@@ -3,6 +3,7 @@
 
     .venv/bin/python tools/throughput.py --model qwen2.5-0.5b-instruct --lengths 512 2048 8192
     .venv/bin/python tools/throughput.py --model qwen2.5-1.5b-instruct --lengths 32768 --repeat 1
+    .venv/bin/python tools/throughput.py --kv-tier INT4 ...
 
 They are two different regimes, so they are two entries per length:
 - **Prefill** runs many positions through each projection at once and is
@@ -60,19 +61,21 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--lengths", type=int, nargs="+", default=[512, 2048, 8192])
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--kv-tier", default="FP16", choices=Engine.KV_TIERS,
+                        help="the static tier the cache is held at (#18)")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
 
     if benchlog.environment(args.log)["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first")
 
-    engine = Engine(REPO / "models" / args.model)
+    engine = Engine(REPO / "models" / args.model, kv_tier=args.kv_tier)
     engine.load_weights()
     rng = np.random.default_rng(SEED)
     method = {"repeat": args.repeat, "warmup": args.warmup, "statistic": "median", "seed": SEED,
               "prompt": "random token ids", "prefill_chunk": engine.prefill_chunk,
-              "kv_cache": engine.kv_cache}
-    tiers = {"FP16": 1.0}
+              "kv_cache": engine.kv_cache, "kv_tier": engine.kv_tier}
+    tiers = {engine.kv_tier: 1.0}
 
     for length in args.lengths:
         ids = rng.integers(1000, engine.config.vocab_size - 1000, length).astype(np.int32)

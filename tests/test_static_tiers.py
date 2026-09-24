@@ -13,8 +13,10 @@ to show here is that the engine reaches it, that each narrower tier costs
 more than the one above, and that its memory is what the layout says.
 """
 
+import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 from test_paged_engine import decode
 
@@ -132,3 +134,26 @@ def test_the_footprint_at_each_tier_is_what_the_layout_computes(tier):
     print(f"\n{tier}: measured {measured / MIB:.1f} MiB, computed {computed / MIB:.1f} MiB")
     assert abs(measured - computed) <= 0.01 * computed
     del cache
+
+
+@pytest.mark.skipif(os.environ.get("MICROINFER_LONG_TESTS") != "1",
+                    reason="tens of minutes; set MICROINFER_LONG_TESTS=1 to run")
+@pytest.mark.parametrize("tier", TIERS[1:])
+def test_a_32k_prompt_prefills_at_each_quantised_tier_on_the_1_5b_model(tier):
+    """ADR-0003's experimental configuration at each quantised tier: the whole
+    context window of Qwen2.5-1.5B, prefilled in chunks into a cache at the
+    tier, then one token chosen. FP16 is test_chunked_prefill.py's. At the
+    peak the cache holds what paged_cache_bytes says for the window, and
+    beside it the RoPE table, which covers every position."""
+    e = Engine(require_model("qwen2.5-1.5b-instruct"), kv_tier=tier)
+    e.load_weights()
+    window = e.config.max_position_embeddings
+    ids = np.random.default_rng(15).integers(1000, 100_000, window).astype(np.int32)
+    e.reset_peak()
+    out = e.generate(ids, 1, stop_at_eos=False)
+    assert out.shape == (1,) and 0 <= out[0] < e.config.vocab_size
+    peak = e.peak_footprint()
+    print(f"\n{tier}: " + peak.render())
+    table = peak.kv_cache - paged_cache_bytes(e.config, window, tier)
+    per_position = e.config.head_dim * 4  # {cos, sin} in fp32 for head_dim / 2 frequencies
+    assert table % per_position == 0 and table // per_position >= window, table
