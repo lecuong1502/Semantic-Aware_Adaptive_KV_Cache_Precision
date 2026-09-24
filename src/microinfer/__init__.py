@@ -24,8 +24,8 @@ except Exception as exc:  # pragma: no cover - environment failure, not logic
     ) from exc
 
 from .config import ConfigMismatch, ModelConfig  # noqa: E402
-from .engine import (Engine, expected_weight_bytes, kv_cache_bytes,  # noqa: E402
-                     paged_cache_bytes, paged_cache_ranges)
+from .engine import (Engine, expected_weight_bytes, expected_weight_shapes,  # noqa: E402
+                     kv_cache_bytes, paged_cache_bytes, paged_cache_ranges, weight_layout)
 from .footprint import Footprint  # noqa: E402
 
 __all__ = [
@@ -36,7 +36,9 @@ __all__ = [
     "ModelConfig",
     "_microinfer",
     "expected_weight_bytes",
+    "expected_weight_shapes",
     "kv_cache_bytes",
     "paged_cache_bytes",
     "paged_cache_ranges",
+    "weight_layout",
 ]

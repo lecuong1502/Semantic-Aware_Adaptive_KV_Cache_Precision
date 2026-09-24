@@ -22,30 +22,58 @@ from .footprint import Footprint
 from .models import VERIFIED
 
 
-def expected_weight_bytes(cfg: ModelConfig) -> int:
-    """Parameter bytes implied by config.json alone, at fp16.
+def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
+    """Every tensor the checkpoint must hold, by its name there, with its
+    shape: implied by config.json alone.
 
-    Derived rather than measured, so that a mismatch against the real
-    checkpoint is a finding rather than a tautology. Qwen2 puts a bias on the
-    query, key and value projections and none on the output projection.
+    Derived rather than read, so that a mismatch against the real checkpoint
+    is a finding rather than a tautology. Qwen2 puts a bias on the query, key
+    and value projections and none on the output projection; a model that
+    ties its embeddings stores no LM head.
     """
-    h, i = cfg.hidden_size, cfg.intermediate_size
+    h, i, vocab = cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size
     q_dim = cfg.num_attention_heads * cfg.head_dim
     kv_dim = cfg.num_key_value_heads * cfg.head_dim
 
-    embedding = cfg.vocab_size * h
-    per_layer = (
-        h * q_dim + q_dim          # q_proj + bias
-        + h * kv_dim + kv_dim      # k_proj + bias
-        + h * kv_dim + kv_dim      # v_proj + bias
-        + q_dim * h                # o_proj, no bias
-        + 3 * h * i                # gate, up, down
-        + 2 * h                    # the two RMSNorm weights
-    )
-    tail = h  # final norm
-    head = 0 if cfg.tie_word_embeddings else cfg.vocab_size * h
+    shapes = {"model.embed_tokens.weight": (vocab, h)}
+    for layer in range(cfg.num_hidden_layers):
+        p = f"model.layers.{layer}."
+        shapes.update({
+            p + "input_layernorm.weight": (h,),
+            p + "self_attn.q_proj.weight": (q_dim, h),
+            p + "self_attn.q_proj.bias": (q_dim,),
+            p + "self_attn.k_proj.weight": (kv_dim, h),
+            p + "self_attn.k_proj.bias": (kv_dim,),
+            p + "self_attn.v_proj.weight": (kv_dim, h),
+            p + "self_attn.v_proj.bias": (kv_dim,),
+            p + "self_attn.o_proj.weight": (h, q_dim),
+            p + "post_attention_layernorm.weight": (h,),
+            p + "mlp.gate_proj.weight": (i, h),
+            p + "mlp.up_proj.weight": (i, h),
+            p + "mlp.down_proj.weight": (h, i),
+        })
+    shapes["model.norm.weight"] = (h,)
+    if not cfg.tie_word_embeddings:
+        shapes["lm_head.weight"] = (vocab, h)
+    return shapes
 
-    return 2 * (embedding + cfg.num_hidden_layers * per_layer + tail + head)
+
+def expected_weight_bytes(cfg: ModelConfig) -> int:
+    """Parameter bytes implied by config.json alone, at fp16."""
+    return 2 * sum(int(np.prod(shape)) for shape in expected_weight_shapes(cfg).values())
+
+
+def weight_layout(cfg: ModelConfig) -> tuple[dict[str, int], int]:
+    """Where each weight goes in the engine's one weight arena (#23): its
+    byte offset, each a multiple of the alignment every weight is given
+    (weight_alignment, kernels.h), and the arena's size. From config.json
+    alone, so the arena is sized before anything is read or uploaded."""
+    align = _microinfer.weight_alignment
+    offsets, end = {}, 0
+    for name, shape in expected_weight_shapes(cfg).items():
+        offsets[name] = -(-end // align) * align
+        end = offsets[name] + 2 * int(np.prod(shape))
+    return offsets, -(-end // align) * align
 
 
 def kv_cache_bytes(cfg: ModelConfig, context_length: int,
@@ -148,6 +176,7 @@ class Engine:
             self.config.verify(expected)
 
         self._tensors: dict[str, _microinfer.DeviceTensor] = {}
+        self._arena: _microinfer.DeviceArena | None = None
         self._model: model.Model | None = None
         self._workspace_bytes = 0
         self._cache = None
@@ -156,19 +185,40 @@ class Engine:
     # -- loading ------------------------------------------------------------
 
     def load_weights(self) -> None:
-        """Read the checkpoint and put it on the device as fp16.
+        """Read the checkpoint and put it on the device as fp16, in one arena.
+
+        The checkpoint's tensors are checked against the ones config.json
+        implies, by name and shape, before anything is allocated. Then one
+        arena is allocated, sized from config.json (weight_layout), and each
+        tensor is uploaded into it at its offset (#23): one allocation, where
+        one per tensor cost 1080 MiB of the driver's memory for 942 MiB of
+        Qwen2.5-0.5B's weights.
 
         Every tensor is range-checked on the way. bf16 carries float32's
         exponent and reaches far past fp16's 65504; a weight over that line
         would become an infinity and poison everything downstream in silence.
         """
         path = self.model_dir / "model.safetensors"
+        expected = expected_weight_shapes(self.config)
+        found = {info.name: info.shape for info in weights.describe(path)}
+        wrong = [f"    {n}: missing" for n in expected if n not in found]
+        wrong += [f"    {n}: not implied by config.json" for n in found if n not in expected]
+        wrong += [f"    {n}: shape {found[n]}, config.json implies {expected[n]}"
+                  for n in expected if n in found and found[n] != expected[n]]
+        if wrong:
+            raise weights.WeightError(
+                f"{path} does not hold what {self.model_dir / 'config.json'} describes; "
+                f"nothing was allocated:\n" + "\n".join(wrong))
+
+        offsets, size = weight_layout(self.config)
+        arena = _microinfer.DeviceArena(size)
         rejected: dict[str, str] = {}
 
         # Built locally and committed only on success. Uploading into
         # self._tensors as we go would leave a half-loaded model observable
         # through `tensors` and `footprint()` after the raise, reported as
-        # though it were whole.
+        # though it were whole. On a raise, the arena goes with the last
+        # tensor in it.
         loaded: dict[str, _microinfer.DeviceTensor] = {}
         for name, values in weights.iter_tensors(path):
             reason = weights.check_fp16_range(name, values)
@@ -176,7 +226,7 @@ class Engine:
                 rejected[name] = reason
                 continue
             flat = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
-            loaded[name] = _microinfer.upload_fp16(flat)
+            loaded[name] = arena.put(offsets[name], flat)
 
         if rejected:
             detail = "\n".join(f"    {n}: {why}" for n, why in rejected.items())
@@ -188,8 +238,14 @@ class Engine:
                 f"infinity or a NaN into the weights, silently."
             )
 
+        self._arena = arena
         self._tensors = loaded
         self._model = model.Model(self.config, model.Weights.from_tensors(self.config, loaded))
+
+    @property
+    def weight_arena(self) -> _microinfer.DeviceArena | None:
+        """The one allocation the weights live in, once loaded (#23)."""
+        return self._arena
 
     @property
     def kv_tier(self) -> str:

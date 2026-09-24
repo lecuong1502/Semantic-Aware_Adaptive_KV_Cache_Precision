@@ -239,11 +239,9 @@ def test_peak_memory_is_reported_and_matches_what_the_driver_saw(engine):
     not the engine's; the peak reading, taken after the work, shows it under
     `unaccounted`, and a warm run shows the engine's own share alone.
 
-    The weights are not in that comparison, and the reason is known: 290
-    allocations take the driver's granularity overhead on top of the 942 MiB
-    they hold (ADR-0007, note from #5). Arena loading is #23. Until then the
-    overhead sits in `unaccounted`, and this test says so rather than
-    pretending the weights are exact."""
+    The weights are not in that comparison: they were loaded before the
+    reading began. What they take from the driver is checked on its own, in
+    test_engine.py: one arena, within 2% of what they hold (#23)."""
     cfg = engine.config
     prompt, new = 600, 16
     ids = np.arange(100, 100 + prompt, dtype=np.int32)
