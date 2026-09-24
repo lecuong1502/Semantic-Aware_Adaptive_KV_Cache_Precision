@@ -402,22 +402,21 @@ namespace
     return py::make_tuple(keys, values);
   }
 
-  py::dict page_layout(microinfer::Tier tier, int kv_heads, int head_dim,
-                       int page_tokens)
+  py::dict page_layout(microinfer::Tier tier, int kv_heads, int head_dim)
   {
-    const auto l = microinfer::quantised_page_layout(tier, page_tokens,
-                                                     kv_heads, head_dim);
+    const auto layout = microinfer::quantised_page_layout(
+        tier, microinfer::kPageTokens, kv_heads, head_dim);
     py::dict d;
-    d["bits"] = l.bits;
-    d["key_codes"] = l.key_codes;
-    d["value_codes"] = l.value_codes;
-    d["key_scales"] = l.key_scales;
-    d["key_zeros"] = l.key_zeros;
-    d["value_scales"] = l.value_scales;
-    d["value_zeros"] = l.value_zeros;
-    d["metadata_bytes"] = l.metadata_bytes;
-    d["page_bytes"] = l.page_bytes;
-    d["effective_bits"] = l.effective_bits;
+    d["bits"] = layout.bits;
+    d["key_codes"] = layout.key_codes;
+    d["value_codes"] = layout.value_codes;
+    d["key_scales"] = layout.key_scales;
+    d["key_zeros"] = layout.key_zeros;
+    d["value_scales"] = layout.value_scales;
+    d["value_zeros"] = layout.value_zeros;
+    d["metadata_bytes"] = layout.metadata_bytes;
+    d["page_bytes"] = layout.page_bytes;
+    d["effective_bits"] = layout.effective_bits;
     return d;
   }
 
@@ -514,7 +513,6 @@ PYBIND11_MODULE(_microinfer, m)
 
   m.def("quantised_page_layout", &page_layout, py::arg("tier"),
         py::arg("kv_heads"), py::arg("head_dim"),
-        py::arg("page_tokens") = microinfer::kPageTokens,
         "Byte offsets of a quantised page's regions (key codes, value codes, "
         "key scales, key zeros, value scales, value zeros), its metadata and "
         "page bytes, and the effective bits per element with the metadata "

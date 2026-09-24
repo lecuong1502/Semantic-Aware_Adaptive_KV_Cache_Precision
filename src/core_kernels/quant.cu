@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
@@ -19,6 +20,8 @@ namespace microinfer
 
     constexpr int kBlockThreads = 128;
     constexpr int kWarp = 32;
+    // The values kernel gives each warp one group and lets it return whole.
+    static_assert(kBlockThreads % kWarp == 0, "blocks must be whole warps");
 
     int bits_of(Tier tier)
     {
@@ -38,7 +41,7 @@ namespace microinfer
           "codes and no metadata");
     }
 
-    void positive(int n, const char *what)
+    void require_positive(int n, const char *what)
     {
       if (n <= 0)
       {
@@ -69,7 +72,8 @@ namespace microinfer
           static_cast<unsigned short>(__half_as_ushort(nearest) + 1));
     }
 
-    // x - zero is exact in fp32, both being fp16; the quotient rounds once.
+    // Rounds at most twice, at x - zero and at the quotient; either can move
+    // a code only where its exact value sits at a rounding tie.
     template <int Bits>
     __device__ unsigned code_of(float x, float zero, float scale)
     {
@@ -101,6 +105,8 @@ namespace microinfer
         return;
       }
       const int first = column * kPerByte;
+      const auto row = [width](int t)
+      { return static_cast<size_t>(t) * width; };
 
       float lo[kPerByte], hi[kPerByte], scale[kPerByte];
       for (int c = 0; c < kPerByte; ++c)
@@ -112,7 +118,7 @@ namespace microinfer
       {
         for (int c = 0; c < kPerByte; ++c)
         {
-          const float x = __half2float(keys[t * width + first + c]);
+          const float x = __half2float(keys[row(t) + first + c]);
           lo[c] = fminf(lo[c], x);
           hi[c] = fmaxf(hi[c], x);
         }
@@ -129,10 +135,11 @@ namespace microinfer
         unsigned byte = 0;
         for (int c = 0; c < kPerByte; ++c)
         {
-          const float x = __half2float(keys[t * width + first + c]);
+          const float x = __half2float(keys[row(t) + first + c]);
           byte |= code_of<Bits>(x, lo[c], scale[c]) << (c * Bits);
         }
-        codes[t * columns + column] = static_cast<std::uint8_t>(byte);
+        codes[static_cast<size_t>(t) * columns + column] =
+            static_cast<std::uint8_t>(byte);
       }
     }
 
@@ -188,51 +195,32 @@ namespace microinfer
       }
     }
 
-    // Both halves at once, one thread per byte of codes. A key's scale is its
-    // channel's; a value's is its (token, head) group's, which every code in
-    // a byte shares because head_dim * Bits is a multiple of 8.
-    template <int Bits>
-    __global__ void
-    dequantise_kernel(const std::uint8_t *__restrict__ page,
-                      __half *__restrict__ keys, __half *__restrict__ values,
-                      QuantisedPageLayout layout, int page_tokens, int kv_heads,
-                      int head_dim)
+    // One half of the page, keys or values, one thread per byte of codes.
+    // Element e of the half is row e / width. Its group is its channel,
+    // e % width, for keys; for values it is its (token, head), e / head_dim,
+    // which every code in a byte shares because head_dim * Bits is a
+    // multiple of 8.
+    template <int Bits, bool PerChannel>
+    __global__ void dequantise_kernel(const std::uint8_t *__restrict__ codes,
+                                      const __half *__restrict__ scales,
+                                      const __half *__restrict__ zeros,
+                                      __half *__restrict__ out, size_t bytes,
+                                      int width, int head_dim)
     {
       constexpr int kPerByte = 8 / Bits;
       constexpr unsigned kMask = (1u << Bits) - 1;
-      const int width = kv_heads * head_dim;
-      const size_t half_bytes =
-          static_cast<size_t>(page_tokens) * width / kPerByte;
-      const auto *key_scales =
-          reinterpret_cast<const __half *>(page + layout.key_scales);
-      const auto *key_zeros =
-          reinterpret_cast<const __half *>(page + layout.key_zeros);
-      const auto *value_scales =
-          reinterpret_cast<const __half *>(page + layout.value_scales);
-      const auto *value_zeros =
-          reinterpret_cast<const __half *>(page + layout.value_zeros);
-
       for (size_t i =
                static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-           i < 2 * half_bytes; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+           i < bytes; i += static_cast<size_t>(gridDim.x) * blockDim.x)
       {
-        const bool is_value = i >= half_bytes;
-        const size_t byte_index = is_value ? i - half_bytes : i;
-        const unsigned byte = page[layout.key_codes + i];
-        const size_t first = byte_index * kPerByte;
-        const size_t t = first / width;
-        const int column = static_cast<int>(first % width);
-        __half *out = is_value ? values : keys;
+        const unsigned byte = codes[i];
         for (int c = 0; c < kPerByte; ++c)
         {
-          const size_t metadata =
-              is_value ? t * kv_heads + (column + c) / head_dim : column + c;
-          const float scale = __half2float(is_value ? value_scales[metadata]
-                                                    : key_scales[metadata]);
-          const float zero = __half2float(is_value ? value_zeros[metadata]
-                                                   : key_zeros[metadata]);
+          const size_t e = i * kPerByte + c;
+          const size_t group = PerChannel ? e % width : e / head_dim;
           const float q = static_cast<float>((byte >> (c * Bits)) & kMask);
-          out[first + c] = __float2half_rn(fmaf(q, scale, zero));
+          out[e] = __float2half_rn(
+              fmaf(q, __half2float(scales[group]), __half2float(zeros[group])));
         }
       }
     }
@@ -266,26 +254,42 @@ namespace microinfer
     template <int Bits>
     void launch_dequantise(const std::uint8_t *page, __half *keys,
                            __half *values, const QuantisedPageLayout &layout,
-                           int page_tokens, int kv_heads, int head_dim)
+                           int kv_heads, int head_dim)
     {
-      const size_t bytes = 2 * (layout.value_codes - layout.key_codes);
-      dequantise_kernel<Bits>
-          <<<grid_stride_blocks(bytes, kBlockThreads), kBlockThreads>>>(
-              page, keys, values, layout, page_tokens, kv_heads, head_dim);
-      cuda_check(cudaGetLastError(), "dequantise kernel launch");
+      const size_t bytes = layout.value_codes - layout.key_codes;
+      const int width = kv_heads * head_dim;
+      const int grid = grid_stride_blocks(bytes, kBlockThreads);
+      const auto meta = [page](std::size_t offset)
+      { return reinterpret_cast<const __half *>(page + offset); };
+      dequantise_kernel<Bits, true><<<grid, kBlockThreads>>>(
+          page + layout.key_codes, meta(layout.key_scales),
+          meta(layout.key_zeros), keys, bytes, width, head_dim);
+      cuda_check(cudaGetLastError(), "dequantise keys kernel launch");
+      dequantise_kernel<Bits, false><<<grid, kBlockThreads>>>(
+          page + layout.value_codes, meta(layout.value_scales),
+          meta(layout.value_zeros), values, bytes, width, head_dim);
+      cuda_check(cudaGetLastError(), "dequantise values kernel launch");
     }
 
-    // Only INT8 has kernels so far. The layout above is every tier's; the
-    // kernels are templated on the code width so that INT4 and INT2 are
-    // instantiations, not rewrites.
-    void require_kernels(Tier tier)
+    // The one place a tier chooses its kernels: `launch` is called with the
+    // code width as a compile-time constant. Only INT8 has kernels so far;
+    // the layout is every tier's, and INT4 and INT2 will be two more cases
+    // here, not new kernels.
+    template <typename Launch> void with_code_width(Tier tier, Launch &&launch)
     {
-      if (tier != Tier::INT8)
+      switch (tier)
       {
+      case Tier::INT8:
+        launch(std::integral_constant<int, 8>{});
+        return;
+      case Tier::INT4:
+      case Tier::INT2:
         throw std::invalid_argument(
             "INT" + std::to_string(bits_of(tier)) +
             " has no quantise or dequantise kernel yet: INT4 and INT2 arrive "
             "with #17");
+      case Tier::FP16:
+        bits_of(tier); // throws: FP16 is not quantised
       }
     }
 
@@ -309,9 +313,9 @@ namespace microinfer
                                             int kv_heads, int head_dim)
   {
     const int bits = bits_of(tier);
-    positive(page_tokens, "page_tokens");
-    positive(kv_heads, "kv_heads");
-    positive(head_dim, "head_dim");
+    require_positive(page_tokens, "page_tokens");
+    require_positive(kv_heads, "kv_heads");
+    require_positive(head_dim, "head_dim");
     if (head_dim * bits % 8 != 0)
     {
       throw std::invalid_argument(
@@ -326,19 +330,19 @@ namespace microinfer
     const std::size_t value_meta =
         static_cast<std::size_t>(page_tokens) * kv_heads * sizeof(__half);
 
-    QuantisedPageLayout l{};
-    l.bits = bits;
-    l.key_codes = 0;
-    l.value_codes = codes;
-    l.key_scales = 2 * codes;
-    l.key_zeros = l.key_scales + key_meta;
-    l.value_scales = l.key_zeros + key_meta;
-    l.value_zeros = l.value_scales + value_meta;
-    l.page_bytes = l.value_zeros + value_meta;
-    l.metadata_bytes = l.page_bytes - 2 * codes;
-    l.effective_bits = 8.0 * static_cast<double>(l.page_bytes) /
-                       static_cast<double>(2 * page_tokens * width);
-    return l;
+    QuantisedPageLayout layout{};
+    layout.bits = bits;
+    layout.key_codes = 0;
+    layout.value_codes = codes;
+    layout.key_scales = 2 * codes;
+    layout.key_zeros = layout.key_scales + key_meta;
+    layout.value_scales = layout.key_zeros + key_meta;
+    layout.value_zeros = layout.value_scales + value_meta;
+    layout.page_bytes = layout.value_zeros + value_meta;
+    layout.metadata_bytes = layout.page_bytes - 2 * codes;
+    layout.effective_bits = 8.0 * static_cast<double>(layout.page_bytes) /
+                            static_cast<double>(2 * page_tokens * width);
+    return layout;
   }
 
   OpenPage::OpenPage(int filled, int page_tokens)
@@ -357,9 +361,13 @@ namespace microinfer
     const QuantisedPageLayout layout =
         quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
     check_filled(filled, page_tokens);
-    require_kernels(tier);
-    launch_quantise<8>(keys, values, page, layout, page_tokens, kv_heads,
-                       head_dim);
+    with_code_width(tier,
+                    [&](auto bits)
+                    {
+                      launch_quantise<decltype(bits)::value>(
+                          keys, values, page, layout, page_tokens, kv_heads,
+                          head_dim);
+                    });
   }
 
   void device::dequantise_page(const std::uint8_t *page, __half *keys,
@@ -368,9 +376,12 @@ namespace microinfer
   {
     const QuantisedPageLayout layout =
         quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
-    require_kernels(tier);
-    launch_dequantise<8>(page, keys, values, layout, page_tokens, kv_heads,
-                         head_dim);
+    with_code_width(tier,
+                    [&](auto bits)
+                    {
+                      launch_dequantise<decltype(bits)::value>(
+                          page, keys, values, layout, kv_heads, head_dim);
+                    });
   }
 
   void quantise_page(const float *keys, const float *values, std::uint8_t *page,
@@ -380,7 +391,6 @@ namespace microinfer
     const QuantisedPageLayout layout =
         quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
     check_filled(filled, page_tokens); // before anything is uploaded
-    require_kernels(tier);
 
     const size_t count = static_cast<size_t>(page_tokens) * kv_heads * head_dim;
     DeviceBuffer dev_keys(count * sizeof(__half));
@@ -404,7 +414,6 @@ namespace microinfer
   {
     const QuantisedPageLayout layout =
         quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
-    require_kernels(tier);
 
     const size_t count = static_cast<size_t>(page_tokens) * kv_heads * head_dim;
     DeviceBuffer dev_page(layout.page_bytes);

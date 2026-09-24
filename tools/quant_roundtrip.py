@@ -98,12 +98,12 @@ def main(argv: list[str]) -> int:
                     err = (np.abs(got_k.astype(np.float64) - k),
                            np.abs(got_v.astype(np.float64) - v))
                     scale = scales(page, layout, heads, head_dim)
-                    for i, (half, x) in enumerate((("keys", k), ("values", v))):
-                        seen[half][0].append(x.astype(np.float64).ravel())
-                        seen[half][1].append(err[i].ravel())
-                        seen[half][2].append(in_steps(err[i], scale[i]))
+                    for i, (part, x) in enumerate((("keys", k), ("values", v))):
+                        seen[part][0].append(x.astype(np.float64).ravel())
+                        seen[part][1].append(err[i].ravel())
+                        seen[part][2].append(in_steps(err[i], scale[i]))
                     pages += 1
-        results = {half: summary(*lists) for half, lists in seen.items()}
+        results = {part: summary(*lists) for part, lists in seen.items()}
         results.update(pages=pages, effective_bits=layout["effective_bits"],
                        metadata_bytes=layout["metadata_bytes"], page_bytes=layout["page_bytes"])
         print(f"{name}: {pages} pages, {layout['effective_bits']:.3f} effective bits; "
