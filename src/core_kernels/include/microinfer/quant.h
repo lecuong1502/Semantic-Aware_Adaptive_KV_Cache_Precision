@@ -19,9 +19,10 @@ namespace microinfer
   // KIVI found key outliers along channels. Values are quantised per (head,
   // token), across head_dim channels. Both are asymmetric: a group's
   // zero-point is its minimum, which a code of 0 stands for, and its scale is
-  // its range over the 2^bits - 1 steps above that. A value comes back as
-  // code * scale + zero-point. A group whose range is zero has scale 0, every
-  // code 0, and comes back exactly.
+  // its range over the 2^bits - 1 steps above that, rounded up to fp16 so
+  // that the last step reaches the maximum. A value comes back as code *
+  // scale + zero-point, within half a step of what went in. A group whose
+  // range is zero has scale 0, every code 0, and comes back exactly.
   //
   // The regions, back to back from byte 0, W = kv_heads * head_dim:
   //

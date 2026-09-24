@@ -48,13 +48,25 @@ namespace microinfer
     }
 
     // The group's scale: its range over the steps above its minimum, formed in
-    // fp64 and rounded once to the fp16 the page stores. Codes are then
-    // formed against that stored scale, so that dequantising with it is
-    // consistent with how they were chosen.
+    // fp64 and rounded *up* to the fp16 the page stores, so that the last
+    // level always reaches the group's maximum and no code is ever clamped.
+    // Rounded to nearest, a scale below fp16's smallest normal, where the
+    // spacing is coarse, could fall short by an eighth, and the clamp would
+    // cost the top of the range several steps. Codes are then formed against
+    // the stored scale, so that dequantising with it is consistent with how
+    // they were chosen.
     template <int Bits> __device__ __half scale_of(float lo, float hi)
     {
       constexpr int kLevels = (1 << Bits) - 1;
-      return __double2half((static_cast<double>(hi) - lo) / kLevels);
+      const double exact = (static_cast<double>(hi) - lo) / kLevels;
+      const __half nearest = __double2half(exact);
+      if (static_cast<double>(__half2float(nearest)) >= exact)
+      {
+        return nearest;
+      }
+      // Non-negative, so the next fp16 up is the next bit pattern.
+      return __ushort_as_half(
+          static_cast<unsigned short>(__half_as_ushort(nearest) + 1));
     }
 
     // x - zero is exact in fp32, both being fp16; the quotient rounds once.

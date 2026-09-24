@@ -83,13 +83,16 @@ def split(page, tier, heads, head_dim):
 def reference(x, bits, axis):
     """Asymmetric quantisation in float64, over `axis`: the zero-point is the
     minimum, which an fp16 input holds exactly, and the scale is the range over
-    2^bits - 1 levels, rounded once to fp16 because that is what the page
-    stores. Codes are formed against the stored scale. Returns the scale, the
+    2^bits - 1 levels, rounded up to fp16, the smallest the page can store that
+    still reaches the maximum. Codes are formed against the stored scale. Returns the scale, the
     zero-point, the codes, and the unrounded code value, whose distance from a
     rounding tie decides whether an fp32 kernel may round the other way."""
     levels = (1 << bits) - 1
     lo, hi = x.min(axis, keepdims=True), x.max(axis, keepdims=True)
-    scale = ((hi - lo) / levels).astype(np.float16).astype(np.float64)
+    exact_scale = (hi - lo) / levels
+    nearest = exact_scale.astype(np.float16)
+    scale = np.where(nearest.astype(np.float64) < exact_scale,
+                     np.nextafter(nearest, np.float16(np.inf)), nearest).astype(np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
         exact = np.where(scale > 0, (x - lo) / scale, 0.0)
     codes = np.clip(np.rint(exact), 0, levels)
@@ -100,22 +103,17 @@ def near_tie(exact):
     return np.abs(exact - np.floor(exact) - 0.5) < 1e-3
 
 
-def round_trip_bound(x, got, bits, axis, scales, zeros):
+def round_trip_bound(x, got, scales):
     """What quantisation may lose, per element, derived rather than chosen:
-    - half a step of the stored scale;
-    - where the fp16 scale rounded down, what the top of the range overshoots
-      the last level by, which the clamp gives up;
+    - half a step of the stored scale, which is rounded up, so that no
+      element lies past the last level and none is clamped;
     - half an fp16 ulp for the dequantised value's own rounding, at the larger
       of what went in and what came out;
-    - an fp32 ulp of the largest level, for the kernel's division and its
-      fused multiply-add."""
-    levels = (1 << bits) - 1
-    hi = x.max(axis, keepdims=True)
-    overshoot = np.maximum(hi - (zeros + levels * scales), 0)
-    larger = np.maximum(np.abs(x), np.abs(got)).astype(np.float16)
-    out_ulp = np.spacing(larger).astype(np.float64)
-    fp32_ulp = 2.0**-23 * (np.abs(zeros) + levels * scales)
-    return scales / 2 + overshoot + out_ulp / 2 + fp32_ulp
+    - an fp32 ulp of the element, for the kernel's division and its fused
+      multiply-add."""
+    larger = np.maximum(np.abs(x), np.abs(got))
+    out_ulp = np.spacing(larger.astype(np.float16)).astype(np.float64)
+    return scales / 2 + out_ulp / 2 + 2.0**-23 * larger
 
 
 def assert_round_trip_within_bound(keys, values, tier=INT8):
@@ -123,11 +121,8 @@ def assert_round_trip_within_bound(keys, values, tier=INT8):
     page = _microinfer.quantise_page(keys, values, tier)
     got_k, got_v = _microinfer.dequantise_page(page, tier, heads, head_dim)
     parts = split(page, tier, heads, head_dim)
-    bits = BITS[tier]
-    k_bound = round_trip_bound(keys.astype(np.float64), got_k, bits, 0,
-                               parts["key_scales"][None], parts["key_zeros"][None])
-    v_bound = round_trip_bound(values.astype(np.float64), got_v, bits, 2,
-                               parts["value_scales"][..., None], parts["value_zeros"][..., None])
+    k_bound = round_trip_bound(keys, got_k, parts["key_scales"][None])
+    v_bound = round_trip_bound(values, got_v, parts["value_scales"][..., None])
     k_err, v_err = np.abs(got_k - keys), np.abs(got_v - values)
     assert np.all(k_err <= k_bound), f"key error {k_err.max():.3g} past its bound"
     assert np.all(v_err <= v_bound), f"value error {v_err.max():.3g} past its bound"
@@ -265,6 +260,22 @@ def test_the_quantiser_is_asymmetric():
     k_err, v_err, parts = assert_round_trip_within_bound(keys, values)
     assert parts["key_zeros"][0, 0] == 100 and parts["value_zeros"][4, 1] == -51
     assert k_err[:, 0, 0].max() <= 1 / 255 and v_err[4, 1].max() <= 1 / 255
+
+
+def test_a_group_too_narrow_for_a_normal_fp16_scale_keeps_its_maximum():
+    """A key channel from layer 0 of the 1.5B model on adversarial-00: a
+    range of 1.26e-4, so its scale, 4.9e-7, is below fp16's smallest normal,
+    where the spacing is 6e-8. Rounded to nearest it fell an eighth short, the
+    last level missed the maximum by 8 steps, and the clamp lost them. The
+    scale is rounded up instead, and the maximum comes back within half a
+    step."""
+    heads, head_dim = SHAPES["qwen2.5-1.5b-instruct"]
+    keys, values = random_page(heads, head_dim, seed=5)
+    keys[:, 1, 58] = fp16_exact(np.linspace(0.00554656982421875, 0.005672454833984375, P))
+    k_err, _, parts = assert_round_trip_within_bound(keys, values)
+    scale = parts["key_scales"][1, 58]
+    assert scale < 2.0**-14 and 255 * scale >= keys[:, 1, 58].max() - keys[:, 1, 58].min()
+    assert k_err[:, 1, 58].max() <= scale / 2 + np.spacing(np.float16(0.0057)) / 2
 
 
 def test_a_constant_group_round_trips_exactly():
