@@ -110,12 +110,13 @@ INT4 and INT2 use #16's layout and kernels unchanged. The kernels are
 templated on the code width, and a tier picks its width in one place,
 `with_code_width` in `quant.cu`. INT4 packs two codes to a byte and INT2
 four, the first in the lowest bits, with no padding: a page's code regions
-are exactly `P * W * bits / 8` bytes each. Every quantiser test runs at all
-three tiers, with nothing special-cased.
+are exactly `P * W * bits / 8` bytes each. Every test of the quantiser runs
+at all three tiers, with nothing special-cased.
 
-**What each tier loses**, measured as #16's was, at f0b2bd2 (entries
-`a5bb87e7`, `df5b22ef`, `c69dff48` for 0.5B and `de213b3e`, `a6037e4e`,
-`dc93ca25` for 1.5B):
+**What each tier loses**, measured as #16's was, at 8912036 (entries
+`1e6ad7c9`, `7ec6d6c7`, `446ab5e0` for 0.5B and `cb994f3c`, `5e138c73`,
+`d36fdd8c` for 1.5B). The same measurement at f0b2bd2 gave the same numbers
+but was logged under #16 by mistake; entry `a0cba718` corrects those six.
 
 | model | tier | effective bits | keys: relative RMS, SNR | values: relative RMS, SNR |
 |---|---|---:|---:|---:|
@@ -131,9 +132,12 @@ on both models, and by exactly as much as the step does. From INT8 to INT4 the
 step grows 255/15 = 17 times, 24.6 dB, and the SNR falls 24.5 to 24.6 dB; from
 INT4 to INT2 it grows 5 times, 14.0 dB, and the SNR falls by 14.0 dB. The
 mean error stays at a quarter of a step at every tier. So nothing is lost to
-the implementation as the codes narrow: each tier costs what its step costs. Every element of every page
-of the golden prompts is within the bound tests/test_quant.py derives: half a
-step, plus the fp16 output's own rounding.
+the implementation as the codes narrow: each tier costs what its step costs.
+
+The bound `microinfer.quantisation` derives, half a step plus the fp16
+output's own rounding, holds for every element of every full page of the
+golden prompts, at every tier on both models: each entry's `beyond_bound` is
+0. tests/test_quant.py asserts the same bound on two prompts.
 
 What this does to the model's output is not measured here. That is #18's
 perplexity per tier.
