@@ -23,24 +23,6 @@ namespace microinfer
     // The values kernel gives each warp one group and lets it return whole.
     static_assert(kBlockThreads % kWarp == 0, "blocks must be whole warps");
 
-    int bits_of(Tier tier)
-    {
-      switch (tier)
-      {
-      case Tier::INT8:
-        return 8;
-      case Tier::INT4:
-        return 4;
-      case Tier::INT2:
-        return 2;
-      case Tier::FP16:
-        break;
-      }
-      throw std::invalid_argument(
-          "FP16 is not a quantised tier: its page is kv_pages.h's, with no "
-          "codes and no metadata");
-    }
-
     void require_positive(int n, const char *what)
     {
       if (n <= 0)
@@ -271,10 +253,9 @@ namespace microinfer
       cuda_check(cudaGetLastError(), "dequantise values kernel launch");
     }
 
-    // The one place a tier chooses its kernels: `launch` is called with the
-    // code width as a compile-time constant. Only INT8 has kernels so far;
-    // the layout is every tier's, and INT4 and INT2 will be two more cases
-    // here, not new kernels.
+    // The one place a tier's code width is written down: `launch` is called
+    // with it as a compile-time constant. The kernels and the layout are the
+    // same for every quantised tier; only the width differs.
     template <typename Launch> void with_code_width(Tier tier, Launch &&launch)
     {
       switch (tier)
@@ -283,14 +264,24 @@ namespace microinfer
         launch(std::integral_constant<int, 8>{});
         return;
       case Tier::INT4:
+        launch(std::integral_constant<int, 4>{});
+        return;
       case Tier::INT2:
-        throw std::invalid_argument(
-            "INT" + std::to_string(bits_of(tier)) +
-            " has no quantise or dequantise kernel yet: INT4 and INT2 arrive "
-            "with #17");
+        launch(std::integral_constant<int, 2>{});
+        return;
       case Tier::FP16:
-        bits_of(tier); // throws: FP16 is not quantised
+        break;
       }
+      throw std::invalid_argument(
+          "FP16 is not a quantised tier: its page is kv_pages.h's, with no "
+          "codes and no metadata");
+    }
+
+    int bits_of(Tier tier)
+    {
+      int bits = 0;
+      with_code_width(tier, [&](auto width) { bits = decltype(width)::value; });
+      return bits;
     }
 
     void check_filled(int filled, int page_tokens)
