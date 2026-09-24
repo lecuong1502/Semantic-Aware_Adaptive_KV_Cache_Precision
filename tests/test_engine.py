@@ -151,8 +151,13 @@ def test_reported_weights_match_what_the_driver_says_was_taken():
     its own (#5), because the driver's overhead tracks the number of
     allocations rather than their size. In one arena (#23) it is one
     allocation, rounded to the driver's granularity: under 2%.
+
+    The CUDA context is this process's first device memory, some 80 MiB of
+    it, so it is made before the first reading; run first in a process, the
+    load would otherwise be charged for it.
     """
     engine = Engine(require_model("qwen2.5-0.5b-instruct"))
+    _microinfer.device_memory_info()  # the CUDA context first: see below
     gc.collect()
     before = nvml.own_used_bytes()
     engine.load_weights()
@@ -196,7 +201,8 @@ def test_freeing_the_engine_returns_the_whole_arena():
     other processes move it by; and against this process's own account,
     exactly."""
     gc.collect()
-    free_before, own_before = stable_free_bytes(), nvml.own_used_bytes()
+    free_before = stable_free_bytes()  # makes the CUDA context, if it is not yet
+    own_before = nvml.own_used_bytes()
     engine = Engine(require_model("qwen2.5-0.5b-instruct"))
     engine.load_weights()
     held = engine.weight_arena.nbytes

@@ -22,7 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import Engine, benchlog, nvml  # noqa: E402
+from microinfer import Engine, _microinfer, benchlog, nvml  # noqa: E402
 
 MIB = 2**20
 
@@ -40,6 +40,10 @@ def main(argv: list[str]) -> int:
         parser.error("tracked files have uncommitted changes; commit first, so that "
                      "each entry names the code that produced it")
 
+    # The CUDA context is this process's first device memory, some 80 MiB of
+    # it. It must exist before the first reading, or the first load is
+    # charged for it.
+    _microinfer.device_memory_info()
     for name in args.models:
         engine = Engine(REPO / "models" / name)
         gc.collect()
