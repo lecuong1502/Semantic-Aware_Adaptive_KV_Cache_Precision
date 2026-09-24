@@ -272,9 +272,8 @@ namespace microinfer
     }
 
     // The one place a tier chooses its kernels: `launch` is called with the
-    // code width as a compile-time constant. Only INT8 has kernels so far;
-    // the layout is every tier's, and INT4 and INT2 will be two more cases
-    // here, not new kernels.
+    // code width as a compile-time constant. The kernels and the layout are
+    // the same for every quantised tier; only the width differs.
     template <typename Launch> void with_code_width(Tier tier, Launch &&launch)
     {
       switch (tier)
@@ -283,11 +282,11 @@ namespace microinfer
         launch(std::integral_constant<int, 8>{});
         return;
       case Tier::INT4:
+        launch(std::integral_constant<int, 4>{});
+        return;
       case Tier::INT2:
-        throw std::invalid_argument(
-            "INT" + std::to_string(bits_of(tier)) +
-            " has no quantise or dequantise kernel yet: INT4 and INT2 arrive "
-            "with #17");
+        launch(std::integral_constant<int, 2>{});
+        return;
       case Tier::FP16:
         bits_of(tier); // throws: FP16 is not quantised
       }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""What a quantised tier loses of the keys and values it holds, per tier (#16).
+"""What a quantised tier loses of the keys and values it holds, per tier (#16, #17).
 
-    .venv/bin/python tools/quant_roundtrip.py [--model qwen2.5-1.5b-instruct] [--tiers INT8]
+    .venv/bin/python tools/quant_roundtrip.py [--model qwen2.5-1.5b-instruct] [--tiers INT8 INT4 INT2]
 
 For every prompt of the model's golden set, prefills it and takes every full
 page of every layer as the cache holds it: keys rotated and without their bias
@@ -69,7 +69,7 @@ def summary(x: list[np.ndarray], err: list[np.ndarray], steps: list[np.ndarray])
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default="qwen2.5-1.5b-instruct")
-    parser.add_argument("--tiers", nargs="+", default=["INT8"])
+    parser.add_argument("--tiers", nargs="+", default=["INT8", "INT4", "INT2"])
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
 
