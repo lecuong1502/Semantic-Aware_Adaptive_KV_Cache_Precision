@@ -38,6 +38,22 @@ namespace microinfer
 
   } // namespace
 
+  std::size_t allocation_granularity()
+  {
+    driver_check(cuInit(0), "cuInit");
+    CUdevice device = 0;
+    driver_check(cuDeviceGet(&device, 0), "cuDeviceGet");
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    std::size_t granule = 0;
+    driver_check(cuMemGetAllocationGranularity(
+                     &granule, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                 "cuMemGetAllocationGranularity");
+    return granule;
+  }
+
   PageNotFound::PageNotFound(PageKey key)
       : std::out_of_range(describe(key) + " is not in the page table")
   {

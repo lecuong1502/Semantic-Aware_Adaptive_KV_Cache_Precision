@@ -169,7 +169,7 @@ def assert_cache_holds(kv_bytes, cfg, positions):
     at least those positions and is sized in whole positions."""
     page_bytes = _microinfer.device.page_bytes(P, cfg.num_key_value_heads * cfg.head_dim)
     held = cfg.num_hidden_layers * -(-positions // P) * page_bytes
-    granule = _microinfer.PagedKVCache([1] * 4, [0] * 4).granule_bytes
+    granule = _microinfer.granule_bytes()
     table = kv_bytes - -(-held // granule) * granule
     per_position = cfg.head_dim * 4  # {cos, sin} in fp32 for head_dim / 2 frequencies
     assert table % per_position == 0 and table // per_position >= positions, table

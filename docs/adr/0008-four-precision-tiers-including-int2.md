@@ -55,3 +55,22 @@ tier earns its place, if it does, through the allocator's freedom to send the
 least important pages there. Whether a page at INT2 still carries what the
 model needs from it is a question about the model's output, not about the
 cache, and #18's perplexity per tier is where it is first measured.
+
+---
+
+## Note from #18: INT2 as a whole-cache tier fails, as the objection predicted
+
+#18 measured INT2 end to end (ADR-0011, measurements). As the tier of a whole
+cache it costs +19.7% perplexity on Qwen2.5-1.5B and +26.7% on 0.5B, which is
+in line with KVQuant's 2-bit and no sign of a fault. Its generation, read,
+is not coherent. The sentences stay grammatical on 1.5B, but it invents
+facts and loops; on 0.5B it degenerates.
+
+This does not settle the objection, and it was never going to. The tier was
+kept for the allocator's freedom to send the *least important* pages to it.
+A static cache sends every page there, including the ones attention needs
+most. Whether a page an importance score picks for INT2 still carries what
+the model needs from it is Milestone 2's question, and the allocation
+experiments' to answer. What #18 adds is a floor: INT2 everywhere is not a
+usable configuration, so any result that uses the tier must show it was
+used selectively.

@@ -27,7 +27,11 @@ For the key cache, a group spans **32 consecutive token positions**, and within
 that group each channel carries its own scale — the algorithm applies
 `GroupQuant(X_Kg, dim=channel, numGroup=l//G)`, dividing the token axis into
 `l/G` groups and quantising per channel inside each. The value cache is quantised
-per token.
+per token, **and grouped along the channels too**: Algorithm 1 (Appendix A) calls
+`GroupQuant(X_Vg, dim=token, numGroup=d//G)`, so each token's values are split
+into `d/G` groups of 32 channels, each with its own scale and zero-point. This
+sentence originally said only "per token"; the correction below explains why the
+difference matters here.
 
 The paper ablates the group size (Section 4.2.3, Table 5), holding residual
 length at 128, measuring exact match on GSM8K with Llama2-13B:
@@ -141,3 +145,31 @@ choice)? Per the ticket, no ADR is amended here.
 - **The paper has no limitations section.** Its conclusion notes only future work:
   "we will further optimize the implementation to reduce the overhead of
   quantization process during the prefill and decoding phase."
+
+---
+
+## Correction, from reading the PDF (before #18)
+
+The provenance note above asked for every number to be checked against the PDF
+before it is quoted. That check was made against arXiv:2402.02750v2 (ICML 2024)
+and confirms G = 32, R = 128, the group-size and residual ablations, and the
+quantiser itself (Section 3.1: `z_X = min X`, `s_X = (max X - min X)/(2^B - 1)`,
+round to nearest). It found one thing the first reading missed:
+
+- **KIVI's value groups are 32 channels, not a whole head.** Algorithm 1
+  quantises values with `GroupQuant(X_Vg, dim=token, numGroup=d//G)` and keys
+  with `GroupQuant(X_Kg, dim=channel, numGroup=l//G)`: G = 32 on the token axis
+  for keys and on the channel axis for values. Section 3.1 says the same: "X is
+  quantized along either the token or channel dimension group-wisely", with a
+  group size of 32 for all configurations.
+- The group-size ablation (Section 4.2.3, Table 5) therefore varied the value
+  groups as well as the key groups, and found that "performance significantly
+  decreases when the group size reaches 128".
+
+This project's value group is a whole `(head, token)`: 64 channels on
+Qwen2.5-0.5B and 128 on 1.5B (ADR-0005, notes from #16 and #17). Before #18 the
+owner chose to keep it, and the 1280 bytes of metadata it gives, rather than
+follow KIVI to 2048 bytes. ADR-0005 records the decision and its consequence:
+comparisons with KIVI's accuracy are not like for like at the value tier, and
+INT2 values are expected to degrade more than KIVI's did.
+

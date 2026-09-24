@@ -46,10 +46,20 @@ layers.
 _Avoid_: precision level, quantisation level, bit-width
 
 **Open page**:
-A layer's last page while its `P` positions are still being written. A key
-channel's scale spans the whole page, so the open page has none and stays at
-`FP16`: a mechanical requirement, independent of the recency floor, though the
-two agree (ADR-0005).
+Where a layer's positions wait while their page's `P` positions are still
+being written. A key channel's scale spans the whole page, so they cannot be
+quantised yet and stay at `FP16`: a mechanical requirement, independent of the
+recency floor, though the two agree (ADR-0005). At `FP16` it is simply the
+layer's last page; at a quantised tier it is one of two FP16 pages of the
+layer's own, `(layer, -1)` and `(layer, -2)`, reused span after span, so that
+every other page is written once, at its tier (ADR-0011).
+
+**Seal**:
+To write a page of positions at a quantised tier, once and for good, when its
+last position arrives: quantised from the rows that brought it, or from the
+open page it filled. A sealed page is never written again, and never changes
+tier (ADR-0011).
+_Avoid_: flush, commit, finalise, close
 _Avoid_: partial page, current block, tail page (the tail is the allocator's
 last slot, ADR-0007)
 

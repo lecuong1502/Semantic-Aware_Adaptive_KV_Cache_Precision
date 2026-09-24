@@ -141,3 +141,50 @@ golden prompts, at every tier on both models: each entry's `beyond_bound` is
 
 What this does to the model's output is not measured here. That is #18's
 perplexity per tier.
+
+---
+
+## Note before #18: value groups are a whole head, where KIVI's are 32 channels
+
+Reading KIVI's PDF (docs_research/kivi-residual-and-group-size.md, correction)
+found that KIVI groups values per token **in 32 channels**, not per whole head:
+Algorithm 1 calls `GroupQuant(X_Vg, dim=token, numGroup=d//G)` with G = 32. This
+project's value group is a whole `(head, token)`, 128 channels on Qwen2.5-1.5B,
+which is the size at which KIVI's group-size ablation found accuracy
+"significantly decreases".
+
+**Decision: keep the whole head.** The owner chose it over KIVI's grouping,
+which would take the metadata from 1280 to 2048 bytes per page on 1.5B and the
+effective bits from 8.63 / 4.63 / 2.63 to 9.0 / 5.0 / 3.0.
+
+**Consequences.**
+
+- Every figure in this ADR, ADR-0008 and CONTRIBUTING that rests on 1280 bytes
+  stands.
+- Comparisons with KIVI's reported accuracy are not like for like for values.
+  When #18 compares perplexity per tier with published figures, a larger
+  degradation at INT2, and to a lesser extent INT4, than KIVI reports is
+  expected from this difference, and is to be attributed to it only after the
+  implementation has been ruled out, not assumed.
+- The value group size is the first thing to revisit if INT2 proves unusable.
+  The layout's value metadata region is `P * kv_heads` entries only because a
+  group is a head; smaller groups would widen that region and change nothing
+  else in it.
+
+---
+
+## Note from #18: the keys, not the whole-head value groups, cost most at INT2
+
+The note before #18 asked that a larger degradation than KIVI's at INT2 be
+put down to the whole-head value groups only once the implementation was
+ruled out. It was: attention over a quantised cache is proven bit-exact
+against attention over what the pages hold (tests/test_quantised_pages.py).
+Then #18's diagnostic split the cost (ADR-0011, measurements). On
+Qwen2.5-0.5B's WikiText-2 perplexity, keys alone at INT2 cost +15.9% and
+values alone +5.5%. The value groups are not the main cause, and +5.5% bounds
+what KIVI's 32-channel groups could recover.
+
+The keys are quantised after RoPE, because ADR-0009 caches them rotated.
+KVQuant found quantising keys *before* RoPE worth 0.82 perplexity on LLaMA-7B
+at 3 bits. That, not the value groups, is the first thing to revisit if the
+low tiers must improve.

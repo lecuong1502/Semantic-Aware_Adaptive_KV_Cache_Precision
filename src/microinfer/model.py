@@ -122,39 +122,75 @@ class ContiguousCache(_Cache):
         for source, buffers in ((keys, self.keys), (values, self.values)):
             device.copy(source, device.view(buffers[layer], start * width, n * width), n * width)
 
-    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int) -> None:
+    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int,
+               keys=None, values=None) -> None:
+        """Attention for the last seq_q of seq_k positions. `keys` and
+        `values` are the rows those queries just stored; a paged cache at a
+        quantised tier reads each query's own page from them (ADR-0011)."""
         device.attention(q, self.keys[layer], self.values[layer], k_bias, self.rope, out,
                          seq_q, seq_k, self.heads, self.kv_heads, self.head_dim)
 
 
+def tier_page_bytes(cfg: ModelConfig, page_tokens: int | None = None) -> list[int]:
+    """One page's bytes at each tier, indexed by Tier: FP16's, then each
+    quantised tier's with its scale metadata (quant.h). What a PagedKVCache
+    for this model is built with."""
+    page_tokens = device.page_tokens if page_tokens is None else page_tokens
+    kv_heads, head_dim = cfg.num_key_value_heads, cfg.head_dim
+    Tier = _microinfer.Tier
+    return [device.page_bytes(page_tokens, kv_heads * head_dim)] + [
+        _microinfer.quantised_page_layout(t, kv_heads, head_dim, page_tokens)["page_bytes"]
+        for t in (Tier.INT8, Tier.INT4, Tier.INT2)]
+
+
 class PagedCache(_Cache):
-    """FP16 keys and values on pages of P positions (ADR-0004), allocated from
-    the VMM allocator (ADR-0007) as the sequence grows (#14).
+    """Keys and values on pages of P positions (ADR-0004), allocated from the
+    VMM allocator (ADR-0007) as the sequence grows (#14), at one precision
+    tier chosen when the cache is made (#18).
 
     Page i of layer l is the page table entry (l, i). Attention reads keys and
     values through the page table, resolved again after any allocator
     operation, so the allocator may move a page between launches without harm.
 
+    At a quantised tier every page is allocated at that tier and sealed once,
+    when its last position arrives; until then its positions are in one of
+    the layer's two FP16 open pages (ADR-0005, ADR-0011). Attention reads a
+    query's own page at FP16 and every page before it sealed, as decode does,
+    however many positions a step brings. The tier never changes: this is
+    Milestone 0's static operation, and moving a page between tiers is
+    Milestone 2's.
+
+    `halves` other than Both is a diagnostic (kv_pages.h): pages stored at
+    FP16 with only keys, or only values, put through the tier's round trip.
+
     The allocator reserves address space for the model's whole context window
-    and takes device memory only as pages are allocated. `nbytes` is therefore
-    what the driver actually holds for the cache: whole granules, and the RoPE
-    table beside them.
+    at the tier the pages are stored at, and for the open pages at FP16, and
+    takes device memory only as pages are allocated. `nbytes` is therefore
+    what the driver actually holds for the cache: whole granules in each
+    tier's range, and the RoPE table beside them.
     """
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, tier=None, halves=None):
         super().__init__(cfg)
+        Tier = _microinfer.Tier
+        self.tier = Tier.FP16 if tier is None else tier
+        halves = device.Halves.Both if halves is None else halves
         page_tokens = device.page_tokens
+        layers = cfg.num_hidden_layers
         pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
-        # The quantised tiers hold nothing until #16; they reserve nothing.
-        self.allocator = _microinfer.PagedKVCache(
-            [device.page_bytes(page_tokens, self.kv_width)] * 4,
-            [cfg.num_hidden_layers * pages_per_layer, 0, 0, 0])
-        self.pages = device.KVPages(self.allocator, cfg.num_hidden_layers, page_tokens,
-                                    self.kv_width, _microinfer.Tier.FP16)
+        storage = self.tier if halves == device.Halves.Both else Tier.FP16
+        capacity = [0] * 4
+        capacity[int(storage)] = layers * pages_per_layer
+        if self.tier != Tier.FP16:
+            capacity[int(Tier.FP16)] += layers * len(device.open_pages)
+        self.allocator = _microinfer.PagedKVCache(tier_page_bytes(cfg), capacity)
+        self.pages = device.KVPages(self.allocator, layers, page_tokens, self.kv_heads,
+                                    self.head_dim, self.tier, halves)
 
     @property
     def nbytes(self) -> int:
-        return self.allocator.mapped_bytes(_microinfer.Tier.FP16) + self.rope.nbytes
+        return (sum(self.allocator.mapped_bytes(t) for t in _microinfer.Tier.__members__.values())
+                + self.rope.nbytes)
 
     def reserve(self, tokens: int) -> None:
         self.pages.reserve(tokens)
@@ -163,9 +199,10 @@ class PagedCache(_Cache):
     def store(self, layer: int, keys, values, start: int, n: int) -> None:
         self.pages.store(layer, keys, values, start, n)
 
-    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int) -> None:
+    def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int,
+               keys=None, values=None) -> None:
         self.pages.attention(layer, q, k_bias, self.rope, out, seq_q, seq_k,
-                             self.heads, self.kv_heads, self.head_dim)
+                             self.heads, self.kv_heads, self.head_dim, keys, values)
 
 
 class Workspace:
@@ -260,7 +297,8 @@ class Model:
             device.rope(ws.q_raw, positions, ws.q, n, heads, head_dim, cfg.rope_theta)
             device.rope(ws.k_raw, positions, ws.k, n, kv_heads, head_dim, cfg.rope_theta)
             cache.store(i, ws.k, ws.v, start, n)
-            cache.attend(i, ws.q, w.self_attn_k_proj_bias, ws.attended, n, start + n)
+            cache.attend(i, ws.q, w.self_attn_k_proj_bias, ws.attended, n, start + n,
+                         ws.k, ws.v)
             device.linear_accumulate(ws.attended, w.self_attn_o_proj_weight, ws.residual,
                                      n, q_width, hidden)
 

@@ -253,37 +253,6 @@ namespace microinfer
       cuda_check(cudaGetLastError(), "dequantise values kernel launch");
     }
 
-    // The one place a tier's code width is written down: `launch` is called
-    // with it as a compile-time constant. The kernels and the layout are the
-    // same for every quantised tier; only the width differs.
-    template <typename Launch> void with_code_width(Tier tier, Launch &&launch)
-    {
-      switch (tier)
-      {
-      case Tier::INT8:
-        launch(std::integral_constant<int, 8>{});
-        return;
-      case Tier::INT4:
-        launch(std::integral_constant<int, 4>{});
-        return;
-      case Tier::INT2:
-        launch(std::integral_constant<int, 2>{});
-        return;
-      case Tier::FP16:
-        break;
-      }
-      throw std::invalid_argument(
-          "FP16 is not a quantised tier: its page is kv_pages.h's, with no "
-          "codes and no metadata");
-    }
-
-    int bits_of(Tier tier)
-    {
-      int bits = 0;
-      with_code_width(tier, [&](auto width) { bits = decltype(width)::value; });
-      return bits;
-    }
-
     void check_filled(int filled, int page_tokens)
     {
       if (filled < page_tokens)
