@@ -61,7 +61,7 @@ cache, and #18's perplexity per tier is where it is first measured.
 ## Note from #18: INT2 as a whole-cache tier fails, as the objection predicted
 
 #18 measured INT2 end to end (ADR-0011, measurements). As the tier of a whole
-cache it costs +19.7% perplexity on Qwen2.5-1.5B and +26.8% on 0.5B, which is
+cache it costs +19.7% perplexity on Qwen2.5-1.5B and +26.7% on 0.5B, which is
 in line with KVQuant's 2-bit and no sign of a fault. Its generation, read,
 is not coherent. The sentences stay grammatical on 1.5B, but it invents
 facts and loops; on 0.5B it degenerates.

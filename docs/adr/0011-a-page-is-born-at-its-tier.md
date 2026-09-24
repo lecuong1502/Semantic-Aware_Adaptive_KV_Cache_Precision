@@ -92,7 +92,9 @@ uses this unless asked (`Engine.kv_halves`).
 
 ## What the static tiers cost, measured
 
-At 1c175f5, with the tree clean. Every figure is in the benchmark log.
+Measured at 1c175f5, with the tree clean, except FP16's 32K prefill, which
+is #15's (entry `56b00ad3`, at 71392f7). Every figure below is in the
+benchmark log except one, the unlogged trial named as such.
 
 **Footprint** (`kv-footprint`, Qwen2.5-1.5B, whole 32K window). This is what
 the driver reports for this process alone, and it equals `paged_cache_bytes`
@@ -113,7 +115,7 @@ tokens, causal as above):
 | FP16 | 14.319 | | 9.640 | |
 | INT8 | 14.319 | +0.00% | 9.641 | +0.007% |
 | INT4 | 14.429 | +0.77% | 9.698 | +0.59% |
-| INT2 | 18.148 | +26.8% | 11.541 | +19.7% |
+| INT2 | 18.148 | +26.7% | 11.541 | +19.7% |
 
 **Against published expectations.** KVQuant (arXiv:2401.18079, Tables 1 and 9)
 reports relative increases on LLaMA-7B on WikiText-2 at 2K:
@@ -123,14 +125,22 @@ reports relative increases on LLaMA-7B on WikiText-2 at 2K:
 - 2-bit: +27.3% for KVQuant, +95.2% for FlexGen.
 
 INT4 here sits with the grouped methods, and INT2 with KVQuant-2bit. Neither
-is the large divergence #18 asks to investigate. Two differences keep this
-from being a like-for-like comparison. The models differ. And every query
-here reads up to P - 1 positions of its own page at FP16, where KVQuant reads
-none.
+is the large divergence #18 asks to investigate. Three differences keep this
+from being a like-for-like comparison:
 
-The investigation was needed all the same. The first design's prefill read
-INT2 at +113% on a trial of four windows of the 0.5B model, which *was* a
-large divergence. It came from the measurement, not the quantiser: every
+- The models differ, and a 7B model tolerates quantisation better than a
+  0.5B or 1.5B one; KVQuant's own table shows the cost falling as the models
+  grow.
+- Every query here reads up to P - 1 positions of its own page at FP16, where
+  KVQuant reads none.
+- KVQuant's best 2-bit variant keeps 1% of values as sparse FP16 outliers
+  (+5.8%). That is a different scheme, with its own storage, and is left out
+  of the comparison for that reason. The plain KVQuant-2bit is the uniform
+  quantiser this project's is closest to.
+
+The investigation was needed all the same. On an unlogged trial of four
+windows of the 0.5B model, the first design's prefill put INT2 far past
+every published 2-bit figure, which *was* a large divergence. It came from the measurement, not the quantiser: every
 query read its own page quantised, through scales that looked ahead. The
 causal design above removed it.
 
@@ -142,20 +152,23 @@ suggested (ADR-0005, note from #17). The whole-head value groups, kept over
 KIVI's 32 channels (ADR-0005, note before #18), are therefore not the main
 cause; +5.5% bounds what smaller value groups could recover. The two errors
 compound: +15.9% and +5.5% together would be +22.3%, where both halves at
-once cost +26.8%.
+once cost +26.7%.
 
 **Generation, read** (`generation-sample`, entries `eb0bac0e` to `1d6bb55e`
 for 1.5B and `d93d4c23` to `f8d2fba9` for 0.5B). The prompts are four
 retrieval prompts and three WikiText articles to summarise.
 
-- FP16 and INT8 give the same text on both models.
+- FP16 and INT8 give the same text on 1.5B. On 0.5B they give the same text
+  on six prompts; on the seventh INT8's summary differs, and is as faithful.
 - INT4 on 1.5B is coherent: every retrieval right, every summary faithful,
   with one name repeated. INT4 on 0.5B is coherent in most places but falls
   into one repetition loop and inverts one answer.
-- **INT2 is not coherent.** On 1.5B the sentences stay grammatical, but it
-  invents facts ("married a woman named Li Bai"), answers once in the user's
-  voice, and falls into one loop, repeating a sentence eight times. On 0.5B
-  it degenerates: two of the three summaries are "= = = =" to the end.
+- **INT2 is not coherent.** On 1.5B it still answers all four retrieval
+  prompts, and its sentences stay grammatical. But it invents facts
+  ("married a woman named Li Bai"), adds a sentence of nonsense to one answer,
+  answers once in the user's voice, and falls into a loop, repeating one
+  sentence eight times. On 0.5B it degenerates: two of the three summaries
+  are "= = = =" to the end.
 - INT2, as the tier of a whole cache, fails #18's coherence criterion. Its
   case in ADR-0008 is as a tier for the least important pages, which static
   operation cannot test.
@@ -164,5 +177,6 @@ retrieval prompts and three WikiText articles to summarise.
 at every tier). The whole window prefills at every tier: 45.8, 45.4 and 44.0
 tokens per second at INT8, INT4 and INT2, against 45.8 at FP16. The cache at
 the peak is 502, 278 and 166 MiB, that is, the footprint above plus the
-16 MiB RoPE table. Dequantising inside attention costs about 4% of prefill
-time, at INT2.
+16 MiB RoPE table. INT2's prefill took 4% longer than FP16's. Each figure is
+a single run, and FP16's was made at another commit, so that is an upper
+bound on what dequantising inside attention costs, not a measurement of it.

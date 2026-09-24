@@ -55,6 +55,10 @@ URL = "https://wikitext.smerity.com/wikitext-2-raw-v1.zip"
 SHA256 = "ef7edb566e3e2b2d31b29c1fdb0c89a4cc683597484c3dc2517919c615435a11"
 SPLIT = "wikitext-2-raw/wiki.test.raw"
 
+#: How attention reads a quantised cache, recorded with every entry that
+#: depends on it.
+ATTENTION = "causal: a query's own page at FP16 (ADR-0011)"
+
 #: Rows of logits turned into log-likelihoods at a time: a 2048-row window's
 #: logits are 1.2 GB in fp32, and float64 work on all of them at once would
 #: double it.
@@ -140,7 +144,7 @@ def main(argv: list[str]) -> int:
                     "scoring": "teacher forcing, every position but each window's first",
                     "kv_cache": engine.kv_cache, "kv_halves": args.kv_halves,
                     "prefill_chunk": engine.prefill_chunk,
-                    "attention": "causal: a query's own page at FP16 (ADR-0011)",
+                    "attention": ATTENTION,
                     "issue": args.issue},
             results=results[tier], log=args.log)
     return 0

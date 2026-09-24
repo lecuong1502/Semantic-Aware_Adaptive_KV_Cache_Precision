@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from microinfer import Engine, benchlog  # noqa: E402
 from microinfer.golden import load_prompts  # noqa: E402
-from perplexity import held_out_text  # noqa: E402
+from perplexity import ATTENTION, held_out_text  # noqa: E402
 
 TEMPLATE = ("<|im_start|>user\nSummarise the following text in three sentences.\n\n{text}"
             "<|im_end|>\n<|im_start|>assistant\n")
@@ -96,7 +96,7 @@ def main(argv: list[str]) -> int:
                                "articles, each as a request to summarise",
                     "template": TEMPLATE, "new_tokens": args.new_tokens, "greedy": True,
                     "kv_cache": engine.kv_cache, "prefill_chunk": engine.prefill_chunk,
-                    "attention": "causal: a query's own page at FP16 (ADR-0011)",
+                    "attention": ATTENTION,
                     "issue": args.issue},
             results={"samples": samples}, log=args.log)
     return 0

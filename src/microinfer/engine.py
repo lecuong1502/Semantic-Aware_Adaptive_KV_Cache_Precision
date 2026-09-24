@@ -69,34 +69,35 @@ def kv_cache_bytes(cfg: ModelConfig, context_length: int,
     return int(per_token * context_length * bytes_per_element)
 
 
-def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16") -> int:
-    """What the paged cache's pages take from the driver for `context_length`
-    positions at a static tier (#18): computed from the layout, not measured.
+def paged_cache_ranges(cfg: ModelConfig, context_length: int, tier: str = "FP16") -> list[int]:
+    """The bytes the paged cache's pages need for `context_length` positions
+    at a static tier (#18), one figure per address range they sit in:
+    computed from the layout, before the driver rounds anything.
 
-    At FP16 that is a page for every started span of P positions in every
-    layer. At a quantised tier it is a page for every *full* span, at the
-    tier's page size with its scale metadata, plus two FP16 open pages per
-    layer for the rest (ADR-0005, ADR-0011). Each tier's pages sit in their
-    own address range and the driver backs a range in whole granules
-    (ADR-0007), so each range is rounded up to one. The RoPE table beside the
-    pages is not included; it is the same at every tier.
-    """
+    At FP16 there is one range, with a page for every started span of P
+    positions in every layer. At a quantised tier there are two: a page for
+    every *full* span at the tier's size, scale metadata included, and two
+    FP16 open pages per layer for the rest (ADR-0005, ADR-0011)."""
     Tier = _microinfer.Tier
     page_tokens = _microinfer.device.page_tokens
     layers = cfg.num_hidden_layers
-    granule = _microinfer.granule_bytes()
     page_bytes = model.tier_page_bytes(cfg)
-
-    def whole_granules(n: int) -> int:
-        return -(-n // granule) * granule
-
     fp16 = page_bytes[int(Tier.FP16)]
     if tier == "FP16":
-        return whole_granules(layers * -(-context_length // page_tokens) * fp16)
+        return [layers * -(-context_length // page_tokens) * fp16]
     page = page_bytes[int(getattr(Tier, tier))]
     open_pages = layers * len(_microinfer.device.open_pages) * fp16 if context_length > 0 else 0
-    return (whole_granules(layers * (context_length // page_tokens) * page)
-            + whole_granules(open_pages))
+    return [layers * (context_length // page_tokens) * page, open_pages]
+
+
+def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16") -> int:
+    """What the paged cache's pages take from the driver for `context_length`
+    positions at a static tier: paged_cache_ranges, each rounded up to whole
+    granules, since the driver backs each range in granules (ADR-0007). The
+    RoPE table beside the pages is not included; it is the same at every
+    tier."""
+    granule = _microinfer.granule_bytes()
+    return sum(-(-n // granule) * granule for n in paged_cache_ranges(cfg, context_length, tier))
 
 
 class Engine:

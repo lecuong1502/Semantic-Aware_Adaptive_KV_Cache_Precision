@@ -25,23 +25,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from microinfer import Engine, ModelConfig, _microinfer, benchlog, model, nvml  # noqa: E402
-from microinfer import paged_cache_bytes  # noqa: E402
+from microinfer import paged_cache_bytes, paged_cache_ranges  # noqa: E402
 
 MIB = 2**20
-
-
-def payload_bytes(cfg: ModelConfig, tokens: int, tier: str) -> int:
-    """The pages' own bytes for `tokens` positions: what the layout needs,
-    before the driver rounds each range up to granules."""
-    page_tokens = _microinfer.device.page_tokens
-    layers = cfg.num_hidden_layers
-    page_bytes = model.tier_page_bytes(cfg)
-    fp16 = page_bytes[int(_microinfer.Tier.FP16)]
-    if tier == "FP16":
-        return layers * -(-tokens // page_tokens) * fp16
-    page = page_bytes[int(getattr(_microinfer.Tier, tier))]
-    return (layers * (tokens // page_tokens) * page
-            + layers * len(_microinfer.device.open_pages) * fp16)
 
 
 def main(argv: list[str]) -> int:
@@ -59,7 +45,7 @@ def main(argv: list[str]) -> int:
     cfg = ModelConfig.from_card(args.model)
     tokens = cfg.max_position_embeddings
     elements = 2 * tokens * cfg.num_hidden_layers * cfg.num_key_value_heads * cfg.head_dim
-    fp16_payload = payload_bytes(cfg, tokens, "FP16")
+    fp16_payload = sum(paged_cache_ranges(cfg, tokens, "FP16"))
     for tier in Engine.KV_TIERS:
         cache = model.PagedCache(cfg, getattr(_microinfer.Tier, tier))
         cache.rope.cover(tokens)
@@ -68,7 +54,7 @@ def main(argv: list[str]) -> int:
         measured = nvml.own_used_bytes() - before
         del cache
         computed = paged_cache_bytes(cfg, tokens, tier)
-        payload = payload_bytes(cfg, tokens, tier)
+        payload = sum(paged_cache_ranges(cfg, tokens, tier))
         results = {"measured_bytes": measured, "computed_bytes": computed,
                    "measured_over_computed": measured / computed,
                    "payload_bytes": payload, "effective_bits": 8 * payload / elements,

@@ -484,10 +484,11 @@ void bind_device(py::module_ &parent)
            py::arg("allocator"), py::arg("layers"), py::arg("page_tokens"),
            py::arg("kv_heads"), py::arg("head_dim"), py::arg("tier"),
            py::arg("halves") = microinfer::Halves::Both, py::keep_alive<1, 2>(),
-           "The allocator's page size at `tier` must be a page's at that tier: "
-           "page_bytes(page_tokens, kv_heads * head_dim) at FP16, else "
-           "quantised_page_layout(...)['page_bytes']; at a quantised tier its "
-           "FP16 pages hold the open pages.")
+           "The allocator's page size at the tier the pages are stored at must "
+           "be a page's there: page_bytes(page_tokens, kv_heads * head_dim) at "
+           "FP16, else quantised_page_layout(...)['page_bytes']. The pages are "
+           "stored at `tier`, or at FP16 under a diagnostic `halves`; at a "
+           "quantised tier the FP16 pages also hold the open pages.")
       .def("reserve", &KVPages::reserve, py::arg("tokens"),
            "Pages for positions [0, tokens) in every layer, allocating only "
            "those not yet held.")
