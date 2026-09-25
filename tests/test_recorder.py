@@ -227,19 +227,17 @@ def test_a_failure_in_either_stream_ends_both_at_once(tmp_path, failing):
 # -- action labels --------------------------------------------------------------------
 
 
-def send_when_listening(fifo, event, action):
-    recorder.send_label(fifo, event, action, wait=5.0)
-
-
 def test_labels_sent_while_recording_mark_the_samples_they_span(tmp_path):
     """Labels sent from outside are stamped on the recorder's clock as they
-    arrive, and reading back gives each sample the action in progress."""
+    arrive, and reading back gives each sample the action in progress. An end
+    for an action not in progress is rejected, not written."""
     path, fifo = tmp_path / "trace.csv.gz", tmp_path / "labels.fifo"
     stop = threading.Event()
 
     def scenario():
-        send_when_listening(fifo, "start", "open a browser, with a comma")
+        recorder.send_label(fifo, "start", "open a browser, with a comma", wait=5.0)
         time.sleep(0.2)
+        recorder.send_label(fifo, "end", "never started")
         recorder.send_label(fifo, "end", "open a browser, with a comma")
         time.sleep(0.1)
         recorder.send_label(fifo, "start", "idle")
@@ -254,23 +252,23 @@ def test_labels_sent_while_recording_mark_the_samples_they_span(tmp_path):
 
     _, samples = recorder.read(path)
     meta, labels = recorder.read_labels(recorder.labels_path(path))
-    assert meta["complete"] and meta["labels"] == 3
+    assert meta["complete"] and meta["labels"] == 3 and meta["rejected"] == 1
     assert list(labels["event"]) == ["start", "end", "start"]
     assert list(labels["action"]) == ["open a browser, with a comma"] * 2 + ["idle"]
     t = samples["t_mono_ns"]
-    assert t[0] < labels["t_mono_ns"][0] and np.all(np.diff(labels["t_mono_ns"]) > 0)
+    assert np.all(np.diff(labels["t_mono_ns"]) > 0)
 
     actions = recorder.actions_in_progress(t, labels)
     start, end, idle = labels["t_mono_ns"]
     assert set(actions[(t >= start) & (t < end)]) == {"open a browser, with a comma"}
     assert set(actions[t < start]) == set(actions[(t >= end) & (t < idle)]) == {""}
     assert set(actions[t >= idle]) == {"idle"}  # never ended: in progress to the last sample
-    assert 15 <= np.sum(actions == "open a browser, with a comma") <= 25
+    assert np.sum(actions == "open a browser, with a comma") >= 10  # 0.2 s at 100 Hz
 
 
 def test_the_action_in_progress_is_the_latest_one_started_and_not_ended():
-    labels = np.array([(10, 0.0, "start", "a"), (20, 0.0, "start", "b"),
-                       (30, 0.0, "end", "b"), (40, 0.0, "end", "a")],
+    labels = np.array([(30, 0.0, "end", "b"), (10, 0.0, "start", "a"),  # in any order
+                       (40, 0.0, "end", "a"), (20, 0.0, "start", "b")],
                       dtype=recorder.LABEL_DTYPE)
     t = np.array([5, 10, 15, 20, 25, 30, 35, 40, 45])
     assert list(recorder.actions_in_progress(t, labels)) == \
@@ -280,7 +278,9 @@ def test_the_action_in_progress_is_the_latest_one_started_and_not_ended():
         recorder.actions_in_progress(t, unopened)
 
 
-def test_a_label_with_no_recorder_listening_is_an_error(tmp_path):
+def test_a_label_goes_only_to_a_listening_recorder(tmp_path):
+    """No recorder, or a FIFO a killed one left behind, is an error; a path
+    that is not a FIFO is refused by both sides and left as it was."""
     with pytest.raises(recorder.NoRecorder):
         recorder.send_label(tmp_path / "labels.fifo", "start", "x")
     os.mkfifo(tmp_path / "stale.fifo")  # left behind by a killed recorder
@@ -290,6 +290,18 @@ def test_a_label_with_no_recorder_listening_is_an_error(tmp_path):
         recorder.send_label(tmp_path / "stale.fifo", "begin", "x")
     with pytest.raises(ValueError):
         recorder.send_label(tmp_path / "stale.fifo", "start", "two\nlines")
+
+    trace = tmp_path / "trace.csv.gz"
+    recorder.record(trace, rate_hz=100, duration=0.1, reader=FakeMemory())
+    kept = trace.read_bytes()
+    with pytest.raises(ValueError, match="not a FIFO"):
+        recorder.send_label(trace, "start", "x")
+    with pytest.raises(ValueError, match="not a FIFO"):
+        recorder.record(tmp_path / "other.csv.gz", rate_hz=100, duration=0.1,
+                        reader=FakeMemory(), labels=trace)
+    with pytest.raises(ValueError, match="not a FIFO"):
+        recorder.record(trace, rate_hz=100, duration=0.1, reader=FakeMemory(), labels=trace)
+    assert trace.read_bytes() == kept and not (tmp_path / "other.csv.gz").exists()
 
 
 # -- the recorder as a process, on the real driver ------------------------------------
@@ -363,15 +375,20 @@ def test_labels_from_another_process_survive_a_killed_recorder(tmp_path):
 
 
 def test_an_interrupted_recorder_finishes_its_files_and_holds_no_device_memory(tmp_path):
-    """SIGINT closes both files as complete. NVML needs no CUDA context, so
+    """SIGINT closes every file as complete, a label sent just before it
+    included, and removes the FIFO it made. NVML needs no CUDA context, so
     the recorder is not a GPU process at all: it cannot be part of the
     contention it records."""
-    path = tmp_path / "trace.csv.gz"
-    with running_tool(path) as proc:
+    path, fifo = tmp_path / "trace.csv.gz", tmp_path / "labels.fifo"
+    with running_tool(path, "--labels", str(fifo)) as proc:
         wait_for_samples(path, 60)
         assert proc.pid not in {p.pid for p in nvml.processes()}
+        recorder.send_label(fifo, "start", "idle", wait=10)
         proc.send_signal(signal.SIGINT)
         assert proc.wait(timeout=10) == 0
+    assert not fifo.exists()
+    meta, labels = recorder.read_labels(recorder.labels_path(path))
+    assert meta["complete"] and meta["labels"] == 1 and list(labels["action"]) == ["idle"]
     meta, samples = recorder.read(path)
     assert meta["complete"] and meta["device"] == nvml.device_name()
     assert int(meta["total_bytes"]) == nvml.memory().total

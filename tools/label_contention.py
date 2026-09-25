@@ -7,7 +7,8 @@
 FIFO is the one the recorder was started with (record_contention.py
 --labels). The recorder stamps the label on its own clock when it arrives, so
 a scenario script needs no clock of its own: it runs this before and after
-each action. Exits with 1 if no recorder is listening.
+each action. Exits with 1 if no recorder is listening, and 2 if FIFO is not a
+FIFO or the label is not one.
 """
 
 from __future__ import annotations
@@ -35,6 +36,9 @@ def main(argv: list[str]) -> int:
     except recorder.NoRecorder as exc:
         print(exc, file=sys.stderr)
         return 1
+    except ValueError as exc:  # not a FIFO, or not a label
+        print(exc, file=sys.stderr)
+        return 2
     return 0
 
 

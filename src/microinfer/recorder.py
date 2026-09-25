@@ -98,10 +98,14 @@ LABEL_FORMAT = "microinfer contention trace, action labels, v1"
 LABEL_COLUMNS = ("t_mono_ns", "t_wall", "event", "action")
 LABEL_DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("event", object),
                         ("action", object)])
-LABEL_EVENTS = ("start", "end")
-#: A label is one line on the FIFO, written whole: under PIPE_BUF, so that
-#: two senders never interleave.
+START, END = "start", "end"
+LABEL_EVENTS = (START, END)
+#: A label is one line on the FIFO, "<event> <action>\n", written whole:
+#: under PIPE_BUF, so that two senders never interleave.
 _LABEL_MAX_BYTES = 512
+#: How often a waiting sender retries, and a listening recorder checks
+#: whether its recording has ended.
+_POLL_SECONDS = 0.05
 
 #: The line a clean stop closes a trace with, apart from the "# key=value"
 #: metadata so that no key can be taken for it.
@@ -289,8 +293,14 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
     The streams fail together. If any raises, the recording stops within a
     device period, no file is closed as complete, and the error is raised
     here."""
-    if labels is not None and path is None:
-        raise ValueError("labels are written beside a recording, and need its path")
+    if labels is not None:
+        if path is None:
+            raise ValueError("labels are written beside a recording, and need its path")
+        # Checked before any file is opened, so that a mistyped path cannot
+        # cost an existing trace.
+        labels = Path(labels)
+        if labels.exists() and not stat.S_ISFIFO(labels.stat().st_mode):
+            raise ValueError(f"{labels} exists and is not a FIFO")
     if reader is None:
         reader = nvml_reader
         if process_reader is None:
@@ -326,7 +336,7 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
             streams.append(_ProcessStream(None if path is None else processes_path(path),
                                           processes_rate_hz, duration, process_reader, meta))
         if labels is not None:
-            streams.append(_LabelStream(Path(labels), labels_path(path), meta))
+            streams.append(_LabelStream(labels, labels_path(path), meta))
         for st in streams:
             st.start()
         missed = _schedule(rate_hz, duration, stop, sample)
@@ -335,10 +345,11 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
             st.end()
         if failed() is not None:
             missed = None  # one failed after the device stream's last check
-        for st in streams:
-            st.close(clean=missed is not None)
-        if out is not None:
-            out.close(None if missed is None else {"samples": len(rows), "missed": missed})
+        clean = missed is not None
+        _close_all([lambda st=st: st.close(clean) for st in streams] +
+                   ([] if out is None else
+                    [lambda: out.close({"samples": len(rows), "missed": missed} if clean
+                                       else None)]))
     if (st := failed()) is not None:
         raise RuntimeError(f"the {st.what} failed") from st.error
     samples = np.array(rows, dtype=_DTYPE)
@@ -348,14 +359,26 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
     return summary
 
 
+def _close_all(closers: list[Callable[[], None]]) -> None:
+    """Run every closer, even after one raises; then raise the first error."""
+    first = None
+    for close in closers:
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001 - raised once all are closed
+            first = first or exc
+    if first is not None:
+        raise first
+
+
 class _SideStream(threading.Thread):
     """A stream on a thread of its own beside the device stream, which ends
     it. An error is kept in `error` for the device stream to raise. Its file
     is closed only once every stream has ended, as complete only if all of
     them ended cleanly."""
 
-    what = "side stream"
-    key = "side"
+    what: str  # how an error names the stream
+    key: str  # where its summary goes in the recording's
 
     def __init__(self, name: str):
         super().__init__(name=name, daemon=True)
@@ -446,31 +469,37 @@ class _LabelStream(_SideStream):
 
     The FIFO is held open for reading and writing both: with a writer of its
     own it never reads end-of-file between senders, and a sender always finds
-    a reader while the recording runs."""
+    a reader while the recording runs. A label that breaks the protocol, an
+    end for an action not in progress among them, is counted as rejected and
+    not written, so that a recording's labels always read back."""
 
     what = "labels stream"
     key = "labels"
-    _POLL_SECONDS = 0.05
 
     def __init__(self, fifo: Path, path: Path, meta: dict):
         super().__init__("recorder-labels")
         self._fifo = fifo
-        self._made = False
-        if not fifo.exists():
-            os.mkfifo(fifo)
-            self._made = True
-        elif not stat.S_ISFIFO(fifo.stat().st_mode):
-            raise ValueError(f"{fifo} exists and is not a FIFO")
-        self._fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
-        self._out = _TraceWriter(path, LABEL_FORMAT, {**meta, "fifo": str(fifo)},
-                                 LABEL_COLUMNS, flush_seconds=0.0)
+        self._made = not fifo.exists()
+        self._fd = None
+        try:
+            if self._made:
+                os.mkfifo(fifo)
+            self._fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+            if not stat.S_ISFIFO(os.fstat(self._fd).st_mode):
+                raise ValueError(f"{fifo} is not a FIFO")
+            self._out = _TraceWriter(path, LABEL_FORMAT, {**meta, "fifo": str(fifo)},
+                                     LABEL_COLUMNS, flush_seconds=0.0)
+        except BaseException:
+            self._release()
+            raise
+        self._open: list[str] = []
         self._taken = self._rejected = 0
 
     def _record(self) -> None:
         pending = b""
         while True:
             ending = self._done.is_set()
-            ready, _, _ = select.select([self._fd], [], [], 0 if ending else self._POLL_SECONDS)
+            ready, _, _ = select.select([self._fd], [], [], 0 if ending else _POLL_SECONDS)
             if ready:
                 try:
                     pending += os.read(self._fd, 65536)
@@ -481,24 +510,65 @@ class _LabelStream(_SideStream):
                     self._take(line)
             elif ending:
                 break  # every label sent before the end has been taken
+        if pending:
+            self._rejected += 1  # a line cut off without its end
         self._counts = {"labels": self._taken, "rejected": self._rejected}
         self.summary = dict(self._counts)
 
     def _take(self, line: bytes) -> None:
         t = time.monotonic_ns()
         wall = f"{time.time():.6f}"
-        event, _, action = line.decode("utf-8", "replace").partition(" ")
-        if event not in LABEL_EVENTS or not action:
+        label = _parse_label(line + b"\n")
+        if label is None or (label[0] == END and label[1] not in self._open):
             self._rejected += 1  # counted, so that a malformed scenario shows
             return
+        event, action = label
+        if event == START:
+            self._open.append(action)
+        else:
+            _remove_last(self._open, action)
         self._out.row(t, wall, event, action)
         self._taken += 1
 
     def close(self, clean: bool) -> None:
-        super().close(clean)
-        os.close(self._fd)
+        try:
+            super().close(clean)
+        finally:
+            self._release()
+
+    def _release(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
         if self._made:
             self._fifo.unlink(missing_ok=True)
+            self._made = False
+
+
+def _label_line(event: str, action: str) -> bytes:
+    """The line that carries a label, or ValueError if it cannot be one."""
+    if event not in LABEL_EVENTS:
+        raise ValueError(f"event must be one of {LABEL_EVENTS}, got {event!r}")
+    line = f"{event} {action}\n".encode()
+    if not action or "\n" in action or len(line) > _LABEL_MAX_BYTES:
+        raise ValueError(f"an action is one non-empty line, and a label at most "
+                         f"{_LABEL_MAX_BYTES} bytes; got {action!r}")
+    return line
+
+
+def _parse_label(line: bytes) -> tuple[str, str] | None:
+    """The (event, action) a line carries, or None if it breaks the protocol:
+    the same rules _label_line enforces on the sender's side."""
+    event, _, action = line.decode("utf-8", "replace").rstrip("\n").partition(" ")
+    try:
+        _label_line(event, action)
+    except ValueError:
+        return None
+    return event, action
+
+
+def _remove_last(open_actions: list[str], action: str) -> None:
+    del open_actions[len(open_actions) - 1 - open_actions[::-1].index(action)]
 
 
 class NoRecorder(RuntimeError):
@@ -507,29 +577,25 @@ class NoRecorder(RuntimeError):
 
 def send_label(fifo: str | Path, event: str, action: str, wait: float = 0.0) -> None:
     """Tell the recorder listening on `fifo` that `action` starts or ends
-    ("start" or "end"). The recorder stamps the label when it arrives. Waits
-    up to `wait` seconds for a recorder to be listening; raises NoRecorder
-    if none is."""
-    if event not in LABEL_EVENTS:
-        raise ValueError(f"event must be one of {LABEL_EVENTS}, got {event!r}")
-    line = f"{event} {action}\n".encode()
-    if not action or "\n" in action or len(line) > _LABEL_MAX_BYTES:
-        raise ValueError(f"an action is one line of at most {_LABEL_MAX_BYTES - 7} bytes, "
-                         f"got {action!r}")
+    (START or END). The recorder stamps the label when it arrives. Waits up
+    to `wait` seconds for a recorder to be listening; raises NoRecorder if
+    none is, and ValueError if `fifo` is not a FIFO, never writing to it."""
+    line = _label_line(event, action)
     deadline = time.monotonic() + wait
     while True:
         try:
             fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
             break
-        except (FileNotFoundError, OSError) as exc:
+        except OSError as exc:
             # ENXIO: a FIFO with no reader, one a killed recorder left behind.
-            missing = isinstance(exc, FileNotFoundError) or exc.errno == errno.ENXIO
-            if not missing:
+            if not (isinstance(exc, FileNotFoundError) or exc.errno == errno.ENXIO):
                 raise
             if time.monotonic() >= deadline:
                 raise NoRecorder(f"no recorder is listening on {fifo}") from exc
-            time.sleep(0.05)
+            time.sleep(_POLL_SECONDS)
     try:
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise ValueError(f"{fifo} is not a FIFO; a label would overwrite it")
         os.write(fd, line)
     finally:
         os.close(fd)
@@ -571,29 +637,26 @@ def actions_in_progress(t_mono_ns: np.ndarray, labels: np.ndarray) -> np.ndarray
     """For each time in `t_mono_ns`, the action in progress: the latest one
     started and not yet ended, "" where there is none. An action is in
     progress from its start label, inclusive, to its end label, exclusive;
-    one never ended runs to the end of the recording. An end for an action
-    not in progress raises ValueError."""
-    order = np.argsort(t_mono_ns, kind="stable")
-    times = np.asarray(t_mono_ns)[order]
+    one never ended runs to the end of the recording. Labels are taken in
+    time order, whatever their order in `labels`. An end for an action not
+    in progress raises ValueError; the recorder never writes one."""
+    times = np.asarray(t_mono_ns)
+    labels = labels[np.argsort(labels["t_mono_ns"], kind="stable")]
     out = np.full(len(times), "", dtype=object)
-    open_: list[str] = []
-    bounds = [0]
-    current = [""]
-    for t, event, action in zip(labels["t_mono_ns"], labels["event"], labels["action"]):
-        if event == "start":
-            open_.append(action)
-        elif action in open_:
-            del open_[len(open_) - 1 - open_[::-1].index(action)]
+    open_actions: list[str] = []
+    for i, (t, event, action) in enumerate(zip(labels["t_mono_ns"], labels["event"],
+                                               labels["action"])):
+        if event == START:
+            open_actions.append(action)
+        elif event == END and action in open_actions:
+            _remove_last(open_actions, action)
         else:
-            raise ValueError(f"{action!r} ends without having started")
-        bounds.append(int(np.searchsorted(times, t, side="left")))
-        current.append(open_[-1] if open_ else "")
-    bounds.append(len(times))
-    for i, action in enumerate(current):
-        out[bounds[i]:bounds[i + 1]] = action
-    result = np.empty_like(out)
-    result[order] = out
-    return result
+            raise ValueError(f"{action!r} ends without having started" if event == END
+                             else f"unknown label event {event!r}")
+        until = labels["t_mono_ns"][i + 1] if i + 1 < len(labels) else None
+        span = times >= t if until is None else (times >= t) & (times < until)
+        out[span] = open_actions[-1] if open_actions else ""
+    return out
 
 
 def summarise(samples: np.ndarray) -> dict:
