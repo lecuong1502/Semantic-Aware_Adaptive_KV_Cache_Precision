@@ -9,6 +9,8 @@
 \usepackage[T1]{fontenc}
 \usepackage{amsmath}
 \usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta}
 \usepackage{hyperref}
 
 \title{Semantic-Aware Adaptive KV Cache Precision\\
@@ -37,7 +39,76 @@ TODO.
 
 \section{Design}
 \label{sec:design}
-% TODO: the VRAM monitor, the attention scorer, the precision controller and
+
+\subsection{Overview}
+\label{sec:overview}
+
+\textit{MicroInfer} keeps a generation session alive when another process on the
+same consumer GPU takes video memory it did not expect to lose. It changes the
+precision at which the key-value cache is held, page by page and while decoding
+continues, and chooses which pages to degrade by how much attention the model
+pays to them.
+
+The solution has two layers. The \textbf{engine} runs the model over CUDA kernels
+written for this work and holds the cache on \textit{pages}, the keys and values
+of $P = 32$ consecutive positions of one layer, each at one of four
+\textit{precision tiers}: FP16, INT8, INT4 or INT2. Pages come from the CUDA
+virtual memory management interface, one address range per tier, so that memory
+a smaller tier frees returns to the driver instead of staying with the engine.
+The \textbf{control loop} decides, while the engine runs, which page is held at
+which tier. It has four components (Figure~\ref{fig:overview}):
+\begin{itemize}
+\item a \textbf{VRAM pressure monitor}, which polls the driver's free memory on a
+background thread and classifies it as GREEN, YELLOW or RED, with hysteresis;
+\item an \textbf{attention importance scorer}, which keeps, for every page, an
+exponentially weighted average of the attention mass on its positions;
+\item a \textbf{precision controller}, which turns the pressure level, the
+importance scores and the current tiers into a \textit{requantisation plan},
+downgrading the least important pages under pressure and upgrading the most
+important first once it passes; it contains no device code, so the policy can be
+tested, and compared with a uniform one, in isolation;
+\item a \textbf{paged mixed-precision cache manager}, which applies the plan by
+requantising each page into a new one at its target tier and freeing the old.
+\end{itemize}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners, align=center, minimum height=1.1cm,
+              text width=3.6cm, font=\small},
+  arrow/.style={-{Stealth}, thick},
+  note/.style={font=\footnotesize, align=center},
+  node distance=1.0cm and 1.3cm]
+  \node[box] (engine) {\textbf{Engine}\\decode loop over\\hand-written kernels};
+  \node[box, above left=of engine] (monitor) {\textbf{VRAM pressure monitor}\\polls the driver;\\GREEN / YELLOW / RED};
+  \node[box, above right=of engine] (scorer) {\textbf{Attention importance scorer}\\attention mass per page};
+  \node[box, above=2.6cm of engine] (controller) {\textbf{Precision controller}\\pressure + scores\\$\rightarrow$ requantisation plan};
+  \node[box, below=of engine] (cache) {\textbf{Paged mixed-precision cache}\\page table; FP16, INT8,\\INT4 and INT2 pages};
+  \node[box, below=of cache] (driver) {\textbf{GPU driver}\\VMM allocator;\\free-memory account};
+  \draw[arrow] (driver.west) -| node[note, pos=0.75, left] {free\\memory} (monitor.south);
+  \draw[arrow] (monitor.north) |- node[note, pos=0.75, above] {pressure level} (controller.west);
+  \draw[arrow] (engine.north east) -- node[note, right] {attention\\mass} (scorer.south west);
+  \draw[arrow] (scorer.north) |- node[note, pos=0.75, above] {importance scores} (controller.east);
+  \draw[arrow] (controller.south) -- node[note, right] {plan, between\\decoding steps} (engine.north);
+  \draw[arrow] (engine.south) -- node[note, right] {apply the plan;\\read and write pages} (cache.north);
+  \draw[arrow] (cache.south) -- node[note, right] {pages allocated\\and returned} (driver.north);
+\end{tikzpicture}
+\caption{An overview of \textit{MicroInfer}: the engine, and the control loop
+that decides at which precision tier each page of its key-value cache is held.}
+\label{fig:overview}
+\end{figure}
+
+A plan is applied only \textit{between} decoding steps, never inside a kernel
+launch, so no kernel sees the cache half converted; attention reads each page at
+its current tier, dequantising as it loads. Three properties hold throughout:
+memory a downgrade frees reaches the driver, where both the process that needs it
+and the measurement can see it; a tier belongs to a \textit{(layer, page)} pair,
+not to a token position; and the recent context stays at FP16, both because the
+page still being filled cannot be quantised --- a key channel's scale spans the
+whole page --- and because a recency floor protects recent positions as a matter
+of policy.
+
+% TODO: each component in detail: the monitor, the scorer, the controller and
 % the paged mixed-precision cache (ADR-0005, ADR-0007, ADR-0008, ADR-0011).
 
 \section{Implementation}
