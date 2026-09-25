@@ -50,6 +50,7 @@ import io
 import math
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -67,9 +68,11 @@ COLUMNS = _DTYPE.names
 FORMAT = "microinfer contention trace, device memory, v1"
 
 #: The processes stream holds two kinds of row, told apart by their first
-#: field. Each sample writes one "state" row, the GPU's P-state and clocks,
-#: then one "process" row for every process on the GPU. A sample with no
-#: process still leaves its state row, so no sample goes unrecorded.
+#: field. Each sample writes one state row, the GPU's P-state and clocks,
+#: then one process row for every process on the GPU. A sample with no
+#: process still leaves its state row, so no sample goes unrecorded. A value
+#: the driver does not report is written as -1.
+STATE_ROW, PROCESS_ROW = "state", "process"
 PROCESS_FORMAT = "microinfer contention trace, processes, v1"
 STATE_COLUMNS = ("t_mono_ns", "t_wall", "query_ns", "pstate", "graphics_mhz", "sm_mhz",
                  "memory_mhz")
@@ -88,12 +91,16 @@ FLUSH_SECONDS = 1.0
 Reader = Callable[[], tuple[int, int]]
 
 
+@dataclass(frozen=True)
 class ProcessSample:
-    """What one process sample reads: the GPU's P-state and clocks, and the
-    processes on it."""
+    """What one process sample reads: the GPU's P-state and clocks, None
+    where the GPU does not report them, and the processes on it."""
 
-    def __init__(self, pstate: int, clocks: dict[str, int], processes: list[nvml.GpuProcess]):
-        self.pstate, self.clocks, self.processes = pstate, clocks, processes
+    pstate: int | None
+    graphics_mhz: int | None
+    sm_mhz: int | None
+    memory_mhz: int | None
+    processes: list[nvml.GpuProcess]
 
 
 ProcessReader = Callable[[], ProcessSample]
@@ -108,7 +115,9 @@ def nvml_reader() -> tuple[int, int]:
 def nvml_process_reader() -> ProcessSample:
     """The GPU's P-state and clocks, and every process on it with what it
     holds, by the driver's account."""
-    return ProcessSample(nvml.performance_state(), nvml.clocks(), nvml.processes())
+    mhz = nvml.clocks()
+    return ProcessSample(nvml.performance_state(), mhz["graphics"], mhz["sm"], mhz["memory"],
+                         nvml.processes())
 
 
 def device_meta() -> dict[str, object]:
@@ -238,7 +247,11 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
     sampled every 1 / processes_rate_hz seconds into processes_path(path).
     With the default readers both streams read NVML; a caller that passes its
     own `reader` records a processes stream only if it passes a
-    `process_reader` too. processes_rate_hz=0 turns the stream off."""
+    `process_reader` too. processes_rate_hz=0 turns the stream off.
+
+    The two streams fail together. If either raises, the recording stops
+    within a device period, neither file is closed as complete, and the
+    error is raised here."""
     if reader is None:
         reader = nvml_reader
         if process_reader is None:
@@ -250,8 +263,14 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
     out = None
     if path is not None:
         out = _TraceWriter(path, FORMAT, {**meta, "rate_hz": f"{rate_hz:g}"}, COLUMNS)
+    stream = None
+    if process_reader is not None and processes_rate_hz > 0:
+        stream = _ProcessStream(None if path is None else processes_path(path),
+                                processes_rate_hz, duration, process_reader, meta)
 
     def sample() -> None:
+        if stream is not None and stream.error is not None:
+            raise RuntimeError("the processes stream failed") from stream.error
         t0 = time.monotonic_ns()
         wall = time.time()
         free, used = reader()
@@ -260,91 +279,101 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
         if out is not None:
             out.row(t0, f"{wall:.6f}", free, used, t1 - t0)
 
-    # The processes thread ends when the device stream does, which sets
-    # `done` however it ends: at the duration, on `stop`, or on an error.
-    done = threading.Event()
-    processes: dict = {}
-    thread = None
-    if process_reader is not None and processes_rate_hz > 0:
-        thread = threading.Thread(
-            target=_record_processes, name="recorder-processes", daemon=True,
-            args=(None if path is None else processes_path(path), processes_rate_hz, duration,
-                  done, process_reader, meta, processes))
-
     missed = None
     try:
-        if thread is not None:
-            thread.start()
+        if stream is not None:
+            stream.start()
         missed = _schedule(rate_hz, duration, stop, sample)
     finally:
-        done.set()
-        if thread is not None:
-            thread.join()
+        if stream is not None:
+            stream.end(clean=missed is not None)
+            if stream.error is not None:
+                missed = None  # it failed after the device stream's last check
         if out is not None:
             out.close(None if missed is None else {"samples": len(rows), "missed": missed})
-    if "error" in processes:
-        raise RuntimeError("the processes stream failed") from processes["error"]
+    if stream is not None and stream.error is not None:
+        raise RuntimeError("the processes stream failed") from stream.error
     samples = np.array(rows, dtype=_DTYPE)
     summary = {**summarise(samples), "missed": missed, "rate_hz": rate_hz}
-    if processes:
-        summary["processes"] = processes
+    if stream is not None:
+        summary["processes"] = stream.summary
     return summary
 
 
-def _record_processes(path: Path | None, rate_hz: float, duration: float | None,
-                      done: threading.Event, process_reader: ProcessReader, meta: dict,
-                      summary: dict) -> None:
+class _ProcessStream(threading.Thread):
     """The processes stream: one state row and one row per process at every
-    sample, until the device stream ends. Fills `summary`, with the exception
-    under "error" if it fails, for the recording thread to raise."""
-    try:
-        _sample_processes(path, rate_hz, duration, done, process_reader, meta, summary)
-    except Exception as exc:  # noqa: BLE001 - handed to the recording thread
-        summary["error"] = exc
+    sample, until the device stream ends it. An error is kept in `error` for
+    the device stream to raise, and ends this stream with its file left
+    incomplete."""
 
+    def __init__(self, path: Path | None, rate_hz: float, duration: float | None,
+                 reader: ProcessReader, meta: dict):
+        super().__init__(name="recorder-processes", daemon=True)
+        self._path, self._rate_hz, self._duration = path, rate_hz, duration
+        self._reader, self._meta = reader, meta
+        self._done = threading.Event()
+        self._clean = True
+        self.error: BaseException | None = None
+        self.summary: dict = {}
 
-def _sample_processes(path: Path | None, rate_hz: float, duration: float | None,
-                      done: threading.Event, process_reader: ProcessReader, meta: dict,
-                      summary: dict) -> None:
-    out = None
-    if path is not None:
-        # A row's first field says which kind it is; the metadata names the
-        # columns of each kind.
-        out = _TraceWriter(path, PROCESS_FORMAT,
-                           {**meta, "rate_hz": f"{rate_hz:g}",
-                            "state_columns": ",".join(STATE_COLUMNS),
-                            "process_columns": ",".join(PROCESS_COLUMNS)},
-                           ("row", "fields..."))
-    query_ns: list[int] = []
-    rows = 0
+    def end(self, clean: bool) -> None:
+        """Stop the stream and wait for it; `clean` says whether the device
+        stream ended cleanly, and so whether this one may close as complete."""
+        self._clean = clean
+        self._done.set()
+        self.join()
 
-    def sample() -> None:
-        nonlocal rows
-        t0 = time.monotonic_ns()
-        wall = f"{time.time():.6f}"
-        s = process_reader()
-        t1 = time.monotonic_ns()
-        query_ns.append(t1 - t0)
-        if out is not None:
-            out.row("state", t0, wall, t1 - t0, s.pstate, s.clocks.get("graphics", -1),
-                    s.clocks.get("sm", -1), s.clocks.get("memory", -1))
-            for p in s.processes:
-                out.row("process", t0, wall, p.pid, p.kind,
-                        -1 if p.used_bytes is None else p.used_bytes, p.name or "")
-                rows += 1
+    def run(self) -> None:
+        try:
+            self._record()
+        except Exception as exc:  # noqa: BLE001 - raised by the device stream
+            self.error = exc
 
-    missed = None
-    try:
-        missed = _schedule(rate_hz, duration, done, sample)
-    finally:
-        if out is not None:
-            out.close(None if missed is None
-                      else {"samples": len(query_ns), "missed": missed, "process_rows": rows})
-    q = np.array(query_ns) / 1e6
-    summary.update({"samples": len(q), "missed": missed, "rate_hz": rate_hz})
-    if len(q):
-        summary["query_ms"] = {"median": float(np.median(q)),
-                               "p99": float(np.percentile(q, 99)), "max": float(q.max())}
+    def _record(self) -> None:
+        out = None
+        if self._path is not None:
+            # A row's first field says which kind it is; the metadata names
+            # the columns of each kind.
+            out = _TraceWriter(self._path, PROCESS_FORMAT,
+                               {**self._meta, "rate_hz": f"{self._rate_hz:g}",
+                                "state_columns": ",".join(STATE_COLUMNS),
+                                "process_columns": ",".join(PROCESS_COLUMNS)},
+                               ("row", "fields..."))
+        query_ns: list[int] = []
+        process_rows = 0
+
+        def unknown(value: int | None) -> int:
+            return -1 if value is None else value
+
+        def sample() -> None:
+            nonlocal process_rows
+            t0 = time.monotonic_ns()
+            wall = f"{time.time():.6f}"
+            got = self._reader()
+            t1 = time.monotonic_ns()
+            query_ns.append(t1 - t0)
+            if out is not None:
+                out.row(STATE_ROW, t0, wall, t1 - t0, unknown(got.pstate),
+                        unknown(got.graphics_mhz), unknown(got.sm_mhz), unknown(got.memory_mhz))
+                for p in got.processes:
+                    out.row(PROCESS_ROW, t0, wall, p.pid, p.kind, unknown(p.used_bytes),
+                            p.name or "")
+                    process_rows += 1
+
+        missed = None
+        try:
+            missed = _schedule(self._rate_hz, self._duration, self._done, sample)
+        finally:
+            if out is not None:
+                out.close({"samples": len(query_ns), "missed": missed,
+                           "process_rows": process_rows}
+                          if missed is not None and self._clean else None)
+        query_ms = np.array(query_ns) / 1e6
+        self.summary = {"samples": len(query_ms), "missed": missed, "rate_hz": self._rate_hz}
+        if len(query_ms):
+            self.summary["query_ms"] = {"median": float(np.median(query_ms)),
+                                        "p99": float(np.percentile(query_ms, 99)),
+                                        "max": float(query_ms.max())}
 
 
 # -- reading ------------------------------------------------------------------------------
@@ -361,12 +390,12 @@ def read(path: str | Path) -> tuple[dict, np.ndarray]:
 def read_processes(path: str | Path) -> tuple[dict, np.ndarray, np.ndarray]:
     """A processes recording's metadata, its state rows (P-state and clocks,
     one per sample) and its process rows (one per process per sample). A
-    process's used_bytes is -1 where the driver did not report it."""
+    value the driver did not report, a size, P-state or clock, is -1."""
     meta, rows = _read_trace(path, PROCESS_FORMAT)
     states = [(int(r[1]), float(r[2]), int(r[3]), int(r[4]), int(r[5]), int(r[6]), int(r[7]))
-              for r in rows if r[0] == "state"]
+              for r in rows if r[0] == STATE_ROW]
     procs = [(int(r[1]), float(r[2]), int(r[3]), r[4], int(r[5]), r[6])
-             for r in rows if r[0] == "process"]
+             for r in rows if r[0] == PROCESS_ROW]
     return (meta, np.array(states, dtype=_STATE_DTYPE),
             np.array(procs, dtype=_PROCESS_DTYPE) if procs
             else np.zeros(0, dtype=_PROCESS_DTYPE))

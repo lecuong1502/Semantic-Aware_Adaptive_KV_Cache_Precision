@@ -77,9 +77,16 @@ def main(argv: list[str]) -> int:
     if args.calibrate:
         benchlog.append(
             "recorder-calibration", model=None, context_length=None, precision_tiers=None,
+            # The device stream's figures are measured with the processes
+            # stream's thread running beside it, when its rate is not 0.
             config={"rate_hz": args.rate, "duration_seconds": args.duration,
+                    "query": "nvmlDeviceGetMemoryInfo",
                     "processes_rate_hz": args.processes_rate,
-                    "query": "nvmlDeviceGetMemoryInfo", "issue": args.issue},
+                    "processes_queries": ["nvmlDeviceGetComputeRunningProcesses_v3",
+                                          "nvmlDeviceGetGraphicsRunningProcesses_v3",
+                                          "nvmlDeviceGetPerformanceState",
+                                          "nvmlDeviceGetClockInfo"],
+                    "issue": args.issue},
             results={**stats, "recorder_is_gpu_process": gpu_process}, log=args.log)
     return 0
 

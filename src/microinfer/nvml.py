@@ -19,6 +19,7 @@ from functools import cache
 from typing import Literal
 
 _SUCCESS = 0
+_NOT_SUPPORTED = 3
 _INSUFFICIENT_SIZE = 7
 
 # nvml.h's buffer sizes for the strings read here.
@@ -101,24 +102,30 @@ def memory() -> _Memory:
 _CLOCKS = {"graphics": 0, "sm": 1, "memory": 2}
 
 
-def performance_state() -> int:
-    """The GPU's current P-state: 0 is its fastest, 15 its slowest, and 32
-    means the driver does not know."""
+def performance_state() -> int | None:
+    """The GPU's current P-state: 0 is its fastest, 15 its slowest. None
+    where the GPU does not report it, which some laptop GPUs do not."""
     lib, handle = _device()
     state = ctypes.c_uint()
-    _check(lib.nvmlDeviceGetPerformanceState(handle, ctypes.byref(state)),
-           "nvmlDeviceGetPerformanceState")
+    status = lib.nvmlDeviceGetPerformanceState(handle, ctypes.byref(state))
+    if status == _NOT_SUPPORTED or (status == _SUCCESS and state.value > 15):
+        return None  # 32 is NVML's "unknown"
+    _check(status, "nvmlDeviceGetPerformanceState")
     return int(state.value)
 
 
-def clocks() -> dict[str, int]:
-    """The GPU's current graphics, SM and memory clocks, in MHz."""
+def clocks() -> dict[str, int | None]:
+    """The GPU's current graphics, SM and memory clocks, in MHz; None for a
+    clock the GPU does not report."""
     lib, handle = _device()
-    found = {}
+    found: dict[str, int | None] = {}
     for domain, kind in _CLOCKS.items():
         mhz = ctypes.c_uint()
-        _check(lib.nvmlDeviceGetClockInfo(handle, kind, ctypes.byref(mhz)),
-               "nvmlDeviceGetClockInfo")
+        status = lib.nvmlDeviceGetClockInfo(handle, kind, ctypes.byref(mhz))
+        if status == _NOT_SUPPORTED:
+            found[domain] = None
+            continue
+        _check(status, "nvmlDeviceGetClockInfo")
         found[domain] = int(mhz.value)
     return found
 
