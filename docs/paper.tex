@@ -1,0 +1,143 @@
+\documentclass[11pt]{article}
+
+% The paper: MicroInfer and semantic-aware adaptive KV cache precision.
+% A skeleton (#26). Sections marked TODO are to be written; the research
+% notes' outline is docs_research/semantic-aware-adaptive-kv-cache.md, and
+% every figure quoted must come from experiments/logs/benchmark.jsonl.
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\title{Semantic-Aware Adaptive KV Cache Precision\\
+  under Video Memory Contention on Consumer GPUs}
+\author{TODO}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+TODO.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+% TODO: the problem (contention on a consumer GPU ends a session outright), the
+% research questions, the contributions.
+
+\section{Background and Related Work}
+\label{sec:background}
+% TODO: the KV cache and its growth; quantisation and eviction; memory
+% management on consumer GPUs; related work grouped by the assumption each
+% family makes that fails in a single-user local setting.
+
+\section{Design}
+\label{sec:design}
+% TODO: the VRAM monitor, the attention scorer, the precision controller and
+% the paged mixed-precision cache (ADR-0005, ADR-0007, ADR-0008, ADR-0011).
+
+\section{Implementation}
+\label{sec:implementation}
+% TODO: an overview of MicroInfer before the boundary below.
+
+\subsection{The From-Scratch Boundary}
+\label{sec:boundary}
+
+\textit{MicroInfer} is built from scratch in the sense this thesis depends on:
+every kernel that the research contribution touches is hand-written CUDA, and no
+external inference engine --- vLLM, llama.cpp or TensorRT-LLM --- is used at any
+point. The phrase stops at one place, the dense matrix multiplications, which
+call NVIDIA's cuBLAS library. This subsection states that boundary explicitly, so
+that no later result is read as implying the projections were hand-written.
+
+\paragraph{Hand-written.} The following are CUDA kernels or host code written for
+this engine:
+\begin{itemize}
+\item the token embedding lookup;
+\item RMSNorm, over fp16 activations or over the fp32 residual stream;
+\item rotary position embedding (RoPE), with its angles formed in fp64, and
+tabulated once per position for the keys the cache completes;
+\item the SwiGLU activation;
+\item the broadcast of a projection's bias into its output rows, on which the
+second precision choice below relies;
+\item attention: causal scaled dot-product attention with an online softmax,
+grouped-query attention, and the completion of keys cached without their
+projection's bias --- over a contiguous cache, over pages, and over pages at a
+quantised tier, dequantising each code as it is loaded;
+\item the paged key-value cache: its page table, the stores that write it, and
+the allocator beneath it, which uses the CUDA virtual memory management API so
+that memory it frees returns to the driver;
+\item quantisation and dequantisation of a page at INT8, INT4 and INT2;
+\item greedy token selection over the logits.
+\end{itemize}
+
+\paragraph{cuBLAS.} The dense projections --- the query, key, value and output
+projections of attention, the gate, up and down projections of the MLP, and the
+language-model head --- call \texttt{cublasGemmEx}, through a single wrapper.
+cuBLAS is a basic linear algebra library, not an inference engine: it multiplies
+the matrices it is given and knows nothing of models, caches or precision tiers.
+
+\paragraph{Why the boundary is here.} Hand-writing the matrix multiplications as
+well was considered and rejected. Every latency figure this thesis reports would
+inherit the gap between a hand-written GEMM and cuBLAS, and a reader could no
+longer separate the overhead of the adaptive precision policy from the cost of a
+slow matrix multiplication --- the very separation the systems claim rests on.
+When the decision was taken the gap was estimated at two to five times. It was
+then measured, in the study described last in this subsection, on the RTX 4050
+Laptop GPU used throughout, at the driver's own clocks and with the desktop's
+processes sharing the GPU. On the models' own projections at 512 rows, a
+shared-memory-tiled kernel ran 8--28 times slower than cuBLAS and a naive one
+93--267 times slower. In single-token decoding the tiled kernel ran 5--21 times
+slower; those timings flatter every implementation somewhat, since a repeated
+launch finds a small projection's weights still in the 24\,MiB L2 cache, which a
+whole model does not fit. The measurement strengthens the decision rather than
+revising it.
+
+\paragraph{Two precision choices.} The wrapper makes two choices on which the
+per-kernel correctness figures reported for the projections depend --- a
+relative error of at most four units in the last place of fp16 and a mean below
+one, against a float64 reference.
+\begin{enumerate}
+\item \textbf{fp32 accumulation, with reduced-precision reduction disallowed.}
+Operands are fp16 and the computation is fp32 (\texttt{CUBLAS\_COMPUTE\_32F}).
+The handle is also set to
+\texttt{CUBLAS\_MATH\_DISALLOW\_REDUCED\_PRECISION\_REDUCTION}: without it,
+cuBLAS may reduce the partial sums of a split-K computation in the output's
+precision, which is a silent fp16 accumulation inside a call that asked for fp32.
+\item \textbf{The bias folded in, so the result is rounded once.} Where a
+projection carries a bias, the output rows are first seeded with it and the
+multiplication adds onto them. The sum is formed in fp32 inside cuBLAS and
+rounded to fp16 once, rather than rounded after the multiplication and again
+after a separate addition.
+\end{enumerate}
+The same principle, to round as late and as seldom as possible, applies to the
+projections without a bias: the output and down projections add straight into
+the fp32 residual stream, and the language-model head writes fp32 logits, so
+neither is rounded to fp16 at all.
+
+\paragraph{The GEMM study.} A naive GEMM kernel and a shared-memory-tiled one were
+written and profiled against cuBLAS with Nsight Compute, as a study of where
+their time goes. At 512 rows the naive kernel is bound by its load and store
+queue, the tiled one by shared memory, and cuBLAS by the tensor cores, which
+neither hand-written kernel uses. In decoding the projection becomes a
+matrix-vector product: cuBLAS switches to a kernel without tensor cores that
+approaches the memory bandwidth, and the hand-written kernels stall well short of
+it. Both compute the projection correctly, to the same per-kernel bound
+as the engine's. The study is a learning and benchmarking artifact and nothing
+more: it is not part of the inference path, and the engine's build, its import
+graph and its packaged form are each tested not to reach it.
+
+\section{Evaluation}
+\label{sec:evaluation}
+% TODO: contention characterisation, the pressure detector, the task-level
+% comparison of allocation strategies, and the ablations.
+
+\section{Conclusion}
+\label{sec:conclusion}
+% TODO.
+
+\end{document}
