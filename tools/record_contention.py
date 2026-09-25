@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Record device-wide free and used memory at a fixed rate (#46).
+"""Record device-wide free and used memory, and who holds it, at fixed rates (#46, #47).
 
-    .venv/bin/python tools/record_contention.py --out trace.csv.gz [--rate 50] [--duration S]
+    .venv/bin/python tools/record_contention.py --out trace.csv.gz [--rate 50]
+        [--processes-rate 5] [--duration S]
     .venv/bin/python tools/record_contention.py --calibrate --issue 46 [--duration 60]
 
 The recorder of RQ1 (microinfer.recorder), as a process of its own: it holds
 no device memory and shares nothing with the engine, so it can record the
 engine as one more process among the desktop's. It stops cleanly on SIGINT or
-SIGTERM, closing its file; killed outright, it leaves a file that reads back
-to within a second.
+SIGTERM, closing its files; killed outright, it leaves files that read back
+to within a second. Beside --out it writes the processes stream, trace.csv.gz
+becoming trace.procs.csv.gz: each GPU process's memory, and the GPU's P-state
+and clocks.
 
 --calibrate records for --duration seconds without a file and logs what the
 recorder achieved on this machine: the cost of one NVML query, the rate, the
@@ -35,6 +38,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, help="the compressed CSV to write")
     parser.add_argument("--rate", type=float, default=50.0, help="samples per second")
+    parser.add_argument("--processes-rate", type=float, default=5.0,
+                        help="process samples per second; 0 turns the stream off")
     parser.add_argument("--duration", type=float, default=None,
                         help="seconds to record; until interrupted if omitted")
     parser.add_argument("--calibrate", action="store_true",
@@ -61,7 +66,8 @@ def main(argv: list[str]) -> int:
         signal.signal(sig, lambda *_: stop.set())
 
     stats = recorder.record(None if args.calibrate else args.out, args.rate,
-                            duration=args.duration, stop=stop)
+                            duration=args.duration, stop=stop,
+                            processes_rate_hz=args.processes_rate)
     # The claim that the recorder is not a GPU process, checked before it exits.
     gpu_process = os.getpid() in {p.pid for p in nvml.processes()}
     print(f"{stats['samples']} samples at {stats.get('achieved_hz', 0):.2f} Hz, "
@@ -72,6 +78,7 @@ def main(argv: list[str]) -> int:
         benchlog.append(
             "recorder-calibration", model=None, context_length=None, precision_tiers=None,
             config={"rate_hz": args.rate, "duration_seconds": args.duration,
+                    "processes_rate_hz": args.processes_rate,
                     "query": "nvmlDeviceGetMemoryInfo", "issue": args.issue},
             results={**stats, "recorder_is_gpu_process": gpu_process}, log=args.log)
     return 0

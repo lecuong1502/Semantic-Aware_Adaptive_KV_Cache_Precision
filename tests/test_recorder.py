@@ -1,4 +1,5 @@
-"""The contention recorder: device-wide memory at 50 Hz (#46).
+"""The contention recorder: device-wide memory at 50 Hz (#46), and who holds
+it at 5 Hz (#47).
 
 RQ1's instrument. It samples the driver's account of free and used device
 memory on a fixed schedule and writes a compressed CSV that can be read back
@@ -131,6 +132,119 @@ def test_a_stop_event_ends_the_recording_cleanly(tmp_path):
     assert meta["complete"] and 15 <= len(samples) <= 25
 
 
+# -- the processes stream -------------------------------------------------------------
+
+
+def gpu_process(pid, name, used=2**20, kind="graphics"):
+    return nvml.GpuProcess(pid=pid, name=name, kind=kind, used_bytes=used)
+
+
+class FakeProcesses:
+    """A process reader whose GPU gains a process at the third sample and
+    loses it at the sixth, and whose clocks rise with the sample count."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        procs = [gpu_process(100, "/usr/bin/Xorg"),
+                 gpu_process(200, "a, name with \"commas\"", used=None, kind="compute")]
+        if 3 <= self.calls < 6:
+            procs.append(gpu_process(300, "game", used=512 * 2**20, kind="compute+graphics"))
+        return recorder.ProcessSample(pstate=self.calls % 16,
+                                      clocks={"graphics": self.calls, "sm": 2 * self.calls,
+                                              "memory": 3 * self.calls},
+                                      processes=procs)
+
+
+def test_the_processes_stream_reads_back_every_sample(tmp_path):
+    """Every sample leaves one state row, P-state and clocks, and one row per
+    process, with names carrying commas and quotes intact and an unreported
+    size as -1."""
+    path = tmp_path / "trace.csv.gz"
+    procs = FakeProcesses()
+    stats = recorder.record(path, rate_hz=200, duration=0.5, reader=FakeMemory(),
+                            meta={"device": "fake"}, processes_rate_hz=20,
+                            process_reader=procs)
+    meta, states, rows = recorder.read_processes(recorder.processes_path(path))
+    assert meta["complete"] and meta["device"] == "fake" and meta["rate_hz"] == "20"
+    assert len(states) == procs.calls == stats["processes"]["samples"] == meta["samples"]
+    assert meta["process_rows"] == len(rows)
+    k = np.arange(1, procs.calls + 1)
+    np.testing.assert_array_equal(states["pstate"], k % 16)
+    np.testing.assert_array_equal(states["graphics_mhz"], k)
+    np.testing.assert_array_equal(states["sm_mhz"], 2 * k)
+    np.testing.assert_array_equal(states["memory_mhz"], 3 * k)
+    named = rows[rows["pid"] == 200]
+    assert len(named) == procs.calls
+    assert set(named["name"]) == {'a, name with "commas"'}
+    assert set(named["kind"]) == {"compute"} and set(named["used_bytes"]) == {-1}
+    # Every process row belongs to a sample: its timestamp is a state row's.
+    assert set(rows["t_mono_ns"]) <= set(states["t_mono_ns"])
+
+
+def test_a_process_appears_and_disappears_with_the_samples_that_saw_it(tmp_path):
+    path = tmp_path / "trace.csv.gz"
+    procs = FakeProcesses()
+    recorder.record(path, rate_hz=100, duration=0.5, reader=FakeMemory(),
+                    processes_rate_hz=20, process_reader=procs)
+    _, states, rows = recorder.read_processes(recorder.processes_path(path))
+    game = rows[rows["pid"] == 300]
+    np.testing.assert_array_equal(game["t_mono_ns"], states["t_mono_ns"][2:5])
+    assert set(game["used_bytes"]) == {512 * 2**20}
+    assert set(game["kind"]) == {"compute+graphics"}
+
+
+def test_the_two_streams_share_one_clock(tmp_path):
+    """Both streams stamp their samples with the same monotonic clock, so the
+    processes stream's samples fall inside the device stream's span, about
+    ten device samples apart at 50 and 5 Hz."""
+    path = tmp_path / "trace.csv.gz"
+    recorder.record(path, rate_hz=50, duration=1.0, reader=FakeMemory(),
+                    processes_rate_hz=5, process_reader=FakeProcesses())
+    _, device = recorder.read(path)
+    _, states, _ = recorder.read_processes(recorder.processes_path(path))
+    assert len(device) == 50 and len(states) == 5
+    assert device["t_mono_ns"][0] - 20e6 < states["t_mono_ns"][0]
+    assert states["t_mono_ns"][-1] < device["t_mono_ns"][-1]
+    between = np.searchsorted(device["t_mono_ns"], states["t_mono_ns"])
+    assert np.all(np.abs(np.diff(between) - 10) <= 1)
+
+
+def test_a_failing_process_reader_fails_the_recording(tmp_path):
+    """A processes stream that dies must not leave a device trace that looks
+    whole beside a processes trace that stopped: the recording raises."""
+    def broken():
+        raise RuntimeError("driver gone")
+
+    with pytest.raises(RuntimeError, match="processes stream") as info:
+        recorder.record(tmp_path / "trace.csv.gz", rate_hz=100, duration=0.2,
+                        reader=FakeMemory(), process_reader=broken)
+    assert "driver gone" in str(info.value.__cause__)
+
+
+def test_without_a_process_reader_an_injected_reader_records_no_processes(tmp_path):
+    path = tmp_path / "trace.csv.gz"
+    stats = recorder.record(path, rate_hz=100, duration=0.1, reader=FakeMemory())
+    assert "processes" not in stats and not recorder.processes_path(path).exists()
+
+
+def test_the_processes_file_sits_beside_the_device_file():
+    assert recorder.processes_path("a/trace.csv.gz") == Path("a/trace.procs.csv.gz")
+    assert recorder.processes_path("trace.gz") == Path("trace.procs.gz")
+
+
+def test_a_processes_trace_is_not_read_as_a_device_trace(tmp_path):
+    path = tmp_path / "trace.csv.gz"
+    recorder.record(path, rate_hz=100, duration=0.1, reader=FakeMemory(),
+                    process_reader=FakeProcesses())
+    with pytest.raises(ValueError, match="not a contention trace"):
+        recorder.read(recorder.processes_path(path))
+    with pytest.raises(ValueError, match="not a contention trace"):
+        recorder.read_processes(path)
+
+
 # -- the recorder as a process, on the real driver ------------------------------------
 
 
@@ -186,6 +300,58 @@ def test_an_interrupted_recorder_finishes_its_file(tmp_path):
     assert meta["complete"] and meta["device"] == nvml.device_name()
     assert int(meta["total_bytes"]) == nvml.memory().total
     assert meta["samples"] == len(samples)
+
+
+def test_an_interrupted_recorder_finishes_its_processes_file(tmp_path):
+    path = tmp_path / "trace.csv.gz"
+    with running_tool(path) as proc:
+        wait_for_samples(path, 60)
+        proc.send_signal(signal.SIGINT)
+        assert proc.wait(timeout=10) == 0
+    meta, states, rows = recorder.read_processes(recorder.processes_path(path))
+    assert meta["complete"] and meta["device"] == nvml.device_name()
+    assert meta["samples"] == len(states) >= 5
+    assert np.all((states["pstate"] >= 0) & (states["pstate"] <= 15))
+    assert np.all(states["memory_mhz"] > 0)
+    assert proc.pid not in set(rows["pid"])
+
+
+def test_a_gpu_process_is_recorded_only_while_it_lives(tmp_path):
+    """A process that takes a CUDA context mid-recording shows up in the
+    samples taken while it holds it, and in none after it exits."""
+    path = tmp_path / "trace.csv.gz"
+    child = ("import time; from microinfer import _microinfer; "
+             "_microinfer.device_memory_info(); print('up', flush=True); time.sleep(1.5)")
+    with running_tool(path) as proc:
+        wait_for_samples(path, 25)
+        gpu = subprocess.Popen([sys.executable, "-c", child], stdout=subprocess.PIPE, text=True)
+        try:
+            assert gpu.stdout.readline().strip() == "up"
+            born = time.monotonic_ns()
+            assert gpu.wait(timeout=30) == 0
+            died = time.monotonic_ns()
+        finally:
+            if gpu.poll() is None:
+                gpu.kill()
+        time.sleep(1.0)
+        proc.send_signal(signal.SIGINT)
+        assert proc.wait(timeout=10) == 0
+    _, states, rows = recorder.read_processes(recorder.processes_path(path))
+    seen = rows["t_mono_ns"][rows["pid"] == gpu.pid]
+    assert len(seen) >= 3, "the process was not recorded while it held the GPU"
+    # The driver may drop an exiting process a sample late.
+    assert seen.max() < died + 250e6
+    after = states["t_mono_ns"][states["t_mono_ns"] > died + 250e6]
+    assert len(after) >= 3 and seen.min() < born + 250e6
+
+
+def test_the_driver_sustains_five_hertz_of_process_samples():
+    stats = recorder.record(None, rate_hz=50, duration=2.0)
+    procs = stats["processes"]
+    assert procs["samples"] == 10 and procs["missed"] == 0
+    assert procs["query_ms"]["p99"] < 50
+    print(f"\nprocess query: median {procs['query_ms']['median']:.2f} ms, "
+          f"p99 {procs['query_ms']['p99']:.2f} ms")
 
 
 def test_the_recorder_holds_no_device_memory(tmp_path):

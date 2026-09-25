@@ -65,6 +65,8 @@ def _declare(lib) -> None:
     lib.nvmlDeviceGetName.argtypes = [handle, ctypes.c_char_p, ctypes.c_uint]
     lib.nvmlSystemGetDriverVersion.argtypes = [ctypes.c_char_p, ctypes.c_uint]
     lib.nvmlSystemGetProcessName.argtypes = [ctypes.c_uint, ctypes.c_char_p, ctypes.c_uint]
+    lib.nvmlDeviceGetPerformanceState.argtypes = [handle, uint_p]
+    lib.nvmlDeviceGetClockInfo.argtypes = [handle, ctypes.c_uint, uint_p]
     for query in (lib.nvmlDeviceGetComputeRunningProcesses_v3,
                   lib.nvmlDeviceGetGraphicsRunningProcesses_v3):
         query.argtypes = [handle, uint_p, ctypes.POINTER(_ProcessInfo)]
@@ -93,6 +95,32 @@ def memory() -> _Memory:
     info = _Memory()
     _check(lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(info)), "nvmlDeviceGetMemoryInfo")
     return info
+
+
+#: nvmlClockType_t: the clock domains read here.
+_CLOCKS = {"graphics": 0, "sm": 1, "memory": 2}
+
+
+def performance_state() -> int:
+    """The GPU's current P-state: 0 is its fastest, 15 its slowest, and 32
+    means the driver does not know."""
+    lib, handle = _device()
+    state = ctypes.c_uint()
+    _check(lib.nvmlDeviceGetPerformanceState(handle, ctypes.byref(state)),
+           "nvmlDeviceGetPerformanceState")
+    return int(state.value)
+
+
+def clocks() -> dict[str, int]:
+    """The GPU's current graphics, SM and memory clocks, in MHz."""
+    lib, handle = _device()
+    found = {}
+    for domain, kind in _CLOCKS.items():
+        mhz = ctypes.c_uint()
+        _check(lib.nvmlDeviceGetClockInfo(handle, kind, ctypes.byref(mhz)),
+               "nvmlDeviceGetClockInfo")
+        found[domain] = int(mhz.value)
+    return found
 
 
 def device_name() -> str:
