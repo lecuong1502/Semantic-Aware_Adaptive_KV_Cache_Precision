@@ -10,14 +10,21 @@ long sample k - 1 took. A slow read delays only itself and the schedule does
 not drift. A read that overruns whole periods skips their deadlines and
 counts them as missed, rather than bunching samples to catch up.
 
-**The file survives an interrupt.** It is gzip-compressed CSV, flushed at
-least once a second, so a recorder killed without warning leaves a file that
-reads back to within a second of the kill. A recording that ends cleanly
-closes with a `# complete` line, and read() reports whether it is there.
+**The file survives an interrupt.** It is gzip-compressed CSV, flushed with
+the first sample taken a second or more after the last flush. Samples arrive
+every period, so a recorder killed without warning leaves a file that reads
+back to within about a second of the kill. A recording that ends cleanly
+closes with a line of its own, `#! complete`, carrying its sample and missed
+counts, and read() reports whether it is there. Only a stream cut short reads
+as incomplete: a missing file, or one that is not a trace, is an error.
 
-**It takes no device memory.** NVML needs no CUDA context, so a process that
-records is not a GPU process at all, and cannot be part of the contention it
-records.
+**It takes no device memory, and gives the GPU no work.** NVML needs no CUDA
+context, so a process that records is not a GPU process at all, and cannot
+be part of the contention it records. A memory query is answered from the
+driver's bookkeeping; it launches nothing on the device.
+
+The samples are also kept in host memory, for the summary: 40 bytes each,
+about 14 MiB for a two-hour recording at 50 Hz.
 
 This is measurement, not inference, so it computes in NumPy on the host
 (ADR-0002, amendment on its scope).
@@ -26,6 +33,7 @@ This is measurement, not inference, so it computes in NumPy on the host
 from __future__ import annotations
 
 import gzip
+import math
 import threading
 import time
 from pathlib import Path
@@ -37,11 +45,15 @@ from . import nvml
 
 #: One row per sample: monotonic time, wall-clock time, the driver's free and
 #: used bytes, and how long the query took.
-COLUMNS = ("t_mono_ns", "t_wall", "free_bytes", "used_bytes", "query_ns")
 _DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("free_bytes", np.int64),
                    ("used_bytes", np.int64), ("query_ns", np.int64)])
+COLUMNS = _DTYPE.names
 
+#: The first line of every trace; read() refuses a file without it.
 FORMAT = "microinfer contention trace, device memory, v1"
+#: The line a clean stop closes a trace with, apart from the "# key=value"
+#: metadata so that no key can be taken for it.
+_COMPLETE = "#! complete"
 FLUSH_SECONDS = 1.0
 
 Reader = Callable[[], tuple[int, int]]
@@ -69,9 +81,13 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
         raise ValueError(f"rate_hz must be positive, got {rate_hz}")
     if reader is None:
         reader = nvml_reader
-        meta = {**device_meta(), **(meta or {})}
+        if path is not None:
+            meta = {**device_meta(), **(meta or {})}
     period = 1e9 / rate_hz
     end = None if duration is None else int(duration * 1e9)
+    # The deadlines inside [0, end): a read overrunning the end must not count
+    # the deadlines after it as missed.
+    deadlines = None if end is None else math.ceil(end / period)
     rows: list[tuple] = []
 
     out = gzip.open(path, "wt", newline="") if path is not None else None
@@ -84,7 +100,7 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
         start = time.monotonic_ns()
         last_flush = start
         k = missed = 0
-        while end is None or k * period < end:
+        while deadlines is None or k < deadlines:
             wait = (start + k * period - time.monotonic_ns()) / 1e9
             if stop is not None:
                 if stop.wait(max(wait, 0.0)):
@@ -104,10 +120,12 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
                     last_flush = t1
             # The next deadline not yet passed; any skipped are missed.
             due = int((t1 - start) // period) + 1
+            if deadlines is not None:
+                due = min(due, deadlines)
             missed += max(due - (k + 1), 0)
             k = max(k + 1, due)
         if out is not None:
-            out.write(f"# complete samples={len(rows)} missed={missed}\n")
+            out.write(f"{_COMPLETE} samples={len(rows)} missed={missed}\n")
     finally:
         if out is not None:
             out.close()
@@ -118,24 +136,32 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
 def read(path: str | Path) -> tuple[dict, np.ndarray]:
     """A recording's metadata and samples. A recording cut short, by a kill or
     a crash, reads back to its last flush, and its metadata says
-    complete=False."""
+    complete=False; a clean one's says complete=True and carries its samples
+    and missed counts. A missing file raises FileNotFoundError, one that is
+    not gzip raises OSError, and one that is not a trace raises ValueError."""
     meta: dict[str, object] = {"complete": False}
     rows: list[tuple] = []
-    try:
-        with gzip.open(path, "rt", newline="") as f:
+    with gzip.open(path, "rt", newline="") as f:
+        try:
+            first = f.readline()
+            if first.rstrip("\n") != f"# {FORMAT}":
+                raise ValueError(f"{path} is not a contention trace: it begins {first[:60]!r}")
             for line in f:
                 if not line.endswith("\n"):
                     break  # the last line was cut mid-write
-                if line.startswith("# complete"):
+                if line.startswith(_COMPLETE):
                     meta["complete"] = True
+                    for field in line[len(_COMPLETE):].split():
+                        key, value = field.split("=", 1)
+                        meta[key] = int(value)
                 elif line.startswith("# ") and "=" in line:
                     key, value = line[2:].rstrip("\n").split("=", 1)
                     meta[key] = value
                 elif line[0].isdigit():
                     a, b, c, d, e = line.rstrip("\n").split(",")
                     rows.append((int(a), float(b), int(c), int(d), int(e)))
-    except (EOFError, OSError):
-        pass  # the gzip stream ends without its trailer: the recorder was killed
+        except EOFError:
+            pass  # the stream ends without its trailer: the recorder was killed
     return meta, np.array(rows, dtype=_DTYPE)
 
 
@@ -148,7 +174,7 @@ def summarise(samples: np.ndarray) -> dict:
     periods = np.diff(samples["t_mono_ns"]) / 1e6
     query = samples["query_ns"] / 1e3
     span = (samples["t_mono_ns"][-1] - samples["t_mono_ns"][0]) / 1e9
-    return {"samples": n, "seconds": span, "achieved_hz": (n - 1) / span,
+    return {"samples": n, "span_seconds": span, "achieved_hz": (n - 1) / span,
             "period_ms": {"mean": float(periods.mean()), "std": float(periods.std()),
                           "p50": float(np.percentile(periods, 50)),
                           "p99": float(np.percentile(periods, 99)), "max": float(periods.max())},

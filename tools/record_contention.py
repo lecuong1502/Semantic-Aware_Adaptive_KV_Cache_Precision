@@ -11,13 +11,15 @@ SIGTERM, closing its file; killed outright, it leaves a file that reads back
 to within a second.
 
 --calibrate records for --duration seconds without a file and logs what the
-recorder achieved on this machine: the cost of one NVML query, the rate, and
-the jitter of the periods. Refuses a dirty tree when it logs.
+recorder achieved on this machine: the cost of one NVML query, the rate, the
+jitter of the periods, and whether NVML saw the recorder as a GPU process,
+which it should not. Refuses a dirty tree when it logs.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -26,7 +28,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import benchlog, recorder  # noqa: E402
+from microinfer import benchlog, nvml, recorder  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
@@ -44,6 +46,8 @@ def main(argv: list[str]) -> int:
     if args.calibrate:
         if args.issue is None:
             parser.error("--calibrate logs its result, and needs --issue")
+        if args.out is not None:
+            parser.error("--calibrate records no file; drop --out")
         if benchlog.environment(args.log)["git_dirty"]:
             parser.error("tracked files have uncommitted changes; commit first, so that "
                          "the entry names the code that produced it")
@@ -58,6 +62,8 @@ def main(argv: list[str]) -> int:
 
     stats = recorder.record(None if args.calibrate else args.out, args.rate,
                             duration=args.duration, stop=stop)
+    # The claim that the recorder is not a GPU process, checked before it exits.
+    gpu_process = os.getpid() in {p.pid for p in nvml.processes()}
     print(f"{stats['samples']} samples at {stats.get('achieved_hz', 0):.2f} Hz, "
           f"{stats['missed']} deadlines missed; period p99 "
           f"{stats.get('period_ms', {}).get('p99', 0):.2f} ms; NVML query median "
@@ -65,9 +71,9 @@ def main(argv: list[str]) -> int:
     if args.calibrate:
         benchlog.append(
             "recorder-calibration", model=None, context_length=None, precision_tiers=None,
-            config={"rate_hz": args.rate, "seconds": args.duration,
+            config={"rate_hz": args.rate, "duration_seconds": args.duration,
                     "query": "nvmlDeviceGetMemoryInfo", "issue": args.issue},
-            results=stats, log=args.log)
+            results={**stats, "recorder_is_gpu_process": gpu_process}, log=args.log)
     return 0
 
 
