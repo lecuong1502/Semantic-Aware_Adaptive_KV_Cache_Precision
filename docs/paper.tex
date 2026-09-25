@@ -51,7 +51,7 @@ TODO.
 every kernel that the research contribution touches is hand-written CUDA, and no
 external inference engine --- vLLM, llama.cpp or TensorRT-LLM --- is used at any
 point. The phrase stops at one place, the dense matrix multiplications, which
-call NVIDIA's cuBLAS library. This section states that boundary explicitly, so
+call NVIDIA's cuBLAS library. This subsection states that boundary explicitly, so
 that no later result is read as implying the projections were hand-written.
 
 \paragraph{Hand-written.} The following are CUDA kernels or host code written for
@@ -59,9 +59,11 @@ this engine:
 \begin{itemize}
 \item the token embedding lookup;
 \item RMSNorm, over fp16 activations or over the fp32 residual stream;
-\item rotary position embedding (RoPE), with its angles formed in fp64 and
-tabulated once per position;
-\item the SwiGLU activation and the residual addition;
+\item rotary position embedding (RoPE), with its angles formed in fp64, and
+tabulated once per position for the keys the cache completes;
+\item the SwiGLU activation;
+\item the broadcast of a projection's bias into its output rows, on which the
+second precision choice below relies;
 \item attention: causal scaled dot-product attention with an online softmax,
 grouped-query attention, and the completion of keys cached without their
 projection's bias --- over a contiguous cache, over pages, and over pages at a
@@ -85,16 +87,20 @@ inherit the gap between a hand-written GEMM and cuBLAS, and a reader could no
 longer separate the overhead of the adaptive precision policy from the cost of a
 slow matrix multiplication --- the very separation the systems claim rests on.
 When the decision was taken the gap was estimated at two to five times. It was
-then measured, in the study described at the end of this section: on the models'
-own projections at 512 rows, a shared-memory-tiled kernel ran 8--28 times slower
-than cuBLAS and a naive one 93--267 times slower, and in single-token decoding the
-tiled kernel ran 5--21 times slower. The measurement strengthens the decision
-rather than revising it.
+then measured, in the study described last in this subsection, on the RTX 4050
+Laptop GPU used throughout, at the driver's own clocks and with the desktop's
+processes sharing the GPU. On the models' own projections at 512 rows, a
+shared-memory-tiled kernel ran 8--28 times slower than cuBLAS and a naive one
+93--267 times slower. In single-token decoding the tiled kernel ran 5--21 times
+slower; those timings flatter every implementation somewhat, since a repeated
+launch finds a small projection's weights still in the 24\,MiB L2 cache, which a
+whole model does not fit. The measurement strengthens the decision rather than
+revising it.
 
 \paragraph{Two precision choices.} The wrapper makes two choices on which the
-per-kernel correctness figures reported for the projections depend --- a maximum
-error below four and a mean below one unit in the last place of fp16, against a
-float64 reference.
+per-kernel correctness figures reported for the projections depend --- a
+relative error of at most four units in the last place of fp16 and a mean below
+one, against a float64 reference.
 \begin{enumerate}
 \item \textbf{fp32 accumulation, with reduced-precision reduction disallowed.}
 Operands are fp16 and the computation is fp32 (\texttt{CUBLAS\_COMPUTE\_32F}).
@@ -106,16 +112,21 @@ precision, which is a silent fp16 accumulation inside a call that asked for fp32
 projection carries a bias, the output rows are first seeded with it and the
 multiplication adds onto them. The sum is formed in fp32 inside cuBLAS and
 rounded to fp16 once, rather than rounded after the multiplication and again
-after a separate addition. For the same reason the output and down projections
-add straight into the fp32 residual stream, and the language-model head writes
-fp32 logits: neither is rounded to fp16 at all.
+after a separate addition.
 \end{enumerate}
+The same principle, to round as late and as seldom as possible, applies to the
+projections without a bias: the output and down projections add straight into
+the fp32 residual stream, and the language-model head writes fp32 logits, so
+neither is rounded to fp16 at all.
 
 \paragraph{The GEMM study.} A naive GEMM kernel and a shared-memory-tiled one were
 written and profiled against cuBLAS with Nsight Compute, as a study of where
-their time goes: the naive kernel is bound by its load and store queue, the tiled
-one by shared memory, and cuBLAS by the tensor cores, which neither hand-written
-kernel uses. Both compute the projection correctly, to the same per-kernel bound
+their time goes. At 512 rows the naive kernel is bound by its load and store
+queue, the tiled one by shared memory, and cuBLAS by the tensor cores, which
+neither hand-written kernel uses. In decoding the projection becomes a
+matrix-vector product: cuBLAS switches to a kernel without tensor cores that
+approaches the memory bandwidth, and the hand-written kernels stall well short of
+it. Both compute the projection correctly, to the same per-kernel bound
 as the engine's. The study is a learning and benchmarking artifact and nothing
 more: it is not part of the inference path, and the engine's build, its import
 graph and its packaged form are each tested not to reach it.
