@@ -138,6 +138,8 @@ A recording of contention as the recorder takes it, in two streams on one
 monotonic clock: the **device stream**, the driver's free and used memory at
 50 Hz, and the **processes stream**, beside it at 5 Hz, the memory each GPU
 process holds with the GPU's P-state and clocks. The processes stream is what
-attributes a spike to the process that caused it. A trace closed cleanly says
+attributes a spike to the process that caused it. A scripted run adds **action
+labels**, the start and end of each action, stamped on the recorder's clock as
+they arrive, which tie every sample to the action in progress. A trace closed cleanly says
 it is complete; one cut short reads back to within a second.
 _Avoid_: log (the benchmark log is a different, hash-chained record), profile
