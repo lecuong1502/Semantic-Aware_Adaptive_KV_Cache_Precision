@@ -100,7 +100,7 @@ Scorer. It is an input to a requantisation plan, not a tier.
 _Avoid_: attention score, relevance, weight, saliency
 
 **Requantisation plan**:
-The list of `(layer, page, current_tier, target_tier)` actions the Precision
+The list of `(layer, page, current_tier, target_tier)` entries the Precision
 Controller emits in response to a pressure level. Producing a plan is a pure
 decision; nothing has moved until the KV Cache Manager applies it.
 _Avoid_: re-quant plan, migration, schedule
@@ -138,6 +138,21 @@ A recording of contention as the recorder takes it, in two streams on one
 monotonic clock: the **device stream**, the driver's free and used memory at
 50 Hz, and the **processes stream**, beside it at 5 Hz, the memory each GPU
 process holds with the GPU's P-state and clocks. The processes stream is what
-attributes a spike to the process that caused it. A trace closed cleanly says
-it is complete; one cut short reads back to within a second.
+attributes a spike to the process that caused it. A scenario adds action
+labels: the start and end of each action, stamped on the recorder's clock as
+they arrive, which tie every sample to the action in progress. A trace closed
+cleanly says it is complete; one cut short reads back to within a second.
 _Avoid_: log (the benchmark log is a different, hash-chained record), profile
+
+**Scenario**:
+A scripted run of desktop actions, repeated, during which a contention trace is
+recorded; RQ1's traces are scenarios and passive sessions, the latter with no
+script at all.
+_Avoid_: benchmark (that measures the engine), workload
+
+**Action**:
+One thing a user does on the desktop during a scenario, such as opening a
+browser or starting a game, marked in the trace by an **action label** at its
+start and another at its end. Nothing else in the project is an action: the
+entries of a requantisation plan are not.
+_Avoid_: event (the label is the event; the action is what it marks), step

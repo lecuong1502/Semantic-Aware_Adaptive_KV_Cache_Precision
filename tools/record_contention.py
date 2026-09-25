@@ -2,7 +2,7 @@
 """Record device-wide free and used memory, and who holds it, at fixed rates (#46, #47).
 
     .venv/bin/python tools/record_contention.py --out trace.csv.gz [--rate 50]
-        [--processes-rate 5] [--duration S]
+        [--processes-rate 5] [--labels FIFO] [--duration S]
     .venv/bin/python tools/record_contention.py --calibrate --issue 46 [--duration 60]
 
 The recorder of RQ1 (microinfer.recorder), as a process of its own: it holds
@@ -11,7 +11,8 @@ engine as one more process among the desktop's. It stops cleanly on SIGINT or
 SIGTERM, closing its files; killed outright, it leaves files that read back
 to within a second. Beside --out it writes the processes stream, trace.csv.gz
 becoming trace.procs.csv.gz: each GPU process's memory, and the GPU's P-state
-and clocks.
+and clocks. With --labels it listens on a FIFO for the start and end of each
+action (tools/label_contention.py) and writes them to trace.labels.csv.gz.
 
 --calibrate records for --duration seconds without a file and logs what the
 recorder achieved on this machine: the cost of one NVML query, the rate, the
@@ -40,6 +41,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--rate", type=float, default=50.0, help="samples per second")
     parser.add_argument("--processes-rate", type=float, default=5.0,
                         help="process samples per second; 0 turns the stream off")
+    parser.add_argument("--labels", type=Path,
+                        help="a FIFO to take action labels on; made if it does not exist")
     parser.add_argument("--duration", type=float, default=None,
                         help="seconds to record; until interrupted if omitted")
     parser.add_argument("--calibrate", action="store_true",
@@ -53,6 +56,8 @@ def main(argv: list[str]) -> int:
             parser.error("--calibrate logs its result, and needs --issue")
         if args.out is not None:
             parser.error("--calibrate records no file; drop --out")
+        if args.labels is not None:
+            parser.error("--calibrate records no file to label; drop --labels")
         if benchlog.environment(args.log)["git_dirty"]:
             parser.error("tracked files have uncommitted changes; commit first, so that "
                          "the entry names the code that produced it")
@@ -67,7 +72,7 @@ def main(argv: list[str]) -> int:
 
     stats = recorder.record(None if args.calibrate else args.out, args.rate,
                             duration=args.duration, stop=stop,
-                            processes_rate_hz=args.processes_rate)
+                            processes_rate_hz=args.processes_rate, labels=args.labels)
     # The claim that the recorder is not a GPU process, checked before it exits.
     gpu_process = os.getpid() in {p.pid for p in nvml.processes()}
     print(f"{stats['samples']} samples at {stats.get('achieved_hz', 0):.2f} Hz, "
