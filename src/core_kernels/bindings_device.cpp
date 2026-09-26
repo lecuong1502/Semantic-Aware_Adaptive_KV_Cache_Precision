@@ -197,12 +197,15 @@ namespace
 
 } // namespace
 
-// Every call that launches device work releases the GIL (#51). A launch
+// Every call that launches device work releases the GIL (ADR-0012). A launch
 // blocks when the device's queue is full, and a copy back to the host waits
 // for every kernel before it: holding the GIL through either would stop every
 // other Python thread for as long as a prefill chunk takes, the pressure
 // monitor's and a status writer's among them. None of these calls touches a
-// Python object while it runs.
+// Python object while it runs, and none takes one by value: a Span holds its
+// owner, and a Span parameter destroyed with the GIL released would drop that
+// reference without it. Spans are taken by reference, and destroyed by the
+// caller that loaded them, after the GIL is held again.
 void bind_device(py::module_ &parent)
 {
   auto m = parent.def_submodule(
@@ -260,7 +263,7 @@ void bind_device(py::module_ &parent)
       {
         const float *data = host.data();
         const auto count = static_cast<size_t>(host.size());
-        py::gil_scoped_release release; // as in index
+        py::gil_scoped_release release; // see the note above bind_device
         auto t = std::make_unique<DeviceFloats>(count);
         if (t->count() > 0)
         {
@@ -364,7 +367,7 @@ void bind_device(py::module_ &parent)
 
   m.def(
       "linear",
-      [](const Span &x, const Span &weight, std::optional<Span> bias,
+      [](const Span &x, const Span &weight, const std::optional<Span> &bias,
          const Span &out, int rows, int in_features, int out_features)
       {
         need(x, product(rows, in_features), "x");
@@ -405,7 +408,7 @@ void bind_device(py::module_ &parent)
   m.def(
       "attention",
       [](const Span &q, const Span &k, const Span &v,
-         std::optional<Span> k_bias, const microinfer::RopeTable *rope,
+         const std::optional<Span> &k_bias, const microinfer::RopeTable *rope,
          const Span &out, int seq_q, int seq_k, int heads, int kv_heads,
          int head_dim)
       {
@@ -558,10 +561,11 @@ void bind_device(py::module_ &parent)
           py::arg("keys"), py::arg("values"), py::arg("start"), py::arg("n"))
       .def(
           "attention",
-          [](KVPages &c, int layer, const Span &q, std::optional<Span> k_bias,
+          [](KVPages &c, int layer, const Span &q,
+             const std::optional<Span> &k_bias,
              const microinfer::RopeTable *rope, const Span &out, int seq_q,
              int seq_k, int heads, int kv_heads, int head_dim,
-             std::optional<Span> keys, std::optional<Span> values)
+             const std::optional<Span> &keys, const std::optional<Span> &values)
           {
             if (seq_q > seq_k)
             {

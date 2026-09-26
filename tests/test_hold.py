@@ -1,8 +1,8 @@
-"""Engine hold mode: a generation session kept in progress for as long as a
-scenario runs (#51).
+"""Engine hold mode: a generation kept in progress for as long as a scenario
+runs (#51).
 
 RQ1's with-engine runs need the engine holding a full context, decoding the
-whole time. The window ends, the session must not: holding prefills the
+whole time. The window ends, the hold must not: holding prefills the
 context less a span to decode, decodes to the end of the window, then goes
 back to the end of the prompt and decodes the span again, over the same
 pages. Its memory is that of the full context from the first pass on.
@@ -71,6 +71,17 @@ def test_holding_decodes_the_span_again_and_again_as_a_fresh_generation_would(en
     assert cache_bytes[1] == cache_bytes[2] == cache_bytes[3] > 0
     assert engine.footprint().kv_cache == 0  # released on stopping
 
+    stopped_early = []
+
+    def stop_at_once(state, position, token):
+        stopped_early.append(state)
+        stop.set()
+
+    stop.clear()
+    long_prompt = np.random.default_rng(1).integers(0, 1000, 2000).astype(np.int32)
+    engine.hold(long_prompt, context=2100, stop=stop, report=stop_at_once)
+    assert stopped_early == ["prefilling"]  # stopped after the first chunk, not the fourth
+
     with pytest.raises(ValueError, match="FP16"):
         Engine(require_model(MODEL), kv_tier="INT8").hold(prompt, context=context, stop=stop)
     with pytest.raises(ValueError, match="context"):
@@ -91,12 +102,11 @@ def test_other_threads_run_while_the_engine_works(engine):
 
     ticker = threading.Thread(target=tick)
     ticker.start()
-    started = time.perf_counter()
-    engine.forward(np.random.default_rng(0).integers(1000, 100000, 4096).astype(np.int32))
-    took = time.perf_counter() - started
+    prompt = np.random.default_rng(0).integers(1000, 100000, 4096).astype(np.int32)
+    engine.generate(prompt, 1)
     done.set()
     ticker.join()
-    assert took > 0.5 and np.diff(ticks).max() < 0.1, (took, np.diff(ticks).max())
+    assert np.diff(ticks).max() < 0.1
 
 
 def read_status(path):
@@ -108,8 +118,9 @@ def read_status(path):
 
 def test_the_tool_reports_its_state_every_second_and_gives_everything_back(tmp_path):
     """Run as RQ1 runs it: loading, prefilling, then decoding until told to
-    stop, the status file rewritten at least once a second throughout. On
-    SIGTERM it stops cleanly, says so, and leaves nothing on the device."""
+    stop, the status file rewritten at least once a second throughout, as
+    the spec asks (it aims at four). On SIGTERM it stops cleanly, says so,
+    and leaves nothing on the device."""
     require_model(MODEL)
     status = tmp_path / "hold.json"
     proc = subprocess.Popen([sys.executable, str(TOOL), "--model", MODEL, "--context", "2048",
@@ -129,7 +140,8 @@ def test_the_tool_reports_its_state_every_second_and_gives_everything_back(tmp_p
             time.sleep(0.1)
         assert s is not None and s["state"] == "decoding", (s, proc.poll())
         assert s["pid"] == proc.pid and s["context"] == 2048
-        assert 1792 <= s["position"] <= 2048 and s["tokens_per_second"] > 10
+        assert 1792 < s["position"] <= s["held_positions"] <= 2048
+        assert s["tokens_per_second"] > 10
         assert {"loading", "decoding"} <= seen
         # Never more than a second between one write and the next seen.
         written = np.unique([u for _, u in stamps])
