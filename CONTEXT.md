@@ -155,6 +155,14 @@ amplitude, a rise time (10% of the amplitude up to its 90% peak), a duration
 _Avoid_: burst, dip (a dip too shallow or too brief is not a spike), step
 (an action's)
 
+**Attribution**:
+The process a spike is laid to: the one whose memory gained most between the
+last 5 Hz process sample before the spike's rise and the samples during its
+peak, if it gained at least a quarter of the amplitude; it is reported with its
+share. A process new since that sample, or a pid now under another name, gained
+all it holds. Otherwise the spike names no process, and says why.
+_Avoid_: blame, cause (a process can gain with a spike it did not start)
+
 **Scenario**:
 A scripted run of desktop actions, repeated, during which a contention trace is
 recorded; RQ1's traces are scenarios and passive sessions, the latter with no
