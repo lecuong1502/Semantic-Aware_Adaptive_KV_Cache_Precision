@@ -147,10 +147,13 @@ _Avoid_: log (the benchmark log is a different, hash-chained record), profile
 **Spike**:
 Free memory at least 64 MiB below the baseline, the rolling median of the
 preceding 5 s, for at least 100 ms. The baseline holds from a spike's start for
-at most one window; a spike still below it then is a lasting step, and does not
-recover. Each spike has an amplitude, a rise time (10% to 90% of the
-amplitude), a duration (below the threshold) and a recovery (90% back to 10%).
-_Avoid_: burst, dip (a dip too shallow or too brief is not a spike)
+at most one window; a spike still below it then is a **lasting drop**, and does
+not recover. A spike ends when its deficit falls below half the threshold, and
+one cut by a gap in the trace or by its end is **censored**. Each spike has an
+amplitude, a rise time (10% of the amplitude up to its 90% peak), a duration
+(at or above the threshold) and a recovery (the peak's 90% back to 10%).
+_Avoid_: burst, dip (a dip too shallow or too brief is not a spike), step
+(an action's)
 
 **Scenario**:
 A scripted run of desktop actions, repeated, during which a contention trace is

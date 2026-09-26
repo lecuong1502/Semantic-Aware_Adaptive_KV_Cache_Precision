@@ -204,6 +204,44 @@ graph and its packaged form are each tested not to reach it.
 
 \section{Evaluation}
 \label{sec:evaluation}
+
+\subsection{Contention Characterisation}
+\label{sec:spikes}
+The traces of RQ1 are read by one analysis, fixed before any trace was
+recorded. Free memory is sampled at 50 Hz. Its \textit{baseline} is the rolling
+median of the preceding 5 s, and a \textit{spike} is free memory at least
+64 MiB below the baseline for at least 100 ms; 64 MiB is an order of magnitude
+above the noise of an idle desktop on the machine used, a few 2 MiB granules.
+The threshold, the window and the minimum duration are parameters, and the raw
+traces are kept, so every figure can be recomputed at another threshold.
+
+Four rules make the definition hold on a real trace.
+\begin{itemize}
+\item \textbf{The baseline holds during a spike, for one window at most.} A
+median left to roll would sink into any spike longer than half its window and
+end it there. From a spike's first sample the baseline is held; a spike still
+below it after a whole window is a \textit{lasting drop}, reported as not
+recovered, after which the new level becomes the baseline.
+\item \textbf{A spike ends only when its deficit falls below half the
+threshold.} Without this hysteresis, noise on a spike near the threshold would
+split it into several.
+\item \textbf{A gap in the trace ends a spike.} A spike cut by a gap, or by the
+end of the trace, is \textit{censored}: its duration is a lower bound, and
+nothing is interpolated across the gap.
+\item \textbf{A measure stays within its own spike.} Where two spikes follow too
+closely for a measure to be taken, it is reported as missing rather than
+stretched across both.
+\end{itemize}
+
+For each spike four measures are taken from its \textit{deficit}, the held
+baseline minus free memory, with crossing times interpolated between samples.
+The \textit{amplitude} is the largest deficit. The \textit{peak} is the run of
+samples at or above 90\% of the amplitude around it. The \textit{rise time} runs
+from the last crossing of 10\% of the amplitude before the peak to the peak's
+start; the \textit{recovery} runs from the peak's end to the next crossing of
+10\%, its mirror. The \textit{duration} is the time the deficit spends at or
+above the threshold.
+
 % TODO: contention characterisation, the pressure detector, the task-level
 % comparison of allocation strategies, and the ablations.
 
