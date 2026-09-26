@@ -163,6 +163,14 @@ share. A process new since that sample, or a pid now under another name, gained
 all it holds. Otherwise the spike names no process, and says why.
 _Avoid_: blame, cause (a process can gain with a spike it did not start)
 
+**Hold**:
+A generation the engine keeps in progress for as long as a scenario runs, so
+that contention is recorded against a working engine: the prompt fills the
+context less a span, and the span is decoded in **passes**, each going back to
+the end of the prompt over the pages already held, so memory stays at the full
+context. FP16 only, since a pass rewrites positions in place.
+_Avoid_: session (a passive session is a recording), loop
+
 **Scenario**:
 A scripted run of desktop actions, repeated, during which a contention trace is
 recorded; RQ1's traces are scenarios and passive sessions, the latter with no

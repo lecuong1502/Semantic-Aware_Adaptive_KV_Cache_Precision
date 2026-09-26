@@ -10,10 +10,12 @@ experiment behind it.
 from __future__ import annotations
 
 import json
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -144,6 +146,10 @@ def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16")
     tier."""
     granule = _microinfer.granule_bytes()
     return sum(-(-n // granule) * granule for n in paged_cache_ranges(cfg, context_length, tier))
+
+
+#: What Engine.hold reports after each prefill chunk and each decoded token.
+PREFILLING, DECODING = "prefilling", "decoding"
 
 
 class Engine:
@@ -355,10 +361,7 @@ class Engine:
         # than prompt plus output.
         self._check_window(len(ids) + max_new_tokens - 1)
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
-        out: list[int] = []
-        for chunk, ws, _, last in self._prefill(cache, ids):
-            if last:  # the prompt's last row decides the first new token
-                out.append(self._model.greedy_last(ws, len(chunk)))
+        out = [self._first_token(cache, ids)]
 
         step = model.Workspace(self.config, rows=1)
         with self._holding(cache, step):
@@ -366,6 +369,70 @@ class Engine:
                 self._model.run(step, cache, np.array(out[-1:], np.int32))
                 out.append(self._model.greedy_last(step, 1))
         return np.asarray(out, dtype=np.int32)
+
+    def hold(self, prompt, *, context: int | None = None, stop: threading.Event,
+             report: Callable[[str, int, int | None], None] | None = None) -> None:
+        """Hold a generation in progress until `stop` is set: RQ1's engine
+        under contention (#51).
+
+        The prompt is prefilled, then tokens are decoded greedily to position
+        `context`, the model's window by default. There the hold goes back to
+        the end of the prompt and decodes the same span again, a new *pass*,
+        from the last token it produced, over the pages it already holds:
+        from the end of the first pass the cache holds the full context, and
+        holds no more however long the hold lasts. Each pass reads only the
+        prompt and itself, as a fresh generation from that token would.
+
+        Going back rewrites positions in place, which only FP16 pages allow: a
+        quantised page is sealed once its positions are written (ADR-0011).
+
+        `report(state, position, token)` is called after each prefill chunk,
+        as (PREFILLING, positions so far, None), and after each decoded token,
+        as (DECODING, the position after it, the token). `stop` is checked
+        after every chunk and every step, so a hold stops within one, and
+        releases its cache as it returns.
+        """
+        if self.kv_tier != "FP16" or self.kv_halves != "both":
+            raise ValueError("holding rewrites positions in place, which only FP16 pages allow")
+        ids = self.encode(prompt) if isinstance(prompt, str) else self._check_ids(prompt)
+        context = self.config.max_position_embeddings if context is None else context
+        if not len(ids) < context:
+            raise ValueError(f"the context, {context}, must exceed the prompt's "
+                             f"{len(ids)} positions, to leave a span to decode")
+        self._check_window(context)
+        report = report or (lambda *_: None)
+
+        cache = self._new_cache(capacity=context)
+
+        def prefilled() -> bool:
+            report(PREFILLING, cache.length, None)
+            return not stop.is_set()
+
+        token = self._first_token(cache, ids, go_on=prefilled)
+        if token is None:
+            return  # stopped while prefilling
+        step = model.Workspace(self.config, rows=1)
+        with self._holding(cache, step):
+            while not stop.is_set():
+                if cache.length == context:
+                    cache.length = len(ids)  # back to the end of the prompt
+                self._model.run(step, cache, np.array([token], np.int32))
+                token = self._model.greedy_last(step, 1)
+                report(DECODING, cache.length, token)
+
+    def _first_token(self, cache, ids: np.ndarray, *,
+                     go_on: Callable[[], bool] | None = None) -> int | None:
+        """Prefill `ids` into `cache`: the greedy choice the prompt's last row
+        makes, the first new token. `go_on`, if given, is asked after every
+        chunk; if it says no, prefilling stops there and this returns None."""
+        token = None
+        for chunk, ws, _, last in self._prefill(cache, ids):
+            if go_on is not None and not go_on():
+                return None
+            if last:
+                token = self._model.greedy_last(ws, len(chunk))
+        # Run out, not left: the prefill notes its peak footprint as it ends.
+        return token
 
     def cached_kv(self, token_ids) -> tuple[np.ndarray, np.ndarray]:
         """What the cache holds after prefilling one sequence: keys and values,
