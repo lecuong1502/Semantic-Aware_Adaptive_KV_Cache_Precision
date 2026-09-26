@@ -70,9 +70,10 @@ from . import nvml
 
 #: One row per device sample: monotonic time, wall-clock time, the driver's
 #: free and used bytes, and how long the query took.
-DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("free_bytes", np.int64),
-                  ("used_bytes", np.int64), ("query_ns", np.int64)])
-COLUMNS = DTYPE.names
+DEVICE_DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64),
+                         ("free_bytes", np.int64), ("used_bytes", np.int64),
+                         ("query_ns", np.int64)])
+COLUMNS = DEVICE_DTYPE.names
 
 #: The first line of every device trace; read() refuses a file without it.
 FORMAT = "microinfer contention trace, device memory, v1"
@@ -352,7 +353,7 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
                                        else None)]))
     if (st := failed()) is not None:
         raise RuntimeError(f"the {st.what} failed") from st.error
-    samples = np.array(rows, dtype=DTYPE)
+    samples = np.array(rows, dtype=DEVICE_DTYPE)
     summary = {**summarise(samples), "missed": missed, "rate_hz": rate_hz}
     for st in streams:
         summary[st.key] = st.summary
@@ -609,7 +610,7 @@ def read(path: str | Path) -> tuple[dict, np.ndarray]:
     recording cut short reads as, and what raises)."""
     meta, rows = _read_trace(path, FORMAT)
     return meta, np.array([(int(a), float(b), int(c), int(d), int(e)) for a, b, c, d, e in rows],
-                          dtype=DTYPE)
+                          dtype=DEVICE_DTYPE)
 
 
 def read_processes(path: str | Path) -> tuple[dict, np.ndarray, np.ndarray]:

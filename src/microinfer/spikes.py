@@ -89,6 +89,14 @@ class Spike:
     def recovered(self) -> bool:
         return self.ending == "recovered"
 
+    @property
+    def rise_start_ns(self) -> int:
+        """When the rise began: its 10% crossing, or the start where the
+        trace does not show it."""
+        if self.rise_s is None:
+            return self.start_ns
+        return min(self.start_ns, self.peak_start_ns - int(self.rise_s * 1e9))
+
 
 @dataclass(frozen=True)
 class _Found:

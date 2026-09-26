@@ -242,6 +242,17 @@ start; the \textit{recovery} runs from the peak's end to the next crossing of
 10\%, its mirror. The \textit{duration} is the time the deficit spends at or
 above the threshold.
 
+Each spike is attributed to the process most responsible for it, from the
+per-process memory sampled at 5 Hz: the process whose holding gained most
+between the last sample before the rise began and the samples taken during the
+peak, provided the gain is at least a quarter of the amplitude, reported with
+its share. Otherwise the spike names no process and records why: no sample fell
+within its peak, the driver did not report the holdings, or no process gained
+enough. Spikes are reported per scripted action, every action included, and as
+rates per hour of recorded time for passive sessions; the counts are repeated at
+thresholds of 32 and 128 MiB. Distributions of duration and recovery are drawn
+from recovered spikes only, since a censored duration is a lower bound.
+
 % TODO: contention characterisation, the pressure detector, the task-level
 % comparison of allocation strategies, and the ablations.
 

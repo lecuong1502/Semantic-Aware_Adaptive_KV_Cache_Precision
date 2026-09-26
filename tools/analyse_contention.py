@@ -4,9 +4,9 @@
     .venv/bin/python tools/analyse_contention.py --issue N trace.csv.gz [more.csv.gz ...]
 
 For each recording (microinfer.contention): its spikes, each attributed to
-the process whose memory rose with it; the distributions per labelled action,
-or the rates per hour of a passive session; and the spike counts at 32, 64
-and 128 MiB. Each recording is one benchmark-log entry carrying the sha256 of
+the process most responsible; the distributions per labelled action, or the
+rates per hour of a passive session; and the spike counts at 32, 64 and
+128 MiB. Each recording is one benchmark-log entry carrying the sha256 of
 its files, the processes and labels files beside it included. Refuses a
 dirty tree, so that each entry names the code that produced it.
 """
@@ -36,10 +36,11 @@ def main(argv: list[str]) -> int:
 
     for trace in args.traces:
         results = contention.log_recording(trace, issue=args.issue, log=args.log)["results"]
-        counts = ", ".join(f"{m} MiB: {n}" for m, n in results["sensitivity_mib"].items())
-        print(f"{trace.name}: {results['spikes']} spikes over "
-              f"{results['span_hours'] * 60:.1f} min ({counts}); attributed "
-              f"{results['attributed']}")
+        counts = ", ".join(f"{m} MiB: {c['count']}"
+                           for m, c in results["sensitivity_mib"].items())
+        print(f"{trace.name}: {len(results['spikes'])} spikes over "
+              f"{results['recorded_hours'] * 60:.1f} min recorded ({counts}); attributed "
+              f"{results['all']['attributed']}")
     return 0
 
 
