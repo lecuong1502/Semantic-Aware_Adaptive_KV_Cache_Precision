@@ -118,12 +118,18 @@ namespace
     {
       return out;
     }
-    const float *dev =
-        logits_into(x, head, scratch, first_row, rows, hidden, vocab);
-    microinfer::cuda_check(cudaMemcpy(out.mutable_data(), dev,
-                                      product(rows, vocab) * sizeof(float),
-                                      cudaMemcpyDeviceToHost),
-                           "cudaMemcpy logits device-to-host");
+    float *host = out.mutable_data();
+    {
+      // Nothing below touches Python, and the copy waits for every kernel
+      // before it: other threads run meanwhile (#51).
+      py::gil_scoped_release release;
+      const float *dev =
+          logits_into(x, head, scratch, first_row, rows, hidden, vocab);
+      microinfer::cuda_check(cudaMemcpy(host, dev,
+                                        product(rows, vocab) * sizeof(float),
+                                        cudaMemcpyDeviceToHost),
+                             "cudaMemcpy logits device-to-host");
+    }
     return out;
   }
 
@@ -138,16 +144,19 @@ namespace
     {
       return out;
     }
-    const float *dev =
-        logits_into(x, head, scratch, first_row, rows, hidden, vocab);
-    int32_t *ids =
-        reinterpret_cast<int32_t *>(reinterpret_cast<char *>(scratch.ptr) +
-                                    product(rows, vocab) * sizeof(float));
-    microinfer::device::argmax_rows(dev, rows, vocab, ids);
-    microinfer::cuda_check(cudaMemcpy(out.mutable_data(), ids,
-                                      rows * sizeof(int32_t),
-                                      cudaMemcpyDeviceToHost),
-                           "cudaMemcpy ids device-to-host");
+    int32_t *host = out.mutable_data();
+    {
+      py::gil_scoped_release release; // as in logits
+      const float *dev =
+          logits_into(x, head, scratch, first_row, rows, hidden, vocab);
+      int32_t *ids =
+          reinterpret_cast<int32_t *>(reinterpret_cast<char *>(scratch.ptr) +
+                                      product(rows, vocab) * sizeof(float));
+      microinfer::device::argmax_rows(dev, rows, vocab, ids);
+      microinfer::cuda_check(
+          cudaMemcpy(host, ids, rows * sizeof(int32_t), cudaMemcpyDeviceToHost),
+          "cudaMemcpy ids device-to-host");
+    }
     // A row with no finite logit has no argmax: the kernel reports one past
     // the vocabulary. Handing that on as a token would put an id the model
     // does not have into the output, and embed would quietly read it as zero.
@@ -165,8 +174,35 @@ namespace
     return out;
   }
 
+  // Frees a DeviceIndex without the GIL. cudaFree waits for every kernel
+  // queued before it, and Python frees a step's token ids and positions as
+  // the step ends, with the GIL held: through a whole prefill chunk's worth
+  // of queued work, other Python threads would stop (#51).
+  struct FreeWithoutGil
+  {
+    void operator()(DeviceIndex *index) const
+    {
+      if (PyGILState_Check())
+      {
+        py::gil_scoped_release release;
+        delete index;
+      }
+      else
+      {
+        delete index;
+      }
+    }
+  };
+  using IndexHolder = std::unique_ptr<DeviceIndex, FreeWithoutGil>;
+
 } // namespace
 
+// Every call that launches device work releases the GIL (#51). A launch
+// blocks when the device's queue is full, and a copy back to the host waits
+// for every kernel before it: holding the GIL through either would stop every
+// other Python thread for as long as a prefill chunk takes, the pressure
+// monitor's and a status writer's among them. None of these calls touches a
+// Python object while it runs.
 void bind_device(py::module_ &parent)
 {
   auto m = parent.def_submodule(
@@ -222,13 +258,15 @@ void bind_device(py::module_ &parent)
       "upload_f32",
       [](py::array_t<float, py::array::c_style | py::array::forcecast> host)
       {
-        auto t =
-            std::make_unique<DeviceFloats>(static_cast<size_t>(host.size()));
+        const float *data = host.data();
+        const auto count = static_cast<size_t>(host.size());
+        py::gil_scoped_release release; // as in index
+        auto t = std::make_unique<DeviceFloats>(count);
         if (t->count() > 0)
         {
-          microinfer::cuda_check(cudaMemcpy(t->data(), host.data(), t->nbytes(),
-                                            cudaMemcpyHostToDevice),
-                                 "cudaMemcpy fp32 host-to-device");
+          microinfer::cuda_check(
+              cudaMemcpy(t->data(), data, t->nbytes(), cudaMemcpyHostToDevice),
+              "cudaMemcpy fp32 host-to-device");
         }
         return t;
       },
@@ -245,8 +283,9 @@ void bind_device(py::module_ &parent)
         microinfer::device::embed_f32(ids.data(), table.ptr, out.data(), count,
                                       hidden, vocab);
       },
-      py::arg("ids"), py::arg("table"), py::arg("out"), py::arg("hidden"),
-      py::arg("vocab"), "The embedding gather, widened exactly to fp32.");
+      py::call_guard<py::gil_scoped_release>(), py::arg("ids"),
+      py::arg("table"), py::arg("out"), py::arg("hidden"), py::arg("vocab"),
+      "The embedding gather, widened exactly to fp32.");
 
   m.def(
       "rmsnorm_f32",
@@ -259,8 +298,9 @@ void bind_device(py::module_ &parent)
         microinfer::device::rmsnorm_f32(x.data(), weight.ptr, out.ptr, rows,
                                         hidden, eps);
       },
-      py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("rows"),
-      py::arg("hidden"), py::arg("eps"), "RMSNorm of an fp32 input to fp16.");
+      py::call_guard<py::gil_scoped_release>(), py::arg("x"), py::arg("weight"),
+      py::arg("out"), py::arg("rows"), py::arg("hidden"), py::arg("eps"),
+      "RMSNorm of an fp32 input to fp16.");
 
   m.def(
       "linear_accumulate",
@@ -273,19 +313,24 @@ void bind_device(py::module_ &parent)
         microinfer::device::linear_accumulate(x.ptr, weight.ptr, out.data(),
                                               rows, in_features, out_features);
       },
-      py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("rows"),
-      py::arg("in_features"), py::arg("out_features"),
+      py::call_guard<py::gil_scoped_release>(), py::arg("x"), py::arg("weight"),
+      py::arg("out"), py::arg("rows"), py::arg("in_features"),
+      py::arg("out_features"),
       "out += x @ weight.T in fp32: a projection added into the residual "
       "stream with no fp16 rounding (ADR-0010).");
 
-  py::class_<DeviceIndex>(m, "DeviceIndex", "int32 on the device.")
+  py::class_<DeviceIndex, IndexHolder>(m, "DeviceIndex", "int32 on the device.")
       .def_property_readonly("count", &DeviceIndex::count);
   m.def(
       "index",
       [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> host)
       {
-        return std::make_unique<DeviceIndex>(host.data(),
-                                             static_cast<size_t>(host.size()));
+        // The copy waits for the kernels queued before it; `host` is held by
+        // the caller throughout, so its data outlives the release.
+        const int32_t *data = host.data();
+        const auto count = static_cast<size_t>(host.size());
+        py::gil_scoped_release release;
+        return IndexHolder(new DeviceIndex(data, count));
       },
       py::arg("host"), "Upload int32 token ids or positions.");
 
@@ -300,8 +345,8 @@ void bind_device(py::module_ &parent)
         microinfer::device::embed(ids.data(), table.ptr, out.ptr, count, hidden,
                                   vocab);
       },
-      py::arg("ids"), py::arg("table"), py::arg("out"), py::arg("hidden"),
-      py::arg("vocab"));
+      py::call_guard<py::gil_scoped_release>(), py::arg("ids"),
+      py::arg("table"), py::arg("out"), py::arg("hidden"), py::arg("vocab"));
 
   m.def(
       "rmsnorm",
@@ -314,8 +359,8 @@ void bind_device(py::module_ &parent)
         microinfer::device::rmsnorm(x.ptr, weight.ptr, out.ptr, rows, hidden,
                                     eps);
       },
-      py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("rows"),
-      py::arg("hidden"), py::arg("eps"));
+      py::call_guard<py::gil_scoped_release>(), py::arg("x"), py::arg("weight"),
+      py::arg("out"), py::arg("rows"), py::arg("hidden"), py::arg("eps"));
 
   m.def(
       "linear",
@@ -333,8 +378,9 @@ void bind_device(py::module_ &parent)
                                    bias ? bias->ptr : nullptr, out.ptr, rows,
                                    in_features, out_features);
       },
-      py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
-      py::arg("rows"), py::arg("in_features"), py::arg("out_features"));
+      py::call_guard<py::gil_scoped_release>(), py::arg("x"), py::arg("weight"),
+      py::arg("bias"), py::arg("out"), py::arg("rows"), py::arg("in_features"),
+      py::arg("out_features"));
 
   m.def(
       "rope",
@@ -352,8 +398,9 @@ void bind_device(py::module_ &parent)
         microinfer::device::rope(x.ptr, positions.data(), out.ptr, seq, heads,
                                  head_dim, theta);
       },
-      py::arg("x"), py::arg("positions"), py::arg("out"), py::arg("seq"),
-      py::arg("heads"), py::arg("head_dim"), py::arg("theta"));
+      py::call_guard<py::gil_scoped_release>(), py::arg("x"),
+      py::arg("positions"), py::arg("out"), py::arg("seq"), py::arg("heads"),
+      py::arg("head_dim"), py::arg("theta"));
 
   m.def(
       "attention",
@@ -380,9 +427,10 @@ void bind_device(py::module_ &parent)
             q.ptr, k.ptr, v.ptr, k_bias ? k_bias->ptr : nullptr, rope, out.ptr,
             seq_q, seq_k, heads, kv_heads, head_dim);
       },
-      py::arg("q"), py::arg("k"), py::arg("v"), py::arg("k_bias"),
-      py::arg("rope"), py::arg("out"), py::arg("seq_q"), py::arg("seq_k"),
-      py::arg("heads"), py::arg("kv_heads"), py::arg("head_dim"),
+      py::call_guard<py::gil_scoped_release>(), py::arg("q"), py::arg("k"),
+      py::arg("v"), py::arg("k_bias"), py::arg("rope"), py::arg("out"),
+      py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"), py::arg("kv_heads"),
+      py::arg("head_dim"),
       "Keys may be stored without their bias, which k_bias then completes "
       "with cos and sin from `rope`, a RopeTable covering seq_k positions "
       "(ADR-0009). rope may be None when k_bias is.");
@@ -393,7 +441,8 @@ void bind_device(py::module_ &parent)
       "formed once in fp64 and read by every layer's attention (ADR-0009, "
       "note from #14).")
       .def(py::init<int, double>(), py::arg("head_dim"), py::arg("theta"))
-      .def("cover", &microinfer::RopeTable::cover, py::arg("positions"),
+      .def("cover", &microinfer::RopeTable::cover,
+           py::call_guard<py::gil_scoped_release>(), py::arg("positions"),
            "Make positions [0, positions) present, growing if needed.")
       .def_property_readonly("positions", &microinfer::RopeTable::positions)
       .def_property_readonly("nbytes", &microinfer::RopeTable::nbytes)
@@ -424,8 +473,8 @@ void bind_device(py::module_ &parent)
         need(out, count, "out");
         microinfer::device::add(a.ptr, b.ptr, out.ptr, count);
       },
-      py::arg("a"), py::arg("b"), py::arg("out"), py::arg("count"),
-      "out = a + b; out may be a or b.");
+      py::call_guard<py::gil_scoped_release>(), py::arg("a"), py::arg("b"),
+      py::arg("out"), py::arg("count"), "out = a + b; out may be a or b.");
 
   m.def(
       "swiglu",
@@ -441,7 +490,8 @@ void bind_device(py::module_ &parent)
         }
         microinfer::device::swiglu(gate.ptr, up.ptr, out.ptr, count);
       },
-      py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("count"));
+      py::call_guard<py::gil_scoped_release>(), py::arg("gate"), py::arg("up"),
+      py::arg("out"), py::arg("count"));
 
   m.def(
       "copy",
@@ -454,7 +504,8 @@ void bind_device(py::module_ &parent)
                                           cudaMemcpyDeviceToDevice),
                                "cudaMemcpy device-to-device");
       },
-      py::arg("source"), py::arg("target"), py::arg("count"),
+      py::call_guard<py::gil_scoped_release>(), py::arg("source"),
+      py::arg("target"), py::arg("count"),
       "Copy count fp16 elements, device to device.");
 
   m.attr("page_tokens") = microinfer::kPageTokens;
@@ -489,7 +540,8 @@ void bind_device(py::module_ &parent)
            "FP16, else quantised_page_layout(...)['page_bytes']. The pages are "
            "stored at `tier`, or at FP16 under a diagnostic `halves`; at a "
            "quantised tier the FP16 pages also hold the open pages.")
-      .def("reserve", &KVPages::reserve, py::arg("tokens"),
+      .def("reserve", &KVPages::reserve,
+           py::call_guard<py::gil_scoped_release>(), py::arg("tokens"),
            "Pages for positions [0, tokens) in every layer, allocating only "
            "those not yet held.")
       .def(
@@ -502,8 +554,8 @@ void bind_device(py::module_ &parent)
             need(values, n * c.kv_width(), "values");
             c.store(layer, keys.ptr, values.ptr, start, n);
           },
-          py::arg("layer"), py::arg("keys"), py::arg("values"),
-          py::arg("start"), py::arg("n"))
+          py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
+          py::arg("keys"), py::arg("values"), py::arg("start"), py::arg("n"))
       .def(
           "attention",
           [](KVPages &c, int layer, const Span &q, std::optional<Span> k_bias,
@@ -537,8 +589,9 @@ void bind_device(py::module_ &parent)
                         keys ? keys->ptr : nullptr,
                         values ? values->ptr : nullptr);
           },
-          py::arg("layer"), py::arg("q"), py::arg("k_bias"), py::arg("rope"),
-          py::arg("out"), py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
+          py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
+          py::arg("q"), py::arg("k_bias"), py::arg("rope"), py::arg("out"),
+          py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
           py::arg("kv_heads"), py::arg("head_dim"),
           py::arg("keys") = py::none(), py::arg("values") = py::none(),
           "At a quantised tier, keys and values are the rows the queries "
