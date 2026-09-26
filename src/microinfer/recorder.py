@@ -70,9 +70,9 @@ from . import nvml
 
 #: One row per device sample: monotonic time, wall-clock time, the driver's
 #: free and used bytes, and how long the query took.
-_DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("free_bytes", np.int64),
-                   ("used_bytes", np.int64), ("query_ns", np.int64)])
-COLUMNS = _DTYPE.names
+DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("free_bytes", np.int64),
+                  ("used_bytes", np.int64), ("query_ns", np.int64)])
+COLUMNS = DTYPE.names
 
 #: The first line of every device trace; read() refuses a file without it.
 FORMAT = "microinfer contention trace, device memory, v1"
@@ -87,11 +87,11 @@ PROCESS_FORMAT = "microinfer contention trace, processes, v1"
 STATE_COLUMNS = ("t_mono_ns", "t_wall", "query_ns", "pstate", "graphics_mhz", "sm_mhz",
                  "memory_mhz")
 PROCESS_COLUMNS = ("t_mono_ns", "t_wall", "pid", "kind", "used_bytes", "name")
-_STATE_DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("query_ns", np.int64),
-                         ("pstate", np.int32), ("graphics_mhz", np.int32), ("sm_mhz", np.int32),
-                         ("memory_mhz", np.int32)])
-_PROCESS_DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("pid", np.int64),
-                           ("kind", object), ("used_bytes", np.int64), ("name", object)])
+STATE_DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("query_ns", np.int64),
+                        ("pstate", np.int32), ("graphics_mhz", np.int32), ("sm_mhz", np.int32),
+                        ("memory_mhz", np.int32)])
+PROCESS_DTYPE = np.dtype([("t_mono_ns", np.int64), ("t_wall", np.float64), ("pid", np.int64),
+                          ("kind", object), ("used_bytes", np.int64), ("name", object)])
 
 #: The labels file: one row per label, as the recorder received it.
 LABEL_FORMAT = "microinfer contention trace, action labels, v1"
@@ -352,7 +352,7 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
                                        else None)]))
     if (st := failed()) is not None:
         raise RuntimeError(f"the {st.what} failed") from st.error
-    samples = np.array(rows, dtype=_DTYPE)
+    samples = np.array(rows, dtype=DTYPE)
     summary = {**summarise(samples), "missed": missed, "rate_hz": rate_hz}
     for st in streams:
         summary[st.key] = st.summary
@@ -609,7 +609,7 @@ def read(path: str | Path) -> tuple[dict, np.ndarray]:
     recording cut short reads as, and what raises)."""
     meta, rows = _read_trace(path, FORMAT)
     return meta, np.array([(int(a), float(b), int(c), int(d), int(e)) for a, b, c, d, e in rows],
-                          dtype=_DTYPE)
+                          dtype=DTYPE)
 
 
 def read_processes(path: str | Path) -> tuple[dict, np.ndarray, np.ndarray]:
@@ -621,9 +621,9 @@ def read_processes(path: str | Path) -> tuple[dict, np.ndarray, np.ndarray]:
               for r in rows if r[0] == STATE_ROW]
     procs = [(int(r[1]), float(r[2]), int(r[3]), r[4], int(r[5]), r[6])
              for r in rows if r[0] == PROCESS_ROW]
-    return (meta, np.array(states, dtype=_STATE_DTYPE),
-            np.array(procs, dtype=_PROCESS_DTYPE) if procs
-            else np.zeros(0, dtype=_PROCESS_DTYPE))
+    return (meta, np.array(states, dtype=STATE_DTYPE),
+            np.array(procs, dtype=PROCESS_DTYPE) if procs
+            else np.zeros(0, dtype=PROCESS_DTYPE))
 
 
 def read_labels(path: str | Path) -> tuple[dict, np.ndarray]:
