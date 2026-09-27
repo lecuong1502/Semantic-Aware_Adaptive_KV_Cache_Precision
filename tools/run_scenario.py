@@ -2,8 +2,11 @@
 """Run RQ1's scripted scenario while the recorder records it (#53).
 
     .venv/bin/python tools/run_scenario.py --out trace.csv.gz
-        [--browser chrome|firefox] [--actions 1,2,3,4,6,7,8,9] [--with-engine]
-        [--hold 60] [--gap 10] [--idle 120]
+        [--browser chrome|firefox] [--actions 1,2,3,4,5,6,7,8,9] [--with-engine]
+        [--hold 60] [--gap 10] [--idle 120] [--call-url URL]
+
+The collection protocol, what to prepare and how many runs of which kind,
+is docs/rq1-protocol.md.
 
 It starts the recorder (tools/record_contention.py) on --out, labels each
 span's start and end through the recorder's FIFO, and runs the actions of
@@ -11,7 +14,9 @@ microinfer.scenario on a fixed schedule: by default the whole scenario in
 Chrome, or with --browser firefox the Firefox pass over actions 2 to 4 that
 #45 compares browsers with. With --with-engine it first starts the engine
 holding Qwen2.5-1.5B at its 32K window (tools/hold_engine.py), labels its
-prefill, and begins the actions once it decodes; the hold's status file
+prefill, and begins the actions once it decodes. At action 5, the video
+call, it opens the call's page and waits at the terminal for the owner to
+start the call and press Enter; the hold's status file
 lands beside the trace. If the engine exits during the scenario, out of
 memory as #52 records it, the moment is labelled "engine-exited" and the
 scenario goes on without it.
@@ -110,8 +115,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--out", type=Path, required=True, help="the trace to record")
     parser.add_argument("--browser", choices=sorted(scenario.DEFAULT_ACTIONS), default="chrome")
     parser.add_argument("--actions", help="the actions of #45 to run, by number, in order; "
-                                          "by default all but 5 in Chrome, 2 to 4 and 9 in "
-                                          "Firefox")
+                                          "by default all of them in Chrome, 2 to 4 and 9 "
+                                          "in Firefox")
     parser.add_argument("--with-engine", action="store_true",
                         help="hold the engine at its 32K window through the scenario")
     parser.add_argument("--model", default="qwen2.5-1.5b-instruct")
@@ -121,12 +126,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--video", type=Path, help="the 4K file VLC plays; Big Buck Bunny, "
                                                    "fetched once, by default")
     parser.add_argument("--youtube-video", default=scenario.YOUTUBE_VIDEO)
+    parser.add_argument("--call-url", default=scenario.CALL_URL,
+                        help="the page the video call is started in")
     args = parser.parse_args(argv)
 
     actions = (tuple(int(a) for a in args.actions.split(",")) if args.actions
                else scenario.DEFAULT_ACTIONS[args.browser])
     timing = scenario.Timing(hold_s=args.hold, gap_s=args.gap, idle_s=args.idle)
-    desktop = scenario.Desktop(args.browser, args.video, args.youtube_video)
+    desktop = scenario.Desktop(args.browser, args.video, args.youtube_video, args.call_url)
     spans = scenario.spans_for(actions, desktop, timing)  # refuses an unknown action first
     if 7 in actions and args.video is None:
         desktop.video = fetch_video()

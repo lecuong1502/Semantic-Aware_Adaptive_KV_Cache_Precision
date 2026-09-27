@@ -1,13 +1,13 @@
 """RQ1's scripted scenario: the desktop actions, on a fixed schedule, each
 marked in the recording with a start and an end label (#53).
 
-The Milestone 1 spec (#45) names nine actions; this runs the eight that need
-no person, the video call (5) being #54's:
+The Milestone 1 spec (#45) names nine actions:
 
 1. the idle desktop;
 2. a browser with 1, then 5, then 10 ordinary tabs, recorded as three spans;
 3. YouTube at 1080p;
 4. YouTube at 4K;
+5. a browser video call with camera and screen share, which needs a person;
 6. a heavy WebGL page, standing in for a game;
 7. VLC playing a local 4K video;
 8. VS Code, opened, held, and closed again;
@@ -24,6 +24,14 @@ video is embedded in a page served here, and the driver asks the player
 inside the frame for the resolution, then records the one it got and the
 height of the video it decodes (browser.py).
 
+**The video call waits for a person** (#54). Signing in and granting the
+camera and the screen are the owner's, so the driver opens the call's page
+and asks, and the wait is a span of its own, "<browser>-video-call-setup",
+from the prompt to the owner's answer: what signing in and starting a
+camera cost is still labelled. The call's own span begins at the answer,
+and the schedule after it is counted from there. With no one to answer,
+the call is skipped and the run goes on.
+
 **Everything it opens is closed**, when action 9 comes or however the run
 ends: `run` closes the desktop in its `finally`, and every application is
 started so that closing it ends every process it started (browser.App).
@@ -37,8 +45,10 @@ usable, and on the schedule of every other repeat.
 from __future__ import annotations
 
 import http.server
+import select
 import shutil
 import socketserver
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -50,12 +60,16 @@ from .recorder import END, START, companion
 
 #: The actions of #45 this driver runs, by number, with the label of each.
 #: A browser action's label names the browser too.
-ACTIONS = {1: "idle", 2: "tabs", 3: "youtube-1080p", 4: "youtube-2160p", 6: "webgl",
-           7: "vlc-2160p", 8: "vscode", 9: "close-all"}
-BROWSER_ACTIONS = (2, 3, 4, 6)
+ACTIONS = {1: "idle", 2: "tabs", 3: "youtube-1080p", 4: "youtube-2160p", 5: "video-call",
+           6: "webgl", 7: "vlc-2160p", 8: "vscode", 9: "close-all"}
+BROWSER_ACTIONS = (2, 3, 4, 5, 6)
 #: What a run covers by default: the whole scenario in Chrome, and #45's
 #: Firefox pass over actions 2 to 4, closing everything after them.
-DEFAULT_ACTIONS = {"chrome": (1, 2, 3, 4, 6, 7, 8, 9), "firefox": (2, 3, 4, 9)}
+DEFAULT_ACTIONS = {"chrome": (1, 2, 3, 4, 5, 6, 7, 8, 9), "firefox": (2, 3, 4, 9)}
+#: A call anyone signed in can start, with no link to share first.
+CALL_URL = "https://meet.google.com/new"
+CALL_PROMPT = ("Action 5, the video call. In the browser window just opened: sign in if "
+               "asked, start the call with the camera on, and share the entire screen.")
 
 #: Ordinary pages, opened as tabs: text, images and scripts, nothing that plays.
 TABS = ("https://en.wikipedia.org/wiki/Graphics_processing_unit",
@@ -101,7 +115,37 @@ class Span:
     end: Callable[[], dict | None] = lambda: None
 
 
-def run(spans: list[Span], desktop, send_label: Callable[[str, str], None],
+@dataclass
+class HumanStep:
+    """A wait for a person, before the span it prepares, labelled as a span
+    of its own: `prepare` runs at its start label, then `ask(stop)` waits
+    for the person, returning {"confirmed": ...} with details, or None if
+    the run was stopped meanwhile. If no one confirms, the span after it is
+    skipped."""
+
+    label: str
+    prepare: Callable[[], dict | None]
+    ask: Callable[[threading.Event], dict | None]
+
+
+def ask_at_terminal(message: str, stop: threading.Event, stream=None, out=None,
+                    poll_s: float = 0.2) -> dict | None:
+    """Print `message` and wait for Enter on `stream` (stdin), checking
+    `stop` as it waits. Returns {"confirmed": True} with the wait in seconds;
+    {"confirmed": False} at the end of the input, no one being there; None if
+    stopped first."""
+    stream, out = stream or sys.stdin, out or sys.stdout
+    started = time.monotonic()
+    print(f"\n>>> {message}\n>>> Press Enter when it is done.", file=out, flush=True)
+    while not stop.is_set():
+        ready, _, _ = select.select([stream], [], [], poll_s)
+        if ready:
+            answered = stream.readline() != ""
+            return {"confirmed": answered, "waited_s": round(time.monotonic() - started, 3)}
+    return None
+
+
+def run(spans: list[Span | HumanStep], desktop, send_label: Callable[[str, str], None],
         stop: threading.Event, gap_s: float) -> list[dict]:
     """Run `spans` on a fixed schedule until they are done or `stop` is set,
     then close the desktop, however the run ended.
@@ -110,7 +154,9 @@ def run(spans: list[Span], desktop, send_label: Callable[[str, str], None],
     the first start: an action slow to open does not move the ones after
     it. `end` runs END_LEAD_S before the span's end, so its work falls
     inside the span. A span whose opening or closing overran its time is
-    marked so, and one that starts late says by how much.
+    marked so, and one that starts late says by how much. A HumanStep
+    waits as long as the person takes, and the schedule after it is counted
+    from the answer.
 
     Returns the log: one entry per span begun, with its times on the
     monotonic clock, its details and any error, which is recorded and the
@@ -137,15 +183,29 @@ def run(spans: list[Span], desktop, send_label: Callable[[str, str], None],
         return stop.wait(max(t - time.monotonic(), 0.0))
 
     try:
-        t0 = time.monotonic()
-        planned = t0
+        planned = time.monotonic()
+        skip_next = False
         for span in spans:
             if until(planned):
                 break
             entry: dict = {"label": span.label, "start_ns": time.monotonic_ns(),
                            "late_s": round(time.monotonic() - planned, 3)}
             log.append(entry)
+            if skip_next:
+                entry["skipped"], skip_next = "no one confirmed the step before it", False
+                entry["end_ns"] = entry["start_ns"]
+                continue  # the next span takes its place in the schedule
             label(entry, START)
+            if isinstance(span, HumanStep):
+                attempt(entry, "prepare", span.prepare)
+                answer = span.ask(stop)
+                entry["answer"] = answer
+                entry["cut_short"] = answer is None
+                label(entry, END)
+                entry["end_ns"] = time.monotonic_ns()
+                skip_next = answer is not None and not answer.get("confirmed")
+                planned = time.monotonic()  # the rest is counted from the answer
+                continue
             end_at = planned + span.hold_s
             if not stop.is_set():
                 attempt(entry, "begin", span.begin)
@@ -163,12 +223,15 @@ def run(spans: list[Span], desktop, send_label: Callable[[str, str], None],
     return log
 
 
-def spans_for(actions: tuple[int, ...], desktop, timing: Timing) -> list[Span]:
-    """The spans of the numbered actions, in the order given."""
+def spans_for(actions: tuple[int, ...], desktop, timing: Timing,
+              ask: Callable[[threading.Event], dict | None] | None = None
+              ) -> list[Span | HumanStep]:
+    """The spans of the numbered actions, in the order given. `ask` waits
+    for the person at the video call; by default, at the terminal."""
+    ask = ask or (lambda stop: ask_at_terminal(CALL_PROMPT, stop))
     unknown = set(actions) - set(ACTIONS)
     if unknown:
-        raise ValueError(f"no action {sorted(unknown)}: the actions are {sorted(ACTIONS)}, "
-                         f"5, the video call, being #54's")
+        raise ValueError(f"no action {sorted(unknown)}: the actions are {sorted(ACTIONS)}")
     browser = desktop.browser_name
 
     def labelled(n: int) -> str:
@@ -184,6 +247,8 @@ def spans_for(actions: tuple[int, ...], desktop, timing: Timing) -> list[Span]:
                                       begin=lambda: desktop.youtube(q),
                                       end=lambda: desktop.youtube_playing(q))])
            for n, q in quality.items()},
+        5: lambda: [HumanStep(f"{labelled(5)}-setup", desktop.video_call, ask),
+                    Span(labelled(5), timing.hold_s)],
         6: lambda: [Span(labelled(6), timing.hold_s, begin=desktop.webgl)],
         7: lambda: [Span(labelled(7), timing.hold_s, begin=desktop.vlc)],
         8: lambda: [Span(labelled(8), timing.hold_s, begin=desktop.vscode,
@@ -277,10 +342,11 @@ class Desktop:
     plays."""
 
     def __init__(self, browser_name: str = "chrome", video: str | Path | None = None,
-                 youtube_video: str = YOUTUBE_VIDEO):
+                 youtube_video: str = YOUTUBE_VIDEO, call_url: str = CALL_URL):
         if browser_name not in browsers.BROWSERS:
             raise ValueError(f"the browsers are {sorted(browsers.BROWSERS)}")
         self.browser_name, self.video, self.youtube_video = browser_name, video, youtube_video
+        self.call_url = call_url
         self._browser = None
         self._tabs = 0
         self._players: dict[str, str] = {}  # quality -> the frame playing it
@@ -325,6 +391,13 @@ class Desktop:
     def youtube_playing(self, quality: str) -> dict:
         """What the player opened for `quality` plays now."""
         return self._open_browser().evaluate(self._players[quality], _PLAYING)
+
+    def video_call(self) -> dict:
+        """The call's page, in a window of its own, for the person to start
+        the call in. It stays open, the call with it, until action 9."""
+        b = self._open_browser()
+        b.open(self.call_url)
+        return {"browser": b.version, "url": self.call_url}
 
     def webgl(self) -> dict:
         b = self._open_browser()

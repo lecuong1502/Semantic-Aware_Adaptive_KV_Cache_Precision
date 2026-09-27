@@ -9,6 +9,7 @@ open nothing.
 
 import contextlib
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -54,7 +55,8 @@ def test_the_schedule_labels_every_span_on_time_and_closes_everything_however_it
     that cannot be sent stops it, the log kept."""
     desktop = FakeDesktop()
     timing = scenario.Timing(hold_s=0.05, gap_s=0.02, idle_s=0.1)
-    spans = scenario.spans_for(scenario.DEFAULT_ACTIONS["chrome"], desktop, timing)
+    no_call = tuple(n for n in scenario.DEFAULT_ACTIONS["chrome"] if n != 5)
+    spans = scenario.spans_for(no_call, desktop, timing)
     labels = []
     log = scenario.run(spans, desktop, lambda e, a: labels.append((e, a)), threading.Event(),
                        gap_s=timing.gap_s)
@@ -80,8 +82,8 @@ def test_the_schedule_labels_every_span_on_time_and_closes_everything_however_it
                                                 scenario.Timing())] == [
         "firefox-tabs-1", "firefox-tabs-5", "firefox-tabs-10", "firefox-youtube-1080p",
         "firefox-youtube-2160p", "close-all"]
-    with pytest.raises(ValueError, match="#54"):
-        scenario.spans_for((5,), desktop, scenario.Timing())
+    with pytest.raises(ValueError, match="the actions are"):
+        scenario.spans_for((10,), desktop, scenario.Timing())
 
     # Opening 1 tab takes three times its span: it overruns, and so does the
     # next span, which can only start after its own end; the one after is
@@ -114,6 +116,58 @@ def test_the_schedule_labels_every_span_on_time_and_closes_everything_however_it
                        desktop, gone, threading.Event(), gap_s=0.01)
     assert [entry["label"] for entry in log] == ["idle", "chrome-webgl"]
     assert "no recorder" in log[1]["label_error"] and desktop.calls[-1] == ("close_all",)
+
+
+def test_the_video_call_waits_for_a_person_and_labels_the_wait():
+    """Action 5 opens the call's page and asks; the wait is a span of its
+    own, and the call's span begins at the answer, the schedule after it
+    counted from there. No one answering skips the call; a stop while
+    waiting ends the run. At the terminal, Enter answers and the end of
+    the input means no one is there."""
+    def answering(after, confirmed=True):
+        def ask(stop):
+            time.sleep(after)
+            return {"confirmed": confirmed}
+        return ask
+
+    timing = scenario.Timing(hold_s=0.1, gap_s=0.02, idle_s=0.05)
+    desktop, labels = FakeDesktop(), []
+    spans = scenario.spans_for((1, 5, 6), desktop, timing, ask=answering(0.3))
+    log = scenario.run(spans, desktop, lambda e, a: labels.append((e, a)), threading.Event(),
+                       gap_s=timing.gap_s)
+    names = ["idle", "chrome-video-call-setup", "chrome-video-call", "chrome-webgl"]
+    assert labels == [(e, n) for n in names for e in (recorder.START, recorder.END)]
+    assert log[1]["answer"] == {"confirmed": True} and desktop.calls[0] == ("video_call",)
+    waited = (log[1]["end_ns"] - log[1]["start_ns"]) / 1e9
+    assert waited >= 0.3 and (log[2]["start_ns"] - log[1]["end_ns"]) / 1e9 < 0.02
+    assert abs((log[3]["start_ns"] - log[2]["start_ns"]) / 1e9 - 0.12) < 0.03
+
+    desktop, labels = FakeDesktop(), []
+    log = scenario.run(scenario.spans_for((5, 6), desktop, timing, ask=answering(0, False)),
+                       desktop, lambda e, a: labels.append((e, a)), threading.Event(), gap_s=0.02)
+    assert [a for _, a in labels] == ["chrome-video-call-setup"] * 2 + ["chrome-webgl"] * 2
+    assert "skipped" in log[1] and log[1]["label"] == "chrome-video-call"
+
+    stop = threading.Event()
+    threading.Timer(0.1, stop.set).start()
+    desktop, labels = FakeDesktop(), []
+    log = scenario.run(scenario.spans_for((5, 6), desktop, timing,
+                                          ask=lambda s: None if s.wait(5) else {}),
+                       desktop, lambda e, a: labels.append((e, a)), stop, gap_s=0.02)
+    assert [a for _, a in labels] == ["chrome-video-call-setup"] * 2
+    assert log[0]["cut_short"] and desktop.calls[-1] == ("close_all",)
+
+    read, write = os.pipe()
+    with os.fdopen(read) as stream, open(os.devnull, "w") as out:
+        threading.Timer(0.2, lambda: os.write(write, b"\n")).start()
+        assert scenario.ask_at_terminal("start the call", threading.Event(), stream, out)[
+            "confirmed"]
+        os.close(write)
+        assert scenario.ask_at_terminal("start the call", threading.Event(), stream, out) == {
+            "confirmed": False, "waited_s": pytest.approx(0, abs=0.3)}
+        stop = threading.Event()
+        stop.set()
+        assert scenario.ask_at_terminal("start the call", stop, stream, out) is None
 
 
 @pytest.mark.parametrize("name", sorted(BROWSERS))
