@@ -151,13 +151,25 @@ def device_meta() -> dict[str, object]:
             "total_bytes": nvml.memory().total}
 
 
+def _stem(path: Path) -> tuple[str, str]:
+    """A trace's name without its suffix, and the suffix."""
+    for suffix in (".csv.gz", ".gz", ".csv"):
+        if path.name.endswith(suffix):
+            return path.name[: -len(suffix)], suffix
+    return path.name, ""
+
+
 def _beside(path: str | Path, tag: str) -> Path:
     path = Path(path)
-    name = path.name
-    for suffix in (".csv.gz", ".gz", ".csv"):
-        if name.endswith(suffix):
-            return path.with_name(name[: -len(suffix)] + f".{tag}" + suffix)
-    return path.with_name(f"{name}.{tag}")
+    stem, suffix = _stem(path)
+    return path.with_name(f"{stem}.{tag}{suffix}")
+
+
+def companion(path: str | Path, ending: str) -> Path:
+    """A file that goes with the recording at `path`, of another kind:
+    trace.csv.gz and ".scenario.json" give trace.scenario.json."""
+    path = Path(path)
+    return path.with_name(_stem(path)[0] + ending)
 
 
 def processes_path(path: str | Path) -> Path:

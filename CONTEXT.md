@@ -181,6 +181,12 @@ recorded; RQ1's traces are scenarios and passive sessions, the latter with no
 script at all.
 _Avoid_: benchmark (that measures the engine), workload
 
+**Span**:
+One labelled stretch of a scenario, between a start and an end label, at a
+fixed place in its schedule: an action, or one of the stages an action is
+recorded in, as tabs are at 1, 5 and 10.
+_Avoid_: step, segment
+
 **Action**:
 One thing a user does on the desktop during a scenario, such as opening a
 browser or starting a game, marked in the trace by an **action label** at its
