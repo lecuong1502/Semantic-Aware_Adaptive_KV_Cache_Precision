@@ -101,7 +101,7 @@ namespace microinfer
     {
       return;
     }
-    cuda_check(cudaMalloc(&ptr_, count * sizeof(int32_t)), "cudaMalloc");
+    cuda_malloc(&ptr_, count * sizeof(int32_t), "token ids or positions");
     // As in DeviceTensor: a throw after the allocation would otherwise leak it.
     try
     {
@@ -130,7 +130,7 @@ namespace microinfer
   {
     if (count > 0)
     {
-      cuda_check(cudaMalloc(&ptr_, count * sizeof(float)), "cudaMalloc");
+      cuda_malloc(&ptr_, count * sizeof(float), "fp32 activations");
     }
   }
 

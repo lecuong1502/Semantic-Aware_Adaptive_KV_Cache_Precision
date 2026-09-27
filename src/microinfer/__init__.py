@@ -23,6 +23,10 @@ except Exception as exc:  # pragma: no cover - environment failure, not logic
         "GPU. Check `nvidia-smi`."
     ) from exc
 
+#: The device had no memory for an allocation: contention's outcome, raised
+#: as a MemoryError naming the allocation that failed (#52).
+OutOfMemory = _microinfer.OutOfMemory
+
 from .config import ConfigMismatch, ModelConfig  # noqa: E402
 from .engine import (Engine, expected_weight_bytes, expected_weight_shapes,  # noqa: E402
                      kv_cache_bytes, paged_cache_bytes, paged_cache_ranges, weight_layout)
@@ -34,6 +38,7 @@ __all__ = [
     "Engine",
     "Footprint",
     "ModelConfig",
+    "OutOfMemory",
     "_microinfer",
     "expected_weight_bytes",
     "expected_weight_shapes",

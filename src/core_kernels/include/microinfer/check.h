@@ -10,8 +10,24 @@
 namespace microinfer
 {
 
+  // The device had no memory for an allocation (#52). Contention is what
+  // this project measures, and running out is its outcome, not a fault: it
+  // has a type of its own, so that a caller can record it and go on, and
+  // every other failure still reads as one. The message names the
+  // allocation that failed.
+  class OutOfMemory : public std::runtime_error
+  {
+  public:
+    using std::runtime_error::runtime_error;
+  };
+
   inline void cuda_check(cudaError_t status, const char *what)
   {
+    if (status == cudaErrorMemoryAllocation)
+    {
+      throw OutOfMemory(std::string(what) +
+                        " failed: " + cudaGetErrorString(status));
+    }
     if (status != cudaSuccess)
     {
       throw std::runtime_error(std::string(what) +
@@ -29,9 +45,14 @@ namespace microinfer
       cuGetErrorName(status, &name);
       const char *desc = nullptr;
       cuGetErrorString(status, &desc);
-      throw std::runtime_error(std::string(what) +
-                               " failed: " + (name ? name : "unknown") + " (" +
-                               (desc ? desc : "no description") + ")");
+      const std::string message = std::string(what) +
+                                  " failed: " + (name ? name : "unknown") +
+                                  " (" + (desc ? desc : "no description") + ")";
+      if (status == CUDA_ERROR_OUT_OF_MEMORY)
+      {
+        throw OutOfMemory(message);
+      }
+      throw std::runtime_error(message);
     }
   }
 
@@ -39,10 +60,31 @@ namespace microinfer
   // as driver_check: reported under its own name, never cast into another.
   inline void cublas_check(cublasStatus_t status, const char *what)
   {
+    if (status == CUBLAS_STATUS_ALLOC_FAILED)
+    {
+      throw OutOfMemory(std::string(what) +
+                        " failed: " + cublasGetStatusString(status));
+    }
     if (status != CUBLAS_STATUS_SUCCESS)
     {
       throw std::runtime_error(std::string(what) +
                                " failed: " + cublasGetStatusString(status));
+    }
+  }
+
+  // cudaMalloc, naming what the memory was for if the device has none. The
+  // name is built only on failure: the call sits on paths that allocate every
+  // step.
+  template <typename T>
+  void cuda_malloc(T **ptr, std::size_t bytes, const char *purpose)
+  {
+    const cudaError_t status =
+        cudaMalloc(reinterpret_cast<void **>(ptr), bytes);
+    if (status != cudaSuccess)
+    {
+      cuda_check(status, ("cudaMalloc of " + std::to_string(bytes) +
+                          " bytes for " + purpose)
+                             .c_str());
     }
   }
 

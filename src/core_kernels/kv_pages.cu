@@ -61,25 +61,6 @@ namespace microinfer
            sizeof(__half);
   }
 
-  namespace
-  {
-    const char *tier_name(Tier tier)
-    {
-      switch (tier)
-      {
-      case Tier::FP16:
-        return "FP16";
-      case Tier::INT8:
-        return "INT8";
-      case Tier::INT4:
-        return "INT4";
-      case Tier::INT2:
-        return "INT2";
-      }
-      return "an unknown tier";
-    }
-  } // namespace
-
   KVPages::KVPages(PagedKVCache &allocator, int layers, int page_tokens,
                    int kv_heads, int head_dim, Tier tier, Halves halves)
       : allocator_(allocator), layers_(layers), page_tokens_(page_tokens),
