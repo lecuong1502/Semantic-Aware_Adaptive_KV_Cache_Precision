@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "microinfer/check.h"
 #include "microinfer/kernels.h"
 #include "microinfer/kv_pages.h"
 #include "microinfer/paged_kv_cache.h"
@@ -549,6 +550,8 @@ PYBIND11_MODULE(_microinfer, m)
   py::register_exception<microinfer::PageNotFound>(m, "PageNotFound",
                                                    PyExc_KeyError);
   py::register_exception<microinfer::OpenPage>(m, "OpenPage", PyExc_ValueError);
+  py::register_exception<microinfer::OutOfMemory>(m, "OutOfMemory",
+                                                  PyExc_MemoryError);
 
   m.def("quantised_page_layout", &page_layout, py::arg("tier"),
         py::arg("kv_heads"), py::arg("head_dim"),

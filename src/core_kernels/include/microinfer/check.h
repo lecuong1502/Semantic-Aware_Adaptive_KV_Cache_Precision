@@ -10,8 +10,25 @@
 namespace microinfer
 {
 
+  // The device had no memory for an allocation (#52). Contention is what
+  // this project studies, and running out is its outcome, not a fault: it
+  // has a type of its own, so that a caller can record it and go on, and
+  // every other failure still reads as one. The message names the
+  // allocation that failed.
+  class OutOfMemory : public std::runtime_error
+  {
+  public:
+    using std::runtime_error::runtime_error;
+  };
+
   inline void cuda_check(cudaError_t status, const char *what)
   {
+    if (status == cudaErrorMemoryAllocation)
+    {
+      cudaGetLastError(); // clear it: running out leaves the context usable
+      throw OutOfMemory(std::string(what) +
+                        " failed: " + cudaGetErrorString(status));
+    }
     if (status != cudaSuccess)
     {
       throw std::runtime_error(std::string(what) +
@@ -29,9 +46,14 @@ namespace microinfer
       cuGetErrorName(status, &name);
       const char *desc = nullptr;
       cuGetErrorString(status, &desc);
-      throw std::runtime_error(std::string(what) +
-                               " failed: " + (name ? name : "unknown") + " (" +
-                               (desc ? desc : "no description") + ")");
+      const std::string message = std::string(what) +
+                                  " failed: " + (name ? name : "unknown") +
+                                  " (" + (desc ? desc : "no description") + ")";
+      if (status == CUDA_ERROR_OUT_OF_MEMORY)
+      {
+        throw OutOfMemory(message);
+      }
+      throw std::runtime_error(message);
     }
   }
 
@@ -39,6 +61,11 @@ namespace microinfer
   // as driver_check: reported under its own name, never cast into another.
   inline void cublas_check(cublasStatus_t status, const char *what)
   {
+    if (status == CUBLAS_STATUS_ALLOC_FAILED)
+    {
+      throw OutOfMemory(std::string(what) +
+                        " failed: " + cublasGetStatusString(status));
+    }
     if (status != CUBLAS_STATUS_SUCCESS)
     {
       throw std::runtime_error(std::string(what) +

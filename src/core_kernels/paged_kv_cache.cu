@@ -157,10 +157,19 @@ namespace microinfer
     {
       fit_granules(r);
     }
-    catch (...)
+    catch (const OutOfMemory &e)
     {
       r.slots.pop_back();
       fit_granules(r); // Give back any granule mapped before the failure.
+      throw OutOfMemory("allocating " + describe(key) + " at " +
+                        tier_name(tier) + " needed a " +
+                        std::to_string(granule_) +
+                        "-byte granule: " + e.what());
+    }
+    catch (...)
+    {
+      r.slots.pop_back();
+      fit_granules(r);
       throw;
     }
     table_[key] = PageLocation{tier, r.slots.size() - 1};

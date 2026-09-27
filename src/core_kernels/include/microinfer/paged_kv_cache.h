@@ -24,6 +24,23 @@ namespace microinfer
 
   constexpr int kTierCount = 4;
 
+  // The tier's name, as the project writes it, for messages.
+  inline const char *tier_name(Tier tier)
+  {
+    switch (tier)
+    {
+    case Tier::FP16:
+      return "FP16";
+    case Tier::INT8:
+      return "INT8";
+    case Tier::INT4:
+      return "INT4";
+    case Tier::INT2:
+      return "INT2";
+    }
+    return "an unknown tier";
+  }
+
   // A logical page: the keys and values for one span of token positions in one
   // layer. The page table is keyed by this pair and nothing else (CONTEXT.md).
   struct PageKey

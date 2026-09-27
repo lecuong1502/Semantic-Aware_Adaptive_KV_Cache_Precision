@@ -1,5 +1,6 @@
 """Engine hold mode: a generation kept in progress for as long as a scenario
-runs (#51).
+runs (#51), and what it records when contention takes the memory it needs
+(#52).
 
 RQ1's with-engine runs need the engine holding a full context, decoding the
 whole time. The window ends, the hold must not: holding prefills the
@@ -157,4 +158,69 @@ def test_the_tool_reports_its_state_every_second_and_gives_everything_back(tmp_p
         if proc.returncode != 0:
             print(err, file=sys.stderr)
     assert read_status(status)["state"] == "stopped"
+    assert proc.pid not in {p.pid for p in nvml.processes()}
+
+
+#: Another process that takes every granule the device has, and goes on
+#: taking any another process gives back, as contention does, so that the
+#: desktop freeing a little cannot keep the hold going.
+HOG = """
+import time
+from microinfer import _microinfer as m
+g = m.granule_bytes()
+cache = m.PagedKVCache([g] * 4, [8192, 0, 0, 0])
+n, full = 0, False
+end = time.monotonic() + 300
+while time.monotonic() < end:
+    try:
+        cache.allocate(0, n, m.Tier.FP16)
+        n += 1
+    except m.OutOfMemory:
+        if not full:
+            full = True
+            print(n, flush=True)
+        time.sleep(0.01)
+"""
+
+
+def test_out_of_memory_is_recorded_and_the_tool_exits_with_nothing_held(tmp_path):
+    """Another process takes every granule the device has left while the
+    hold is still growing its cache: the next allocation fails. The status
+    file records when, at what position, the headroom then and the
+    allocation that failed; the tool exits, with its own code, and holds
+    nothing on the device."""
+    require_model(MODEL)
+    status = tmp_path / "hold.json"
+    proc = subprocess.Popen([sys.executable, str(TOOL), "--model", MODEL, "--context", "16384",
+                             "--decode-positions", "15872", "--status", str(status)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    hog = None
+    try:
+        end = time.monotonic() + 120
+        while time.monotonic() < end:
+            s = read_status(status)
+            if s is not None and s["state"] == "decoding":
+                break
+            time.sleep(0.1)
+        assert s is not None and s["state"] == "decoding", (s, proc.poll())
+        hog = subprocess.Popen([sys.executable, "-c", HOG], stdout=subprocess.PIPE, text=True)
+        assert int(hog.stdout.readline()) > 0  # the device is full
+        full = time.monotonic_ns()
+        assert proc.wait(timeout=120) == 3
+    finally:
+        for p in (proc, hog):
+            if p is not None and p.poll() is None:
+                p.kill()
+        _, err = proc.communicate(timeout=10)
+        if proc.returncode not in (3, -signal.SIGKILL):
+            print(err, file=sys.stderr)
+
+    s = read_status(status)
+    assert s["state"] == "out_of_memory"
+    failure = s["failure"]
+    assert failure["phase"] == "decoding" and failure["position"] > 512
+    assert full - 10**9 < failure["t_mono_ns"] < time.monotonic_ns()
+    assert 0 <= failure["headroom_bytes"] < 64 * 2**20
+    assert "out of memory" in failure["allocation"].lower() or \
+        "OUT_OF_MEMORY" in failure["allocation"]
     assert proc.pid not in {p.pid for p in nvml.processes()}
