@@ -30,7 +30,8 @@ and asks, and the wait is a span of its own, "<browser>-video-call-setup",
 from the prompt to the owner's answer: what signing in and starting a
 camera cost is still labelled. The call's own span begins at the answer,
 and the schedule after it is counted from there. With no one to answer,
-the call is skipped and the run goes on.
+in ten minutes or at the end of the input, the call is skipped and the run
+goes on.
 
 **Everything it opens is closed**, when action 9 comes or however the run
 ends: `run` closes the desktop in its `finally`, and every application is
@@ -49,6 +50,7 @@ import select
 import shutil
 import socketserver
 import sys
+import termios
 import threading
 import time
 from dataclasses import dataclass
@@ -94,12 +96,16 @@ END_LEAD_S = 5.0
 
 @dataclass(frozen=True)
 class Timing:
-    """How long each span is held, the gap between spans, and how long the
-    idle desktop is recorded (#45: 60 s, with gaps, and 2 minutes)."""
+    """How long each span is held, the gap between spans, how long the idle
+    desktop is recorded (#45: 60 s, with gaps, and 2 minutes), and how long
+    a person is waited for."""
 
     hold_s: float = 60.0
     gap_s: float = 10.0
     idle_s: float = 120.0
+    #: How long the video call waits for the owner before it is skipped, so
+    #: that a run no one attends still ends.
+    call_timeout_s: float = 600.0
 
 
 @dataclass
@@ -116,36 +122,54 @@ class Span:
 
 
 @dataclass
-class HumanStep:
-    """A wait for a person, before the span it prepares, labelled as a span
-    of its own: `prepare` runs at its start label, then `ask(stop)` waits
-    for the person, returning {"confirmed": ...} with details, or None if
-    the run was stopped meanwhile. If no one confirms, the span after it is
-    skipped."""
+class WaitSpan:
+    """A span that waits for a person, before the span it prepares: it has
+    no fixed length, and the schedule after it is counted from its end.
+    `prepare` runs at its start label; if that works, `ask(stop)` waits for
+    the person, returning {"confirmed": ...} with details, or None if the
+    run was stopped meanwhile. Unless someone confirms, the span after it is
+    skipped: there is nothing to hold."""
 
     label: str
     prepare: Callable[[], dict | None]
     ask: Callable[[threading.Event], dict | None]
 
 
-def ask_at_terminal(message: str, stop: threading.Event, stream=None, out=None,
-                    poll_s: float = 0.2) -> dict | None:
+#: How often a wait for a person checks whether the run was stopped.
+_POLL_S = 0.2
+
+
+def ask_at_terminal(message: str, stop: threading.Event, timeout_s: float,
+                    stream=None, out=None) -> dict | None:
     """Print `message` and wait for Enter on `stream` (stdin), checking
-    `stop` as it waits. Returns {"confirmed": True} with the wait in seconds;
-    {"confirmed": False} at the end of the input, no one being there; None if
-    stopped first."""
+    `stop` as it waits. A terminal's input typed before the prompt, an Enter
+    pressed during the prefill, is discarded first, so only an answer to
+    this prompt counts. Returns {"confirmed": True} with the wait in seconds;
+    {"confirmed": False, "reason": ...} at the end of the input, no one being
+    there, or after `timeout_s`, no one answering; None if stopped first."""
     stream, out = stream or sys.stdin, out or sys.stdout
+    if stream.isatty():
+        termios.tcflush(stream, termios.TCIFLUSH)
     started = time.monotonic()
-    print(f"\n>>> {message}\n>>> Press Enter when it is done.", file=out, flush=True)
+    print(f"\n>>> {message}\n>>> Press Enter when it is done "
+          f"(within {timeout_s / 60:g} minutes).", file=out, flush=True)
+
+    def answer(confirmed: bool, reason: str | None = None) -> dict:
+        return {"confirmed": confirmed, "waited_s": round(time.monotonic() - started, 3),
+                **({"reason": reason} if reason else {})}
+
     while not stop.is_set():
-        ready, _, _ = select.select([stream], [], [], poll_s)
+        if time.monotonic() - started > timeout_s:
+            return answer(False, "no answer in time")
+        ready, _, _ = select.select([stream], [], [], _POLL_S)
         if ready:
-            answered = stream.readline() != ""
-            return {"confirmed": answered, "waited_s": round(time.monotonic() - started, 3)}
+            if stream.readline() == "":
+                return answer(False, "the end of the input: no one there")
+            return answer(True)
     return None
 
 
-def run(spans: list[Span | HumanStep], desktop, send_label: Callable[[str, str], None],
+def run(spans: list[Span | WaitSpan], desktop, send_label: Callable[[str, str], None],
         stop: threading.Event, gap_s: float) -> list[dict]:
     """Run `spans` on a fixed schedule until they are done or `stop` is set,
     then close the desktop, however the run ended.
@@ -154,9 +178,9 @@ def run(spans: list[Span | HumanStep], desktop, send_label: Callable[[str, str],
     the first start: an action slow to open does not move the ones after
     it. `end` runs END_LEAD_S before the span's end, so its work falls
     inside the span. A span whose opening or closing overran its time is
-    marked so, and one that starts late says by how much. A HumanStep
-    waits as long as the person takes, and the schedule after it is counted
-    from the answer.
+    marked so, and one that starts late says by how much. A WaitSpan
+    lasts as long as the person takes, and the span it prepares follows at
+    once, without a gap: the schedule after it is counted from the answer.
 
     Returns the log: one entry per span begun, with its times on the
     monotonic clock, its details and any error, which is recorded and the
@@ -182,6 +206,11 @@ def run(spans: list[Span | HumanStep], desktop, send_label: Callable[[str, str],
         """Wait until monotonic time `t`; True if stopped first."""
         return stop.wait(max(t - time.monotonic(), 0.0))
 
+    def finish(entry: dict) -> None:
+        entry["cut_short"] = stop.is_set()
+        label(entry, END)
+        entry["end_ns"] = time.monotonic_ns()
+
     try:
         planned = time.monotonic()
         skip_next = False
@@ -192,17 +221,17 @@ def run(spans: list[Span | HumanStep], desktop, send_label: Callable[[str, str],
                            "late_s": round(time.monotonic() - planned, 3)}
             log.append(entry)
             if skip_next:
-                entry["skipped"], skip_next = "no one confirmed the step before it", False
+                entry["skipped"], skip_next = "no one confirmed the span before it", False
                 entry["end_ns"] = entry["start_ns"]
                 continue  # the next span takes its place in the schedule
             label(entry, START)
-            if isinstance(span, HumanStep):
+            if isinstance(span, WaitSpan):
                 attempt(entry, "prepare", span.prepare)
-                answer = span.ask(stop)
+                # Nothing to ask the person to do if preparing it failed.
+                answer = (span.ask(stop) if "error" not in entry
+                          else {"confirmed": False, "reason": "preparing it failed"})
                 entry["answer"] = answer
-                entry["cut_short"] = answer is None
-                label(entry, END)
-                entry["end_ns"] = time.monotonic_ns()
+                finish(entry)
                 skip_next = answer is not None and not answer.get("confirmed")
                 planned = time.monotonic()  # the rest is counted from the answer
                 continue
@@ -214,9 +243,7 @@ def run(spans: list[Span | HumanStep], desktop, send_label: Callable[[str, str],
                 attempt(entry, "end", span.end)
                 entry["overran"] = entry["overran"] or time.monotonic() > end_at
                 until(end_at)
-            entry["cut_short"] = stop.is_set()
-            label(entry, END)
-            entry["end_ns"] = time.monotonic_ns()
+            finish(entry)
             planned = end_at + gap_s
     finally:
         desktop.close_all()
@@ -225,10 +252,10 @@ def run(spans: list[Span | HumanStep], desktop, send_label: Callable[[str, str],
 
 def spans_for(actions: tuple[int, ...], desktop, timing: Timing,
               ask: Callable[[threading.Event], dict | None] | None = None
-              ) -> list[Span | HumanStep]:
+              ) -> list[Span | WaitSpan]:
     """The spans of the numbered actions, in the order given. `ask` waits
     for the person at the video call; by default, at the terminal."""
-    ask = ask or (lambda stop: ask_at_terminal(CALL_PROMPT, stop))
+    ask = ask or (lambda stop: ask_at_terminal(CALL_PROMPT, stop, timing.call_timeout_s))
     unknown = set(actions) - set(ACTIONS)
     if unknown:
         raise ValueError(f"no action {sorted(unknown)}: the actions are {sorted(ACTIONS)}")
@@ -247,7 +274,7 @@ def spans_for(actions: tuple[int, ...], desktop, timing: Timing,
                                       begin=lambda: desktop.youtube(q),
                                       end=lambda: desktop.youtube_playing(q))])
            for n, q in quality.items()},
-        5: lambda: [HumanStep(f"{labelled(5)}-setup", desktop.video_call, ask),
+        5: lambda: [WaitSpan(f"{labelled(5)}-setup", desktop.video_call, ask),
                     Span(labelled(5), timing.hold_s)],
         6: lambda: [Span(labelled(6), timing.hold_s, begin=desktop.webgl)],
         7: lambda: [Span(labelled(7), timing.hold_s, begin=desktop.vlc)],

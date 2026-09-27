@@ -57,8 +57,9 @@ open until action 9 closes them.
 | 8 | `vscode`, opened and closed | 60 s |
 | 9 | `close-all` | 60 s |
 
-There is a 10 s gap between spans. A run takes about 14 minutes plus the
-time the video call's setup takes. With the engine, add its prefill (about
+There is a 10 s gap between spans, except after the video call's setup: the
+call's own span begins the moment you confirm. A run takes about 14 minutes
+plus the time the video call's setup takes. With the engine, add its prefill (about
 12 minutes on Qwen2.5-1.5B at 32K). That prefill is labelled
 `engine-prefill`, and the actions begin once the engine decodes.
 
@@ -72,7 +73,10 @@ the terminal. Then:
 
 The time from the prompt to your Enter is the `-setup` span, so what signing
 in and starting the camera cost is labelled too. The call's own 60 s begin
-at your Enter. The call stays open until action 9.
+at your Enter. The call stays open until action 9. Anything typed before the
+prompt appears is discarded, so only an Enter pressed for this prompt counts.
+With no answer in 10 minutes (`--call-timeout`), the call is skipped and the
+run goes on. Such a run is not complete: see below.
 
 ## The runs
 
@@ -100,10 +104,14 @@ alike:
 .venv/bin/python tools/run_scenario.py --out data/rq1/firefox-r1.csv.gz --browser firefox
 ```
 
-Repeat the preparation before every run. Rerun a repeat if its
-`.scenario.json` shows an `error` on any span other than an engine that ran
-out of memory. The recorder exiting non-zero also means a rerun, since the
-driver then exits 1.
+Repeat the preparation before every run. **Rerun a repeat** if its
+`.scenario.json` shows any of the following:
+
+- `"interrupted": true`;
+- a span with an `error`, a `label_error`, or `"skipped"`;
+- a `"recorder_exit_code"` other than 0, in which case the driver also exits 1.
+
+An engine that ran out of memory is not a reason to rerun; see below.
 
 **With the engine,** an engine that runs out of memory mid-scenario is
 labelled `engine-exited`, and the run goes on without it. That is an
@@ -146,16 +154,24 @@ once there are at least ten minutes of it.
 ## Publishing (#57)
 
 Once every run is analysed and logged, publish the files of each recording
-as the assets of one GitHub Release:
+as the assets of one GitHub Release.
+
+Each recording's `contention-trace` entry in `experiments/logs/benchmark.jsonl`
+records the sha256 of every file of the recording: the trace, the processes
+stream, the labels, and the scenario's log and the hold's status where there
+are any. Every published asset must match its entry. **Check first:**
+
+```
+.venv/bin/python tools/verify_release.py data/rq1/*
+```
+
+It lists each file as ok, MISMATCH, or UNLOGGED (no entry names it), and exits
+1 unless every file matches. A recording analysed twice is checked against its
+latest entry. Only once it exits 0, publish:
 
 ```
 gh release create rq1-traces-v1 data/rq1/* --title "RQ1 contention traces" --notes-file <notes>
 ```
 
-Each recording's `contention-trace` entry in `experiments/logs/benchmark.jsonl`
-records the sha256 of its trace, processes and labels files. The published
-assets must match those hashes. Check before announcing:
-
-```
-sha256sum data/rq1/*.csv.gz
-```
+Then download the assets into an empty directory and run the same check on
+them.

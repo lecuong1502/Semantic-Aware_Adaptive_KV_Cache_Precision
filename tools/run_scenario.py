@@ -3,7 +3,7 @@
 
     .venv/bin/python tools/run_scenario.py --out trace.csv.gz
         [--browser chrome|firefox] [--actions 1,2,3,4,5,6,7,8,9] [--with-engine]
-        [--hold 60] [--gap 10] [--idle 120] [--call-url URL]
+        [--hold 60] [--gap 10] [--idle 120] [--call-url URL] [--call-timeout 600]
 
 The collection protocol, what to prepare and how many runs of which kind,
 is docs/rq1-protocol.md.
@@ -16,7 +16,7 @@ Chrome, or with --browser firefox the Firefox pass over actions 2 to 4 that
 holding Qwen2.5-1.5B at its 32K window (tools/hold_engine.py), labels its
 prefill, and begins the actions once it decodes. At action 5, the video
 call, it opens the call's page and waits at the terminal for the owner to
-start the call and press Enter; the hold's status file
+start the call and press Enter, for --call-timeout seconds at most; the hold's status file
 lands beside the trace. If the engine exits during the scenario, out of
 memory as #52 records it, the moment is labelled "engine-exited" and the
 scenario goes on without it.
@@ -128,11 +128,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--youtube-video", default=scenario.YOUTUBE_VIDEO)
     parser.add_argument("--call-url", default=scenario.CALL_URL,
                         help="the page the video call is started in")
+    parser.add_argument("--call-timeout", type=float, default=scenario.Timing.call_timeout_s,
+                        help="seconds to wait for the owner at the video call")
     args = parser.parse_args(argv)
 
     actions = (tuple(int(a) for a in args.actions.split(",")) if args.actions
                else scenario.DEFAULT_ACTIONS[args.browser])
-    timing = scenario.Timing(hold_s=args.hold, gap_s=args.gap, idle_s=args.idle)
+    timing = scenario.Timing(hold_s=args.hold, gap_s=args.gap, idle_s=args.idle,
+                             call_timeout_s=args.call_timeout)
     desktop = scenario.Desktop(args.browser, args.video, args.youtube_video, args.call_url)
     spans = scenario.spans_for(actions, desktop, timing)  # refuses an unknown action first
     if 7 in actions and args.video is None:

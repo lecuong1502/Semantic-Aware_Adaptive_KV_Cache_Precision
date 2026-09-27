@@ -184,7 +184,10 @@ _Avoid_: benchmark (that measures the engine), workload
 **Span**:
 One labelled stretch of a scenario, between a start and an end label, at a
 fixed place in its schedule: an action, or one of the stages an action is
-recorded in, as tabs are at 1, 5 and 10.
+recorded in, as tabs are at 1, 5 and 10. A **wait span** is the exception: it
+lasts until a person does what an action needs, such as starting the video
+call, and the schedule after it is counted from its end. A span a wait span
+prepares, if no one comes, is **skipped**: logged, not labelled.
 _Avoid_: step, segment
 
 **Action**:

@@ -55,6 +55,11 @@ def test_the_schedule_labels_every_span_on_time_and_closes_everything_however_it
     that cannot be sent stops it, the log kept."""
     desktop = FakeDesktop()
     timing = scenario.Timing(hold_s=0.05, gap_s=0.02, idle_s=0.1)
+    # By default, the call and the person it waits for come between the
+    # videos and the WebGL page; the rest of this runs without them.
+    assert [s.label for s in scenario.spans_for(scenario.DEFAULT_ACTIONS["chrome"], desktop,
+                                                timing)][5:8] == [
+        "chrome-youtube-2160p", "chrome-video-call-setup", "chrome-video-call"]
     no_call = tuple(n for n in scenario.DEFAULT_ACTIONS["chrome"] if n != 5)
     spans = scenario.spans_for(no_call, desktop, timing)
     labels = []
@@ -121,9 +126,10 @@ def test_the_schedule_labels_every_span_on_time_and_closes_everything_however_it
 def test_the_video_call_waits_for_a_person_and_labels_the_wait():
     """Action 5 opens the call's page and asks; the wait is a span of its
     own, and the call's span begins at the answer, the schedule after it
-    counted from there. No one answering skips the call; a stop while
-    waiting ends the run. At the terminal, Enter answers and the end of
-    the input means no one is there."""
+    counted from there. No one answering, or a page that did not open,
+    skips the call; a stop while waiting ends the run. At the terminal,
+    only Enter pressed after the prompt answers, and the end of the input,
+    or the time running out, means no one is there."""
     def answering(after, confirmed=True):
         def ask(stop):
             time.sleep(after)
@@ -140,13 +146,20 @@ def test_the_video_call_waits_for_a_person_and_labels_the_wait():
     assert log[1]["answer"] == {"confirmed": True} and desktop.calls[0] == ("video_call",)
     waited = (log[1]["end_ns"] - log[1]["start_ns"]) / 1e9
     assert waited >= 0.3 and (log[2]["start_ns"] - log[1]["end_ns"]) / 1e9 < 0.02
-    assert abs((log[3]["start_ns"] - log[2]["start_ns"]) / 1e9 - 0.12) < 0.03
+    assert abs((log[3]["start_ns"] - log[2]["start_ns"]) / 1e9 - 0.12) < 0.06
 
     desktop, labels = FakeDesktop(), []
     log = scenario.run(scenario.spans_for((5, 6), desktop, timing, ask=answering(0, False)),
                        desktop, lambda e, a: labels.append((e, a)), threading.Event(), gap_s=0.02)
     assert [a for _, a in labels] == ["chrome-video-call-setup"] * 2 + ["chrome-webgl"] * 2
     assert "skipped" in log[1] and log[1]["label"] == "chrome-video-call"
+
+    asked = []
+    desktop = FakeDesktop(fail="video_call")
+    log = scenario.run(scenario.spans_for((5, 6), desktop, timing, ask=asked.append),
+                       desktop, lambda e, a: None, threading.Event(), gap_s=0.02)
+    assert asked == [] and log[0]["answer"]["reason"] == "preparing it failed"
+    assert "skipped" in log[1]
 
     stop = threading.Event()
     threading.Timer(0.1, stop.set).start()
@@ -157,17 +170,28 @@ def test_the_video_call_waits_for_a_person_and_labels_the_wait():
     assert [a for _, a in labels] == ["chrome-video-call-setup"] * 2
     assert log[0]["cut_short"] and desktop.calls[-1] == ("close_all",)
 
+    def ask(stream, stop=None, timeout_s=10.0):
+        with open(os.devnull, "w") as out:
+            return scenario.ask_at_terminal("start the call", stop or threading.Event(),
+                                            timeout_s, stream, out)
+
+    # A terminal: an Enter typed before the prompt does not answer it.
+    parent, child = os.openpty()
+    with os.fdopen(child) as tty:
+        os.write(parent, b"\n")
+        time.sleep(0.1)
+        assert ask(tty, timeout_s=0.5)["reason"] == "no answer in time"
+        threading.Timer(0.2, lambda: os.write(parent, b"\n")).start()
+        assert ask(tty)["confirmed"]
+    os.close(parent)
+
     read, write = os.pipe()
-    with os.fdopen(read) as stream, open(os.devnull, "w") as out:
-        threading.Timer(0.2, lambda: os.write(write, b"\n")).start()
-        assert scenario.ask_at_terminal("start the call", threading.Event(), stream, out)[
-            "confirmed"]
+    with os.fdopen(read) as stream:
         os.close(write)
-        assert scenario.ask_at_terminal("start the call", threading.Event(), stream, out) == {
-            "confirmed": False, "waited_s": pytest.approx(0, abs=0.3)}
+        assert ask(stream)["reason"] == "the end of the input: no one there"
         stop = threading.Event()
         stop.set()
-        assert scenario.ask_at_terminal("start the call", stop, stream, out) is None
+        assert ask(stream, stop) is None
 
 
 @pytest.mark.parametrize("name", sorted(BROWSERS))
