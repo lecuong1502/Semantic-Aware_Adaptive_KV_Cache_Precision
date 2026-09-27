@@ -5,7 +5,7 @@ The Milestone 1 spec (#45) names nine actions; this runs the eight that need
 no person, the video call (5) being #54's:
 
 1. the idle desktop;
-2. a browser with 1, then 5, then 10 ordinary tabs, three labelled steps;
+2. a browser with 1, then 5, then 10 ordinary tabs, recorded as three spans;
 3. YouTube at 1080p;
 4. YouTube at 4K;
 6. a heavy WebGL page, standing in for a game;
@@ -46,15 +46,16 @@ from pathlib import Path
 from typing import Callable
 
 from . import browser as browsers
-from .recorder import END, START
+from .recorder import END, START, companion
 
-#: The actions of #45 this driver runs, by number.
+#: The actions of #45 this driver runs, by number, with the label of each.
+#: A browser action's label names the browser too.
 ACTIONS = {1: "idle", 2: "tabs", 3: "youtube-1080p", 4: "youtube-2160p", 6: "webgl",
            7: "vlc-2160p", 8: "vscode", 9: "close-all"}
+BROWSER_ACTIONS = (2, 3, 4, 6)
 #: What a run covers by default: the whole scenario in Chrome, and #45's
 #: Firefox pass over actions 2 to 4, closing everything after them.
 DEFAULT_ACTIONS = {"chrome": (1, 2, 3, 4, 6, 7, 8, 9), "firefox": (2, 3, 4, 9)}
-BROWSER_ACTIONS = {2, 3, 4, 6}
 
 #: Ordinary pages, opened as tabs: text, images and scripts, nothing that plays.
 TABS = ("https://en.wikipedia.org/wiki/Graphics_processing_unit",
@@ -72,12 +73,15 @@ TAB_COUNTS = (1, 5, 10)
 YOUTUBE_VIDEO = "LXb3EKWsInQ"
 #: The WebGL Aquarium: thousands of fish, rendered every frame.
 WEBGL_URL = "https://webglsamples.org/aquarium/aquarium.html"
+#: How long before its end label a span's closing work begins: time for VS
+#: Code to close, or a player to be read, inside the span's own time.
+END_LEAD_S = 5.0
 
 
 @dataclass(frozen=True)
 class Timing:
-    """How long each action is held, the gap between actions, and how long
-    the idle desktop is recorded (#45: 60 s, with gaps, and 2 minutes)."""
+    """How long each span is held, the gap between spans, and how long the
+    idle desktop is recorded (#45: 60 s, with gaps, and 2 minutes)."""
 
     hold_s: float = 60.0
     gap_s: float = 10.0
@@ -85,9 +89,11 @@ class Timing:
 
 
 @dataclass
-class Step:
-    """One labelled span of a scenario: `begin` runs as it starts, `end`
-    before its end label; each may return details for the log."""
+class Span:
+    """One labelled span of a scenario (CONTEXT.md): an action, or one of
+    the stages an action is recorded in, such as 5 tabs of 1, 5 and 10.
+    `begin` runs at its start label, `end` shortly before its end label, and
+    each may return details for the log."""
 
     label: str
     hold_s: float
@@ -95,85 +101,102 @@ class Step:
     end: Callable[[], dict | None] = lambda: None
 
 
-def run(steps: list[Step], desktop, send_label: Callable[[str, str], None],
+def run(spans: list[Span], desktop, send_label: Callable[[str, str], None],
         stop: threading.Event, gap_s: float) -> list[dict]:
-    """Run `steps` in order, each between its start and its end label, with
-    `gap_s` between them, until they are done or `stop` is set; then close
-    the desktop, however the run ended. Returns the log: one entry per step
-    begun, with its times on the monotonic clock, its details, and its
-    error if it had one. A step under way when `stop` is set is cut short
-    and still ends with its label."""
+    """Run `spans` on a fixed schedule until they are done or `stop` is set,
+    then close the desktop, however the run ended.
+
+    Span k starts at the sum of the spans and gaps before it, counted from
+    the first start: an action slow to open does not move the ones after
+    it. `end` runs END_LEAD_S before the span's end, so its work falls
+    inside the span. A span whose opening or closing overran its time is
+    marked so, and one that starts late says by how much.
+
+    Returns the log: one entry per span begun, with its times on the
+    monotonic clock, its details and any error, which is recorded and the
+    run goes on. A span under way when `stop` is set is cut short and still
+    ends with its label. A label that cannot be sent, the recorder gone,
+    stops the run: nothing after it would be labelled."""
     log: list[dict] = []
+
+    def label(entry: dict, event: str) -> None:
+        try:
+            send_label(event, entry["label"])
+        except Exception as exc:  # noqa: BLE001 - recorded, and the run stops
+            entry.setdefault("label_error", f"{event}: {type(exc).__name__}: {exc}")
+            stop.set()
+
+    def attempt(entry: dict, part: str, work: Callable[[], dict | None]) -> None:
+        try:
+            entry[part] = work()
+        except Exception as exc:  # noqa: BLE001 - recorded; the run goes on
+            entry.setdefault("error", f"{part}: {type(exc).__name__}: {exc}")
+
+    def until(t: float) -> bool:
+        """Wait until monotonic time `t`; True if stopped first."""
+        return stop.wait(max(t - time.monotonic(), 0.0))
+
     try:
-        for i, step in enumerate(steps):
-            if stop.is_set() or (i and stop.wait(gap_s)):
+        t0 = time.monotonic()
+        planned = t0
+        for span in spans:
+            if until(planned):
                 break
-            entry: dict = {"label": step.label, "start_ns": time.monotonic_ns()}
-            send_label(START, step.label)
-            try:
-                for part, action in (("begin", step.begin), ("end", step.end)):
-                    try:
-                        entry[part] = action()
-                    except Exception as exc:  # noqa: BLE001 - recorded; the run goes on
-                        entry.setdefault("error", f"{part}: {type(exc).__name__}: {exc}")
-                    if part == "begin":
-                        # The step spans hold_s from its start label, however
-                        # long opening took, failed or not: the schedule is
-                        # the same in every repeat.
-                        held = (time.monotonic_ns() - entry["start_ns"]) / 1e9
-                        stop.wait(max(step.hold_s - held, 0.0))
-            finally:
-                send_label(END, step.label)
-                entry["end_ns"] = time.monotonic_ns()
-                entry["cut_short"] = stop.is_set()
-                log.append(entry)
+            entry: dict = {"label": span.label, "start_ns": time.monotonic_ns(),
+                           "late_s": round(time.monotonic() - planned, 3)}
+            log.append(entry)
+            label(entry, START)
+            end_at = planned + span.hold_s
+            if not stop.is_set():
+                attempt(entry, "begin", span.begin)
+                entry["overran"] = time.monotonic() > end_at
+                until(end_at - min(END_LEAD_S, span.hold_s / 2))
+                attempt(entry, "end", span.end)
+                entry["overran"] = entry["overran"] or time.monotonic() > end_at
+                until(end_at)
+            entry["cut_short"] = stop.is_set()
+            label(entry, END)
+            entry["end_ns"] = time.monotonic_ns()
+            planned = end_at + gap_s
     finally:
         desktop.close_all()
     return log
 
 
-def steps_for(actions: tuple[int, ...], desktop, timing: Timing) -> list[Step]:
-    """The steps of the numbered actions, in the order given."""
+def spans_for(actions: tuple[int, ...], desktop, timing: Timing) -> list[Span]:
+    """The spans of the numbered actions, in the order given."""
     unknown = set(actions) - set(ACTIONS)
     if unknown:
         raise ValueError(f"no action {sorted(unknown)}: the actions are {sorted(ACTIONS)}, "
                          f"5, the video call, being #54's")
-    b = desktop.browser_name
-    steps: list[Step] = []
-    for n in actions:
-        if n == 1:
-            steps.append(Step("idle", timing.idle_s))
-        elif n == 2:
-            for count in TAB_COUNTS:
-                steps.append(Step(f"{b}-tabs-{count}", timing.hold_s,
-                                  begin=lambda count=count: desktop.tabs(count)))
-        elif n in (3, 4):
-            quality = "hd1080" if n == 3 else "hd2160"
-            steps.append(Step(f"{b}-{ACTIONS[n]}", timing.hold_s,
-                              begin=lambda q=quality: desktop.youtube(q),
-                              end=lambda q=quality: desktop.youtube_playing(q)))
-        elif n == 6:
-            steps.append(Step(f"{b}-webgl", timing.hold_s, begin=desktop.webgl))
-        elif n == 7:
-            steps.append(Step("vlc-2160p", timing.hold_s, begin=desktop.vlc))
-        elif n == 8:
-            steps.append(Step("vscode", timing.hold_s, begin=desktop.vscode,
-                              end=desktop.close_vscode))
-        elif n == 9:
-            steps.append(Step("close-all", timing.hold_s, begin=desktop.close_all))
-    return steps
+    browser = desktop.browser_name
+
+    def labelled(n: int) -> str:
+        return f"{browser}-{ACTIONS[n]}" if n in BROWSER_ACTIONS else ACTIONS[n]
+
+    quality = {3: "hd1080", 4: "hd2160"}
+    spans_of = {
+        1: lambda: [Span(labelled(1), timing.idle_s)],
+        2: lambda: [Span(f"{labelled(2)}-{count}", timing.hold_s,
+                         begin=lambda count=count: desktop.tabs(count))
+                    for count in TAB_COUNTS],
+        **{n: (lambda q=q, n=n: [Span(labelled(n), timing.hold_s,
+                                      begin=lambda: desktop.youtube(q),
+                                      end=lambda: desktop.youtube_playing(q))])
+           for n, q in quality.items()},
+        6: lambda: [Span(labelled(6), timing.hold_s, begin=desktop.webgl)],
+        7: lambda: [Span(labelled(7), timing.hold_s, begin=desktop.vlc)],
+        8: lambda: [Span(labelled(8), timing.hold_s, begin=desktop.vscode,
+                         end=desktop.close_vscode)],
+        9: lambda: [Span(labelled(9), timing.hold_s, begin=desktop.close_all)],
+    }
+    return [span for n in actions for span in spans_of[n]()]
 
 
 def log_path(trace: str | Path) -> Path:
     """Where a scenario's log is written: beside its recording, trace.csv.gz
     becoming trace.scenario.json."""
-    trace = Path(trace)
-    name = trace.name
-    for suffix in (".csv.gz", ".gz", ".csv"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    return trace.with_name(name + ".scenario.json")
+    return companion(trace, ".scenario.json")
 
 
 # -- the desktop ------------------------------------------------------------------------
@@ -219,13 +242,23 @@ class _PageHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-#: Asks the player for `want`, until it plays at it or 30 s pass, and says
-#: what it plays: the player's quality, and the height of the video decoded.
+#: What the player in the frame plays: its quality and state, the height of
+#: the video it decodes, and any error it shows.
+_PLAYING = """(() => {
+  const p = document.getElementById("movie_player");
+  return {
+    quality: p && p.getPlaybackQuality ? p.getPlaybackQuality() : null,
+    state: p && p.getPlayerState ? p.getPlayerState() : null,
+    video_height: (document.querySelector("video") || {}).videoHeight || null,
+    error: (document.querySelector(".ytp-error") || {}).innerText || null};
+})()"""
+
+#: Asks the player for a quality until it plays at it or 30 s pass, then
+#: says what it plays.
 _FORCE_QUALITY = """(async () => {
   const want = %s;
-  let p = null;
   for (let i = 0; i < 60; i++) {
-    p = document.getElementById("movie_player");
+    const p = document.getElementById("movie_player");
     if (p && p.getAvailableQualityLevels && p.getAvailableQualityLevels().length) {
       p.mute(); p.setPlaybackQualityRange(want, want); p.playVideo();
       if (p.getPlaybackQuality() === want) break;
@@ -234,11 +267,6 @@ _FORCE_QUALITY = """(async () => {
   }
   return %s;
 })()"""
-_PLAYING = """({
-  quality: p && p.getPlaybackQuality ? p.getPlaybackQuality() : null,
-  state: p && p.getPlayerState ? p.getPlayerState() : null,
-  video_height: (document.querySelector("video") || {}).videoHeight || null,
-  error: (document.querySelector(".ytp-error") || {}).innerText || null})"""
 
 
 class Desktop:
@@ -277,8 +305,8 @@ class Desktop:
                 where = b.evaluate(page, "location.href")
                 if not where.startswith(("http://", "https://")):
                     failed[url] = f"showed {where}"  # the browser's own error page
-            except browsers.BrowserError as exc:
-                failed[url] = str(exc)
+            except (browsers.BrowserError, OSError) as exc:
+                failed[url] = f"{type(exc).__name__}: {exc}"
             opened.append(url)
             self._tabs += 1
         return {"browser": b.version, "tabs": self._tabs, "opened": opened, "failed": failed}
@@ -296,10 +324,7 @@ class Desktop:
 
     def youtube_playing(self, quality: str) -> dict:
         """What the player opened for `quality` plays now."""
-        frame = self._players[quality]
-        return self._browser.evaluate(
-            frame, f'(() => {{ const p = document.getElementById("movie_player"); '
-                   f'return {_PLAYING}; }})()')
+        return self._open_browser().evaluate(self._players[quality], _PLAYING)
 
     def webgl(self) -> dict:
         b = self._open_browser()
@@ -331,19 +356,38 @@ class Desktop:
             app.close()
         return None
 
+    def _everything(self) -> list[tuple[str, object]]:
+        return [*self._apps.items(),
+                *([(self.browser_name, self._browser)] if self._browser is not None else [])]
+
     def close_all(self) -> dict:
-        """Close every application open, the browser included."""
-        closed = list(self._apps)
-        for app in list(self._apps.values()):
-            app.close()
+        """Close every application open, the browser included: each on its
+        own, so that one that will not close does not keep the rest open."""
+        closed, errors = [], {}
+        for name, app in self._everything():
+            try:
+                app.close()
+                closed.append(name)
+            except Exception as exc:  # noqa: BLE001 - reported; the rest still close
+                errors[name] = f"{type(exc).__name__}: {exc}"
+        self._forget()
+        return {"closed": closed, **({"errors": errors} if errors else {})}
+
+    def kill_all(self) -> None:
+        """End every application at once, without grace: the driver forced
+        to stop."""
+        for _, app in self._everything():
+            try:
+                app.kill()
+            except Exception:  # noqa: BLE001, S110 - the rest must still die
+                pass
+        self._forget()
+
+    def _forget(self) -> None:
         self._apps.clear()
-        if self._browser is not None:
-            closed.append(self.browser_name)
-            self._browser.close()
-            self._browser, self._tabs = None, 0
-            self._players.clear()
+        self._browser, self._tabs = None, 0
+        self._players.clear()
         if self._pages is not None:
             self._pages.shutdown()
             self._pages.server_close()
             self._pages = None
-        return {"closed": closed}
