@@ -8,6 +8,9 @@ which process caused each spike is known in advance.
 
 import gzip
 import hashlib
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,6 +18,7 @@ import pytest
 from microinfer import benchlog, contention, recorder, spikes
 from microinfer.contention import Unnamed
 
+VERIFY = Path(__file__).resolve().parent.parent / "tools" / "verify_release.py"
 MiB = 2**20
 RATE = 50
 BASE = 3000 * MiB
@@ -158,6 +162,8 @@ def test_a_recording_is_logged_with_every_spike_and_the_sha256_of_its_files(tmp_
     recorder.record(path, rate_hz=100, duration=2.0, reader=reader,
                     meta={"device": "fake", "model": "Qwen2.5-1.5B", "context_length": 32768,
                           "precision": "FP16"})
+    scenario_log = recorder.companion(path, ".scenario.json")
+    scenario_log.write_text('{"spans": []}\n')  # as the scenario driver leaves it
     log = tmp_path / "log.jsonl"
     entry = contention.log_recording(path, issue=50, log=log, window_s=0.5)
 
@@ -166,7 +172,7 @@ def test_a_recording_is_logged_with_every_spike_and_the_sha256_of_its_files(tmp_
     assert entry["context_length"] == 32768 and entry["precision_tiers"] is None
     assert entry["config"]["recording"]["precision"] == "FP16"
     assert entry["config"]["files"] == {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()}
+        f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in (path, scenario_log)}
     results = entry["results"]
     assert results["complete"] and not results["process_stream"]
     assert [s["amplitude_mib"] for s in results["spikes"]] == [200.0]
@@ -176,3 +182,17 @@ def test_a_recording_is_logged_with_every_spike_and_the_sha256_of_its_files(tmp_
     with pytest.raises(ValueError, match="not a contention trace"):
         contention.log_recording(tmp_path / "other.csv.gz", issue=50, log=log)
     assert len(benchlog.read(log)) == 1
+
+    # Before publishing: every file matches what the log records, until one
+    # is changed, or is not in the log at all.
+    def verify(*files):
+        return subprocess.run([sys.executable, str(VERIFY), "--log", str(log),
+                               *map(str, files)], capture_output=True, text=True)
+
+    assert verify(path, scenario_log).returncode == 0
+    scenario_log.write_text('{"spans": [1]}\n')
+    unlogged = tmp_path / "other.csv.gz"
+    result = verify(path, scenario_log, unlogged)
+    assert result.returncode == 1
+    assert f"MISMATCH  {scenario_log}" in result.stdout
+    assert f"UNLOGGED  {unlogged}" in result.stdout and f"ok        {path}" in result.stdout

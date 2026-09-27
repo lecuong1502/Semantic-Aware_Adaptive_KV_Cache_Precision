@@ -241,7 +241,8 @@ def log_recording(path: str | Path, *, issue: int, log: str | Path = benchlog.DE
                   min_share: float = DEFAULT_MIN_SHARE) -> dict:
     """Analyse the recording at `path`, with its processes and labels files
     if they are beside it, and append its results to the benchmark log as a
-    "contention-trace" entry carrying each file's sha256. Returns the entry.
+    "contention-trace" entry carrying each file's sha256, the scenario's log
+    and the hold's status beside it included. Returns the entry.
     A file that is not a recording raises before anything is logged."""
     path = Path(path)
     meta, samples = recorder.read(path)
@@ -254,6 +255,10 @@ def log_recording(path: str | Path, *, issue: int, log: str | Path = benchlog.DE
     if (p := recorder.labels_path(path)).exists():
         _, labels = recorder.read_labels(p)
         files.append(p)
+    # What the scenario driver and the hold wrote beside it: published with
+    # the trace, so hashed with it (#54).
+    files += [p for p in (recorder.companion(path, ".scenario.json"),
+                          recorder.companion(path, ".hold.json")) if p.exists()]
 
     results = {**analyse(samples, stream, labels, window_s=window_s,
                          threshold_bytes=threshold_bytes, min_share=min_share),
