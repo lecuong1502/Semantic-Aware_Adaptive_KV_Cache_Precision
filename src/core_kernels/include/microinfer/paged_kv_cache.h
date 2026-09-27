@@ -163,6 +163,8 @@ namespace microinfer
     // size, since every caller is about to copy that many.
     CUdeviceptr address(PageKey key, std::size_t bytes) const;
     // Maps or releases granules until exactly those the slots reach remain.
+    // Undoes the slot the failed allocate took, giving back its granules.
+    void roll_back(Range &r);
     void fit_granules(Range &r);
     void release_everything() noexcept;
 

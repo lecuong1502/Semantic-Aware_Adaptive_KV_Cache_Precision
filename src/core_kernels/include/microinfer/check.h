@@ -11,7 +11,7 @@ namespace microinfer
 {
 
   // The device had no memory for an allocation (#52). Contention is what
-  // this project studies, and running out is its outcome, not a fault: it
+  // this project measures, and running out is its outcome, not a fault: it
   // has a type of its own, so that a caller can record it and go on, and
   // every other failure still reads as one. The message names the
   // allocation that failed.
@@ -25,7 +25,6 @@ namespace microinfer
   {
     if (status == cudaErrorMemoryAllocation)
     {
-      cudaGetLastError(); // clear it: running out leaves the context usable
       throw OutOfMemory(std::string(what) +
                         " failed: " + cudaGetErrorString(status));
     }
@@ -70,6 +69,22 @@ namespace microinfer
     {
       throw std::runtime_error(std::string(what) +
                                " failed: " + cublasGetStatusString(status));
+    }
+  }
+
+  // cudaMalloc, naming what the memory was for if the device has none. The
+  // name is built only on failure: the call sits on paths that allocate every
+  // step.
+  template <typename T>
+  void cuda_malloc(T **ptr, std::size_t bytes, const char *purpose)
+  {
+    const cudaError_t status =
+        cudaMalloc(reinterpret_cast<void **>(ptr), bytes);
+    if (status != cudaSuccess)
+    {
+      cuda_check(status, ("cudaMalloc of " + std::to_string(bytes) +
+                          " bytes for " + purpose)
+                             .c_str());
     }
   }
 

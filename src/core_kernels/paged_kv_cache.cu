@@ -146,8 +146,7 @@ namespace microinfer
     Range &r = range(tier);
     if (r.slots.size() == r.capacity_pages)
     {
-      throw std::length_error("tier " + std::to_string(static_cast<int>(tier)) +
-                              " is full at " +
+      throw std::length_error(std::string(tier_name(tier)) + " is full at " +
                               std::to_string(r.capacity_pages) + " pages");
     }
     ContextScope scope(ctx_);
@@ -159,21 +158,39 @@ namespace microinfer
     }
     catch (const OutOfMemory &e)
     {
-      r.slots.pop_back();
-      fit_granules(r); // Give back any granule mapped before the failure.
-      throw OutOfMemory("allocating " + describe(key) + " at " +
-                        tier_name(tier) + " needed a " +
-                        std::to_string(granule_) +
-                        "-byte granule: " + e.what());
+      // Read before anything is given back: the headroom the failure met.
+      std::size_t free_bytes = 0, total_bytes = 0;
+      const bool known =
+          cuMemGetInfo(&free_bytes, &total_bytes) == CUDA_SUCCESS;
+      roll_back(r);
+      throw OutOfMemory(
+          "allocating " + describe(key) + " at " + tier_name(tier) +
+          " needed a " + std::to_string(granule_) +
+          "-byte granule: " + e.what() +
+          (known ? "; " + std::to_string(free_bytes) + " bytes were free"
+                 : std::string()));
     }
     catch (...)
     {
-      r.slots.pop_back();
-      fit_granules(r);
+      roll_back(r);
       throw;
     }
     table_[key] = PageLocation{tier, r.slots.size() - 1};
     ++generation_;
+  }
+
+  void PagedKVCache::roll_back(Range &r)
+  {
+    r.slots.pop_back();
+    try
+    {
+      fit_granules(r); // Give back any granule mapped before the failure.
+    }
+    catch (...)
+    {
+      // The failure being reported is the one that matters; one in giving
+      // back must not replace it.
+    }
   }
 
   void PagedKVCache::free(PageKey key)

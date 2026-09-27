@@ -16,6 +16,17 @@ caught, and the failure recorded in the status file: RQ1's with-engine runs
 exist to observe it. The tool then releases what it holds and exits with
 code 3, the outcome observed rather than a fault of the tool.
 
+How rarely that can happen is itself a finding. The paged cache takes device
+memory only as positions arrive, a 2 MiB granule at a time, and a pass goes
+back over pages already held: once the first pass has reached the end of
+the window, a hold allocates nothing but a few bytes of token ids a step.
+Contention that arrives after that can only fail the engine at those
+allocations, and it is the other processes that meet it instead. A hold
+whose cache is still growing, in the first pass or with a larger
+--decode-positions, allocates a granule each time the pages of every layer
+fill one: on Qwen2.5-1.5B a 32-position page row is 896 KiB, so every 73
+positions, about every 110 s at 32K.
+
 The status file is rewritten, whole, four times a second:
 
     {"state": "loading" | "prefilling" | "decoding" | "stopped" |
@@ -31,16 +42,20 @@ The status file is rewritten, whole, four times a second:
      "error": what failed, with "failed",
      "failure": with "out_of_memory", {"t_mono_ns", "t_wall": when it was
        caught; "phase": prefilling or decoding; "position" and
-       "held_positions" then; "headroom_bytes": the device's free memory
-       then, by NVML; "allocation": the allocation that failed, as the
-       extension names it}}
+       "held_positions" then; "headroom_bytes": the device's free memory at
+       the failure, as the allocator read it before giving anything back,
+       or by NVML when caught if the allocation does not say
+       ("headroom_at": "failure" or "caught"); "allocation": the allocation
+       that failed, as the extension names it; "held_after_release_bytes":
+       what the process still held on the device once the hold had
+       released its cache and weights, by NVML: the CUDA context}}
 
 A reader, the recorder or the scenario driver, knows the engine is ready when
 the state is "decoding", and that the file is stale if t_mono_ns stops
 moving. "stopped" and "out_of_memory" mean the hold ended and its cache and
-weights are released; the CUDA context, about 90 MiB, goes when the process exits, so a
-reader that needs every byte back waits for the pid to leave NVML. "failed"
-promises nothing about memory. The prompt is random token ids: what is held
+weights are released; the CUDA context, about 90 MiB, goes when the process
+exits, so a reader that needs every byte back waits for the pid to leave
+NVML. "failed" promises nothing about memory. The prompt is random token ids: what is held
 and how fast it decodes depend on length, not content.
 """
 
@@ -50,6 +65,7 @@ import argparse
 import gc
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -103,20 +119,31 @@ class Status:
             while len(self._recent) > 2 and self._recent[1][0] <= now - SECOND_NS:
                 self._recent.popleft()
 
-    def failure(self, allocation: str) -> dict:
-        """What running out looked like, taken the moment it was caught."""
+    def record_failure(self, allocation: str) -> dict:
+        """What running out looked like, taken the moment it was caught. The
+        headroom is the allocator's reading at the failure where the message
+        carries one, since giving back what the failed call took, and any
+        other process's next allocation, move it before it can be caught."""
+        at_failure = re.search(r"(\d+) bytes were free", allocation)
         with self._lock:
             return {"t_mono_ns": time.monotonic_ns(), "t_wall": time.time(),
                     "phase": self._state, "position": self._position,
                     "held_positions": self._held,
-                    "headroom_bytes": nvml.memory().free, "allocation": allocation}
+                    "headroom_bytes": (int(at_failure.group(1)) if at_failure
+                                       else nvml.memory().free),
+                    "headroom_at": "failure" if at_failure else "caught",
+                    "allocation": allocation}
 
-    def close(self, state: str, **extra) -> None:
-        """Stop the thread and write the final state, with `extra` fields."""
+    def close(self, state: str, *, error: str | None = None,
+              failure: dict | None = None) -> None:
+        """Stop the thread and write the final state: with the error of a
+        hold that failed, or what running out looked like."""
         self._done.set()
         self._thread.join()
         with self._lock:
-            self._state, self._extra = state, extra
+            self._state = state
+            self._extra = {k: v for k, v in (("error", error), ("failure", failure))
+                           if v is not None}
             self._recent.clear()
         self._write()
 
@@ -186,7 +213,7 @@ def main(argv: list[str]) -> int:
         if not stop.is_set():
             engine.hold(prompt, context=context, stop=stop, report=report)
     except OutOfMemory as exc:
-        failure = status.failure(str(exc))
+        failure = status.record_failure(str(exc))
         # Leaving this block drops the exception, and with its traceback the
         # frames that still hold the cache.
     except Exception as exc:
@@ -196,6 +223,7 @@ def main(argv: list[str]) -> int:
     del engine
     gc.collect()
     if failure is not None:
+        failure["held_after_release_bytes"] = nvml.own_used_bytes()
         status.close(OUT_OF_MEMORY, failure=failure)
         print(f"out of memory at position {failure['position']}: {failure['allocation']}",
               flush=True)

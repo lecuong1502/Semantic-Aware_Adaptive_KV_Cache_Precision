@@ -38,6 +38,7 @@ __all__ = [
     "Engine",
     "Footprint",
     "ModelConfig",
+    "OutOfMemory",
     "_microinfer",
     "expected_weight_bytes",
     "expected_weight_shapes",

@@ -371,8 +371,13 @@ def test_running_out_is_an_error_of_its_own_that_names_the_page_and_takes_nothin
     and holds exactly what it held before the call: running out is what the
     project studies, so a caller records it and goes on (#52)."""
     size = granule()
-    cache = make_cache([size] * 4, capacity_pages=8192)
+    # Room in the address range for more than the device has free, whatever
+    # the device.
+    capacity = _microinfer.device_memory_info()["free"] // size + 64
+    cache = make_cache([size] * 4, capacity_pages=capacity)
     held = 0
+    # Dropped however the test ends, pytest.raises holding its traceback or
+    # not: the device is full until it is.
     try:
         with pytest.raises(_microinfer.OutOfMemory) as info:
             while True:
@@ -381,6 +386,7 @@ def test_running_out_is_an_error_of_its_own_that_names_the_page_and_takes_nothin
         assert isinstance(info.value, MemoryError)
         assert f"page (layer 0, page_index {held})" in str(info.value)
         assert f"{size}-byte granule" in str(info.value)
+        assert "bytes were free" in str(info.value)  # read before giving back
         assert cache.mapped_bytes(Tier.FP16) == held * size
         assert (0, held) not in cache
     finally:

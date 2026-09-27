@@ -21,8 +21,7 @@ namespace microinfer
   public:
     explicit DeviceBuffer(std::size_t bytes)
     {
-      cuda_check(cudaMalloc(&ptr_, bytes),
-                 ("cudaMalloc of " + std::to_string(bytes) + " bytes").c_str());
+      cuda_malloc(&ptr_, bytes, "a device buffer");
     }
 
     ~DeviceBuffer()

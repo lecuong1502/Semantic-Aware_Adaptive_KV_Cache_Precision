@@ -385,6 +385,9 @@ class Engine:
 
         Going back rewrites positions in place, which only FP16 pages allow: a
         quantised page is sealed once its positions are written (ADR-0011).
+        It also means that once the first pass is done a hold allocates
+        nothing but each step's token ids: only while the cache still grows
+        can contention make it run out of memory (OutOfMemory, #52).
 
         `report(state, position, token)` is called after each prefill chunk,
         as (PREFILLING, positions so far, None), and after each decoded token,

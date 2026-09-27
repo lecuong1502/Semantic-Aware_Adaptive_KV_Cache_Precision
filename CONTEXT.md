@@ -170,7 +170,9 @@ context less a span, and the span is decoded in **passes**, each going back to
 the end of the prompt over the pages already held, so memory stays at the full
 context. FP16 only, since a pass rewrites positions in place. A hold that runs
 out of memory records it, with the allocation that failed and the headroom
-then, and ends: running out is the outcome RQ1's with-engine runs observe.
+then, and ends: running out is the outcome RQ1's with-engine runs observe. It
+can only happen while the cache still grows: once the first pass is done a
+hold allocates next to nothing, and contention meets the other processes.
 _Avoid_: session (a passive session is a recording), loop
 
 **Scenario**:

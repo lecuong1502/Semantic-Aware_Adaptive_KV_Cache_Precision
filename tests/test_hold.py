@@ -211,6 +211,8 @@ def test_out_of_memory_is_recorded_and_the_tool_exits_with_nothing_held(tmp_path
         for p in (proc, hog):
             if p is not None and p.poll() is None:
                 p.kill()
+        if hog is not None:
+            hog.wait(timeout=30)  # the device is not the next test's until it is gone
         _, err = proc.communicate(timeout=10)
         if proc.returncode not in (3, -signal.SIGKILL):
             print(err, file=sys.stderr)
@@ -221,6 +223,11 @@ def test_out_of_memory_is_recorded_and_the_tool_exits_with_nothing_held(tmp_path
     assert failure["phase"] == "decoding" and failure["position"] > 512
     assert full - 10**9 < failure["t_mono_ns"] < time.monotonic_ns()
     assert 0 <= failure["headroom_bytes"] < 64 * 2**20
-    assert "out of memory" in failure["allocation"].lower() or \
-        "OUT_OF_MEMORY" in failure["allocation"]
+    # What the extension names: a page and the granule it needed, or the
+    # few bytes of a step's token ids.
+    allocation = failure["allocation"]
+    assert ("page (layer" in allocation and failure["headroom_at"] == "failure") or \
+        "cudaMalloc of" in allocation, allocation
+    # Released before the status said so: what remains is the CUDA context.
+    assert 0 < failure["held_after_release_bytes"] < 256 * 2**20
     assert proc.pid not in {p.pid for p in nvml.processes()}
