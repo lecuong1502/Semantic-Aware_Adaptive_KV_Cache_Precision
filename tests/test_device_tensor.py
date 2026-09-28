@@ -28,13 +28,12 @@ def test_upload_rounds_to_fp16_and_says_so_in_its_size():
     assert tensor.nbytes == 2
 
 
-@pytest.mark.parametrize("count", [0, 1, 7, 1024, 100_000])
-def test_nbytes_is_two_per_element(count):
+def test_nbytes_is_two_per_element():
     """`footprint.weights` is a sum of these. A wrong factor here misreports
     every figure downstream without failing anything."""
-    tensor = _microinfer.upload_fp16(np.zeros(count, dtype=np.float32))
-    assert tensor.numel == count
-    assert tensor.nbytes == 2 * count
+    for count in (0, 1, 7, 1024, 100_000):
+        tensor = _microinfer.upload_fp16(np.zeros(count, dtype=np.float32))
+        assert (tensor.numel, tensor.nbytes) == (count, 2 * count), count
 
 
 def test_upload_actually_takes_device_memory():

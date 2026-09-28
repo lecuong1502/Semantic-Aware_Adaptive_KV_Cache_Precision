@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 
 import nvml
+from conftest import each
 from microinfer import _microinfer
 from microinfer._microinfer import PagedKVCache, PageNotFound, Tier
 
@@ -86,9 +87,12 @@ def pattern(layer: int, page_index: int, nbytes: int) -> np.ndarray:
 # -- granules ---------------------------------------------------------------
 
 
-def test_granule_comes_from_the_driver():
-    """Queried with cuMemGetAllocationGranularity, never hardcoded. Observed on
-    the RTX 4050 Laptop (driver 580.178.04): 2 MiB, recorded in ADR-0007."""
+def test_the_granule_is_the_drivers_and_reserving_takes_no_device_memory():
+    """The granule is queried with cuMemGetAllocationGranularity, never
+    hardcoded (2 MiB on the RTX 4050 Laptop, driver 580.178.04: ADR-0007),
+    and each tier's range is whole granules. Reserving 7.5 GiB across the
+    four tiers, more than the whole card, leaves NVML still: had it
+    allocated anything it could not have succeeded."""
     g = granule()
     assert g > 0 and g & (g - 1) == 0, f"granule {g} is not a power of two"
     cache = make_cache([g // 3, g // 5, g // 7, g // 11], capacity_pages=[10, 20, 30, 0])
@@ -96,96 +100,86 @@ def test_granule_comes_from_the_driver():
         assert cache.reserved_bytes(tier) % g == 0
         assert cache.reserved_bytes(tier) >= cache.page_bytes(tier) * [10, 20, 30, 0][tier.value]
 
-
-def test_reserving_address_space_takes_no_device_memory():
-    """7.5 GiB across the four tiers: more than the whole card, so had
-    reserving allocated anything it could not have succeeded, let alone left
-    NVML still."""
     held = []
-    total = nvml.memory().total
-    g = granule()
     capacity = (4 << 30) // (g // 64)
-
     delta = median_delta(lambda: held.append(make_cache(halving_pages(), capacity)),
                          lambda: held.clear())
     assert abs(delta) < g / 2, f"reserving moved NVML free memory by {delta / 2**20:.2f} MiB"
-
     cache = make_cache(halving_pages(), capacity)
-    assert sum(cache.reserved_bytes(t) for t in TIERS) > total
+    assert sum(cache.reserved_bytes(t) for t in TIERS) > nvml.memory().total
     assert all(cache.mapped_bytes(t) == 0 for t in TIERS)
 
 
 # -- allocation takes whole granules ----------------------------------------
 
 
-@pytest.mark.parametrize("granules_worth", [1, 2.5, 40.25])
-def test_allocating_pages_takes_whole_granules(granules_worth):
+def test_allocating_pages_takes_whole_granules():
     """A partly filled granule is still a whole granule to the driver, and one
     more page crossing into the next granule costs a whole one more."""
-    g = granule()
-    page = g // 64
-    count = int(granules_worth * 64)
-    expected = -(-count * page // g) * g  # ceil to whole granules
-    cache = make_cache([page] * 4, capacity_pages=count)
+    def takes(granules_worth):
+        g = granule()
+        page = g // 64
+        count = int(granules_worth * 64)
+        expected = -(-count * page // g) * g  # ceil to whole granules
+        cache = make_cache([page] * 4, capacity_pages=count)
 
-    def fill():
-        for i in range(count):
-            cache.allocate(0, i, Tier.FP16)
+        def fill():
+            for i in range(count):
+                cache.allocate(0, i, Tier.FP16)
 
-    def empty():
-        for i in range(count):
-            cache.free(0, i)
+        def empty():
+            for i in range(count):
+                cache.free(0, i)
 
-    taken = -median_delta(fill, empty)
-    fill()
-    assert cache.mapped_bytes(Tier.FP16) == expected
-    assert abs(taken - expected) < g / 2, (
-        f"NVML used rose by {taken / g:.2f} granules for {expected // g} mapped"
-    )
+        taken = -median_delta(fill, empty)
+        fill()
+        assert cache.mapped_bytes(Tier.FP16) == expected
+        assert abs(taken - expected) < g / 2, (
+            f"NVML used rose by {taken / g:.2f} granules for {expected // g} mapped")
+
+    each([1, 2.5, 40.25], takes)
 
 
 # -- the central test -------------------------------------------------------
 
 
-@pytest.mark.parametrize("granules_emptied", [1, 64])
-def test_emptying_a_granule_returns_it_to_nvml(granules_emptied):
+def test_emptying_a_granule_returns_it_to_nvml_with_its_last_page_and_not_before():
     """Releasing enough pages to empty a granule raises NVML-reported free
     memory by at least the granule size.
 
     The pages freed are the *lowest* in the range, not the tail, so every one
     of them triggers a tail swap: memory comes back only because the tail
     retracts. Freeing the lowest pages and seeing nothing return would be the
-    private-pool failure ADR-0007 was written against."""
-    g = granule()
-    page = g // 64
-    per_granule = g // page
-    held = (granules_emptied + 3) * per_granule
-    freed = granules_emptied * per_granule
-    cache = make_cache([page] * 4, capacity_pages=held)
-    for i in range(held):
-        cache.allocate(0, i, Tier.FP16)
-
-    def release():
-        for i in range(freed):
-            cache.free(0, i)
-
-    def restore():
-        for i in range(freed):
+    private-pool failure ADR-0007 was written against. And the counterpart:
+    65 pages reach one page into a second granule; freeing any one of them
+    empties it, and freeing another empties nothing."""
+    def returns(granules_emptied):
+        g = granule()
+        page = g // 64
+        per_granule = g // page
+        held = (granules_emptied + 3) * per_granule
+        freed = granules_emptied * per_granule
+        cache = make_cache([page] * 4, capacity_pages=held)
+        for i in range(held):
             cache.allocate(0, i, Tier.FP16)
 
-    gained = median_delta(release, restore)
-    assert gained >= granules_emptied * g, (
-        f"freeing {granules_emptied} granule(s) of pages returned "
-        f"{gained / 2**20:.2f} MiB to the driver"
-    )
+        def release():
+            for i in range(freed):
+                cache.free(0, i)
 
+        def restore():
+            for i in range(freed):
+                cache.allocate(0, i, Tier.FP16)
 
-def test_a_granule_is_released_with_its_last_page_and_not_before():
-    """The counterpart. 65 pages reach one page into a second granule; freeing
-    any one of them empties it, and freeing another empties nothing."""
+        gained = median_delta(release, restore)
+        assert gained >= granules_emptied * g, (
+            f"freeing {granules_emptied} granule(s) of pages returned "
+            f"{gained / 2**20:.2f} MiB to the driver")
+
+    each([1, 64], returns)
+
     g = granule()
-    page = g // 64
-    cache = make_cache([page] * 4, capacity_pages=128)
+    cache = make_cache([g // 64] * 4, capacity_pages=128)
     for i in range(65):  # one page into the second granule
         cache.allocate(0, i, Tier.FP16)
     assert cache.mapped_bytes(Tier.FP16) == 2 * g
@@ -198,48 +192,41 @@ def test_a_granule_is_released_with_its_last_page_and_not_before():
 # -- the tail swap ----------------------------------------------------------
 
 
-def test_freeing_a_non_tail_page_moves_the_tail_into_its_slot():
+def test_freeing_a_page_moves_the_tail_into_its_slot_with_its_contents():
+    """Freeing a page other than the tail moves the tail into its slot, the
+    tail's entry with it; freeing the tail moves nothing. Contents survive the
+    swap, also where a page is three eighths of a granule, so pages straddle
+    granule boundaries and the copy reads across two physical allocations.
+    One tier's swap leaves the other tiers alone."""
     cache = make_cache(halving_pages())
     for i in range(4):
         cache.allocate(0, i, Tier.INT8)
-
     cache.free(0, 1)
-
     assert cache.pages(Tier.INT8) == [(0, 0), (0, 3), (0, 2)]
     assert cache.locate(0, 3) == (Tier.INT8, 1), "the tail's entry was not moved"
     assert (0, 1) not in cache, "the freed page's entry was not removed"
-    assert cache.locate(0, 0) == (Tier.INT8, 0)
-    assert cache.locate(0, 2) == (Tier.INT8, 2)
+    assert cache.locate(0, 0) == (Tier.INT8, 0) and cache.locate(0, 2) == (Tier.INT8, 2)
 
-
-def test_freeing_the_tail_moves_nothing():
     cache = make_cache(halving_pages())
     for i in range(3):
         cache.allocate(0, i, Tier.FP16)
     cache.free(0, 2)
     assert cache.pages(Tier.FP16) == [(0, 0), (0, 1)]
 
+    def contents_survive(divisor):
+        page = int(granule() / divisor)
+        cache = make_cache([page] * 4, capacity_pages=64)
+        for i in range(20):
+            cache.allocate(0, i, Tier.FP16)
+            cache.write(0, i, pattern(0, i, page))
+        for i in [0, 3, 7, 8, 1]:
+            cache.free(0, i)
+        for layer, page_index in cache.pages(Tier.FP16):
+            np.testing.assert_array_equal(cache.read(layer, page_index),
+                                          pattern(layer, page_index, page))
 
-@pytest.mark.parametrize("divisor", [64, 8 / 3])
-def test_page_contents_survive_a_tail_swap(divisor):
-    """At divisor 8/3 a page is three eighths of a granule, so pages straddle
-    granule boundaries and the copy reads across two physical allocations."""
-    page = int(granule() / divisor)
-    cache = make_cache([page] * 4, capacity_pages=64)
-    count = 20
-    for i in range(count):
-        cache.allocate(0, i, Tier.FP16)
-        cache.write(0, i, pattern(0, i, page))
+    each([64, 8 / 3], contents_survive)
 
-    for i in [0, 3, 7, 8, 1]:
-        cache.free(0, i)
-
-    for layer, page_index in cache.pages(Tier.FP16):
-        np.testing.assert_array_equal(cache.read(layer, page_index),
-                                      pattern(layer, page_index, page))
-
-
-def test_a_tier_s_swap_leaves_other_tiers_alone():
     pages = halving_pages()
     cache = make_cache(pages)
     for tier in TIERS:
@@ -257,36 +244,27 @@ def test_a_tier_s_swap_leaves_other_tiers_alone():
 # -- the page table ---------------------------------------------------------
 
 
-def test_the_page_table_is_keyed_by_layer_and_page_index():
+def test_the_page_table_is_keyed_by_layer_and_page_and_says_what_it_refuses():
     """The same page_index in two layers is two pages, and may sit in two
-    tiers: a tier belongs to a (layer, page) pair (CONTEXT.md)."""
+    tiers: a tier belongs to a (layer, page) pair (CONTEXT.md). A page cannot
+    be allocated twice; an unknown page is PageNotFound, a KeyError; a full
+    tier says so and keeps what it held; a page is written and read whole,
+    in any dtype of the right size."""
     cache = make_cache(halving_pages())
     cache.allocate(0, 5, Tier.FP16)
     cache.allocate(1, 5, Tier.INT2)
-    assert cache.locate(0, 5) == (Tier.FP16, 0)
-    assert cache.locate(1, 5) == (Tier.INT2, 0)
-
+    assert cache.locate(0, 5) == (Tier.FP16, 0) and cache.locate(1, 5) == (Tier.INT2, 0)
     cache.free(0, 5)
     assert (0, 5) not in cache and (1, 5) in cache
 
-
-def test_a_page_cannot_be_allocated_twice():
-    cache = make_cache(halving_pages())
     cache.allocate(0, 0, Tier.FP16)
     with pytest.raises(ValueError, match="already allocated"):
         cache.allocate(0, 0, Tier.INT8)
-
-
-def test_an_unknown_page_is_a_key_error():
-    cache = make_cache(halving_pages())
-    for call in (lambda: cache.free(0, 0), lambda: cache.read(0, 0),
-                 lambda: cache.locate(0, 0)):
+    assert issubclass(PageNotFound, KeyError)
+    for call in (lambda: cache.free(9, 9), lambda: cache.read(9, 9), lambda: cache.locate(9, 9)):
         with pytest.raises(PageNotFound):
             call()
-    assert issubclass(PageNotFound, KeyError)
 
-
-def test_a_full_tier_says_so():
     cache = make_cache(halving_pages(), capacity_pages=[2, 1, 1, 1])
     cache.allocate(0, 0, Tier.FP16)
     cache.allocate(0, 1, Tier.FP16)
@@ -294,8 +272,6 @@ def test_a_full_tier_says_so():
         cache.allocate(0, 2, Tier.FP16)
     assert cache.pages(Tier.FP16) == [(0, 0), (0, 1)]
 
-
-def test_a_page_is_written_and_read_whole():
     pages = halving_pages()
     cache = make_cache(pages)
     cache.allocate(0, 0, Tier.INT4)

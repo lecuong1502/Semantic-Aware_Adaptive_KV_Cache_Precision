@@ -171,19 +171,17 @@ def test_smoke_greedy_generation_matches_huggingface(engine, golden):
         pytest.xfail(f"smoke test red, {matching}/10 match; investigate, do not gate:\n{lines}")
 
 
-def test_generation_stops_at_end_of_sequence(engine):
-    """Asked through the chat template for one word, the instruct model ends its
-    turn; generation stops there, and includes the end token, as HuggingFace's
-    does."""
+def test_generation_stops_at_its_end_token_or_its_limit(engine):
+    """Asked through the chat template for one word, the instruct model ends
+    its turn; generation stops there, and includes the end token, as
+    HuggingFace's does. It takes text, honours its limit, and returns int32
+    token ids that decode to text."""
     prompt = ("<|im_start|>user\nReply with exactly one word: yes.<|im_end|>\n"
               "<|im_start|>assistant\n")
     out = engine.generate(prompt, max_new_tokens=32)
-    assert out[-1] in engine.eos_token_ids
-    assert len(out) < 32
+    assert out[-1] in engine.eos_token_ids and len(out) < 32
     assert not any(t in engine.eos_token_ids for t in out[:-1])
 
-
-def test_generation_takes_text_and_honours_its_limit(engine):
     out = engine.generate("The capital of France is", max_new_tokens=5, stop_at_eos=False)
     assert out.dtype == np.int32 and len(out) == 5
     assert isinstance(engine.decode(out), str)
@@ -193,9 +191,12 @@ def test_generation_takes_text_and_honours_its_limit(engine):
 # -- one sequence, no batching ------------------------------------------------
 
 
-def test_there_is_no_batch_dimension(engine):
+def test_one_sequence_of_known_tokens_on_loaded_weights_and_no_pytorch(engine):
     """batch_size is 1 throughout, and no batching machinery exists: the entry
-    points take one sequence and say so when handed more."""
+    points take one sequence and say so when handed more. Token ids outside
+    the vocabulary, and no tokens at all, are refused, and so is inference
+    before the weights are loaded. PyTorch is not in the process after
+    inference."""
     with pytest.raises(ValueError, match="one sequence"):
         engine.forward(np.zeros((2, 4), np.int32))
     with pytest.raises(ValueError, match="one sequence"):
@@ -203,22 +204,12 @@ def test_there_is_no_batch_dimension(engine):
     for method in (Engine.forward, Engine.generate, ContiguousCache.__init__,
                    PagedCache.__init__, Workspace.__init__):
         assert not any("batch" in p for p in inspect.signature(method).parameters)
-
-
-def test_token_ids_outside_the_vocabulary_are_refused(engine):
     with pytest.raises(ValueError, match="token ids"):
         engine.forward(np.array([0, engine.config.vocab_size], np.int32))
     with pytest.raises(ValueError, match="empty"):
         engine.forward(np.array([], np.int32))
-
-
-def test_inference_needs_weights():
-    e = Engine(require_model(MODEL))
     with pytest.raises(RuntimeError, match="load_weights"):
-        e.forward([1, 2, 3])
-
-
-def test_no_pytorch_in_the_process_after_inference(engine):
+        Engine(require_model(MODEL)).forward([1, 2, 3])
     engine.generate("Hello", max_new_tokens=2)
     assert "torch" not in sys.modules
 

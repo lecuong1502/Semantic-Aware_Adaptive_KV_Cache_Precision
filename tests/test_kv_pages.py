@@ -20,6 +20,7 @@ that.
 
 import numpy as np
 import pytest
+from conftest import each
 from ulp_gate import fp16_exact
 
 from microinfer import _microinfer
@@ -67,85 +68,95 @@ def attend_both(cfg, cache, layer, q, k, v, bias, seq_k):
 # -- equality with the contiguous path ---------------------------------------
 
 
-@pytest.mark.parametrize("name", MODELS)
-@pytest.mark.parametrize("page_tokens", PAGE_TOKENS)
-def test_paged_attention_is_bit_identical_to_contiguous(name, page_tokens):
-    """Prefill and decode, with and without the key bias, at lengths below a
-    page, at one page, one past it, and several pages with a ragged last one."""
-    cfg = ModelConfig.from_card(name)
-    rng = np.random.default_rng(page_tokens)
-    heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
-    for seq_k in (1, page_tokens - 1, page_tokens, page_tokens + 1, 3 * page_tokens + 5):
-        _, cache = pages_for(cfg, page_tokens)
-        k, v = normal(rng, seq_k, kv_heads, hd), normal(rng, seq_k, kv_heads, hd)
-        cache.reserve(seq_k)
-        cache.store(1, put(k), put(v), 0, seq_k)
-        for bias in (None, normal(rng, kv_heads, hd) * 30):
-            for seq_q in {seq_k, 1}:
-                q = normal(rng, seq_q, heads, hd)
-                paged, whole = attend_both(cfg, cache, 1, q, k, v, bias, seq_k)
-                np.testing.assert_array_equal(paged, whole, err_msg=f"P={page_tokens} seq_k={seq_k}")
+def test_paged_attention_is_bit_identical_to_contiguous():
+    """At both models and both page sizes: prefill and decode, with and
+    without the key bias, at lengths below a page, at one page, one past it,
+    and several pages with a ragged last one. Storing one position at a time,
+    as decode does across page boundaries, leaves the pages holding what one
+    store of the whole would."""
+    def identical(name, page_tokens):
+        cfg = ModelConfig.from_card(name)
+        rng = np.random.default_rng(page_tokens)
+        heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        for seq_k in (1, page_tokens - 1, page_tokens, page_tokens + 1, 3 * page_tokens + 5):
+            _, cache = pages_for(cfg, page_tokens)
+            k, v = normal(rng, seq_k, kv_heads, hd), normal(rng, seq_k, kv_heads, hd)
+            cache.reserve(seq_k)
+            cache.store(1, put(k), put(v), 0, seq_k)
+            for bias in (None, normal(rng, kv_heads, hd) * 30):
+                for seq_q in {seq_k, 1}:
+                    q = normal(rng, seq_q, heads, hd)
+                    paged, whole = attend_both(cfg, cache, 1, q, k, v, bias, seq_k)
+                    np.testing.assert_array_equal(paged, whole, err_msg=f"seq_k={seq_k}")
 
+    def stepped(page_tokens):
+        rng = np.random.default_rng(7)
+        kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+        seq = 2 * page_tokens + 3
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        _, cache = pages_for(CFG, page_tokens)
+        for t in range(seq):
+            cache.reserve(t + 1)
+            cache.store(0, put(k[t]), put(v[t]), t, 1)
+        q = normal(rng, 1, CFG.num_attention_heads, hd)
+        paged, whole = attend_both(CFG, cache, 0, q, k, v, None, seq)
+        np.testing.assert_array_equal(paged, whole)
 
-@pytest.mark.parametrize("page_tokens", PAGE_TOKENS)
-def test_storing_in_steps_is_storing_at_once(page_tokens):
-    """Decode writes one position at a time, crossing page boundaries as it
-    goes; the pages must end up holding what one store of the whole would."""
-    rng = np.random.default_rng(7)
-    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
-    seq = 2 * page_tokens + 3
-    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
-    _, stepped = pages_for(CFG, page_tokens)
-    for t in range(seq):
-        stepped.reserve(t + 1)
-        stepped.store(0, put(k[t]), put(v[t]), t, 1)
-    q = normal(rng, 1, CFG.num_attention_heads, hd)
-    paged, whole = attend_both(CFG, stepped, 0, q, k, v, None, seq)
-    np.testing.assert_array_equal(paged, whole)
+    each([(n, p) for n in MODELS for p in PAGE_TOKENS], identical)
+    each(PAGE_TOKENS, stepped, name=lambda p: f"stepped P={p}")
 
 
 # -- pages move ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("page_tokens", PAGE_TOKENS)
-def test_a_page_moved_between_launches_is_still_read_correctly(page_tokens):
+def test_a_page_moved_between_launches_is_still_read_correctly():
     """A page belonging to someone else is allocated between the cache's pages
     and then freed. The allocator moves its tier's tail, one of the cache's
     pages, into the freed slot. The next launch must find it there."""
-    rng = np.random.default_rng(3)
-    heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
-    allocator, cache = pages_for(CFG, page_tokens)
-    seq = 3 * page_tokens
-    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
-    q = normal(rng, 1, heads, hd)
+    def moved(page_tokens):
+        rng = np.random.default_rng(3)
+        heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
+        allocator, cache = pages_for(CFG, page_tokens)
+        seq = 3 * page_tokens
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        q = normal(rng, 1, heads, hd)
 
-    cache.reserve(page_tokens)
-    allocator.allocate(99, 0, Tier.FP16)  # someone else's page, mid-range
-    cache.reserve(seq)
-    cache.store(0, put(k), put(v), 0, seq)
-    before, _ = attend_both(CFG, cache, 0, q, k, v, None, seq)
+        cache.reserve(page_tokens)
+        allocator.allocate(99, 0, Tier.FP16)  # someone else's page, mid-range
+        cache.reserve(seq)
+        cache.store(0, put(k), put(v), 0, seq)
+        before, _ = attend_both(CFG, cache, 0, q, k, v, None, seq)
 
-    tail = allocator.pages(Tier.FP16)[-1]
-    slot_before = allocator.locate(*tail)[1]
-    allocator.free(99, 0)
-    assert allocator.locate(*tail)[1] < slot_before, "no page of the cache moved"
-    assert tail[0] < LAYERS, "the page that moved should be the cache's own"
-    # The slot it left still holds its old bytes, which a stale address would
-    # read back correctly by luck. Another page takes the slot and fills it
-    # with NaN, so a stale read cannot pass.
-    allocator.allocate(98, 0, Tier.FP16)
-    assert allocator.locate(98, 0)[1] == slot_before
-    allocator.write(98, 0, np.full(cache.page_bytes // 2, np.nan, np.float16))
+        tail = allocator.pages(Tier.FP16)[-1]
+        slot_before = allocator.locate(*tail)[1]
+        allocator.free(99, 0)
+        assert allocator.locate(*tail)[1] < slot_before, "no page of the cache moved"
+        assert tail[0] < LAYERS, "the page that moved should be the cache's own"
+        # The slot it left still holds its old bytes, which a stale address
+        # would read back correctly by luck. Another page takes the slot and
+        # fills it with NaN, so a stale read cannot pass.
+        allocator.allocate(98, 0, Tier.FP16)
+        assert allocator.locate(98, 0)[1] == slot_before
+        allocator.write(98, 0, np.full(cache.page_bytes // 2, np.nan, np.float16))
 
-    after, whole = attend_both(CFG, cache, 0, q, k, v, None, seq)
-    np.testing.assert_array_equal(after, whole)
-    np.testing.assert_array_equal(after, before)
+        after, whole = attend_both(CFG, cache, 0, q, k, v, None, seq)
+        np.testing.assert_array_equal(after, whole)
+        np.testing.assert_array_equal(after, before)
+
+    each(PAGE_TOKENS, moved)
 
 
 # -- on demand, failure, and clean up ------------------------------------------
 
 
-def test_pages_are_allocated_on_demand():
+def test_pages_come_on_demand_go_with_the_cache_and_misuse_is_refused():
+    """A reserve takes the pages its positions need and no more, and never
+    frees. Under contention an allocation fails partway through a range: the
+    pages already taken for it are returned, so nothing leaks and a later
+    reserve fails for the same reason, not because it finds half a range
+    allocated. The cache returns its pages when it goes. A store past what
+    is reserved, attention past seq_k, and pages of the wrong size are
+    refused."""
     page_tokens = PAGE_TOKENS[-1]
     allocator, cache = pages_for(CFG, page_tokens)
     held = lambda: len(allocator.pages(Tier.FP16))  # noqa: E731
@@ -159,13 +170,9 @@ def test_pages_are_allocated_on_demand():
     cache.reserve(3)
     assert held() == 2 * LAYERS, "reserving less never frees"
     assert cache.pages_per_layer == 2 and cache.capacity_tokens == 2 * page_tokens
+    del cache
+    assert allocator.pages(Tier.FP16) == [] and allocator.mapped_bytes(Tier.FP16) == 0
 
-
-def test_a_failed_reserve_gives_back_what_it_took():
-    """Under contention an allocation will fail partway through a position
-    range. The pages already taken for that range are returned, so nothing
-    leaks, and the cache is as it was: a later reserve fails for the same
-    reason, not because it finds half a range already allocated."""
     page_tokens = PAGE_TOKENS[0]
     allocator, cache = pages_for(CFG, page_tokens, capacity_pages=LAYERS + 1)
     cache.reserve(page_tokens)
@@ -175,17 +182,6 @@ def test_a_failed_reserve_gives_back_what_it_took():
         assert len(allocator.pages(Tier.FP16)) == LAYERS
         assert cache.pages_per_layer == 1
 
-
-def test_the_cache_returns_its_pages_when_it_goes():
-    allocator, cache = pages_for(CFG, PAGE_TOKENS[0])
-    cache.reserve(100)
-    assert len(allocator.pages(Tier.FP16)) > 0
-    del cache
-    assert allocator.pages(Tier.FP16) == []
-    assert allocator.mapped_bytes(Tier.FP16) == 0
-
-
-def test_misuse_is_refused():
     kv_width = CFG.num_key_value_heads * CFG.head_dim
     _, cache = pages_for(CFG, 16)
     cache.reserve(16)
@@ -203,31 +199,31 @@ def test_misuse_is_refused():
 # -- the RoPE table -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", MODELS)
-def test_the_rope_table_is_the_fp64_value_rounded_once(name):
+def test_the_rope_table_is_the_fp64_value_rounded_once_and_must_reach_every_key():
     """Attention completes keys with cos and sin from this table (ADR-0009,
     note from #14): each entry is the float64 value rounded once to fp32, out
-    to the model's whole context window. It grows by doubling, so a decode
-    step does not rebuild it."""
-    cfg = ModelConfig.from_card(name)
-    hd = cfg.head_dim
-    table = device.RopeTable(hd, cfg.rope_theta)
-    table.cover(5)
-    table.cover(6)
-    assert table.positions == 10, "grows by doubling"
-    table.cover(cfg.max_position_embeddings)
-    got = table.to_numpy()
-    assert table.nbytes == got.nbytes
+    to the model's whole context window, at both models' head_dims. It grows
+    by doubling, so a decode step does not rebuild it. A key bias needs a
+    table that reaches every key."""
+    def rounded_once(name):
+        cfg = ModelConfig.from_card(name)
+        hd = cfg.head_dim
+        table = device.RopeTable(hd, cfg.rope_theta)
+        table.cover(5)
+        table.cover(6)
+        assert table.positions == 10, "grows by doubling"
+        table.cover(cfg.max_position_embeddings)
+        got = table.to_numpy()
+        assert table.nbytes == got.nbytes
+        angle = (np.arange(got.shape[0], dtype=np.float64)[:, None]
+                 * cfg.rope_theta ** (-2.0 * np.arange(hd // 2) / hd))
+        for value, reference in ((got[..., 0], np.cos(angle)), (got[..., 1], np.sin(angle))):
+            rounded = reference.astype(np.float32)
+            ulps = np.abs(value - rounded) / np.spacing(np.abs(rounded).astype(np.float32))
+            assert ulps.max() <= 1, f"{ulps.max()} fp32 ulp from the float64 value"
 
-    angle = (np.arange(got.shape[0], dtype=np.float64)[:, None]
-             * cfg.rope_theta ** (-2.0 * np.arange(hd // 2) / hd))
-    for value, reference in ((got[..., 0], np.cos(angle)), (got[..., 1], np.sin(angle))):
-        rounded = reference.astype(np.float32)
-        ulps = np.abs(value - rounded) / np.spacing(np.abs(rounded).astype(np.float32))
-        assert ulps.max() <= 1, f"{ulps.max()} fp32 ulp from the float64 value"
+    each(MODELS, rounded_once)
 
-
-def test_a_key_bias_needs_a_table_that_reaches_every_key():
     rng = np.random.default_rng(1)
     heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
     q, k = normal(rng, 1, heads, hd), normal(rng, 8, kv_heads, hd)

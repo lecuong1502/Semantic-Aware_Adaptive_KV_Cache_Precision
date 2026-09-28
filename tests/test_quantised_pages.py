@@ -24,6 +24,7 @@ tools/quant_roundtrip.py, and nothing here may lose more, or less. P runs at
 
 import numpy as np
 import pytest
+from conftest import each
 from test_kv_pages import CFG, LAYERS, MODELS, PAGE_TOKENS, normal, put
 
 from microinfer import _microinfer
@@ -34,11 +35,6 @@ from microinfer.model import tier_page_bytes
 device = _microinfer.device
 Halves = device.Halves
 QUANTISED = (Tier.INT8, Tier.INT4, Tier.INT2)
-
-
-@pytest.fixture(params=QUANTISED, ids=lambda t: t.name)
-def tier(request):
-    return request.param
 
 
 def pages_for(cfg, page_tokens, tier, halves=Halves.Both, capacity_pages=4096):
@@ -122,178 +118,179 @@ def attend(cfg, cache, layer, q, k, v, bias, start):
 # -- what a page holds ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("page_tokens", PAGE_TOKENS)
-def test_a_full_page_holds_quantise_page_of_its_positions(tier, page_tokens):
-    """Runs that cover a page whole, that end mid-page, that finish a page an
-    open page began, and single positions: each full page is quantise_page's
-    bytes for its positions."""
-    rng = np.random.default_rng(page_tokens)
-    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
-    seq = 4 * page_tokens + 5
-    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
-    runs = [7, page_tokens, 1, 1, 2 * page_tokens - 9]
-    runs.append(seq - sum(runs))
-    allocator, cache = pages_for(CFG, page_tokens, tier)
-    store_in_runs(cache, 1, k, v, runs)
+def test_a_page_holds_quantise_page_of_its_positions_at_its_tier_for_good():
+    """At every tier and both page sizes, runs that cover a page whole, that
+    end mid-page, that finish a page an open page began, and single positions:
+    each full page is quantise_page's bytes for its positions. And every
+    allocation the cache makes, followed position by position: a page of
+    positions appears at the cache's tier once its last position is reserved,
+    the two open pages appear at FP16 once, and no page, once seen, is ever
+    at another tier or gone."""
+    def holds(tier, page_tokens):
+        rng = np.random.default_rng(page_tokens)
+        kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+        seq = 4 * page_tokens + 5
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        runs = [7, page_tokens, 1, 1, 2 * page_tokens - 9]
+        runs.append(seq - sum(runs))
+        allocator, cache = pages_for(CFG, page_tokens, tier)
+        store_in_runs(cache, 1, k, v, runs)
+        for i in range(seq // page_tokens):
+            span = slice(i * page_tokens, (i + 1) * page_tokens)
+            np.testing.assert_array_equal(
+                allocator.read(1, i),
+                _microinfer.quantise_page(k[span], v[span], tier, page_tokens),
+                err_msg=f"page {i}")
 
-    for i in range(seq // page_tokens):
-        span = slice(i * page_tokens, (i + 1) * page_tokens)
-        np.testing.assert_array_equal(
-            allocator.read(1, i), _microinfer.quantise_page(k[span], v[span], tier, page_tokens),
-            err_msg=f"page {i}")
+    def never_changes(tier, page_tokens):
+        rng = np.random.default_rng(1)
+        kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+        seq = 3 * page_tokens + 4
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        allocator, cache = pages_for(CFG, page_tokens, tier)
+        seen = {}
+        for t in range(seq):
+            cache.reserve(t + 1)
+            for layer in range(LAYERS):
+                cache.store(layer, put(k[t]), put(v[t]), t, 1)
+            now = {key: t_ for t_ in Tier.__members__.values() for key in allocator.pages(t_)}
+            for key, was in seen.items():
+                assert now.get(key) == was, f"{key} was at {was}, now {now.get(key)}"
+            seen.update(now)
+            full = (t + 1) // page_tokens
+            assert sorted(allocator.pages(tier)) == [(layer, i) for layer in range(LAYERS)
+                                                     for i in range(full)]
+            assert sorted(allocator.pages(Tier.FP16)) == sorted(
+                (layer, p) for layer in range(LAYERS) for p in device.open_pages)
+        assert cache.pages_per_layer == seq // page_tokens and cache.tier == tier
 
-
-def test_pages_are_taken_at_the_tier_and_never_change_it(tier):
-    """Every allocation the cache makes, followed position by position: a page
-    of positions appears at the cache's tier once its last position is
-    reserved, the two open pages appear at FP16 once, and no page, once seen,
-    is ever at another tier or gone."""
-    page_tokens = PAGE_TOKENS[0]
-    rng = np.random.default_rng(1)
-    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
-    seq = 3 * page_tokens + 4
-    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
-    allocator, cache = pages_for(CFG, page_tokens, tier)
-
-    seen = {}
-    for t in range(seq):
-        cache.reserve(t + 1)
-        for layer in range(LAYERS):
-            cache.store(layer, put(k[t]), put(v[t]), t, 1)
-        now = {key: t_ for t_ in Tier.__members__.values() for key in allocator.pages(t_)}
-        for key, was in seen.items():
-            assert now.get(key) == was, f"{key} was at {was}, now {now.get(key)}"
-        seen.update(now)
-        full = (t + 1) // page_tokens
-        assert sorted(allocator.pages(tier)) == [(layer, i) for layer in range(LAYERS)
-                                                 for i in range(full)]
-        assert sorted(allocator.pages(Tier.FP16)) == sorted(
-            (layer, p) for layer in range(LAYERS) for p in device.open_pages)
-    assert cache.pages_per_layer == seq // page_tokens and cache.tier == tier
+    each([(holds, t, p) for t in QUANTISED for p in PAGE_TOKENS]
+         + [(never_changes, t, PAGE_TOKENS[0]) for t in QUANTISED],
+         lambda f, t, p: f(t, p), name=lambda c: f"{c[0].__name__} {c[1].name} P={c[2]}")
 
 
 # -- attention over it --------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", MODELS)
-@pytest.mark.parametrize("page_tokens", PAGE_TOKENS)
-def test_each_query_reads_earlier_pages_sealed_and_its_own_as_it_came(name, tier, page_tokens):
-    """A prompt in one step, then more positions in a step that begins
-    mid-page and crosses pages, then single positions: after each, every
-    query's output is the causal reference's, with and without the key bias."""
-    cfg = ModelConfig.from_card(name)
-    rng = np.random.default_rng(page_tokens)
-    heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
-    seq = 3 * page_tokens + 7
-    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
-    for runs in ([seq], [page_tokens + 5, seq - page_tokens - 5],
-                 [page_tokens - 1, 1, 2 * page_tokens + 4, 1, 1, 1]):
-        allocator, cache = pages_for(cfg, page_tokens, tier)
-        start = store_in_runs(cache, 1, k, v, runs)
-        for bias in (None, normal(rng, kv_heads, hd) * 30):
-            q = normal(rng, seq - start, heads, hd)
-            want = causal_reference(cfg, allocator, 1, q, k, v, bias, start, page_tokens, tier)
-            np.testing.assert_array_equal(attend(cfg, cache, 1, q, k, v, bias, start), want,
-                                          err_msg=f"{tier.name} P={page_tokens} runs={runs}")
+def test_each_query_reads_earlier_pages_sealed_and_its_own_as_it_came():
+    """At every tier, both models and both page sizes: a prompt in one step,
+    then more positions in a step that begins mid-page and crosses pages,
+    then single positions; after each, every query's output is the causal
+    reference's, with and without the key bias. And as test_kv_pages.py's,
+    at a quantised tier: the allocator moves one of the cache's pages into a
+    slot another page left, and that slot is then filled with another page's
+    garbage, so a stale address cannot pass."""
+    def causal(name, tier, page_tokens):
+        cfg = ModelConfig.from_card(name)
+        rng = np.random.default_rng(page_tokens)
+        heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        seq = 3 * page_tokens + 7
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        for runs in ([seq], [page_tokens + 5, seq - page_tokens - 5],
+                     [page_tokens - 1, 1, 2 * page_tokens + 4, 1, 1, 1]):
+            allocator, cache = pages_for(cfg, page_tokens, tier)
+            start = store_in_runs(cache, 1, k, v, runs)
+            for bias in (None, normal(rng, kv_heads, hd) * 30):
+                q = normal(rng, seq - start, heads, hd)
+                want = causal_reference(cfg, allocator, 1, q, k, v, bias, start, page_tokens,
+                                        tier)
+                np.testing.assert_array_equal(attend(cfg, cache, 1, q, k, v, bias, start), want,
+                                              err_msg=f"runs={runs}")
 
+    def moved(tier):
+        page_tokens = PAGE_TOKENS[0]
+        rng = np.random.default_rng(3)
+        heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
+        allocator, cache = pages_for(CFG, page_tokens, tier)
+        seq = 3 * page_tokens + 2
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        q = normal(rng, 1, heads, hd)
+        cache.reserve(page_tokens)
+        allocator.allocate(99, 0, tier)  # someone else's page, mid-range
+        start = store_in_runs(cache, 0, k, v, [seq - 1, 1])
+        before = attend(CFG, cache, 0, q, k, v, None, start)
+        tail = allocator.pages(tier)[-1]
+        slot_before = allocator.locate(*tail)[1]
+        allocator.free(99, 0)
+        assert allocator.locate(*tail)[1] < slot_before, "no page of the cache moved"
+        allocator.allocate(98, 0, tier)
+        assert allocator.locate(98, 0)[1] == slot_before
+        allocator.write(98, 0, np.full(cache.page_bytes, 0xFF, np.uint8))
+        after = attend(CFG, cache, 0, q, k, v, None, start)
+        np.testing.assert_array_equal(after, before)
+        np.testing.assert_array_equal(
+            after, causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens, tier))
 
-def test_a_quantised_page_moved_between_launches_is_still_read_correctly(tier):
-    """As test_kv_pages.py's, at a quantised tier: the allocator moves one of
-    the cache's pages into a slot another page left, and that slot is then
-    filled with another page's garbage, so a stale address cannot pass."""
-    page_tokens = PAGE_TOKENS[0]
-    rng = np.random.default_rng(3)
-    heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
-    allocator, cache = pages_for(CFG, page_tokens, tier)
-    seq = 3 * page_tokens + 2
-    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
-    q = normal(rng, 1, heads, hd)
-
-    cache.reserve(page_tokens)
-    allocator.allocate(99, 0, tier)  # someone else's page, mid-range
-    start = store_in_runs(cache, 0, k, v, [seq - 1, 1])
-    before = attend(CFG, cache, 0, q, k, v, None, start)
-
-    tail = allocator.pages(tier)[-1]
-    slot_before = allocator.locate(*tail)[1]
-    allocator.free(99, 0)
-    assert allocator.locate(*tail)[1] < slot_before, "no page of the cache moved"
-    allocator.allocate(98, 0, tier)
-    assert allocator.locate(98, 0)[1] == slot_before
-    allocator.write(98, 0, np.full(cache.page_bytes, 0xFF, np.uint8))
-
-    after = attend(CFG, cache, 0, q, k, v, None, start)
-    np.testing.assert_array_equal(after, before)
-    np.testing.assert_array_equal(
-        after, causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens, tier))
+    each([(n, t, p) for n in MODELS for t in QUANTISED for p in PAGE_TOKENS], causal,
+         name=lambda c: f"{c[0]} {c[1].name} P={c[2]}")
+    each(QUANTISED, moved, name=lambda t: f"moved {t.name}")
 
 
 # -- the diagnostic: one half at a time ---------------------------------------------
 
 
-@pytest.mark.parametrize("halves", [Halves.Keys, Halves.Values], ids=lambda h: h.name)
-def test_a_diagnostic_page_rounds_one_half_and_keeps_the_other(tier, halves):
+def test_a_diagnostic_page_rounds_one_half_and_keeps_the_other():
     """Stored at FP16, with the named half replaced by the tier's round trip
     and the other as it came; and attention reads it causally all the same."""
-    page_tokens = PAGE_TOKENS[0]
-    rng = np.random.default_rng(4)
-    heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
-    seq = 2 * page_tokens + 3
-    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
-    allocator, cache = pages_for(CFG, page_tokens, tier, halves)
-    assert cache.storage_tier == Tier.FP16 and cache.halves == halves
-    start = store_in_runs(cache, 0, k, v, [page_tokens + 2, seq - page_tokens - 2])
+    def diagnostic(tier, halves):
+        page_tokens = PAGE_TOKENS[0]
+        rng = np.random.default_rng(4)
+        heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
+        seq = 2 * page_tokens + 3
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        allocator, cache = pages_for(CFG, page_tokens, tier, halves)
+        assert cache.storage_tier == Tier.FP16 and cache.halves == halves
+        start = store_in_runs(cache, 0, k, v, [page_tokens + 2, seq - page_tokens - 2])
+        got_k, got_v = sealed(allocator, CFG, 0, 2, page_tokens, tier, halves)
+        for i in range(2):
+            span = slice(i * page_tokens, (i + 1) * page_tokens)
+            rk, rv = _microinfer.dequantise_page(
+                _microinfer.quantise_page(k[span], v[span], tier, page_tokens), tier, kv_heads,
+                hd, page_tokens)
+            np.testing.assert_array_equal(got_k[span], rk if halves == Halves.Keys else k[span])
+            np.testing.assert_array_equal(got_v[span], rv if halves == Halves.Values else v[span])
+        q = normal(rng, seq - start, heads, hd)
+        np.testing.assert_array_equal(
+            attend(CFG, cache, 0, q, k, v, None, start),
+            causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens, tier, halves))
 
-    got_k, got_v = sealed(allocator, CFG, 0, 2, page_tokens, tier, halves)
-    for i in range(2):
-        span = slice(i * page_tokens, (i + 1) * page_tokens)
-        rk, rv = _microinfer.dequantise_page(
-            _microinfer.quantise_page(k[span], v[span], tier, page_tokens), tier, kv_heads, hd,
-            page_tokens)
-        np.testing.assert_array_equal(got_k[span], rk if halves == Halves.Keys else k[span])
-        np.testing.assert_array_equal(got_v[span], rv if halves == Halves.Values else v[span])
-    q = normal(rng, seq - start, heads, hd)
-    np.testing.assert_array_equal(
-        attend(CFG, cache, 0, q, k, v, None, start),
-        causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens, tier, halves))
+    each([(t, h) for t in QUANTISED for h in (Halves.Keys, Halves.Values)], diagnostic,
+         name=lambda c: f"{c[0].name} {c[1].name}")
 
 
 # -- the rest of the contract ----------------------------------------------------------
 
 
-def test_the_cache_returns_every_page_when_it_goes(tier):
-    allocator, cache = pages_for(CFG, PAGE_TOKENS[0], tier)
-    cache.reserve(100)
-    assert allocator.pages(tier) and allocator.pages(Tier.FP16)
-    del cache
-    for t in Tier.__members__.values():
-        assert allocator.pages(t) == [] and allocator.mapped_bytes(t) == 0
-
-
-def test_a_failed_reserve_gives_back_the_open_pages_it_took(tier):
-    """The first reserve takes the open pages and then the pages of positions;
-    if the second part fails, the first is given back too."""
-    page_tokens = PAGE_TOKENS[0]
-    allocator, cache = pages_for(CFG, page_tokens, tier, capacity_pages=LAYERS)
-    with pytest.raises(ValueError, match="full"):
-        cache.reserve(2 * page_tokens)
-    assert all(allocator.pages(t) == [] for t in Tier.__members__.values())
-    cache.reserve(page_tokens)
-    assert cache.pages_per_layer == 1
-
-
-def test_a_quantised_cache_needs_room_for_its_open_pages(tier):
-    wrong = tier_page_bytes(CFG, 16)
-    wrong[int(Tier.FP16)] += 2
-    with pytest.raises(ValueError, match="open page"):
-        device.KVPages(PagedKVCache(wrong, [8] * 4), LAYERS, 16, CFG.num_key_value_heads,
-                       CFG.head_dim, tier)
-
-
-def test_attention_at_a_quantised_tier_needs_the_queries_rows(tier):
-    _, cache = pages_for(CFG, PAGE_TOKENS[0], tier)
-    cache.reserve(4)
+def test_the_rest_of_the_contract():
+    """At every tier: the cache returns every page when it goes; a failed
+    first reserve, which takes the open pages and then the pages of
+    positions, gives the open pages back too; a quantised cache needs room
+    for its open pages; attention at a quantised tier needs the queries'
+    rows."""
     heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
-    with pytest.raises(ValueError, match="rows"):
-        cache.attention(0, device.empty(heads * hd), None, None, device.empty(heads * hd),
-                        1, 4, heads, kv_heads, hd)
+    for tier in QUANTISED:
+        allocator, cache = pages_for(CFG, PAGE_TOKENS[0], tier)
+        cache.reserve(100)
+        assert allocator.pages(tier) and allocator.pages(Tier.FP16)
+        del cache
+        for t in Tier.__members__.values():
+            assert allocator.pages(t) == [] and allocator.mapped_bytes(t) == 0
+
+        page_tokens = PAGE_TOKENS[0]
+        allocator, cache = pages_for(CFG, page_tokens, tier, capacity_pages=LAYERS)
+        with pytest.raises(ValueError, match="full"):
+            cache.reserve(2 * page_tokens)
+        assert all(allocator.pages(t) == [] for t in Tier.__members__.values())
+        cache.reserve(page_tokens)
+        assert cache.pages_per_layer == 1
+
+        wrong = tier_page_bytes(CFG, 16)
+        wrong[int(Tier.FP16)] += 2
+        with pytest.raises(ValueError, match="open page"):
+            device.KVPages(PagedKVCache(wrong, [8] * 4), LAYERS, 16, kv_heads, hd, tier)
+
+        _, cache = pages_for(CFG, PAGE_TOKENS[0], tier)
+        cache.reserve(4)
+        with pytest.raises(ValueError, match="rows"):
+            cache.attention(0, device.empty(heads * hd), None, None, device.empty(heads * hd),
+                            1, 4, heads, kv_heads, hd)

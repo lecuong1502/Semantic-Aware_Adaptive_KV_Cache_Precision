@@ -14,15 +14,12 @@ from microinfer.config import ConfigMismatch, ModelConfig
 from microinfer.models import VERIFIED, verified_card
 
 
-def test_both_adr_0003_models_are_recorded():
-    assert set(VERIFIED) == {"qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct"}
-
-
-@pytest.mark.parametrize("name", sorted(VERIFIED))
-def test_recorded_card_matches_the_expected_constants(name):
+def test_both_adr_0003_models_are_recorded_with_the_constants_expected():
     """The card is a copy of the upstream config.json; the expectation is
     written out separately. They must agree, or one of them is a typo."""
-    ModelConfig.from_card(name).verify(VERIFIED[name])
+    assert set(VERIFIED) == {"qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct"}
+    for name in sorted(VERIFIED):
+        ModelConfig.from_card(name).verify(VERIFIED[name])
 
 
 def test_derived_head_dim_matches_hidden_over_heads():

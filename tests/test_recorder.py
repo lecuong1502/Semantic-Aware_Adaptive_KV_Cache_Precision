@@ -203,25 +203,25 @@ def failing_after(calls, reader):
     return read
 
 
-@pytest.mark.parametrize("failing", ["device", "processes"])
-def test_a_failure_in_either_stream_ends_both_at_once(tmp_path, failing):
+def test_a_failure_in_either_stream_ends_both_at_once(tmp_path):
     """A stream that fails stops the recording within a period, not at its
     end, and neither file closes as complete: a whole trace beside a broken
     one would pass for a recording it is not."""
-    path = tmp_path / "trace.csv.gz"
-    device, procs = FakeMemory(), FakeProcesses()
-    if failing == "device":
-        device = failing_after(30, device)
-    else:
-        procs = failing_after(3, procs)
-    started = time.monotonic()
-    with pytest.raises(RuntimeError) as info:
-        recorder.record(path, rate_hz=100, duration=30, reader=device,
-                        processes_rate_hz=20, process_reader=procs)
-    assert time.monotonic() - started < 1.0
-    assert "driver gone" in str(info.value) + str(info.value.__cause__)
-    assert not recorder.read(path)[0]["complete"]
-    assert not recorder.read_processes(recorder.processes_path(path))[0]["complete"]
+    for failing in ("device", "processes"):
+        path = tmp_path / f"{failing}.csv.gz"
+        device, procs = FakeMemory(), FakeProcesses()
+        if failing == "device":
+            device = failing_after(30, device)
+        else:
+            procs = failing_after(3, procs)
+        started = time.monotonic()
+        with pytest.raises(RuntimeError) as info:
+            recorder.record(path, rate_hz=100, duration=30, reader=device,
+                            processes_rate_hz=20, process_reader=procs)
+        assert time.monotonic() - started < 1.0, failing
+        assert "driver gone" in str(info.value) + str(info.value.__cause__)
+        assert not recorder.read(path)[0]["complete"]
+        assert not recorder.read_processes(recorder.processes_path(path))[0]["complete"]
 
 
 # -- action labels --------------------------------------------------------------------
