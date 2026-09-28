@@ -2,7 +2,7 @@
 """Run RQ1's scripted scenario while the recorder records it (#53).
 
     .venv/bin/python tools/run_scenario.py --out trace.csv.gz
-        [--browser chrome|firefox] [--actions 1,2,3,4,5,6,7,8,9] [--with-engine]
+        [--browser chrome|firefox] [--actions 1,2,3,4,6,7,8,9] [--with-engine]
         [--hold 60] [--gap 10] [--idle 120] [--call-url URL] [--call-timeout 600]
 
 The collection protocol, what to prepare and how many runs of which kind,
@@ -14,9 +14,10 @@ microinfer.scenario on a fixed schedule: by default the whole scenario in
 Chrome, or with --browser firefox the Firefox pass over actions 2 to 4 that
 #45 compares browsers with. With --with-engine it first starts the engine
 holding Qwen2.5-1.5B at its 32K window (tools/hold_engine.py), labels its
-prefill, and begins the actions once it decodes. At action 5, the video
-call, it opens the call's page and waits at the terminal for the owner to
-start the call and press Enter, for --call-timeout seconds at most; the hold's status file
+prefill, and begins the actions once it decodes. Action 5, the video call,
+runs only when --actions names it: it opens the call's page and waits at
+the terminal for the owner to start the call and press Enter, for
+--call-timeout seconds at most; the hold's status file
 lands beside the trace. If the engine exits during the scenario, out of
 memory as #52 records it, the moment is labelled "engine-exited" and the
 scenario goes on without it.
@@ -115,7 +116,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--out", type=Path, required=True, help="the trace to record")
     parser.add_argument("--browser", choices=sorted(scenario.DEFAULT_ACTIONS), default="chrome")
     parser.add_argument("--actions", help="the actions of #45 to run, by number, in order; "
-                                          "by default all of them in Chrome, 2 to 4 and 9 "
+                                          "by default all but 5 in Chrome, 2 to 4 and 9 "
                                           "in Firefox")
     parser.add_argument("--with-engine", action="store_true",
                         help="hold the engine at its 32K window through the scenario")

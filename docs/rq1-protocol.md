@@ -29,11 +29,9 @@ measures: the RTX 4050 Laptop, 6 GiB.
    things, so that memory freed late has returned before the recording
    starts.
 5. **Stay off the machine.** Do not type, click or open anything while a run
-   is going. The one exception is the video call's prompt, below.
+   is going.
 6. **The network.** Use the same connection for every run: the YouTube
    resolution is forced, but loading still depends on it.
-7. **For the video call,** have a Google account ready. The driver opens a
-   fresh browser profile each run, so you sign in each time.
 
 The 4K clip VLC plays (Big Buck Bunny, 632 MB) is fetched on the first run,
 before recording starts, and checked against a pinned sha256.
@@ -51,27 +49,33 @@ open until action 9 closes them.
 | 2 | `chrome-tabs-1`, `chrome-tabs-5`, `chrome-tabs-10` | 60 s each |
 | 3 | `chrome-youtube-1080p` | 60 s |
 | 4 | `chrome-youtube-2160p` | 60 s |
-| 5 | `chrome-video-call-setup`, then `chrome-video-call` | until you confirm, then 60 s |
+| 5 | not run by default: see below | |
 | 6 | `chrome-webgl` | 60 s |
 | 7 | `vlc-2160p` | 60 s |
 | 8 | `vscode`, opened and closed | 60 s |
 | 9 | `close-all` | 60 s |
 
-There is a 10 s gap between spans, except after the video call's setup: the
-call's own span begins the moment you confirm. A run takes about 14 minutes
-plus the time the video call's setup takes. With the engine, add its prefill (about
+There is a 10 s gap between spans. A run takes about 13 minutes. With the engine, add its prefill (about
 12 minutes on Qwen2.5-1.5B at 32K). That prefill is labelled
 `engine-prefill`, and the actions begin once the engine decodes.
 
-**At action 5** the driver opens Google Meet and stops, printing a prompt in
-the terminal. Then:
+**Action 5, the video call, is not run by default.** In the first run of
+#55, Google refused the owner's sign-in in the driver's browser: a fresh
+profile, controlled remotely, which Google treats as automated. Without a
+signed-in account Meet cannot start a call. So the scenarios record actions
+1 to 4 and 6 to 9, and the video call is left out of RQ1's results.
+
+The driver can still run it, for a setup where signing in works, with
+`--actions 1,2,3,4,5,6,7,8,9`. Then, at action 5, it opens Google Meet and
+stops, printing a prompt in the terminal:
 
 1. Sign in.
 2. Start a new call with the camera on.
 3. Share the entire screen.
 4. Press Enter in the terminal.
 
-The time from the prompt to your Enter is the `-setup` span, so what signing
+There is no gap after the call's setup. The time from the prompt to your
+Enter is the `-setup` span, so what signing
 in and starting the camera cost is labelled too. The call's own 60 s begin
 at your Enter. The call stays open until action 9. Anything typed before the
 prompt appears is discarded, so only an Enter pressed for this prompt counts.

@@ -55,13 +55,12 @@ def test_the_schedule_labels_every_span_on_time_and_closes_everything_however_it
     that cannot be sent stops it, the log kept."""
     desktop = FakeDesktop()
     timing = scenario.Timing(hold_s=0.05, gap_s=0.02, idle_s=0.1)
-    # By default, the call and the person it waits for come between the
-    # videos and the WebGL page; the rest of this runs without them.
-    assert [s.label for s in scenario.spans_for(scenario.DEFAULT_ACTIONS["chrome"], desktop,
-                                                timing)][5:8] == [
-        "chrome-youtube-2160p", "chrome-video-call-setup", "chrome-video-call"]
-    no_call = tuple(n for n in scenario.DEFAULT_ACTIONS["chrome"] if n != 5)
-    spans = scenario.spans_for(no_call, desktop, timing)
+    # The call runs only when asked for, between the videos and the WebGL
+    # page; the rest of this runs the default, without it.
+    assert [s.label for s in scenario.spans_for((4, 5, 6), desktop, timing)] == [
+        "chrome-youtube-2160p", "chrome-video-call-setup", "chrome-video-call", "chrome-webgl"]
+    assert 5 not in scenario.DEFAULT_ACTIONS["chrome"]
+    spans = scenario.spans_for(scenario.DEFAULT_ACTIONS["chrome"], desktop, timing)
     labels = []
     log = scenario.run(spans, desktop, lambda e, a: labels.append((e, a)), threading.Event(),
                        gap_s=timing.gap_s)
