@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from conftest import each
 from test_linear import CASES, make_case, projections, reference_linear, term_count
 from ulp_gate import accumulation_floor, assert_within_gate
 
@@ -53,18 +54,20 @@ SHAPES = sorted({(name, proj) for name, proj in CASES
                  if proj in ("q_proj", "k_proj", "gate_proj", "down_proj")})
 
 
-@pytest.mark.parametrize("name,proj", SHAPES)
-def test_both_kernels_match_the_reference_at_every_model_shape(study, name, proj):
+def test_both_kernels_match_the_reference_at_every_model_shape(study):
     """Decode (one row) and a prefill length that is not a multiple of any
     tile, at every distinct projection shape of both models."""
-    in_features, out_features, _ = projections(ModelConfig.from_card(name))[proj]
-    for rows in (1, 37):
-        x, w, _ = make_case(rows, in_features, out_features, bias=False, seed=rows)
-        ref, terms = reference_linear(x, w)
-        for kernel in KERNELS:
-            got = getattr(study, kernel)(x, w)
-            assert got.shape == ref.shape
-            assert_within_gate(got, ref, accumulation_floor(terms, term_count(x, None)))
+    def matches(name, proj):
+        in_features, out_features, _ = projections(ModelConfig.from_card(name))[proj]
+        for rows in (1, 37):
+            x, w, _ = make_case(rows, in_features, out_features, bias=False, seed=rows)
+            ref, terms = reference_linear(x, w)
+            for kernel in KERNELS:
+                got = getattr(study, kernel)(x, w)
+                assert got.shape == ref.shape
+                assert_within_gate(got, ref, accumulation_floor(terms, term_count(x, None)))
+
+    each(SHAPES, matches)
 
 
 def test_ragged_edges_on_every_side(study):

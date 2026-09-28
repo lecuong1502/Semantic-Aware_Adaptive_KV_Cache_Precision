@@ -80,16 +80,16 @@ def assert_same_output(single, chunked, what):
 # -- the same output -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("prompt_id,chunks", [
-    ("medium-02", (1, 16)),        # 37 tokens: one position at a time, and a ragged last chunk
-    ("adversarial-01", (37, 128)),  # 501 tokens
-    ("long-01", (128, 512)),        # 1,090 tokens, the longest
-])
-def test_chunked_prefill_matches_single_shot(engine, golden, prompt_id, chunks):
-    ids = golden[prompt_id].token_ids
-    single = forward_with(engine, ids, None)
-    for chunk in chunks:
-        assert_same_output(single, forward_with(engine, ids, chunk), f"{prompt_id} chunk {chunk}")
+def test_chunked_prefill_matches_single_shot(engine, golden):
+    """37 tokens one position at a time and with a ragged last chunk; 501
+    tokens; the longest prompt, 1,090 tokens."""
+    for prompt_id, chunks in (("medium-02", (1, 16)), ("adversarial-01", (37, 128)),
+                              ("long-01", (128, 512))):
+        ids = golden[prompt_id].token_ids
+        single = forward_with(engine, ids, None)
+        for chunk in chunks:
+            assert_same_output(single, forward_with(engine, ids, chunk),
+                               f"{prompt_id} chunk {chunk}")
 
 
 def test_a_boundary_mid_sentence_leaves_positions_and_masking_alone(engine):

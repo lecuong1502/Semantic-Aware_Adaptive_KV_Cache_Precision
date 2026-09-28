@@ -17,6 +17,7 @@ in `ulp_gate`.
 
 import numpy as np
 import pytest
+from conftest import each
 from ulp_gate import MAX_REL, assert_within_gate, fp16_exact, relative_error
 
 from microinfer import _microinfer
@@ -53,81 +54,45 @@ def check(x, w, eps=EPS):
     return assert_within_gate(_microinfer.rmsnorm(x, w, eps), reference_rmsnorm(x, w, eps))
 
 
-def test_matches_float64_reference():
-    check(*make_case(64, 896))
-
-
 # 896 is Qwen2.5-0.5B's hidden size and 1536 is Qwen2.5-1.5B's (ADR-0003). The
 # others are there to catch anything hardcoded. RMSNorm reduces over the hidden
 # axis and has no head_dim: Qwen2.5 has no QK-norm, so no RMSNorm in this model
 # ever sees a head dimension. Issue #3's criterion naming `head_dim` is not
 # satisfiable for this kernel and is raised on the ticket rather than papered
 # over here.
-@pytest.mark.parametrize("hidden", [64, 128, 896, 1536, 2048, 4096])
-def test_hidden_size_is_a_parameter(hidden):
-    check(*make_case(8, hidden, seed=hidden))
+def test_matches_float64_reference_at_every_shape():
+    """The models' hidden sizes and others to catch anything hardcoded; sizes
+    that are not a multiple of the warp; row counts from 1 to 512. And fp32
+    input, the contract Seam B advertises with both roundings in play: a
+    strict xfail while ADR-0006's mean bound stood at 2e-4 (0.41 ulp, 14%
+    above one fp16 rounding's floor), now passing on its merits in ulps."""
+    cases = ([(64, 896)] + [(8, h) for h in (64, 128, 896, 1536, 2048, 4096)]
+             + [(4, h) for h in (1, 3, 31, 33, 100, 897)]
+             + [(r, 128) for r in (1, 2, 7, 512)])
+    each(cases, lambda rows, hidden: check(*make_case(rows, hidden, seed=rows * hidden)))
+    each([128, 896, 1536], lambda hidden: check(*make_case_fp32(128, hidden, seed=hidden)))
 
 
-@pytest.mark.parametrize("hidden", [1, 3, 31, 33, 100, 897])
-def test_hidden_size_need_not_be_a_multiple_of_the_warp(hidden):
-    check(*make_case(4, hidden, seed=hidden))
-
-
-@pytest.mark.parametrize("rows", [1, 2, 7, 512])
-def test_row_count_is_a_parameter(rows):
-    check(*make_case(rows, 128, seed=rows))
-
-
-@pytest.mark.parametrize("hidden", [128, 896, 1536])
-def test_arbitrary_fp32_input_meets_the_gate(hidden):
-    """The contract Seam B advertises, with both roundings in play.
-
-    This was a strict xfail while ADR-0006's mean bound stood at 2e-4, which is
-    0.41 ulp — only 14% above the floor a single fp16 rounding produces, and so
-    unreachable for a value rounded twice. The ADR is now stated in ulps and the
-    case passes on its merits.
-    """
-    check(*make_case_fp32(128, hidden, seed=hidden))
-
-
-def test_rows_are_independent():
-    """A reduction bug that leaks across rows passes a single-row test."""
+def test_rows_are_independent_and_the_weight_and_eps_apply():
+    """A reduction bug that leaks across rows passes a single-row test. The
+    weight is applied elementwise, and eps is a parameter. The output is a
+    NumPy array of the input's shape."""
     x, w = make_case(16, 256)
     all_rows = _microinfer.rmsnorm(x, w, EPS)
     for i in (0, 7, 15):
-        one = _microinfer.rmsnorm(x[i : i + 1].copy(), w, EPS)
-        np.testing.assert_array_equal(one[0], all_rows[i])
-
-
-def test_weight_is_applied_elementwise():
+        np.testing.assert_array_equal(_microinfer.rmsnorm(x[i : i + 1].copy(), w, EPS)[0],
+                                      all_rows[i])
     x, w = make_case(4, 128)
     doubled = _microinfer.rmsnorm(x, (w * 2).astype(np.float32), EPS)
     base = _microinfer.rmsnorm(x, w, EPS)
-    err = relative_error(doubled, base.astype(np.float64) * 2)
-    assert err.max() < MAX_REL
+    assert relative_error(doubled, base.astype(np.float64) * 2).max() < MAX_REL
+    assert not np.array_equal(base, _microinfer.rmsnorm(x, w, 1.0))
+    assert isinstance(base, np.ndarray) and base.shape == x.shape
 
 
-def test_eps_is_a_parameter():
-    x, w = make_case(4, 128)
-    assert not np.array_equal(
-        _microinfer.rmsnorm(x, w, EPS), _microinfer.rmsnorm(x, w, 1.0)
-    )
-
-
-def test_returns_a_numpy_array_of_the_input_shape():
-    x, w = make_case(5, 64)
-    out = _microinfer.rmsnorm(x, w, EPS)
-    assert isinstance(out, np.ndarray)
-    assert out.shape == x.shape
-
-
-def test_rejects_mismatched_weight_length():
+def test_malformed_operands_are_refused():
     x, w = make_case(4, 128)
     with pytest.raises(ValueError, match="128"):
         _microinfer.rmsnorm(x, w[:64].copy(), EPS)
-
-
-def test_rejects_non_2d_input():
-    _, w = make_case(4, 128)
     with pytest.raises(ValueError):
         _microinfer.rmsnorm(np.zeros(128, dtype=np.float32), w, EPS)

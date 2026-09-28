@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import each
 from microinfer import recorder, scenario
 from microinfer.browser import BROWSERS, sweep
 
@@ -193,11 +194,10 @@ def test_the_video_call_waits_for_a_person_and_labels_the_wait():
         assert ask(stream, stop) is None
 
 
-@pytest.mark.parametrize("name", sorted(BROWSERS))
-def test_a_browser_opens_pages_evaluates_in_their_frames_and_leaves_nothing(name):
-    """Each browser, headless on a page this test serves: it opens a window,
-    finds the frame inside it, evaluates there, and closing it ends every
-    process that named its profile."""
+def test_each_browser_opens_pages_evaluates_in_their_frames_and_leaves_nothing():
+    """Chrome and Firefox, headless on a page this test serves: each opens a
+    window, finds the frame inside it, evaluates there, and each page finds
+    its own frame; closing it ends every process that named its profile."""
     import http.server
     import socketserver
 
@@ -217,26 +217,32 @@ def test_a_browser_opens_pages_evaluates_in_their_frames_and_leaves_nothing(name
 
     server = socketserver.TCPServer(("127.0.0.1", 0), Page)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    b = BROWSERS[name](headless=True)
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+
+    def drives(name):
+        b = BROWSERS[name](headless=True)
+        try:
+            assert name in b.version.lower()
+            page = b.open(url)
+            assert b.evaluate(page, "Promise.resolve({title: document.title, n: 6 * 7})") == {
+                "title": "outer", "n": 42}
+            frame = b.frame(page, "/inner")
+            assert b.evaluate(frame, "document.title") == "inner"
+            # A second page with the same frame: each page finds its own.
+            other_frame = b.frame(b.open(url), "/inner")
+            assert other_frame != frame
+            b.evaluate(other_frame, "(document.title = 'mine')")
+            assert b.evaluate(frame, "document.title") == "inner"
+        finally:
+            profile = b.app.directory
+            b.close()
+        assert sweep(profile) == 0
+        assert not Path(profile).exists()
+
     try:
-        assert b.version.lower().startswith(name) or name in b.version.lower()
-        page = b.open(f"http://127.0.0.1:{server.server_address[1]}/")
-        assert b.evaluate(page, "Promise.resolve({title: document.title, n: 6 * 7})") == {
-            "title": "outer", "n": 42}
-        frame = b.frame(page, "/inner")
-        assert b.evaluate(frame, "document.title") == "inner"
-        # A second page with the same frame: each page finds its own.
-        other = b.open(f"http://127.0.0.1:{server.server_address[1]}/")
-        other_frame = b.frame(other, "/inner")
-        assert other_frame != frame
-        b.evaluate(other_frame, "(document.title = 'mine')")
-        assert b.evaluate(frame, "document.title") == "inner"
+        each(sorted(BROWSERS), drives)
     finally:
-        profile = b.app.directory
-        b.close()
         server.shutdown()
-    assert sweep(profile) == 0
-    assert not Path(profile).exists()
 
 
 def test_the_driver_records_a_labelled_scenario_and_stops_cleanly(tmp_path):

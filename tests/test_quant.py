@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import require_model
+from conftest import each, require_model
 from microinfer import Engine, _microinfer
 from microinfer.config import ModelConfig
 from microinfer.golden import GoldenError, GoldenSet
@@ -52,13 +52,6 @@ def random_page(heads, head_dim, seed=0):
     values = rng.normal(0, 1, (P, heads, head_dim))
     values[rng.choice(P, 2, replace=False)] *= 25
     return fp16_exact(keys), fp16_exact(values)
-
-
-@pytest.fixture(params=QUANTISED, ids=lambda t: t.name)
-def tier(request):
-    """Every quantised tier, for every test that takes one: nothing about the
-    quantiser is special to a tier but the code width."""
-    return request.param
 
 
 def steps(tier) -> int:
@@ -109,16 +102,13 @@ def assert_round_trip_within_bound(keys, values, tier):
 # -- the layout ---------------------------------------------------------------------
 
 
-def test_metadata_is_1280_bytes_per_page_for_the_1_5b_model():
-    heads, head_dim = SHAPES["qwen2.5-1.5b-instruct"]
-    for tier in QUANTISED:
-        assert _microinfer.quantised_page_layout(tier, heads, head_dim)["metadata_bytes"] == 1280
-
-
-def test_the_regions_tile_the_page_in_the_documented_order():
+def test_the_page_layout_is_documented_order_with_1280_bytes_of_metadata():
     """Key codes, value codes, then key scales, key zero-points, value scales,
-    value zero-points, back to back. The metadata is the same at every tier;
-    only the codes shrink."""
+    value zero-points, back to back. The metadata is the same at every tier,
+    1280 bytes on the 1.5B model; only the codes shrink. What a compression
+    ratio must quote (ADR-0005) counts it: on the 1.5B model INT8 is 8.625
+    bits per element, not 8, INT4 4.625 and INT2 2.625. FP16 has no
+    quantised layout."""
     for heads, head_dim in SHAPES.values():
         width = heads * head_dim
         for tier in QUANTISED:
@@ -135,20 +125,13 @@ def test_the_regions_tile_the_page_in_the_documented_order():
                 offset += size
             assert layout["page_bytes"] == offset
             assert layout["metadata_bytes"] == offset - 2 * codes
+            assert layout["effective_bits"] == 8 * offset / (2 * P * width)
 
-
-def test_effective_bits_count_the_metadata():
-    """What a compression ratio must quote (ADR-0005): on the 1.5B model INT8
-    is 8.63 bits per element, not 8; INT4 is 4.63 and INT2 2.63."""
     heads, head_dim = SHAPES["qwen2.5-1.5b-instruct"]
-    got = {tier: _microinfer.quantised_page_layout(tier, heads, head_dim)["effective_bits"]
-           for tier in QUANTISED}
-    assert got == {Tier.INT8: 8.625, Tier.INT4: 4.625, Tier.INT2: 2.625}
-    layout = _microinfer.quantised_page_layout(INT8, heads, head_dim)
-    assert layout["effective_bits"] == 8 * layout["page_bytes"] / (2 * P * heads * head_dim)
-
-
-def test_fp16_has_no_quantised_layout():
+    got = {tier: _microinfer.quantised_page_layout(tier, heads, head_dim) for tier in QUANTISED}
+    assert {t: g["metadata_bytes"] for t, g in got.items()} == dict.fromkeys(QUANTISED, 1280)
+    assert {t: g["effective_bits"] for t, g in got.items()} == {
+        Tier.INT8: 8.625, Tier.INT4: 4.625, Tier.INT2: 2.625}
     with pytest.raises(ValueError, match="FP16"):
         _microinfer.quantised_page_layout(Tier.FP16, 2, 64)
 
@@ -156,43 +139,46 @@ def test_fp16_has_no_quantised_layout():
 # -- the kernel against float64 --------------------------------------------------------
 
 
-@pytest.mark.parametrize("model", sorted(SHAPES))
-def test_codes_and_metadata_are_the_float64_reference(model, tier):
-    heads, head_dim = SHAPES[model]
-    keys, values = random_page(heads, head_dim)
-    parts = read_page(_microinfer.quantise_page(keys, values, tier), tier, heads, head_dim)
+def test_the_kernel_is_the_float64_reference():
+    """At every tier and both models' shapes: the codes and metadata are the
+    reference's own, but for a code whose unrounded value sits within a hair
+    of a tie; and dequantising is q * scale + zero from the page's own codes
+    and metadata, to within the per-kernel gate. That is one fused
+    multiply-add, with no cancellation to floor."""
+    def codes_and_metadata(model, tier):
+        heads, head_dim = SHAPES[model]
+        keys, values = random_page(heads, head_dim)
+        parts = read_page(_microinfer.quantise_page(keys, values, tier), tier, heads, head_dim)
+        bits = parts["bits"]
+        k_scale, k_zero, k_codes, k_exact = reference(keys.astype(np.float64), bits, axis=0)
+        v_scale, v_zero, v_codes, v_exact = reference(values.astype(np.float64), bits, axis=2)
+        np.testing.assert_array_equal(parts["key_scales"], k_scale[0])
+        np.testing.assert_array_equal(parts["key_zeros"], k_zero[0])
+        np.testing.assert_array_equal(parts["value_scales"], v_scale[..., 0])
+        np.testing.assert_array_equal(parts["value_zeros"], v_zero[..., 0])
+        for got, want, exact in ((parts["key_codes"], k_codes, k_exact),
+                                 (parts["value_codes"], v_codes, v_exact)):
+            differ = got != want
+            assert not np.any(differ & ~near_tie(exact)), "a code differs away from a tie"
+            assert np.all(np.abs(got - want) <= 1)
 
-    bits = parts["bits"]
-    k_scale, k_zero, k_codes, k_exact = reference(keys.astype(np.float64), bits, axis=0)
-    v_scale, v_zero, v_codes, v_exact = reference(values.astype(np.float64), bits, axis=2)
-    np.testing.assert_array_equal(parts["key_scales"], k_scale[0])
-    np.testing.assert_array_equal(parts["key_zeros"], k_zero[0])
-    np.testing.assert_array_equal(parts["value_scales"], v_scale[..., 0])
-    np.testing.assert_array_equal(parts["value_zeros"], v_zero[..., 0])
-    for got, want, exact in ((parts["key_codes"], k_codes, k_exact),
-                             (parts["value_codes"], v_codes, v_exact)):
-        differ = got != want
-        assert not np.any(differ & ~near_tie(exact)), "a code differs away from a tie"
-        assert np.all(np.abs(got - want) <= 1)
+    def dequantised(model, tier):
+        heads, head_dim = SHAPES[model]
+        keys, values = random_page(heads, head_dim, seed=1)
+        page = _microinfer.quantise_page(keys, values, tier)
+        parts = read_page(page, tier, heads, head_dim)
+        got_k, got_v = _microinfer.dequantise_page(page, tier, heads, head_dim)
+        assert_within_gate(got_k, parts["key_codes"] * parts["key_scales"][None]
+                           + parts["key_zeros"][None])
+        assert_within_gate(got_v, parts["value_codes"] * parts["value_scales"][..., None]
+                           + parts["value_zeros"][..., None])
+
+    each([(check, m, t) for check in (codes_and_metadata, dequantised)
+          for m in sorted(SHAPES) for t in QUANTISED],
+         lambda check, m, t: check(m, t), name=lambda c: f"{c[0].__name__} {c[1]} {c[2].name}")
 
 
-@pytest.mark.parametrize("model", sorted(SHAPES))
-def test_dequantised_values_are_the_float64_reference(model, tier):
-    """q * scale + zero from the page's own codes and metadata, to within the
-    per-kernel gate. It is a single fused multiply-add, so there is no
-    cancellation to floor: fp32 rounds its result, not its terms."""
-    heads, head_dim = SHAPES[model]
-    keys, values = random_page(heads, head_dim, seed=1)
-    page = _microinfer.quantise_page(keys, values, tier)
-    parts = read_page(page, tier, heads, head_dim)
-    got_k, got_v = _microinfer.dequantise_page(page, tier, heads, head_dim)
-    assert_within_gate(got_k, parts["key_codes"] * parts["key_scales"][None]
-                       + parts["key_zeros"][None])
-    assert_within_gate(got_v, parts["value_codes"] * parts["value_scales"][..., None]
-                       + parts["value_zeros"][..., None])
-
-
-def test_codes_are_packed_with_no_padding_first_in_the_lowest_bits(tier):
+def test_codes_are_packed_with_no_padding_first_in_the_lowest_bits():
     """Inputs placed exactly on the levels, so every code is known without
     rounding: each key channel and each value group holds 0 and 2^bits - 1,
     making its scale 1 and its zero-point 0, and its codes the inputs
@@ -200,154 +186,145 @@ def test_codes_are_packed_with_no_padding_first_in_the_lowest_bits(tier):
     8/bits to a byte with the first in the lowest bits, byte for byte, and
     exactly P * W * bits / 8 bytes each: two codes to a byte at INT4, four at
     INT2, and nothing between them."""
-    heads, head_dim = SHAPES["qwen2.5-1.5b-instruct"]
-    layout = _microinfer.quantised_page_layout(tier, heads, head_dim)
-    bits, top = layout["bits"], steps(tier)
-    rng = np.random.default_rng(6)
-    keys = rng.integers(0, top + 1, (P, heads, head_dim)).astype(np.float32)
-    keys[0], keys[1] = 0, top
-    values = rng.integers(0, top + 1, (P, heads, head_dim)).astype(np.float32)
-    values[:, :, 0], values[:, :, 1] = 0, top
-    page = _microinfer.quantise_page(keys, values, tier)
+    def packed_by_hand(tier):
+        heads, head_dim = SHAPES["qwen2.5-1.5b-instruct"]
+        layout = _microinfer.quantised_page_layout(tier, heads, head_dim)
+        bits, top = layout["bits"], steps(tier)
+        rng = np.random.default_rng(6)
+        keys = rng.integers(0, top + 1, (P, heads, head_dim)).astype(np.float32)
+        keys[0], keys[1] = 0, top
+        values = rng.integers(0, top + 1, (P, heads, head_dim)).astype(np.float32)
+        values[:, :, 0], values[:, :, 1] = 0, top
+        page = _microinfer.quantise_page(keys, values, tier)
 
-    def packed(codes):
-        per_byte = 8 // bits
-        grouped = codes.astype(np.uint8).reshape(-1, per_byte)
-        shifts = np.arange(per_byte, dtype=np.uint8) * bits
-        return np.bitwise_or.reduce(grouped << shifts, axis=1)
+        def packed(codes):
+            per_byte = 8 // bits
+            grouped = codes.astype(np.uint8).reshape(-1, per_byte)
+            shifts = np.arange(per_byte, dtype=np.uint8) * bits
+            return np.bitwise_or.reduce(grouped << shifts, axis=1)
 
-    size = P * heads * head_dim * bits // 8
-    assert layout["value_codes"] - layout["key_codes"] == size
-    assert layout["key_scales"] - layout["value_codes"] == size
-    np.testing.assert_array_equal(page[layout["key_codes"]:layout["value_codes"]], packed(keys))
-    np.testing.assert_array_equal(page[layout["value_codes"]:layout["key_scales"]], packed(values))
-    got_k, got_v = _microinfer.dequantise_page(page, tier, heads, head_dim)
-    np.testing.assert_array_equal(got_k, keys)
-    np.testing.assert_array_equal(got_v, values)
+        size = P * heads * head_dim * bits // 8
+        assert layout["value_codes"] - layout["key_codes"] == size
+        assert layout["key_scales"] - layout["value_codes"] == size
+        np.testing.assert_array_equal(page[layout["key_codes"]:layout["value_codes"]],
+                                      packed(keys))
+        np.testing.assert_array_equal(page[layout["value_codes"]:layout["key_scales"]],
+                                      packed(values))
+        got_k, got_v = _microinfer.dequantise_page(page, tier, heads, head_dim)
+        np.testing.assert_array_equal(got_k, keys)
+        np.testing.assert_array_equal(got_v, values)
+
+    each(QUANTISED, packed_by_hand)
 
 
 # -- what quantisation loses -------------------------------------------------------
 
 
-@pytest.mark.parametrize("model", sorted(SHAPES))
-@pytest.mark.parametrize("seed", range(3))
-def test_a_round_trip_loses_at_most_half_a_step(model, seed, tier):
-    heads, head_dim = SHAPES[model]
-    assert_round_trip_within_bound(*random_page(heads, head_dim, seed), tier)
+def test_a_round_trip_loses_at_most_half_a_step_and_more_as_the_tiers_narrow():
+    """Every element comes back within half a step, at every tier, on pages of
+    both models' shapes; and in relative RMS error INT8 < INT4 < INT2, for
+    keys and for values. The golden-data test below asserts both on real
+    pages."""
+    for model in sorted(SHAPES):
+        heads, head_dim = SHAPES[model]
+        pages = [random_page(heads, head_dim, seed) for seed in range(4)]
+        relative = []
+        for tier in QUANTISED:
+            errs = [assert_round_trip_within_bound(k, v, tier)[:2] for k, v in pages]
+            relative.append([np.linalg.norm(np.concatenate([e[i].ravel() for e in errs]))
+                             / np.linalg.norm(np.concatenate([p[i].ravel() for p in pages]))
+                             for i in (0, 1)])
+        relative = np.array(relative)  # (tier, keys-or-values)
+        assert np.all(np.diff(relative, axis=0) > 0), (model, relative)
 
 
-@pytest.mark.parametrize("model", sorted(SHAPES))
-def test_the_error_grows_as_the_tiers_narrow(model):
-    """INT8 < INT4 < INT2 in relative RMS error, for keys and for values, on
-    random pages of both models' shapes; the golden-data test below asserts
-    the same on real ones."""
-    heads, head_dim = SHAPES[model]
-    pages = [random_page(heads, head_dim, seed) for seed in range(4)]
-    relative = []
-    for tier in QUANTISED:
-        errs = [assert_round_trip_within_bound(k, v, tier)[:2] for k, v in pages]
-        relative.append([np.linalg.norm(np.concatenate([e[i].ravel() for e in errs]))
-                         / np.linalg.norm(np.concatenate([p[i].ravel() for p in pages]))
-                         for i in (0, 1)])
-    relative = np.array(relative)  # (tier, keys-or-values)
-    assert np.all(np.diff(relative, axis=0) > 0), relative
+def test_each_group_is_quantised_on_its_own_asymmetric_range():
+    """At every tier:
 
+    - Keys are scaled per channel and values per token: an outlier in one key
+      channel changes no other channel's round trip by a bit, one in a value
+      group, a (token, head) pair, no other group's; only its own coarsens.
+    - The quantiser is asymmetric: a channel far from zero keeps a step of its
+      own range, not of its magnitude. At INT8 [100, 101] steps by 1/255,
+      where a symmetric quantiser would step by 101/127.
+    - A group too narrow for a normal fp16 scale keeps its maximum: a key
+      channel from layer 0 of the 1.5B model on adversarial-00 spans 1.26e-4,
+      so its scale is subnormal; rounded to nearest it fell an eighth short
+      and the clamp lost the top 8 steps. It is rounded up instead.
+    - A constant group round-trips exactly, with a scale of 0."""
+    def per_channel_and_per_token(tier):
+        heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
+        keys, values = random_page(heads, head_dim, seed=2)
+        base_k, base_v = _microinfer.dequantise_page(
+            _microinfer.quantise_page(keys, values, tier), tier, heads, head_dim)
+        k_out, v_out = keys.copy(), values.copy()
+        k_out[5, 1, 7] = 3000.0  # one channel: (head 1, channel 7)
+        v_out[9, 0, 3] = -3000.0  # one group: (token 9, head 0)
+        got_k, got_v = _microinfer.dequantise_page(
+            _microinfer.quantise_page(k_out, v_out, tier), tier, heads, head_dim)
+        other_channels = np.ones((heads, head_dim), bool)
+        other_channels[1, 7] = False
+        np.testing.assert_array_equal(got_k[:, other_channels], base_k[:, other_channels])
+        other_groups = np.ones((P, heads), bool)
+        other_groups[9, 0] = False
+        np.testing.assert_array_equal(got_v[other_groups], base_v[other_groups])
+        assert not np.array_equal(got_k[:, 1, 7], base_k[:, 1, 7])
+        assert not np.array_equal(got_v[9, 0], base_v[9, 0])
 
-def test_keys_are_scaled_per_channel_and_values_per_token(tier):
-    """The granularity, asserted by independence: an outlier planted in one
-    key channel changes no other channel's round trip by a single bit, and an
-    outlier in one value group, a (head, token) pair, changes no other group's.
-    Only the group that holds the outlier coarsens."""
-    heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
-    keys, values = random_page(heads, head_dim, seed=2)
-    base_k, base_v = _microinfer.dequantise_page(
-        _microinfer.quantise_page(keys, values, tier), tier, heads, head_dim)
+    def asymmetric(tier):
+        heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
+        keys, values = random_page(heads, head_dim, seed=3)
+        keys[:, 0, 0] = fp16_exact(np.linspace(100, 101, P))
+        values[4, 1] = fp16_exact(np.linspace(-51, -50, head_dim))
+        k_err, v_err, parts = assert_round_trip_within_bound(keys, values, tier)
+        assert parts["key_zeros"][0, 0] == 100 and parts["value_zeros"][4, 1] == -51
+        assert k_err[:, 0, 0].max() <= 1 / steps(tier) and v_err[4, 1].max() <= 1 / steps(tier)
 
-    k_out, v_out = keys.copy(), values.copy()
-    k_out[5, 1, 7] = 3000.0  # one channel: (head 1, channel 7)
-    v_out[9, 0, 3] = -3000.0  # one group: (token 9, head 0)
-    got_k, got_v = _microinfer.dequantise_page(
-        _microinfer.quantise_page(k_out, v_out, tier), tier, heads, head_dim)
+    def narrow(tier):
+        heads, head_dim = SHAPES["qwen2.5-1.5b-instruct"]
+        keys, values = random_page(heads, head_dim, seed=5)
+        keys[:, 1, 58] = fp16_exact(np.linspace(0.00554656982421875, 0.005672454833984375, P))
+        k_err, _, parts = assert_round_trip_within_bound(keys, values, tier)
+        scale = parts["key_scales"][1, 58]
+        channel = keys[:, 1, 58]
+        assert scale < 2.0**-14 and steps(tier) * scale >= channel.max() - channel.min()
+        assert k_err[:, 1, 58].max() <= scale / 2 + np.spacing(np.float16(0.0057)) / 2
 
-    other_channels = np.ones((heads, head_dim), bool)
-    other_channels[1, 7] = False
-    np.testing.assert_array_equal(got_k[:, other_channels], base_k[:, other_channels])
-    other_groups = np.ones((P, heads), bool)
-    other_groups[9, 0] = False
-    np.testing.assert_array_equal(got_v[other_groups], base_v[other_groups])
-    assert not np.array_equal(got_k[:, 1, 7], base_k[:, 1, 7])
-    assert not np.array_equal(got_v[9, 0], base_v[9, 0])
+    def constant(tier):
+        heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
+        keys, values = random_page(heads, head_dim, seed=4)
+        keys[:, 0, 5] = -2.5
+        values[3, 1] = 0.75
+        k_err, v_err, parts = assert_round_trip_within_bound(keys, values, tier)
+        assert parts["key_scales"][0, 5] == 0 and k_err[:, 0, 5].max() == 0
+        assert parts["value_scales"][3, 1] == 0 and v_err[3, 1].max() == 0
 
-
-def test_the_quantiser_is_asymmetric(tier):
-    """A channel far from zero keeps a step of its own range, not of its
-    magnitude: at INT8 [100, 101] quantises in steps of 1/255, where a
-    symmetric quantiser would step by 101/127 and lose almost everything."""
-    heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
-    keys, values = random_page(heads, head_dim, seed=3)
-    keys[:, 0, 0] = fp16_exact(np.linspace(100, 101, P))
-    values[4, 1] = fp16_exact(np.linspace(-51, -50, head_dim))
-    k_err, v_err, parts = assert_round_trip_within_bound(keys, values, tier)
-    assert parts["key_zeros"][0, 0] == 100 and parts["value_zeros"][4, 1] == -51
-    assert k_err[:, 0, 0].max() <= 1 / steps(tier) and v_err[4, 1].max() <= 1 / steps(tier)
-
-
-def test_a_group_too_narrow_for_a_normal_fp16_scale_keeps_its_maximum(tier):
-    """A key channel from layer 0 of the 1.5B model on adversarial-00: a
-    range of 1.26e-4, so its scale, 4.9e-7, is below fp16's smallest normal,
-    where the spacing is 6e-8. Rounded to nearest it fell an eighth short, the
-    last level missed the maximum by 8 steps, and the clamp lost them. The
-    scale is rounded up instead, and the maximum comes back within half a
-    step."""
-    heads, head_dim = SHAPES["qwen2.5-1.5b-instruct"]
-    keys, values = random_page(heads, head_dim, seed=5)
-    keys[:, 1, 58] = fp16_exact(np.linspace(0.00554656982421875, 0.005672454833984375, P))
-    k_err, _, parts = assert_round_trip_within_bound(keys, values, tier)
-    scale = parts["key_scales"][1, 58]
-    assert scale < 2.0**-14 and steps(tier) * scale >= keys[:, 1, 58].max() - keys[:, 1, 58].min()
-    assert k_err[:, 1, 58].max() <= scale / 2 + np.spacing(np.float16(0.0057)) / 2
-
-
-def test_a_constant_group_round_trips_exactly(tier):
-    heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
-    keys, values = random_page(heads, head_dim, seed=4)
-    keys[:, 0, 5] = -2.5
-    values[3, 1] = 0.75
-    k_err, v_err, parts = assert_round_trip_within_bound(keys, values, tier)
-    assert parts["key_scales"][0, 5] == 0 and k_err[:, 0, 5].max() == 0
-    assert parts["value_scales"][3, 1] == 0 and v_err[3, 1].max() == 0
+    each([(c, t) for c in (per_channel_and_per_token, asymmetric, narrow, constant)
+          for t in QUANTISED], lambda c, t: c(t), name=lambda c: f"{c[0].__name__} {c[1].name}")
 
 
 # -- what may not be quantised -------------------------------------------------------
 
 
-def test_the_page_being_filled_cannot_be_quantised(tier):
-    """A key channel's scale spans all P positions, so a page with fewer has
-    none to compute: the open page stays at FP16 (ADR-0005)."""
+def test_what_is_not_a_full_page_is_not_quantised():
+    """A key channel's scale spans all P positions, so the page being filled
+    has none to compute and stays FP16 (ADR-0005): OpenPage, a ValueError.
+    Malformed pages are refused, and FP16 is not a tier to quantise to."""
     heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
     keys, values = random_page(heads, head_dim)
-    for filled in (1, P - 1):
-        with pytest.raises(_microinfer.OpenPage, match=f"{filled} of {P} positions.*FP16"):
-            _microinfer.quantise_page(keys[:filled], values[:filled], tier)
     assert issubclass(_microinfer.OpenPage, ValueError)
-
-
-def test_malformed_pages_are_refused(tier):
-    heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
-    keys, values = random_page(heads, head_dim)
-    with pytest.raises(ValueError, match="positions"):
-        _microinfer.quantise_page(np.concatenate([keys, keys]),
-                                  np.concatenate([values, values]), tier)
-    with pytest.raises(ValueError, match="shape"):
-        _microinfer.quantise_page(keys, values[:, :1], tier)
-    page = _microinfer.quantise_page(keys, values, tier)
-    with pytest.raises(ValueError, match="bytes"):
-        _microinfer.dequantise_page(page[:-1], tier, heads, head_dim)
-
-
-def test_fp16_is_not_quantised():
-    heads, head_dim = SHAPES["qwen2.5-0.5b-instruct"]
-    keys, values = random_page(heads, head_dim)
+    for tier in QUANTISED:
+        for filled in (1, P - 1):
+            with pytest.raises(_microinfer.OpenPage, match=f"{filled} of {P} positions.*FP16"):
+                _microinfer.quantise_page(keys[:filled], values[:filled], tier)
+        with pytest.raises(ValueError, match="positions"):
+            _microinfer.quantise_page(np.concatenate([keys, keys]),
+                                      np.concatenate([values, values]), tier)
+        with pytest.raises(ValueError, match="shape"):
+            _microinfer.quantise_page(keys, values[:, :1], tier)
+        page = _microinfer.quantise_page(keys, values, tier)
+        with pytest.raises(ValueError, match="bytes"):
+            _microinfer.dequantise_page(page[:-1], tier, heads, head_dim)
     with pytest.raises(ValueError, match="FP16"):
         _microinfer.quantise_page(keys, values, Tier.FP16)
 

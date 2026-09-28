@@ -20,6 +20,7 @@ because what they check is a shape the model never has.
 
 import numpy as np
 import pytest
+from conftest import each
 from ulp_gate import assert_within_gate, fp16_exact, fp32_accumulation_bound
 
 from microinfer import _microinfer
@@ -37,9 +38,7 @@ RNG = np.random.default_rng(12)
 VOCAB_SLICE = 1021
 
 
-@pytest.fixture(params=MODELS)
-def cfg(request) -> ModelConfig:
-    return ModelConfig.from_card(request.param)
+CFGS = [ModelConfig.from_card(name) for name in MODELS]
 
 
 def put(host: np.ndarray):
@@ -61,7 +60,7 @@ def normal(*shape, scale=1.0):
 # -- the existing kernels, reached from the device --------------------------
 
 
-def test_rmsnorm_is_the_tested_kernel(cfg):
+def rmsnorm_is_the_tested_kernel(cfg):
     rows, hidden = 7, cfg.hidden_size
     x, w = normal(rows, hidden), normal(hidden)
     out = device.empty(rows * hidden)
@@ -70,8 +69,7 @@ def test_rmsnorm_is_the_tested_kernel(cfg):
                                   _microinfer.rmsnorm(x, w, cfg.rms_norm_eps))
 
 
-@pytest.mark.parametrize("bias", [False, True])
-def test_linear_is_the_tested_kernel(cfg, bias):
+def linear_is_the_tested_kernel(cfg, bias):
     rows, n_in, n_out = 5, cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim
     x, w = normal(rows, n_in), normal(n_out, n_in, scale=n_in**-0.5)
     b = normal(n_out) if bias else None
@@ -80,7 +78,7 @@ def test_linear_is_the_tested_kernel(cfg, bias):
     np.testing.assert_array_equal(get(out, (rows, n_out)), _microinfer.linear(x, w, b))
 
 
-def test_rope_is_the_tested_kernel(cfg):
+def rope_is_the_tested_kernel(cfg):
     seq, heads, hd = 6, cfg.num_attention_heads, cfg.head_dim
     x = normal(seq, heads, hd)
     positions = np.array([0, 1, 2, 31, 2048, cfg.max_position_embeddings - 1], np.int32)
@@ -90,14 +88,14 @@ def test_rope_is_the_tested_kernel(cfg):
                                   _microinfer.rope(x, positions, cfg.rope_theta))
 
 
-def test_swiglu_is_the_tested_kernel(cfg):
+def swiglu_is_the_tested_kernel(cfg):
     gate, up = normal(3, cfg.intermediate_size), normal(3, cfg.intermediate_size)
     out = device.empty(gate.size)
     device.swiglu(put(gate), put(up), out, gate.size)
     np.testing.assert_array_equal(get(out, gate.shape), _microinfer.swiglu(gate, up))
 
 
-def test_attention_reads_the_first_seq_k_rows_of_a_larger_cache(cfg):
+def attention_reads_the_first_seq_k_rows_of_a_larger_cache(cfg):
     """The engine's KV cache is sized for the whole generation and filled as it
     goes, so attention is always handed a buffer longer than seq_k. What lies
     past seq_k must not be read: it is filled with NaN here, and a single read
@@ -112,7 +110,7 @@ def test_attention_reads_the_first_seq_k_rows_of_a_larger_cache(cfg):
     np.testing.assert_array_equal(get(out, q.shape), _microinfer.attention(q, k, v))
 
 
-def test_a_view_writes_only_its_own_elements(cfg):
+def a_view_writes_only_its_own_elements(cfg):
     """The KV cache is written through views, one step's rows at an offset."""
     rows, n_in, n_out = 2, cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim
     x, w = normal(rows, n_in), normal(n_out, n_in, scale=n_in**-0.5)
@@ -131,7 +129,7 @@ def test_a_view_writes_only_its_own_elements(cfg):
 # -- the kernels new here ---------------------------------------------------
 
 
-def test_embed_is_an_exact_gather(cfg):
+def embed_is_an_exact_gather(cfg):
     vocab, hidden = VOCAB_SLICE, cfg.hidden_size
     table = normal(vocab, hidden)
     ids = np.array([3, 0, vocab - 1, 3, 17], np.int32)
@@ -140,7 +138,7 @@ def test_embed_is_an_exact_gather(cfg):
     np.testing.assert_array_equal(get(out, (len(ids), hidden)), table[ids])
 
 
-def test_add_is_one_fp32_addition_rounded_once_and_may_update_in_place(cfg):
+def add_is_one_fp32_addition_rounded_once_and_may_update_in_place(cfg):
     """The residual stream's update: three tokens' worth."""
     a, b = normal(3 * cfg.hidden_size), normal(3 * cfg.hidden_size)
     expected = (a.astype(np.float32) + b.astype(np.float32)).astype(np.float16).astype(np.float32)
@@ -149,7 +147,7 @@ def test_add_is_one_fp32_addition_rounded_once_and_may_update_in_place(cfg):
     np.testing.assert_array_equal(ta.to_numpy(), expected)
 
 
-def test_logits_are_fp32_and_within_fp32_accumulation_of_float64(cfg):
+def logits_are_fp32_and_within_fp32_accumulation_of_float64(cfg):
     rows, hidden, vocab = 4, cfg.hidden_size, VOCAB_SLICE
     x, head = normal(rows + 2, hidden), normal(vocab, hidden, scale=hidden**-0.5)
     got = device.logits(put(x), put(head), scratch(rows, vocab), 2, rows, hidden, vocab)
@@ -162,14 +160,14 @@ def test_logits_are_fp32_and_within_fp32_accumulation_of_float64(cfg):
     assert np.all(np.abs(got - ref) <= bound), np.max(np.abs(got - ref) / bound)
 
 
-def test_greedy_is_the_argmax_of_the_logits(cfg):
+def greedy_is_the_argmax_of_the_logits(cfg):
     rows, hidden, vocab = 6, cfg.hidden_size, VOCAB_SLICE
     x, head = normal(rows, hidden), normal(vocab, hidden, scale=hidden**-0.5)
     got = device.greedy(put(x), put(head), scratch(rows, vocab), 0, rows, hidden, vocab)
     np.testing.assert_array_equal(got, device.logits(put(x), put(head), scratch(rows, vocab), 0, rows, hidden, vocab).argmax(-1))
 
 
-def test_greedy_breaks_ties_to_the_lowest_index(cfg):
+def greedy_breaks_ties_to_the_lowest_index(cfg):
     """Duplicate rows in the head give bit-identical logits, a tie by
     construction. NumPy's argmax, and HuggingFace's through torch, take the
     first; so must the device."""
@@ -187,7 +185,7 @@ def test_greedy_breaks_ties_to_the_lowest_index(cfg):
 # -- the fp32 residual stream (ADR-0010) ----------------------------------
 
 
-def test_the_embedding_widens_exactly_to_fp32(cfg):
+def the_embedding_widens_exactly_to_fp32(cfg):
     vocab, hidden = VOCAB_SLICE, cfg.hidden_size
     table = normal(vocab, hidden)
     ids = np.array([3, 0, vocab - 1], np.int32)
@@ -196,7 +194,7 @@ def test_the_embedding_widens_exactly_to_fp32(cfg):
     np.testing.assert_array_equal(out.to_numpy().reshape(len(ids), hidden), table[ids])
 
 
-def test_rmsnorm_of_fp32_is_the_tested_kernel_on_fp16_exact_input(cfg):
+def rmsnorm_of_fp32_is_the_tested_kernel_on_fp16_exact_input(cfg):
     """Every element is widened to fp32 on read, so an fp16-exact input gives
     the fp16 path's bits exactly."""
     rows, hidden = 5, cfg.hidden_size
@@ -207,7 +205,7 @@ def test_rmsnorm_of_fp32_is_the_tested_kernel_on_fp16_exact_input(cfg):
     np.testing.assert_array_equal(get(out, x.shape), _microinfer.rmsnorm(x, w, cfg.rms_norm_eps))
 
 
-def test_rmsnorm_of_fp32_meets_the_gate_on_input_fp16_cannot_hold(cfg):
+def rmsnorm_of_fp32_meets_the_gate_on_input_fp16_cannot_hold(cfg):
     """The point of the fp32 residual: inputs with more precision than fp16,
     normalised without being rounded to fp16 first. Held to ADR-0006's gate
     against float64, as a product-shaped kernel, with no floor."""
@@ -223,7 +221,7 @@ def test_rmsnorm_of_fp32_meets_the_gate_on_input_fp16_cannot_hold(cfg):
     assert_within_gate(get(out, x.shape), ref)
 
 
-def test_a_projection_accumulates_into_fp32_without_rounding(cfg):
+def a_projection_accumulates_into_fp32_without_rounding(cfg):
     """out += x W^T in fp32, twice, as the o_proj and down_proj updates of one
     layer do; within fp32 accumulation of float64, with the terms of both the
     sums and the residual they are added to."""
@@ -244,26 +242,26 @@ def test_a_projection_accumulates_into_fp32_without_rounding(cfg):
 # -- bounds -----------------------------------------------------------------
 
 
-def test_an_operand_too_small_is_rejected_before_launch():
+def an_operand_too_small_is_rejected_before_launch():
     small = device.empty(10)
     with pytest.raises(ValueError, match="out holds 10"):
         device.rmsnorm(put(normal(2, 8)), put(normal(8)), small, 2, 8, 1e-6)
 
 
-def test_a_view_cannot_reach_past_its_tensor():
+def a_view_cannot_reach_past_its_tensor():
     t = device.empty(10)
     with pytest.raises(ValueError, match="view"):
         device.view(t, 8, 3)
 
 
-def test_logits_refuse_scratch_too_small_for_them():
+def logits_refuse_scratch_too_small_for_them():
     hidden, vocab = 8, 100
     small = device.empty(device.scratch_elements(1, vocab) - 1)
     with pytest.raises(ValueError, match="scratch"):
         device.logits(put(normal(1, hidden)), put(normal(vocab, hidden)), small, 0, 1, hidden, vocab)
 
 
-def test_a_negative_first_row_is_refused_rather_than_wrapped():
+def a_negative_first_row_is_refused_rather_than_wrapped():
     """first_row + rows can be positive while first_row is not; the pointer
     offset computed from it would then wrap to anywhere."""
     hidden, vocab = 8, 100
@@ -273,7 +271,7 @@ def test_a_negative_first_row_is_refused_rather_than_wrapped():
             call(x, head, scratch(3, vocab), -1, 3, hidden, vocab)
 
 
-def test_greedy_refuses_a_row_with_no_finite_logit():
+def greedy_refuses_a_row_with_no_finite_logit():
     """No argmax exists; the kernel's answer is one past the vocabulary, and it
     must not reach the caller as a token."""
     hidden, vocab = 8, 100
@@ -282,20 +280,58 @@ def test_greedy_refuses_a_row_with_no_finite_logit():
         device.greedy(put(normal(1, hidden)), head, scratch(1, vocab), 0, 1, hidden, vocab)
 
 
-def test_rope_refuses_to_write_over_its_input():
+def rope_refuses_to_write_over_its_input():
     x = put(normal(1, 1, 8))
     with pytest.raises(ValueError, match="over its input"):
         device.rope(x, device.index(np.zeros(1, np.int32)), x, 1, 1, 8, 1e4)
 
 
-def test_swiglu_refuses_to_write_over_its_input():
+def swiglu_refuses_to_write_over_its_input():
     gate, up = put(normal(8)), put(normal(8))
     with pytest.raises(ValueError, match="over its input"):
         device.swiglu(gate, up, gate, 8)
 
 
-def test_attention_refuses_more_queries_than_keys():
+def attention_refuses_more_queries_than_keys():
     q = put(normal(3, 1, 8))
     kv = put(normal(2, 1, 8))
     with pytest.raises(ValueError, match="seq_q"):
         device.attention(q, kv, kv, None, None, device.empty(24), 3, 2, 1, 1, 8)
+
+
+# -- the tests: each check above, for both models -----------------------------
+
+
+def _named(case):
+    check, *args = case
+    return " ".join([check.__name__, *(getattr(a, "name", str(a)) for a in args)])
+
+
+def test_the_device_surface_is_the_tested_kernels():
+    """Each existing kernel reached from the device is bit-identical to the
+    one the per-kernel tests hold to the gate, at both models' shapes; the
+    linear with and without its bias. Attention reads the first seq_k rows of
+    a larger cache, and a view writes only its own elements."""
+    each([(check, cfg) for check in (rmsnorm_is_the_tested_kernel, rope_is_the_tested_kernel, swiglu_is_the_tested_kernel, attention_reads_the_first_seq_k_rows_of_a_larger_cache, a_view_writes_only_its_own_elements) for cfg in CFGS]
+         + [(linear_is_the_tested_kernel, cfg, bias) for cfg in CFGS for bias in (False, True)],
+         lambda check, *args: check(*args), name=_named)
+
+
+def test_the_kernels_new_to_the_device():
+    """What each is, at both models' shapes: embed an exact gather; add one
+    fp32 addition rounded once, in place too; logits fp32 and within fp32
+    accumulation of float64; greedy the argmax of the logits, ties to the
+    lowest index. And the fp32 residual stream (ADR-0010): the embedding
+    widens exactly; RMSNorm of fp32 is the tested kernel on fp16-exact input
+    and meets the gate on input fp16 cannot hold; a projection accumulates
+    into fp32 without rounding."""
+    each([(check, cfg) for check in (embed_is_an_exact_gather, add_is_one_fp32_addition_rounded_once_and_may_update_in_place, logits_are_fp32_and_within_fp32_accumulation_of_float64, greedy_is_the_argmax_of_the_logits, greedy_breaks_ties_to_the_lowest_index, the_embedding_widens_exactly_to_fp32, rmsnorm_of_fp32_is_the_tested_kernel_on_fp16_exact_input, rmsnorm_of_fp32_meets_the_gate_on_input_fp16_cannot_hold, a_projection_accumulates_into_fp32_without_rounding) for cfg in CFGS],
+         lambda check, cfg: check(cfg), name=_named)
+
+
+def test_bounds_are_checked_before_a_launch():
+    """With literals, since what they check is a shape the model never has:
+    an operand too small, a view past its tensor, logits' scratch too small,
+    a negative first row, a row with no finite logit, RoPE or SwiGLU writing
+    over their input, more queries than keys."""
+    each([(check,) for check in (an_operand_too_small_is_rejected_before_launch, a_view_cannot_reach_past_its_tensor, logits_refuse_scratch_too_small_for_them, a_negative_first_row_is_refused_rather_than_wrapped, greedy_refuses_a_row_with_no_finite_logit, rope_refuses_to_write_over_its_input, swiglu_refuses_to_write_over_its_input, attention_refuses_more_queries_than_keys)], lambda check: check(), name=_named)

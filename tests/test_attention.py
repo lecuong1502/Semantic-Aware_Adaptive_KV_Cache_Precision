@@ -36,6 +36,7 @@ the kernel is forbidden to do. That is the point of it being a reference.
 
 import numpy as np
 import pytest
+from conftest import each
 from ulp_gate import FP32_REL_ULP, assert_within_gate, floor_from_bound, fp16_exact
 
 from microinfer import _microinfer
@@ -136,48 +137,31 @@ def sequence_lengths():
     return sorted({1, TILE_K // 2 - 1, TILE_Q, TILE_K, TILE_K + 1, 3 * TILE_K - 5, 100, 257})
 
 
-@pytest.mark.parametrize("name", MODELS)
-@pytest.mark.parametrize("seq", sequence_lengths())
-def test_prefill_matches_float64_reference(name, seq):
-    """head_dim 64 and 128 both come from here: one per model (ADR-0003)."""
-    cfg = ModelConfig.from_card(name)
-    check(*make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=seq))
+def test_matches_the_float64_reference_at_every_shape():
+    """Prefill at both models' head counts and head_dims (64 and 128, one per
+    model: ADR-0003) over every awkward length; one query decoding over many
+    keys; fewer queries than keys aligned to the end, as chunked prefill
+    has; and head_dim as a parameter."""
+    cfgs = [ModelConfig.from_card(n) for n in MODELS]
+    assert {c.head_dim for c in cfgs} == {64, 128}  # the cards still supply both
+    cases = ([(c.num_attention_heads, c.head_dim, s, s) for c in cfgs for s in sequence_lengths()]
+             + [(c.num_attention_heads, c.head_dim, 1, s) for c in cfgs
+                for s in (1, TILE_K - 1, TILE_K + 1, 300)]
+             + [(cfgs[0].num_attention_heads, cfgs[0].head_dim, q, k)
+                for q, k in ((5, 40), (TILE_Q + 3, 3 * TILE_K + 1), (64, 65))]
+             + [(2, d, TILE_K + 7, TILE_K + 7) for d in (16, 32, 64, 96, 128, 256)])
+    each(cases, lambda heads, head_dim, seq_q, seq_k: check(
+        *make_qkv(seq_q, seq_k, heads, head_dim, seed=seq_q + seq_k)))
 
 
-def test_head_dim_covers_both_adr_0003_sizes():
-    """The criterion names 64 and 128; this fails if the cards ever stop
-    supplying both, rather than letting the parametrisation quietly shrink."""
-    assert {ModelConfig.from_card(n).head_dim for n in MODELS} == {64, 128}
+def test_the_precision_contract_is_fp32_scores_and_weights():
+    """fp32 input costs exactly one rounding into fp16, and then the kernel
+    runs as it would on that fp16 input, bit for bit: rounding q and k moves
+    every score through an exponential, so no floor could bound it instead.
 
-
-@pytest.mark.parametrize("name", MODELS)
-@pytest.mark.parametrize("seq_k", [1, TILE_K - 1, TILE_K + 1, 300])
-def test_decode_one_query_sees_every_key(name, seq_k):
-    cfg = ModelConfig.from_card(name)
-    check(*make_qkv(1, seq_k, cfg.num_attention_heads, cfg.head_dim, seed=seq_k))
-
-
-@pytest.mark.parametrize("seq_q,seq_k", [(5, 40), (TILE_Q + 3, 3 * TILE_K + 1), (64, 65)])
-def test_fewer_queries_than_keys_align_to_the_end(seq_q, seq_k):
-    """Chunked prefill: the queries are the last seq_q positions."""
-    cfg = ModelConfig.from_card(MODELS[0])
-    check(*make_qkv(seq_q, seq_k, cfg.num_attention_heads, cfg.head_dim, seed=seq_q))
-
-
-@pytest.mark.parametrize("head_dim", [16, 32, 64, 96, 128, 256])
-def test_head_dim_is_a_parameter(head_dim):
-    check(*make_qkv(TILE_K + 7, TILE_K + 7, 2, head_dim, seed=head_dim))
-
-
-def test_arbitrary_fp32_input_is_rounded_to_fp16_and_nothing_else():
-    """Seam B's advertised contract, stated exactly rather than as a tolerance.
-
-    RoPE and the projections compare fp32 input against a float64 reference
-    with a floor for the input rounding. Attention cannot: rounding q and k
-    perturbs every score, and that perturbation is exponentiated, so no floor
-    derived from the output's terms bounds it. What can be said exactly is that
-    the fp32 input costs one round-to-nearest into fp16 and then the kernel runs
-    as it would have on that fp16 input — bit for bit."""
+    And the floor admits fp32 scores and sums, and no more: holding the
+    softmax weights in fp16 for P @ V, as tensor-core kernels do, is
+    simulated and fails the gate. That trade would go through ADR-0006."""
     cfg = ModelConfig.from_card(MODELS[0])
     rng = np.random.default_rng(4)
     q, k, v = (rng.standard_normal((50, cfg.num_attention_heads, cfg.head_dim)).astype(np.float32)
@@ -186,13 +170,6 @@ def test_arbitrary_fp32_input_is_rounded_to_fp16_and_nothing_else():
         _microinfer.attention(q, k, v),
         _microinfer.attention(fp16_exact(q), fp16_exact(k), fp16_exact(v)))
 
-
-def test_the_gate_would_reject_fp16_softmax_weights():
-    """The floor admits fp32 rounding of scores and sums, and must not admit
-    more. The obvious next optimisation — holding the softmax weights in fp16
-    for the P @ V product, as tensor-core kernels do — is simulated in NumPy
-    and checked to fail. It is a legitimate trade for a later ticket to make,
-    but it would have to be made through ADR-0006, not past it."""
     cfg = model_with_head_dim(128)
     seq = 3 * TILE_K
     q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=10)
@@ -202,148 +179,102 @@ def test_the_gate_would_reject_fp16_softmax_weights():
         check(q, k, v, got=fp16_weights)
 
 
-# --- grouped-query attention ---------------------------------------------
+def test_grouped_query_attention_reads_each_query_heads_own_kv_head():
+    """The configuration the engine runs: every query head of each model over
+    its two KV heads (groups of 7 and 6), prefilling and decoding; group sizes
+    the models do not use, one KV head for all (MQA) and none shared, so
+    nothing assumes 7 or 6. And the mapping itself: change one KV head, and
+    exactly its group of query heads moves. HuggingFace gives query head h KV
+    head h // group; h % kv_heads is the plausible mistake, and it passes any
+    test whose KV heads are identical."""
+    cfgs = [ModelConfig.from_card(n) for n in MODELS]
+    assert all(c.num_key_value_heads < c.num_attention_heads for c in cfgs)
+    cases = ([(c.num_attention_heads, c.num_key_value_heads, c.head_dim, q, k) for c in cfgs
+              for q, k in ((1, 1), (TILE_K - 1, TILE_K - 1), (TILE_K + 1, TILE_K + 1),
+                           (257, 257), (1, 300))]
+             + [(h, kv, c.head_dim, TILE_K + 5, TILE_K + 5) for c in cfgs
+                for h, kv in ((8, 1), (8, 2), (8, 4), (6, 3), (7, 1), (12, 12))])
+    each(cases, lambda heads, kv_heads, head_dim, seq_q, seq_k: check(
+        *make_qkv(seq_q, seq_k, heads, head_dim, seed=heads * 10 + kv_heads + seq_k,
+                  kv_heads=kv_heads)))
+
+    for cfg in cfgs:
+        heads, kv_heads = cfg.num_attention_heads, cfg.num_key_value_heads
+        group = heads // kv_heads
+        q, k, v = make_qkv(TILE_K + 3, TILE_K + 3, heads, cfg.head_dim, seed=4, kv_heads=kv_heads)
+        base = _microinfer.attention(q, k, v)
+        for changed in range(kv_heads):
+            k2, v2 = k.copy(), v.copy()
+            k2[:, changed] = -k2[:, changed]
+            v2[:, changed] = -v2[:, changed]
+            moved = _microinfer.attention(q, k2, v2)
+            differs = [not np.array_equal(moved[:, h], base[:, h]) for h in range(heads)]
+            assert differs == [h // group == changed for h in range(heads)], (cfg.name, changed)
 
 
-@pytest.mark.parametrize("name", MODELS)
-@pytest.mark.parametrize("seq", [1, TILE_K - 1, TILE_K + 1, 257])
-def test_grouped_query_attention_at_model_shapes(name, seq):
-    """The configuration the engine actually runs: every query head of the
-    model, sharing the model's two KV heads. Both grouping factors, 7 and 6,
-    come from the cards."""
-    cfg = ModelConfig.from_card(name)
-    assert cfg.num_key_value_heads < cfg.num_attention_heads
-    check(*make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=seq,
-                    kv_heads=cfg.num_key_value_heads))
-
-
-@pytest.mark.parametrize("name", MODELS)
-def test_grouped_decode_one_query_sees_every_key(name):
-    cfg = ModelConfig.from_card(name)
-    check(*make_qkv(1, 300, cfg.num_attention_heads, cfg.head_dim, seed=3,
-                    kv_heads=cfg.num_key_value_heads))
-
-
-@pytest.mark.parametrize("name", MODELS)
-@pytest.mark.parametrize("heads,kv_heads", [(8, 1), (8, 2), (8, 4), (6, 3), (7, 1), (12, 12)])
-def test_grouping_factor_is_a_parameter(name, heads, kv_heads):
-    """Group sizes the models do not use, including one KV head for all (MQA)
-    and none shared at all, so nothing can quietly assume 7 or 6.
-
-    The head counts are literals because not being the cards' is the point.
-    head_dim is not: it comes from each card, as in every other numerics test."""
-    head_dim = ModelConfig.from_card(name).head_dim
-    check(*make_qkv(TILE_K + 5, TILE_K + 5, heads, head_dim, seed=heads * 10 + kv_heads,
-                    kv_heads=kv_heads))
-
-
-@pytest.mark.parametrize("name", MODELS)
-def test_each_query_head_reads_its_own_group_kv_head(name):
-    """Change one KV head, and exactly its group of query heads moves.
-
-    The mapping is the thing grouping can get wrong while still matching a
-    reference that happens to be symmetric. HuggingFace assigns query head h to
-    KV head h // group (contiguous groups); h % kv_heads (interleaved) is the
-    plausible mistake, and it passes any test whose KV heads are identical."""
-    cfg = ModelConfig.from_card(name)
-    heads, kv_heads = cfg.num_attention_heads, cfg.num_key_value_heads
-    group = heads // kv_heads
-    q, k, v = make_qkv(TILE_K + 3, TILE_K + 3, heads, cfg.head_dim, seed=4, kv_heads=kv_heads)
-    base = _microinfer.attention(q, k, v)
-    for changed in range(kv_heads):
-        k2, v2 = k.copy(), v.copy()
-        k2[:, changed] = -k2[:, changed]
-        v2[:, changed] = -v2[:, changed]
-        moved = _microinfer.attention(q, k2, v2)
-        differs = [not np.array_equal(moved[:, h], base[:, h]) for h in range(heads)]
-        assert differs == [h // group == changed for h in range(heads)], f"KV head {changed}"
-
-
-# --- causality -------------------------------------------------------------
-
-
-@pytest.mark.parametrize("seq", [TILE_K - 3, 2 * TILE_K + 5])
-def test_a_query_is_unaffected_by_later_keys_and_values(seq):
-    """The criterion as stated: change everything at positions > i, and query
-    i's output does not move — not approximately, but in every bit."""
+def test_attention_is_causal():
+    """Change everything after position i, and query i's output does not move,
+    in any bit. A NaN in a masked key does not leak, as it would through a
+    mask applied by multiplying by zero or adding a large negative number. And
+    position 0 attends to itself: with the diagonal masked by an off-by-one
+    its output would be NaN or zero, not exactly v[0]."""
     cfg = ModelConfig.from_card(MODELS[0])
-    q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=1)
-    base = _microinfer.attention(q, k, v)
     rng = np.random.default_rng(2)
-    for i in (0, 1, TILE_K // 2, seq - 2):
-        k2, v2 = k.copy(), v.copy()
-        k2[i + 1 :] = fp16_exact(1000 * rng.standard_normal(k2[i + 1 :].shape))
-        v2[i + 1 :] = fp16_exact(1000 * rng.standard_normal(v2[i + 1 :].shape))
-        moved = _microinfer.attention(q, k2, v2)
-        np.testing.assert_array_equal(moved[: i + 1], base[: i + 1], err_msg=f"rows <= {i}")
-        assert not np.array_equal(moved[i + 1 :], base[i + 1 :]), "the change should be visible"
+    for seq in (TILE_K - 3, 2 * TILE_K + 5):
+        q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=1)
+        base = _microinfer.attention(q, k, v)
+        for i in (0, 1, TILE_K // 2, seq - 2):
+            k2, v2 = k.copy(), v.copy()
+            k2[i + 1 :] = fp16_exact(1000 * rng.standard_normal(k2[i + 1 :].shape))
+            v2[i + 1 :] = fp16_exact(1000 * rng.standard_normal(v2[i + 1 :].shape))
+            moved = _microinfer.attention(q, k2, v2)
+            np.testing.assert_array_equal(moved[: i + 1], base[: i + 1], err_msg=f"{seq}, <= {i}")
+            assert not np.array_equal(moved[i + 1 :], base[i + 1 :]), "the change should show"
 
-
-def test_masked_keys_do_not_reach_the_arithmetic():
-    """A NaN in a masked key must not leak. A mask applied by multiplying by
-    zero, or by adding a large negative number, lets it through; a mask applied
-    by selection does not."""
-    cfg = ModelConfig.from_card(MODELS[0])
     seq = TILE_K + 9
     q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=5)
     base = _microinfer.attention(q, k, v)
     k2 = k.copy()
     k2[-1] = np.nan
-    got = _microinfer.attention(q, k2, v)
-    np.testing.assert_array_equal(got[:-1], base[:-1])
+    np.testing.assert_array_equal(_microinfer.attention(q, k2, v)[:-1], base[:-1])
 
-
-def test_a_query_attends_to_itself():
-    """With the diagonal masked by an off-by-one, position 0 would see nothing
-    and the output would be NaN or zero. It must be exactly v[0]'s row."""
-    cfg = ModelConfig.from_card(MODELS[0])
     q, k, v = make_qkv(3, 3, cfg.num_attention_heads, cfg.head_dim, seed=6)
-    out = _microinfer.attention(q, k, v)
-    np.testing.assert_array_equal(out[0], v[0])
+    np.testing.assert_array_equal(_microinfer.attention(q, k, v)[0], v[0])
 
 
-# --- stability -------------------------------------------------------------
+def test_the_running_maximum_survives_large_and_late_scores():
+    """Softmax does not change when every score moves by a constant, but exp()
+    overflows even fp64 near 1000: an offset built into one dimension of every
+    key survives to the kernel, and only a tracked running maximum survives
+    it in turn. A stability test, and a weak precision one by construction:
+    an fp32 score near 1000 has an ulp of 6e-5.
 
+    A maximum set only from the first tile would pass that, every key sharing
+    the offset. So one late key also towers over all before it: the maximum
+    changes after tiles have been accumulated, and they must be rescaled.
+    There the floor judges under 1% of outputs."""
+    def offset(name):
+        cfg = ModelConfig.from_card(name)
+        seq = 3 * TILE_K + 5
+        q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=7)
+        q[..., -1], k[..., -1] = 32.0, 352.0  # scaled score offset ~ 32*352/sqrt(d)
+        assert 32.0 * 352.0 / np.sqrt(cfg.head_dim) > 700, "too small to overflow exp()"
+        got = _microinfer.attention(q, k, v)
+        assert np.all(np.isfinite(got))
+        check(q, k, v, got=got)
 
-@pytest.mark.parametrize("name", MODELS)
-def test_a_large_common_score_offset_changes_nothing(name):
-    """Softmax is invariant to adding a constant to every score, but exp() is
-    not: a score near 1000 overflows even fp64. The offset is built into the
-    inputs — one dimension of every key carries a large shared component — so
-    it survives as far as the kernel. Only a tracked running maximum survives
-    it in turn; an assumed one (0, or the first tile's) overflows or underflows
-    to NaN.
+    def late(name):
+        cfg = ModelConfig.from_card(name)
+        seq = 4 * TILE_K
+        q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=8)
+        q[..., -1] = 16.0
+        k[..., -1] = np.linspace(0.0, 400.0, seq, dtype=np.float32)[:, None].astype(np.float16)
+        got = _microinfer.attention(q, k, v)
+        assert np.all(np.isfinite(got))
+        check(q, k, v, got=got)
 
-    This is a stability test, and a weak precision test by construction. An
-    fp32 score near 1000 carries an ulp of 6e-5, so the floor — which is honest
-    about that — judges most outputs against their terms. The precision claim
-    at large scores is test_the_maximum_can_arrive_late's, where the floor
-    judges under 1% of outputs."""
-    cfg = ModelConfig.from_card(name)
-    seq = 3 * TILE_K + 5
-    q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=7)
-    q[..., -1], k[..., -1] = 32.0, 352.0  # scaled score offset ~ 32*352/sqrt(d)
-    offset = 32.0 * 352.0 / np.sqrt(cfg.head_dim)
-    assert offset > 700, "not large enough to overflow an unshifted exp()"
-    got = _microinfer.attention(q, k, v)
-    assert np.all(np.isfinite(got))
-    check(q, k, v, got=got)
-
-
-@pytest.mark.parametrize("name", MODELS)
-def test_the_maximum_can_arrive_late(name):
-    """A running maximum that is only ever set from the first tile passes the
-    offset test, because every key shares the offset. Here one late key towers
-    over everything before it, so the maximum changes after tiles have been
-    accumulated, and their contribution has to be rescaled correctly."""
-    cfg = ModelConfig.from_card(name)
-    seq = 4 * TILE_K
-    q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=8)
-    q[..., -1] = 16.0
-    k[..., -1] = np.linspace(0.0, 400.0, seq, dtype=np.float32)[:, None].astype(np.float16)
-    got = _microinfer.attention(q, k, v)
-    assert np.all(np.isfinite(got))
-    check(q, k, v, got=got)
+    each([(offset, n) for n in MODELS] + [(late, n) for n in MODELS], lambda f, n: f(n),
+         name=lambda c: f"{c[0].__name__} {c[1]}")
 
 
 # --- no mask tensor -------------------------------------------------------
@@ -375,52 +306,30 @@ def test_runs_at_a_length_whose_mask_alone_would_not_fit():
 # --- the surface -----------------------------------------------------------
 
 
-def test_returns_the_query_shape():
+def test_the_surface_returns_the_query_shape_and_refuses_what_it_cannot_do():
+    """The output has the queries' shape. Refused: more queries than keys,
+    which bottom-right alignment would put before position 0; head counts
+    that do not group (a remainder, or more KV heads than query heads); zero
+    heads on one side only (none on both is an empty computation); keys and
+    values of different shapes; a head_dim that differs between q and k."""
     q, k, v = make_qkv(5, 9, 3, 64)
     out = _microinfer.attention(q, k, v)
-    assert isinstance(out, np.ndarray)
-    assert out.shape == q.shape
-
-
-def test_rejects_more_queries_than_keys():
-    """Bottom-right alignment would put the first query before position 0."""
-    q, k, v = make_qkv(10, 4, 2, 64)
-    with pytest.raises(ValueError, match="10"):
-        _microinfer.attention(q, k, v)
-
-
-@pytest.mark.parametrize("heads,kv_heads", [(4, 3), (7, 2), (2, 4)])
-def test_rejects_head_counts_that_do_not_group(heads, kv_heads):
-    """Every KV head must serve the same number of query heads. A remainder has
-    no defined grouping, and more KV heads than query heads has none either."""
-    q, k, v = make_qkv(4, 4, heads, 64, kv_heads=kv_heads)
-    with pytest.raises(ValueError, match="head"):
-        _microinfer.attention(q, k, v)
-
-
-def test_zero_heads_is_empty_only_when_both_sides_have_none():
-    """No heads on either side is an empty computation, as zero tokens is. No
-    heads on one side only has no grouping: 0 query heads over 2 KV heads would
-    make every group empty, and 2 over 0 would divide by zero in the kernel."""
+    assert isinstance(out, np.ndarray) and out.shape == q.shape
     q, k, v = make_qkv(4, 4, 0, 64, kv_heads=0)
     assert _microinfer.attention(q, k, v).shape == (4, 0, 64)
-    for heads, kv_heads in [(0, 2), (2, 0)]:
-        q, k, v = make_qkv(4, 4, heads, 64, kv_heads=kv_heads)
-        with pytest.raises(ValueError, match="both are zero or neither"):
-            _microinfer.attention(q, k, v)
 
-
-def test_rejects_mismatched_key_and_value_shapes():
+    refused = [(make_qkv(10, 4, 2, 64), "10")]
+    refused += [(make_qkv(4, 4, h, 64, kv_heads=kv), "head") for h, kv in ((4, 3), (7, 2), (2, 4))]
+    refused += [(make_qkv(4, 4, h, 64, kv_heads=kv), "both are zero or neither")
+                for h, kv in ((0, 2), (2, 0))]
     q, k, v = make_qkv(4, 6, 2, 64)
-    with pytest.raises(ValueError):
-        _microinfer.attention(q, k, v[:5].copy())
-
-
-def test_rejects_mismatched_head_dim():
+    refused.append(((q, k, v[:5].copy()), None))
     q, _, _ = make_qkv(4, 4, 2, 64)
     _, k, v = make_qkv(4, 4, 2, 128)
-    with pytest.raises(ValueError, match="head_dim"):
-        _microinfer.attention(q, k, v)
+    refused.append(((q, k, v), "head_dim"))
+    for (q, k, v), message in refused:
+        with pytest.raises(ValueError, match=message):
+            _microinfer.attention(q, k, v)
 
 
 # --- keys stored without their bias (ADR-0009) -------------------------------
@@ -452,37 +361,32 @@ def qwen_like_keys(cfg, seq, seed):
     return q, k_part, v, bias
 
 
-@pytest.mark.parametrize("name", MODELS)
-@pytest.mark.parametrize("seq_q,seq_k", [(TILE_K + 7, TILE_K + 7), (1, 3 * TILE_K + 2)])
-def test_keys_completed_by_their_bias_match_the_reference(name, seq_q, seq_k):
-    """k_bias completes each stored key as k + RoPE(bias, j) at its row j. The
-    reference forms the whole key in float64; the kernel forms it in fp32 from
-    an fp16 part and an fp16 bias, so it is held to the same gate as ever."""
-    cfg = ModelConfig.from_card(name)
-    q, k_part, v, bias = qwen_like_keys(cfg, seq_k, seed=seq_q)
-    q = q[-seq_q:]
-    k_whole = k_part.astype(np.float64) + rotated_bias(bias, seq_k, cfg.rope_theta)
-    got = _microinfer.attention(q, k_part, v, k_bias=bias, theta=cfg.rope_theta)
-    check(q, k_whole, v, got=got)
+def test_keys_completed_by_their_bias_match_the_reference_and_beat_whole_fp16_keys():
+    """k_bias completes each stored key as k + RoPE(bias, j) at its row j:
+    the reference forms the whole key in float64, the kernel in fp32 from an
+    fp16 part and an fp16 bias, held to the same gate as ever. And ADR-0009's
+    reason: storing the whole key in fp16 rounds it at the bias's magnitude,
+    where fp16's ulp is as large as what tells one key from another, and on
+    the same keys that fails the gate. k_bias is one row per KV head."""
+    def completed(name, seq_q, seq_k):
+        cfg = ModelConfig.from_card(name)
+        q, k_part, v, bias = qwen_like_keys(cfg, seq_k, seed=seq_q)
+        q = q[-seq_q:]
+        k_whole = k_part.astype(np.float64) + rotated_bias(bias, seq_k, cfg.rope_theta)
+        check(q, k_whole, v, got=_microinfer.attention(q, k_part, v, k_bias=bias,
+                                                       theta=cfg.rope_theta))
 
+    each([(n, q, k) for n in MODELS
+          for q, k in ((TILE_K + 7, TILE_K + 7), (1, 3 * TILE_K + 2))], completed)
 
-@pytest.mark.parametrize("name", MODELS)
-def test_a_large_bias_costs_whole_fp16_keys_what_bias_free_keys_keep(name):
-    """ADR-0009's reason, at the kernel. Storing the whole key in fp16 rounds it
-    at the bias's magnitude, where fp16's ulp is as large as what tells one key
-    from another; storing it without the bias rounds only the small part. On
-    the same keys, the first fails the gate and the second passes."""
-    cfg = ModelConfig.from_card(name)
-    seq = 2 * TILE_K + 3
-    q, k_part, v, bias = qwen_like_keys(cfg, seq, seed=9)
-    k_whole = k_part.astype(np.float64) + rotated_bias(bias, seq, cfg.rope_theta)
+    for name in MODELS:
+        cfg = ModelConfig.from_card(name)
+        seq = 2 * TILE_K + 3
+        q, k_part, v, bias = qwen_like_keys(cfg, seq, seed=9)
+        k_whole = k_part.astype(np.float64) + rotated_bias(bias, seq, cfg.rope_theta)
+        with pytest.raises(AssertionError):
+            check(q, k_whole, v, got=_microinfer.attention(q, fp16_exact(k_whole), v))
 
-    check(q, k_whole, v, got=_microinfer.attention(q, k_part, v, k_bias=bias, theta=cfg.rope_theta))
-    with pytest.raises(AssertionError):
-        check(q, k_whole, v, got=_microinfer.attention(q, fp16_exact(k_whole), v))
-
-
-def test_k_bias_must_be_one_row_per_kv_head():
     q, k, v = make_qkv(4, 4, 4, 64, kv_heads=2)
     with pytest.raises(ValueError, match="k_bias"):
         _microinfer.attention(q, k, v, k_bias=np.zeros((4, 64), np.float32), theta=1e4)

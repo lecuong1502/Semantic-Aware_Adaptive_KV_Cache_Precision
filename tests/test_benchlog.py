@@ -39,12 +39,16 @@ def entry(log, kind="test", **overrides):
 
 
 def test_one_call_appends_one_self_describing_entry(tmp_path):
+    """Everything a result depends on, and the machine it came from: the GPU,
+    whether this process had it alone and what shared it, the commit, UTC
+    time. Model, context length and tier configuration must be stated, not
+    defaulted: None where one does not apply, but said. It reads by hand, as
+    a summary that shows nested results and corrections, and parses for
+    plotting."""
     log = tmp_path / "log.jsonl"
     written = entry(log, config={"max_new_tokens": 64})
     lines = log.read_text().splitlines()
-    assert len(lines) == 1
-    assert json.loads(lines[0]) == written
-
+    assert len(lines) == 1 and json.loads(lines[0]) == written
     for field in ("timestamp", "git_commit", "git_dirty", "model", "context_length",
                   "precision_tiers", "gpu", "exclusive_gpu", "other_gpu_processes",
                   "kind", "config", "results", "previous", "sha256"):
@@ -53,71 +57,50 @@ def test_one_call_appends_one_self_describing_entry(tmp_path):
         assert written["gpu"][field], field
     assert written["timestamp"].endswith("+00:00"), "timestamps are UTC"
     assert len(written["git_commit"]) == 40
-
-
-def test_the_ticket_s_fields_must_be_stated_not_defaulted(tmp_path):
-    """Model, context length and tier configuration are what a result depends
-    on, so a caller cannot leave them out by accident. It may say None, where
-    one does not apply, but it has to say it."""
-    with pytest.raises(TypeError):
-        benchlog.append("test", results={}, model="m", log=tmp_path / "log.jsonl")
-
-
-def test_exclusive_use_is_recorded_with_what_shared_the_gpu(tmp_path):
-    written = entry(tmp_path / "log.jsonl")
     others = written["other_gpu_processes"]
     assert written["exclusive_gpu"] == (len(others) == 0)
     assert all(p["pid"] != os.getpid() for p in others)
-    for p in others:
-        assert set(p) == {"pid", "name", "kind", "used_bytes"}
+    assert all(set(p) == {"pid", "name", "kind", "used_bytes"} for p in others)
+    with pytest.raises(TypeError):
+        benchlog.append("test", results={}, model="m", log=tmp_path / "other.jsonl")
+
+    log = tmp_path / "plot.jsonl"
+    first = entry(log, kind="alpha", results={"latency_ms": 3.0, "timings": [1, 2, 3]})
+    entry(log, kind="beta", results={"latency_ms": 4.0})
+    entry(log, kind="correction", results={"corrects": [first["sha256"]]})
+    rows = benchlog.read(log)
+    assert [r["kind"] for r in rows] == ["alpha", "beta", "correction"]
+    assert [r["results"].get("latency_ms") for r in rows] == [3.0, 4.0, None]
+    table = benchlog.render(rows)
+    assert "alpha" in table and "beta" in table
+    assert "timings=[3 items]" in table and "(see correction 3)" in table
 
 
-def test_results_that_are_not_json_are_refused_before_anything_is_written(tmp_path):
+def test_what_a_plot_could_not_read_is_refused_before_anything_is_written(tmp_path):
+    """Results that are not JSON; tier names that are not CONTEXT.md's and
+    ADR-0008's, which would split one tier across two spellings in a plot;
+    kinds that are not kebab-case, but for peak_memory, whose entries existed
+    before the rule; a context length that is neither a count nor a readable
+    range."""
     log = tmp_path / "log.jsonl"
     entry(log)
     before = log.read_bytes()
     with pytest.raises(TypeError):
         entry(log, results={"x": object()})
-    assert log.read_bytes() == before
-
-
-def test_the_format_reads_by_hand_and_parses_for_plotting(tmp_path):
-    log = tmp_path / "log.jsonl"
-    entry(log, kind="alpha", results={"latency_ms": 3.0})
-    entry(log, kind="beta", results={"latency_ms": 4.0})
-    rows = benchlog.read(log)
-    assert [r["kind"] for r in rows] == ["alpha", "beta"]
-    assert [r["results"]["latency_ms"] for r in rows] == [3.0, 4.0]
-    table = benchlog.render(rows)
-    assert "alpha" in table and "beta" in table
-
-
-def test_tier_names_are_the_project_s_own(tmp_path):
-    """A tier configuration names tiers from CONTEXT.md and ADR-0008, so that
-    a plot grouping by tier cannot split one tier across two spellings."""
     with pytest.raises(ValueError, match="precision tiers"):
-        entry(tmp_path / "log.jsonl", precision_tiers={"fp16": 1.0})
-
-
-def test_kinds_are_kebab_case_except_the_one_written_before_the_rule(tmp_path):
-    """A plot groups by kind. peak_memory stays, because its entries already
-    exist and every entry of one measurement must share a kind."""
-    log = tmp_path / "log.jsonl"
-    for kind in ("gate", "gemm-study-timing", "peak_memory"):
-        entry(log, kind=kind)
+        entry(log, precision_tiers={"fp16": 1.0})
     for kind in ("Peak Memory", "new_kind", "trailing-"):
         with pytest.raises(ValueError, match="kebab-case"):
             entry(log, kind=kind)
-
-
-def test_a_context_length_is_a_count_or_a_readable_range(tmp_path):
-    log = tmp_path / "log.jsonl"
-    for context_length in (None, 0, 4096, {"min": 4, "max": 1090, "prompts": 24}):
-        entry(log, context_length=context_length)
     for context_length in ({"prompts": 10, "new_tokens": 64},  # a range a plot cannot read
                            {"min": 9, "max": 4}, -1, "long"):
         with pytest.raises(ValueError, match="context_length"):
             entry(log, context_length=context_length)
+    assert log.read_bytes() == before
+    for kind in ("gate", "gemm-study-timing", "peak_memory"):
+        entry(log, kind=kind)
+    for context_length in (None, 0, 4096, {"min": 4, "max": 1090, "prompts": 24}):
+        entry(log, context_length=context_length)
 
 
 def test_a_tracked_log_does_not_make_its_own_entries_dirty(tmp_path, monkeypatch):
@@ -156,27 +139,21 @@ def test_the_summary_shows_nested_results_and_corrections(tmp_path):
 # -- append-only ----------------------------------------------------------------
 
 
-def test_appending_never_rewrites_what_is_there(tmp_path):
-    log = tmp_path / "log.jsonl"
-    for i in range(3):
-        before = log.read_bytes() if log.exists() else b""
-        entry(log, results={"i": i})
-        assert log.read_bytes().startswith(before)
-
-
-def test_each_entry_chains_to_the_one_before(tmp_path):
-    log = tmp_path / "log.jsonl"
-    first, second = entry(log), entry(log)
-    assert first["previous"] is None
-    assert second["previous"] == first["sha256"]
-    benchlog.verify(log)
-
-
-def test_an_edited_log_fails_verification_where_it_was_edited(tmp_path):
-    """An edit, even to the last entry; a deletion; a reordering."""
+def test_entries_chain_and_an_edit_anywhere_is_found_where_it_was_made(tmp_path):
+    """Appending never rewrites what is there, and each entry chains to the
+    one before. An edit, even to the last entry, a deletion and a reordering
+    each fail verification at the entry they touch. A log without a final
+    newline is refused, not joined: the new entry would run on from the last,
+    and a log that is never rewritten could not be repaired. Trailing blank
+    lines do not hide the last entry."""
     log = tmp_path / "log.jsonl"
     for i in range(4):
-        entry(log, results={"i": i})
+        before = log.read_bytes() if log.exists() else b""
+        written = entry(log, results={"i": i})
+        assert log.read_bytes().startswith(before)
+    rows = benchlog.read(log)
+    assert rows[0]["previous"] is None and rows[1]["previous"] == rows[0]["sha256"]
+    assert benchlog.verify(log) == 4
     original = log.read_text().splitlines()
 
     def edit(lines):
@@ -198,25 +175,14 @@ def test_an_edited_log_fails_verification_where_it_was_edited(tmp_path):
         with pytest.raises(benchlog.LogTampered, match=f"entry {at}"):
             benchlog.verify(log)
 
-
-def test_a_log_without_a_final_newline_is_refused_not_joined(tmp_path):
-    """Appending would run the new entry on from the last, and a log that is
-    never rewritten could not be repaired."""
-    log = tmp_path / "log.jsonl"
-    entry(log)
-    log.write_bytes(log.read_bytes().rstrip(b"\n"))
+    log.write_text("\n".join(original))  # no final newline
     before = log.read_bytes()
     with pytest.raises(benchlog.LogTampered, match="newline"):
         entry(log)
     assert log.read_bytes() == before
 
-
-def test_trailing_blank_lines_do_not_hide_the_last_entry(tmp_path):
-    log = tmp_path / "log.jsonl"
-    first = entry(log)
-    with open(log, "a") as f:
-        f.write("\n\n")
-    assert entry(log)["previous"] == first["sha256"]
+    log.write_text("\n".join(original) + "\n\n\n")
+    assert entry(log)["previous"] == written["sha256"]
     benchlog.verify(log)
 
 

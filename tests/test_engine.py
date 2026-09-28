@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from test_weights import write_safetensors
 
-from conftest import require_model, stable_free_bytes
+from conftest import each, require_model, stable_free_bytes
 from microinfer import (ConfigMismatch, Engine, ModelConfig, _microinfer, expected_weight_bytes,
                         expected_weight_shapes, kv_cache_bytes, nvml, weight_layout)
 from microinfer.weights import WeightError, describe
@@ -27,45 +27,30 @@ def cfg(name):
 
 # -- arithmetic, no checkpoint needed ---------------------------------------
 
-@pytest.mark.parametrize(
-    "name,per_token",
-    [("qwen2.5-0.5b-instruct", 12 * 1024), ("qwen2.5-1.5b-instruct", 28 * 1024)],
-)
-def test_kv_bytes_per_token_matches_adr_0003(name, per_token):
-    """12 KiB and 28 KiB are the figures the whole model choice was argued
-    from. If they are wrong, ADR-0003 is wrong."""
-    assert cfg(name).kv_bytes_per_token == per_token
-    assert kv_cache_bytes(cfg(name), 1) == per_token
+def test_the_arithmetic_is_adr_0003s():
+    """12 KiB and 28 KiB per token are the figures the whole model choice was
+    argued from, and 896 and 384 MiB at 32K its table: if they are wrong,
+    ADR-0003 is wrong. Raw cache bytes scale linearly with the element size,
+    the one term the engine can renegotiate mid-session. They exclude scale
+    metadata, which is why the ratios are clean powers of two: they are not
+    compression ratios, which ADR-0005 puts at 4.63 effective bits for INT4
+    and CONTRIBUTING forbids quoting as 4x. Expected weight bytes match the
+    published parameter counts, 0.49B and 1.54B at two bytes each, tightly
+    enough to catch a missing term."""
+    for name, per_token, at_32k in (("qwen2.5-0.5b-instruct", 12 * 1024, 384 * MIB),
+                                    ("qwen2.5-1.5b-instruct", 28 * 1024, 896 * MIB)):
+        assert cfg(name).kv_bytes_per_token == per_token
+        assert kv_cache_bytes(cfg(name), 1) == per_token
+        assert kv_cache_bytes(cfg(name), 32768) == at_32k
 
-
-def test_kv_cache_at_32k_matches_the_table_in_adr_0003():
-    assert kv_cache_bytes(cfg("qwen2.5-1.5b-instruct"), 32768) == 896 * MIB
-    assert kv_cache_bytes(cfg("qwen2.5-0.5b-instruct"), 32768) == 384 * MIB
-
-
-def test_raw_cache_bytes_scale_linearly_with_element_size():
-    """Element size is the one term the engine can renegotiate mid-session.
-
-    These are *raw* bytes with scale metadata excluded, which is why the ratios
-    are clean powers of two. They are not compression ratios: ADR-0005 puts
-    INT4 at 4.63 effective bits once its 1280 bytes per page are counted, and
-    CONTRIBUTING forbids quoting 4x for it.
-    """
     c = cfg("qwen2.5-1.5b-instruct")
     fp16 = kv_cache_bytes(c, 32768, bytes_per_element=2)
     assert kv_cache_bytes(c, 32768, bytes_per_element=1) == fp16 // 2
     assert kv_cache_bytes(c, 32768, bytes_per_element=0.5) == fp16 // 4
     assert isinstance(kv_cache_bytes(c, 32768, bytes_per_element=0.5), int)
 
-
-def test_expected_weight_bytes_is_in_the_right_region():
-    """Cross-checked against the published parameter counts: 0.49B and 1.54B,
-    two bytes each. Tight enough to catch a missing term, loose enough not to
-    depend on how upstream rounds."""
-    small = expected_weight_bytes(cfg("qwen2.5-0.5b-instruct"))
-    large = expected_weight_bytes(cfg("qwen2.5-1.5b-instruct"))
-    assert 0.9e9 < small < 1.1e9
-    assert 2.9e9 < large < 3.3e9
+    assert 0.9e9 < expected_weight_bytes(cfg("qwen2.5-0.5b-instruct")) < 1.1e9
+    assert 2.9e9 < expected_weight_bytes(cfg("qwen2.5-1.5b-instruct")) < 3.3e9
 
 
 # -- configuration gate ------------------------------------------------------
@@ -79,34 +64,36 @@ def stage_config(tmp_path: Path, card: str = "qwen2.5-0.5b-instruct") -> Path:
     return tmp_path
 
 
-def test_an_unknown_model_is_refused_by_name(tmp_path):
+def test_an_unknown_model_is_refused_by_name_unless_waived(tmp_path):
     """Identity comes from the directory name. An unrecognised one has no
     recorded constants to check against, and running blind is the failure this
-    ticket exists to prevent."""
+    ticket exists to prevent. The check can be waived, deliberately."""
     with pytest.raises(ConfigMismatch, match="no verified constants"):
         Engine(stage_config(tmp_path))
-
-
-def test_verification_can_be_waived_deliberately(tmp_path):
-    engine = Engine(stage_config(tmp_path), verify=False)
-    assert engine.config.num_hidden_layers == 24
+    assert Engine(stage_config(tmp_path), verify=False).config.num_hidden_layers == 24
 
 
 # -- against the real checkpoint --------------------------------------------
 
-@pytest.mark.parametrize("name", ["qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct"])
-def test_loads_and_reports_weights_within_one_percent_of_config(name):
-    engine = Engine(require_model(name))
-    engine.load_weights()
+def test_loads_and_reports_weights_within_one_percent_of_config():
+    """Both models, and config.json names exactly the checkpoint's tensors:
+    the arena is laid out from it before the checkpoint is read, so it must
+    name every tensor with its shape, and nothing else."""
+    def within_one_percent(name):
+        path = require_model(name) / "model.safetensors"
+        assert expected_weight_shapes(cfg(name)) == {i.name: i.shape for i in describe(path)}
+        engine = Engine(require_model(name))
+        engine.load_weights()
+        measured = engine.footprint().weights
+        predicted = engine.expected_weight_bytes()
+        error = abs(measured - predicted) / predicted
+        del engine
+        gc.collect()
+        assert error < 0.01, (
+            f"measured {measured / MIB:.1f} MiB on device, config.json implies "
+            f"{predicted / MIB:.1f} MiB, {error:.2%} apart")
 
-    measured = engine.footprint().weights
-    predicted = engine.expected_weight_bytes()
-    error = abs(measured - predicted) / predicted
-
-    assert error < 0.01, (
-        f"measured {measured / MIB:.1f} MiB on device, config.json implies "
-        f"{predicted / MIB:.1f} MiB — {error:.2%} apart"
-    )
+    each(["qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct"], within_one_percent)
 
 
 def test_footprint_separates_weights_cache_and_workspace():
@@ -164,15 +151,6 @@ def test_reported_weights_match_what_the_driver_says_was_taken():
         f"driver took {taken / MIB:.1f} MiB against a claim of "
         f"{claimed / MIB:.1f} MiB: more overhead than one allocation's granularity "
         f"explains")
-
-
-@pytest.mark.parametrize("name", ["qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct"])
-def test_config_implies_exactly_the_checkpoints_tensors(name):
-    """The arena is laid out from config.json before the checkpoint is read, so
-    config.json must name every tensor the checkpoint holds, with its shape,
-    and nothing else."""
-    path = require_model(name) / "model.safetensors"
-    assert expected_weight_shapes(cfg(name)) == {i.name: i.shape for i in describe(path)}
 
 
 def test_weights_occupy_one_allocation_sized_from_config():

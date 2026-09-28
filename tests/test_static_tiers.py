@@ -21,7 +21,7 @@ import pytest
 from test_chunked_prefill import LOGIT_BOUND
 from test_paged_engine import decode
 
-from conftest import require_model
+from conftest import each, require_model
 from microinfer import Engine, ModelConfig, _microinfer, model, nvml, paged_cache_bytes
 from microinfer.gate import KL_MAX, TOP1_MIN, run_gate
 from microinfer.golden import GoldenError, GoldenSet
@@ -92,8 +92,7 @@ def test_every_tier_runs_and_each_narrower_one_costs_more(engine, golden):
     assert all(a >= b for a, b in zip(top1, top1[1:])), top1
 
 
-@pytest.mark.parametrize("tier", TIERS)
-def test_decoding_continues_as_a_full_prefill_would_at_every_tier(engine, golden, tier):
+def test_decoding_continues_as_a_full_prefill_would_at_every_tier(engine, golden):
     """Attention at a quantised tier is causal as decode is (ADR-0011): a
     query reads its own page at FP16 and every page before it sealed, however
     many positions came with it. So a prompt decoded one token at a time and
@@ -102,7 +101,7 @@ def test_decoding_continues_as_a_full_prefill_would_at_every_tier(engine, golden
     one-row GEMM than in a long one (ADR-0006, note from #15), which can flip
     an argmax at a near-tie and every token after it: the first difference,
     if any, is where the prefill's top two logits are within LOGIT_BOUND."""
-    for prompt_id in ("short-00", "medium-01", "adversarial-04", "long-03"):
+    def continues(tier, prompt_id):
         ids = golden[prompt_id].token_ids
         with at_tier(engine, tier):
             out = engine.generate(ids, 40, stop_at_eos=False)
@@ -111,74 +110,85 @@ def test_decoding_continues_as_a_full_prefill_would_at_every_tier(engine, golden
         if differ.size:
             top_two = np.sort(full[differ[0]])[-2:]
             assert top_two[1] - top_two[0] < LOGIT_BOUND, (
-                f"{tier} {prompt_id}: decode left the prefill's choice at step {differ[0]}, "
-                f"away from a near-tie")
+                f"decode left the prefill's choice at step {differ[0]}, away from a near-tie")
+
+    each([(t, p) for t in TIERS for p in ("short-00", "medium-01", "adversarial-04", "long-03")],
+         continues)
 
 
-@pytest.mark.parametrize("tier", TIERS[1:])
-def test_no_page_changes_tier_during_a_generation(engine, golden, tier):
+def test_no_page_changes_tier_during_a_generation(engine, golden):
     """A real prefill and decode at a quantised tier, with the allocator read
     after every step: every page of positions is at the cache's tier, the only
     FP16 pages are the open pages, two per layer, and no page once seen is ever
     at another tier."""
     cfg = engine.config
-    cache = model.PagedCache(cfg, getattr(_microinfer.Tier, tier))
-    ids = golden["medium-02"].token_ids
-    seen = {}
 
-    def check(step):
-        allocator = cache.allocator
-        now = {key: t for t in _microinfer.Tier.__members__.values() for key in allocator.pages(t)}
-        for key, was in seen.items():
-            assert now.get(key) == was, f"{key} was at {was}, now {now.get(key)} (step {step})"
-        seen.update(now)
-        full = cache.length // P
-        assert len(allocator.pages(cache.tier)) == cfg.num_hidden_layers * full
-        assert sorted(allocator.pages(_microinfer.Tier.FP16)) == sorted(
-            (layer, p) for layer in range(cfg.num_hidden_layers)
-            for p in _microinfer.device.open_pages)
+    def generation(tier):
+        cache = model.PagedCache(cfg, getattr(_microinfer.Tier, tier))
+        ids = golden["medium-02"].token_ids
+        seen = {}
 
-    decode(engine, ids, 3 * P, cache, between_steps=check)
-    check("end")
+        def check(step):
+            allocator = cache.allocator
+            now = {key: t for t in _microinfer.Tier.__members__.values()
+                   for key in allocator.pages(t)}
+            for key, was in seen.items():
+                assert now.get(key) == was, f"{key} was at {was}, now {now.get(key)} ({step})"
+            seen.update(now)
+            full = cache.length // P
+            assert len(allocator.pages(cache.tier)) == cfg.num_hidden_layers * full
+            assert sorted(allocator.pages(_microinfer.Tier.FP16)) == sorted(
+                (layer, p) for layer in range(cfg.num_hidden_layers)
+                for p in _microinfer.device.open_pages)
+
+        decode(engine, ids, 3 * P, cache, between_steps=check)
+        check("end")
+
+    each(TIERS[1:], generation)
 
 
-@pytest.mark.parametrize("tier", TIERS)
-def test_the_footprint_at_each_tier_is_what_the_layout_computes(tier):
+def test_the_footprint_at_each_tier_is_what_the_layout_computes():
     """Qwen2.5-1.5B's whole 32K window at each tier, allocated but not run: what
     this process holds by the driver's own account, which no other process
     moves, against paged_cache_bytes, within 1%. The RoPE table is covered
     before the reading, so the pages alone are measured."""
     cfg = ModelConfig.from_card("qwen2.5-1.5b-instruct")
     tokens = cfg.max_position_embeddings
-    cache = model.PagedCache(cfg, getattr(_microinfer.Tier, tier))
-    cache.rope.cover(tokens)
-    before = nvml.own_used_bytes()
-    cache.pages.reserve(tokens)
-    measured = nvml.own_used_bytes() - before
-    computed = paged_cache_bytes(cfg, tokens, tier)
-    print(f"\n{tier}: measured {measured / MIB:.1f} MiB, computed {computed / MIB:.1f} MiB")
-    assert abs(measured - computed) <= 0.01 * computed
-    del cache
+
+    def footprint(tier):
+        cache = model.PagedCache(cfg, getattr(_microinfer.Tier, tier))
+        cache.rope.cover(tokens)
+        before = nvml.own_used_bytes()
+        cache.pages.reserve(tokens)
+        measured = nvml.own_used_bytes() - before
+        computed = paged_cache_bytes(cfg, tokens, tier)
+        print(f"\n{tier}: measured {measured / MIB:.1f} MiB, computed {computed / MIB:.1f} MiB")
+        del cache
+        assert abs(measured - computed) <= 0.01 * computed
+
+    each(TIERS, footprint)
 
 
 @pytest.mark.skipif(os.environ.get("MICROINFER_LONG_TESTS") != "1",
                     reason="tens of minutes; set MICROINFER_LONG_TESTS=1 to run")
-@pytest.mark.parametrize("tier", TIERS[1:])
-def test_a_32k_prompt_prefills_at_each_quantised_tier_on_the_1_5b_model(tier):
+def test_a_32k_prompt_prefills_at_each_quantised_tier_on_the_1_5b_model():
     """ADR-0003's experimental configuration at each quantised tier: the whole
     context window of Qwen2.5-1.5B, prefilled in chunks into a cache at the
     tier, then one token chosen. FP16 is test_chunked_prefill.py's. At the
     peak the cache holds what paged_cache_bytes says for the window, and
     beside it the RoPE table, which covers every position."""
-    e = Engine(require_model("qwen2.5-1.5b-instruct"), kv_tier=tier)
-    e.load_weights()
-    window = e.config.max_position_embeddings
-    ids = np.random.default_rng(15).integers(1000, 100_000, window).astype(np.int32)
-    e.reset_peak()
-    out = e.generate(ids, 1, stop_at_eos=False)
-    assert out.shape == (1,) and 0 <= out[0] < e.config.vocab_size
-    peak = e.peak_footprint()
-    print(f"\n{tier}: " + peak.render())
-    table = peak.kv_cache - paged_cache_bytes(e.config, window, tier)
-    per_position = e.config.head_dim * 4  # {cos, sin} in fp32 for head_dim / 2 frequencies
-    assert table % per_position == 0 and table // per_position >= window, table
+    def prefills(tier):
+        e = Engine(require_model("qwen2.5-1.5b-instruct"), kv_tier=tier)
+        e.load_weights()
+        window = e.config.max_position_embeddings
+        ids = np.random.default_rng(15).integers(1000, 100_000, window).astype(np.int32)
+        e.reset_peak()
+        out = e.generate(ids, 1, stop_at_eos=False)
+        assert out.shape == (1,) and 0 <= out[0] < e.config.vocab_size
+        peak = e.peak_footprint()
+        print(f"\n{tier}: " + peak.render())
+        table = peak.kv_cache - paged_cache_bytes(e.config, window, tier)
+        per_position = e.config.head_dim * 4  # {cos, sin} in fp32 for head_dim / 2 frequencies
+        assert table % per_position == 0 and table // per_position >= window, table
+
+    each(TIERS[1:], prefills)

@@ -14,6 +14,7 @@ intermediate ratio, and lm_head widens by two orders of magnitude.
 
 import numpy as np
 import pytest
+from conftest import each
 from ulp_gate import accumulation_floor, assert_within_gate, fp16_exact, input_rounding_floor
 
 from microinfer import _microinfer
@@ -89,24 +90,31 @@ def check(x, w, b):
     return within_gate(_microinfer.linear(x, w, b), x, w, b)
 
 
-@pytest.mark.parametrize("name,proj", CASES)
-@pytest.mark.parametrize("rows", [1, 64])
-def test_matches_float64_reference_at_every_model_projection(name, proj, rows):
-    """rows=1 is a decode step and rows=64 a prefill; cuBLAS picks different
-    algorithms for the two, so both are exercised."""
-    in_f, out_f, bias = projections(ModelConfig.from_card(name))[proj]
-    check(*make_case(rows, in_f, out_f, bias, seed=in_f + out_f + rows))
+def test_matches_float64_reference_at_every_shape():
+    """Every projection of both models, at rows=1, a decode step, and rows=64,
+    a prefill, since cuBLAS picks different algorithms for the two; the LM
+    head at the full vocabulary, the most rectangular shape the model has,
+    for the smaller model only (the larger one's weight is a 0.9 GiB host
+    array for no more coverage); and shapes that are not multiples of eight,
+    which tensor cores prefer and the wrapper may not require."""
+    def projection(name, proj, rows):
+        in_f, out_f, bias = projections(ModelConfig.from_card(name))[proj]
+        check(*make_case(rows, in_f, out_f, bias, seed=in_f + out_f + rows))
 
-
-def test_lm_head_at_full_vocabulary():
-    """The most rectangular shape the model has: hidden -> vocab, tied to the
-    embedding. Run for the smaller model only — the larger one's weight is a
-    0.9 GiB host array for no additional coverage."""
+    each([(n, p, r) for n, p in CASES for r in (1, 64)], projection)
     cfg = ModelConfig.from_card(MODELS[0])
     check(*make_case(4, cfg.hidden_size, cfg.vocab_size, bias=False, seed=11))
+    each([(3, 5, 7), (1, 1, 1), (17, 33, 65), (2, 896, 3)], lambda rows, in_f, out_f: check(
+        *make_case(rows, in_f, out_f, bias=True, seed=rows * in_f * out_f)))
 
 
-def test_arbitrary_fp32_input_meets_the_gate():
+def test_the_gate_holds_fp32_input_and_would_reject_fp16_accumulation():
+    """fp32 input meets the gate with its rounding floored. And the
+    accumulation floor forgives fp32's rounding and no more: partial sums
+    kept in fp16, which is what reduced-precision split-K does and why the
+    wrapper disallows it, are simulated and fail at the widest reduction the
+    model has (measured, 370 ulp max; were the floor `terms` itself they
+    would pass, at 3.0 ulp max and 0.33 mean)."""
     cfg = ModelConfig.from_card(MODELS[0])
     rng = np.random.default_rng(5)
     x = rng.standard_normal((8, cfg.hidden_size), dtype=np.float32)
@@ -115,15 +123,6 @@ def test_arbitrary_fp32_input_meets_the_gate():
     ref, terms = reference_linear(x, w)
     assert_within_gate(_microinfer.linear(x, w), ref, input_rounding_floor(terms))
 
-
-def test_the_gate_would_reject_fp16_accumulation():
-    """The accumulation floor forgives fp32's rounding and must not forgive
-    more. The failure it exists to catch — partial sums kept in fp16, which is
-    what reduced-precision split-K does and why the wrapper disallows it — is
-    simulated in NumPy and checked to fail at the widest reduction the model
-    has: measured, 370 ulp max. Were the floor `terms` itself it would pass,
-    at 3.0 ulp max and 0.33 mean."""
-    cfg = ModelConfig.from_card(MODELS[0])
     x, w, _ = make_case(2, cfg.intermediate_size, 256, bias=False, seed=13)
     products = (x[:, None, :] * w[None, :, :]).astype(np.float16)
     fp16_accumulated = np.cumsum(products, axis=-1, dtype=np.float16)[..., -1].astype(np.float32)
@@ -131,51 +130,32 @@ def test_the_gate_would_reject_fp16_accumulation():
         within_gate(fp16_accumulated, x, w)
 
 
-@pytest.mark.parametrize("rows,in_f,out_f", [(3, 5, 7), (1, 1, 1), (17, 33, 65), (2, 896, 3)])
-def test_shapes_need_not_be_aligned(rows, in_f, out_f):
-    """Tensor cores prefer multiples of eight; the wrapper may not require them."""
-    check(*make_case(rows, in_f, out_f, bias=True, seed=rows * in_f * out_f))
-
-
-def test_weight_is_used_as_out_by_in_not_transposed():
-    """A transposition bug on a square weight still yields a matrix of the right
-    shape. Only a comparison against `x @ w.T` specifically catches it."""
+def test_the_weight_is_out_by_in_the_bias_added_once_and_rows_independent():
+    """A transposition bug on a square weight still yields the right shape:
+    only a comparison against `x @ w.T` specifically catches it. The bias is
+    added once per row, and each row's result is the same computed alone."""
     x, w, _ = make_case(4, 128, 128, bias=False)
     got = _microinfer.linear(x, w)
     within_gate(got, x, w)
     assert not np.allclose(got, x.astype(np.float64) @ w.astype(np.float64), atol=1e-2)
 
-
-def test_bias_is_added_once_per_row():
     x, w, b = make_case(5, 64, 32, bias=True)
     with_bias = _microinfer.linear(x, w, b)
-    without = _microinfer.linear(x, w)
     within_gate(with_bias, x, w, b)
-    assert not np.array_equal(with_bias, without)
+    assert not np.array_equal(with_bias, _microinfer.linear(x, w))
 
-
-def test_rows_are_independent():
     x, w, b = make_case(16, 256, 96, bias=True)
     all_rows = _microinfer.linear(x, w, b)
     for i in (0, 9, 15):
-        one = _microinfer.linear(x[i : i + 1].copy(), w, b)
-        within_gate(one, x[i : i + 1], w, b)
+        within_gate(_microinfer.linear(x[i : i + 1].copy(), w, b), x[i : i + 1], w, b)
         within_gate(all_rows[i : i + 1], x[i : i + 1], w, b)
 
 
-def test_rejects_mismatched_inner_dimension():
-    x, w, _ = make_case(2, 64, 32, bias=False)
+def test_malformed_operands_are_refused():
+    x, w, b = make_case(2, 64, 32, bias=True)
     with pytest.raises(ValueError, match="64"):
         _microinfer.linear(x, w[:, :48].copy())
-
-
-def test_rejects_mismatched_bias_length():
-    x, w, b = make_case(2, 64, 32, bias=True)
     with pytest.raises(ValueError, match="32"):
         _microinfer.linear(x, w, b[:16].copy())
-
-
-def test_rejects_non_2d_input():
-    _, w, _ = make_case(2, 64, 32, bias=False)
     with pytest.raises(ValueError):
         _microinfer.linear(np.zeros(64, dtype=np.float32), w)

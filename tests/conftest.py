@@ -69,3 +69,20 @@ def stable_free_bytes() -> int:
 
     gc.collect()
     return _microinfer.device_memory_info()["free"]
+
+
+def each(cases, check, name=repr) -> None:
+    """Run check(*case) for every case, and fail once at the end, naming
+    each case that failed and why. One test holds a family of cases that
+    parametrize would have counted one by one, and a failure still says
+    which of them it was."""
+    cases = list(cases)
+    failures = []
+    for case in cases:
+        try:
+            check(*(case if isinstance(case, tuple) else (case,)))
+        except AssertionError as exc:
+            failures.append(f"{name(case)}: {exc}")
+    if failures:
+        pytest.fail(f"{len(failures)} of {len(cases)} cases failed:\n" + "\n".join(failures),
+                    pytrace=False)
