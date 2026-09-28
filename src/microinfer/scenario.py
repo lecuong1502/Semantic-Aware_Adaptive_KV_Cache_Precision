@@ -65,9 +65,11 @@ from .recorder import END, START, companion
 ACTIONS = {1: "idle", 2: "tabs", 3: "youtube-1080p", 4: "youtube-2160p", 5: "video-call",
            6: "webgl", 7: "vlc-2160p", 8: "vscode", 9: "close-all"}
 BROWSER_ACTIONS = (2, 3, 4, 5, 6)
-#: What a run covers by default: the whole scenario in Chrome, and #45's
-#: Firefox pass over actions 2 to 4, closing everything after them.
-DEFAULT_ACTIONS = {"chrome": (1, 2, 3, 4, 5, 6, 7, 8, 9), "firefox": (2, 3, 4, 9)}
+#: What a run covers by default: the scenario in Chrome, and #45's Firefox
+#: pass over actions 2 to 4, closing everything after them. Action 5 runs
+#: only when asked for: Google refused the owner's sign-in in the driver's
+#: fresh, remotely controlled profile (#55), so the call could not start.
+DEFAULT_ACTIONS = {"chrome": (1, 2, 3, 4, 6, 7, 8, 9), "firefox": (2, 3, 4, 9)}
 #: A call anyone signed in can start, with no link to share first.
 CALL_URL = "https://meet.google.com/new"
 CALL_PROMPT = ("Action 5, the video call. In the browser window just opened: sign in if "
