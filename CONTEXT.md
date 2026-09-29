@@ -133,6 +133,14 @@ KV cache size as a proportion of total device memory, for a given model and
 context length. It varies by an order of magnitude across models with different
 GQA ratios, and every reported result is qualified by it.
 
+**Simulated contention**:
+Device memory taken on a schedule of (time, bytes taken) by a process of its
+own, the contention simulator: memory only, a granule at a time through the
+engine's allocator, so that it is another process to NVML and to the monitor,
+as real contention is. Its schedules come from synthetic patterns or from a
+contention trace. It *takes* memory; *holding* is the engine's (Hold).
+_Avoid_: load generator, stress test (it runs no kernels)
+
 **Contention trace**:
 A recording of contention as the recorder takes it, in two streams on one
 monotonic clock: the **device stream**, the driver's free and used memory at
