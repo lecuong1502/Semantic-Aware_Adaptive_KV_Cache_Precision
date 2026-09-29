@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Hold device memory on a schedule, as a process of its own (#58).
+"""Take device memory on a schedule, as a process of its own (#58).
 
     .venv/bin/python tools/simulate_contention.py --schedule schedule.json
         [--events events.jsonl]
     .venv/bin/python tools/simulate_contention.py --calibrate --issue 58 [--repeats 20]
 
 The contention simulator (microinfer.simulator): its own CUDA context, memory
-only, one-granule pages through the engine's VMM allocator, following a
-schedule of (time, bytes held) from a JSON file ({"points": [[t, bytes], ...]}).
-Each change is appended to --events as a JSON line as it happens: when it was
-due and applied, the bytes asked and held, and its latency until the call
-returned and until NVML showed it. It exits when the schedule ends, or on
-SIGINT or SIGTERM, giving back everything it holds; killed, the driver takes
-it all back with the process.
+only, taken a granule at a time through the engine's VMM allocator,
+following a schedule of (time, bytes taken) from a JSON file
+({"points": [[t, bytes], ...]}). The last level is kept until the simulator
+is stopped; a schedule that means to give everything back ends at 0.
 
---calibrate runs its own schedule, holding and releasing steps from one
-granule to 1 GiB --repeats times, and logs the latency of each direction to
-the benchmark log. Refuses a dirty tree, so that the entry names its code.
+It prints "ready" once its CUDA context exists, before the schedule starts,
+for a caller that must know when its memory is another process's. Each change
+is appended to --events as a JSON line as it happens: when it was due, how
+late it began, the bytes asked and taken and any shortfall, and its latency
+until the calls returned and until NVML showed it. It stops on SIGINT or
+SIGTERM, giving back everything it took; killed, the driver takes it all back
+with the process.
+
+--calibrate takes and gives back steps from one granule to 1 GiB --repeats
+times, and logs the latency of each size and direction to the benchmark log.
+Refuses a dirty tree, so that the entry names its code.
 """
 
 from __future__ import annotations
@@ -66,12 +71,14 @@ def main(argv: list[str]) -> int:
                         precision_tiers=None,
                         config={"issue": args.issue, "repeats": args.repeats,
                                 "sizes_bytes": list(simulator.CALIBRATION_BYTES),
-                                "step_s": 0.5, "granule_bytes": simulator.GRANULE},
+                                "step_s": simulator.CALIBRATION_STEP_S,
+                                "granule_bytes": simulator.GRANULE,
+                                "nvml_poll_s": simulator.NVML_POLL_S},
                         results=results, log=args.log)
-        for direction, r in results.items():
-            print(f"{direction}: {r['changes']} changes, NVML shows it after "
-                  f"{r['nvml_ms']['median']:.2f} ms (median), {r['nvml_ms']['max']:.2f} ms "
-                  f"(max); {r['unseen']} unseen")
+        for size, directions in results.items():
+            print(f"{int(size) / 2**20:6.0f} MiB: " + "; ".join(
+                f"{d} NVML {r['nvml_ms']['median']:.2f} ms median, {r['nvml_ms']['max']:.2f} "
+                f"max, {r['unseen']} unseen" for d, r in directions.items()))
         return 0
 
     out = open(args.events, "a") if args.events else None
@@ -81,11 +88,12 @@ def main(argv: list[str]) -> int:
             out.write(json.dumps(event) + "\n")
             out.flush()
 
-    holder = simulator.Holder()
+    reservation = simulator.Reservation()
+    print("ready", flush=True)
     try:
-        simulator.run(schedule, holder, stop, on_change=record)
+        simulator.run(schedule, reservation, stop, on_change=record)
     finally:
-        holder.release()
+        reservation.release()
         if out is not None:
             out.close()
     return 0

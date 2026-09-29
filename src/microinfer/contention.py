@@ -126,7 +126,7 @@ def attribute(spike: spikes.Spike, stream: ProcessStream, *,
                        share=known[best] / spike.amplitude_bytes)
 
 
-def _spread(values: list[float]) -> dict | None:
+def spread(values: list[float]) -> dict | None:
     """Median, P90 and max, or None if there are no values."""
     if not values:
         return None
@@ -136,7 +136,7 @@ def _spread(values: list[float]) -> dict | None:
 
 
 def _ms(seconds: list[float | None]) -> dict | None:
-    return _spread([s * 1e3 for s in seconds if s is not None])  # None: not measured
+    return spread([s * 1e3 for s in seconds if s is not None])  # None: not measured
 
 
 def _distributions(group: list[tuple[spikes.Spike, Attribution]]) -> dict:
@@ -144,7 +144,7 @@ def _distributions(group: list[tuple[spikes.Spike, Attribution]]) -> dict:
     recovered = [s for s in found if s.recovered]
     endings = {e: sum(s.ending == e for s in found) for e in get_args(spikes.Ending)}
     return {"count": len(found), "endings": endings,
-            "amplitude_mib": _spread([s.amplitude_bytes / MIB for s in found]),
+            "amplitude_mib": spread([s.amplitude_bytes / MIB for s in found]),
             "rise_ms": _ms([s.rise_s for s in found]),
             "duration_ms": _ms([s.duration_s for s in recovered]),
             "recovery_ms": _ms([s.recovery_s for s in recovered]),
