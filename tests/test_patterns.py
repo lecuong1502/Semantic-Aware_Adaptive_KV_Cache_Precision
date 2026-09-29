@@ -1,9 +1,10 @@
 """Synthetic contention: schedules for the simulator from patterns (#59).
 
-A step, a sawtooth, and Poisson spikes whose amplitudes, rise times and
-durations are drawn from given distributions: fixed, uniform, or RQ1's own
-spikes, read back from the benchmark log. Tested for their shapes, their
-determinism given a seed, and by running one through the simulator.
+A step, a sawtooth, trapezoids of a known shape, and Poisson arrivals of
+trapezoids drawn from distributions: fixed, uniform, or RQ1's own, read back
+from the benchmark log and the labels beside the traces. Tested for their
+shapes, their determinism given a seed, what RQ1's measures become, and by
+running one through the simulator.
 """
 
 import threading
@@ -11,7 +12,9 @@ import threading
 import numpy as np
 import pytest
 
-from microinfer import benchlog, patterns, simulator
+from conftest import each
+from microinfer import benchlog, patterns, recorder, simulator
+from microinfer.patterns import Fixed, Trapezoid, Uniform
 
 MiB = 2**20
 GRANULE = simulator.GRANULE
@@ -21,105 +24,124 @@ def levels(schedule, times):
     return [schedule.at(t) for t in times]
 
 
-def test_a_step_and_a_sawtooth_have_the_shapes_asked_for():
-    """A step takes X for T seconds, after a lead, and gives it back. A
-    sawtooth climbs from 0 to its peak over each period and drops at once,
-    for as many cycles as asked, and ends at 0. Every level is whole
-    granules."""
-    step = patterns.step(300 * MiB, hold_s=2.0, lead_s=0.5)
-    assert step.points == [(0.0, 0), (0.5, 300 * MiB), (2.5, 0)]
+def test_a_step_a_sawtooth_and_trapezoids_have_the_shapes_asked_for():
+    """A step takes X for T seconds after a lead. A sawtooth climbs from 0 to
+    its peak over each period and drops. A trapezoid rises, keeps its
+    plateau and falls, and a train repeats it after a gap. Every level is
+    whole granules, halves rounded up, and every schedule ends at 0."""
+    assert patterns.step(300 * MiB, for_s=2.0, lead_s=0.5).points == [
+        (0.0, 0), (0.5, 300 * MiB), (2.5, 0)]
+    assert patterns.step(GRANULE // 2, for_s=1.0).points[0] == (0.0, GRANULE)
 
     saw = patterns.sawtooth(512 * MiB, period_s=1.0, cycles=3, resolution_s=0.1)
     for cycle in range(3):
         climb = levels(saw, [cycle + 0.05 + 0.1 * k for k in range(10)])
-        assert climb == sorted(climb) and climb[0] < 64 * MiB, cycle
-        assert abs(climb[-1] - 512 * MiB) <= 512 * MiB * 0.1 + GRANULE
+        assert climb[0] == 0 and climb == sorted(climb) and climb[-1] == 512 * MiB, cycle
     assert saw.at(3.0) == 0 and saw.duration_s == pytest.approx(3.0)
-    assert all(b % GRANULE == 0 for _, b in step.points + saw.points)
-    for bad in (lambda: patterns.step(-1, 1.0), lambda: patterns.sawtooth(1, 0, 1)):
+
+    shape = Trapezoid(amplitude_bytes=400 * MiB, rise_s=0.4, plateau_s=1.0, fall_s=0.2)
+    one = patterns.trapezoids(shape, lead_s=1.0, resolution_s=0.01)
+    assert levels(one, [0.9, 1.2, 1.41, 2.3, 2.61]) == [0, 200 * MiB, 400 * MiB, 400 * MiB, 0]
+    train = patterns.trapezoids(shape, count=3, gap_s=0.5, resolution_s=0.01)
+    starts = [t for (t0, b0), (t, b) in zip(train.points, train.points[1:]) if b0 == 0 and b]
+    assert starts == pytest.approx([0.01, 2.11, 4.21], abs=0.011)
+    assert all(b % GRANULE == 0 for s in (saw, one, train) for _, b in s.points)
+    assert all(s.points[-1][1] == 0 for s in (saw, one, train))
+
+    def refused(make):
         with pytest.raises(ValueError):
-            bad()
+            make()
+
+    each([(lambda: patterns.step(-1, 1.0),), (lambda: patterns.step(1, 0),),
+          (lambda: patterns.sawtooth(1, 0.1, 1, 0.1),), (lambda: patterns.trapezoids(shape, 0),)],
+         refused)
 
 
-def test_poisson_spikes_are_drawn_from_their_distributions_and_the_same_given_a_seed():
-    """Arrivals at the rate asked; each spike a trapezoid whose amplitude,
-    rise, plateau and fall come from their distributions; overlapping spikes
+def test_poisson_arrivals_are_drawn_from_their_distributions_and_the_same_given_a_seed():
+    """Arrivals at the rate asked, over the length asked; overlapping shapes
     add. The same seed gives the same schedule, another seed another."""
-    params = patterns.SpikeParameters(
-        rate_per_s=0.5, amplitude_bytes=patterns.Uniform(100 * MiB, 300 * MiB),
-        rise_s=patterns.Fixed(0.1), duration_s=patterns.Uniform(0.2, 1.0),
-        fall_s=patterns.Fixed(0.2))
-    a = patterns.poisson_spikes(params, duration_s=120.0, seed=7)
-    assert a.duration_s >= 120.0  # as long as asked, however early the last spike
-    assert a == patterns.poisson_spikes(params, duration_s=120.0, seed=7)
-    assert a != patterns.poisson_spikes(params, duration_s=120.0, seed=8)
-
-    # Recover the spikes from the schedule: each rise from 0.
+    params = patterns.ShapeParameters(
+        rate_per_s=0.5, amplitude_bytes=Uniform(100 * MiB, 300 * MiB), rise_s=Fixed(0.1),
+        plateau_s=Uniform(0.2, 1.0), fall_s=Fixed(0.2))
+    a = patterns.poisson(params, length_s=120.0, seed=7)
+    assert a == patterns.poisson(params, length_s=120.0, seed=7)
+    assert a != patterns.poisson(params, length_s=120.0, seed=8)
+    assert a.duration_s >= 120.0 and a.points[-1][1] == 0
     rises = [t for (t0, b0), (t, b) in zip(a.points, a.points[1:]) if b0 == 0 and b > 0]
     assert 40 <= len(rises) <= 80  # about 60 at 0.5 per second over 120 s, overlaps merged
-    peak = max(b for _, b in a.points)
-    assert 300 * MiB < peak <= 4 * 300 * MiB + GRANULE  # some overlap, and add
-    assert a.at(a.duration_s) == 0 and all(b % GRANULE == 0 for _, b in a.points)
-
-    alone = patterns.poisson_spikes(
-        patterns.SpikeParameters(rate_per_s=0.05, amplitude_bytes=patterns.Fixed(200 * MiB),
-                                 rise_s=patterns.Fixed(0.0), duration_s=patterns.Fixed(0.5),
-                                 fall_s=patterns.Fixed(0.0)), duration_s=600.0, seed=3)
-    assert {b for _, b in alone.points} <= {0, 200 * MiB, 400 * MiB}
+    assert 300 * MiB < max(b for _, b in a.points) <= 4 * 300 * MiB  # some overlap, and add
 
 
 def test_a_generated_schedule_runs_on_the_simulator():
-    schedule = patterns.step(64 * MiB, hold_s=0.3)
     stop = threading.Event()
     reservation = simulator.Reservation()
     threading.Timer(0.6, stop.set).start()
     try:
-        events = simulator.run(schedule, reservation, stop)
+        events = simulator.run(patterns.step(64 * MiB, for_s=0.3), reservation, stop)
     finally:
         reservation.release()
     assert [e["taken_bytes"] for e in events] == [64 * MiB, 0]
 
 
-def test_parameters_come_from_rq1s_spikes_in_the_benchmark_log(tmp_path):
-    """The spikes each contention-trace entry lists, of the issues and the
-    action asked for, become empirical distributions. The rate is the spikes
-    per second of recorded time, or, for one action, of the time the
-    recordings spent on it: a minute each, as the protocol holds a span."""
-    log = tmp_path / "log.jsonl"
+def test_rq1s_spikes_and_lasting_drops_become_their_own_parameters(tmp_path):
+    """Spikes that recovered give amplitude, rise, plateau and fall; lasting
+    drops give amplitude and rise, and are kept as long as the caller says.
+    A measured rise or recovery is 0.8 of its ramp; a plateau is the time at
+    or above the threshold less the ramps' share above it. Censored spikes
+    count for neither. The rate for an action is per second of its spans,
+    read from the labels beside the traces, in the recordings that have it."""
+    log, traces = tmp_path / "log.jsonl", tmp_path / "traces"
+    traces.mkdir()
 
-    def recording(issue, spikes, hours):
+    def recording(issue, name, spikes, spans, hours):
         benchlog.append("contention-trace", model=None, context_length=None,
-                        precision_tiers=None, config={"issue": issue, "trace": "t.csv.gz"},
+                        precision_tiers=None,
+                        config={"issue": issue, "trace": name, "threshold_mib": 64},
                         results={"recorded_hours": hours, "spikes": spikes}, log=log)
+        writer = recorder._TraceWriter(recorder.labels_path(traces / name), recorder.LABEL_FORMAT,
+                                       {}, recorder.LABEL_COLUMNS)
+        for action, start_s, end_s in spans:
+            writer.row(int(start_s * 1e9), 0.0, recorder.START, action)
+            writer.row(int(end_s * 1e9), 0.0, recorder.END, action)
+        writer.close({"labels": 2 * len(spans), "rejected": 0})
 
-    def spike(action, amplitude, rise, duration, recovery):
-        return {"action": action, "amplitude_mib": amplitude, "rise_ms": rise,
-                "duration_ms": duration, "recovery_ms": recovery, "ending": "recovered"}
+    def spike(action, ending, amplitude=128, rise=80, duration=1000, recovery=160):
+        return {"action": action, "ending": ending, "amplitude_mib": amplitude,
+                "rise_ms": rise, "duration_ms": duration,
+                "recovery_ms": recovery if ending == "recovered" else None}
 
-    recording(55, [spike("vlc-2160p", 500, 100, 2000, 300),
-                   spike("chrome-tabs-1", 150, 20, 400, None)], 0.25)
-    recording(56, [spike("vlc-2160p", 540, 120, 1800, 400)], 0.25)
-    recording(99, [spike("vlc-2160p", 9999, 1, 1, 1)], 1.0)  # another issue's
+    recording(55, "a.csv.gz", [spike("vlc", "lasting", 500), spike("tabs", "recovered"),
+                               spike("tabs", "censored")],
+              [("vlc", 100, 160), ("tabs", 10, 70)], hours=0.25)
+    recording(56, "b.csv.gz", [spike("vlc", "lasting", 540), spike("engine-prefill", "lasting")],
+              [("engine-prefill", 0, 600), ("vlc", 700, 760)], hours=0.25)
 
-    vlc = patterns.from_rq1(log, issues=(55, 56), action="vlc-2160p")
+    vlc = patterns.from_rq1("drops", "vlc", log, traces=traces, kept_s=Fixed(60.0))
     assert sorted(vlc.amplitude_bytes.values) == [500 * MiB, 540 * MiB]
-    assert sorted(vlc.rise_s.values) == pytest.approx([0.125, 0.15])  # 10% to 90%: 0.8 of a rise
-    assert sorted(vlc.duration_s.values) == [1.8, 2.0]
-    assert sorted(vlc.fall_s.values) == pytest.approx([0.375, 0.5])  # 90% to 10%: 0.8 of a fall
-    assert vlc.rate_per_s == pytest.approx(2 / (2 * 60))
+    assert vlc.rate_per_s == pytest.approx(2 / 120)  # two in two minutes of vlc
+    assert vlc.plateau_s == Fixed(60.0) and vlc.fall_s == Fixed(0.0)
+    engine = patterns.from_rq1("drops", "engine-prefill", log, traces=traces, kept_s=Fixed(1))
+    assert engine.rate_per_s == pytest.approx(1 / 600)  # a.csv.gz had no engine
 
-    every = patterns.from_rq1(log, issues=(55, 56))
-    assert len(every.amplitude_bytes.values) == 3
+    tabs = patterns.from_rq1("spikes", "tabs", log, traces=traces)
+    assert tabs.rate_per_s == pytest.approx(1 / 60)  # the censored one is left out
+    assert tabs.rise_s.values == pytest.approx((0.1,)) and tabs.fall_s.values == pytest.approx((0.2,))
+    # 1.0 s at or above 64 MiB of a 128 MiB spike: half of each ramp is above.
+    assert tabs.plateau_s.values == pytest.approx((1.0 - (0.1 + 0.2) * 0.5,))
+
+    every = patterns.from_rq1("drops", log=log, traces=traces, kept_s=Fixed(1))
     assert every.rate_per_s == pytest.approx(3 / 1800)
-    assert len(every.fall_s.values) == 2  # a spike with no recovery gives no fall
 
-    # No spike of this action recovered: its fall is drawn as instant.
-    recording(56, [spike("chrome-webgl", 100, 50, 900, None)], 0.25)
-    assert patterns.from_rq1(log, issues=(56,), action="chrome-webgl").fall_s == patterns.Fixed(0.0)
-    with pytest.raises(ValueError):
-        patterns.Empirical(())
+    def refused(call, error):
+        with pytest.raises(error):
+            call()
 
+    (traces / "b.labels.csv.gz").unlink()
+    each([(lambda: patterns.from_rq1("drops", "vlc", log, traces=traces), ValueError),
+          (lambda: patterns.from_rq1("spikes", "nothing", log, issues=(55,), traces=traces),
+           ValueError),
+          (lambda: patterns.from_rq1("drops", "vlc", log, traces=traces, kept_s=Fixed(1)),
+           FileNotFoundError),
+          (lambda: patterns.Empirical(()), ValueError)], refused)
     rng = np.random.default_rng(0)
     assert all(vlc.amplitude_bytes.draw(rng) in (500 * MiB, 540 * MiB) for _ in range(20))
-    with pytest.raises(ValueError, match="no spikes"):
-        patterns.from_rq1(log, issues=(55,), action="nothing")
