@@ -81,6 +81,9 @@ def test_a_recording_becomes_what_the_others_held_and_a_replay_is_compared_with_
     assert schedule.points[0] == (0.0, 0) and schedule.points[-1][1] == 0
     assert schedule.at(7.0) == 200 * MiB and schedule.at(5.9) == 0 and schedule.at(8.1) == 0
     assert schedule.duration_s == pytest.approx(13.02, abs=0.001)
+    on_base = replay.to_schedule(held, base_bytes=1024 * MiB)
+    assert on_base.at(0.0) == 1024 * MiB and on_base.at(7.0) == 1224 * MiB
+    assert on_base.points[-1] == (schedule.duration_s, 0)
 
     everything = replay.held(path)  # no window; the engine's pid from the hold's status
     assert everything.bytes.min() == 0 and everything.bytes.max() == 200 * MiB
@@ -105,6 +108,17 @@ def test_a_recording_becomes_what_the_others_held_and_a_replay_is_compared_with_
         replay.held(path, start_s=12.0, end_s=11.0)
     # The processes stream agrees with what is left once the engine is off.
     assert replay.engine_residual(path)["max"] == 0
+
+    # The headroom the original had with the others at their least, the
+    # engine as it stood: 6 GiB less 1100 MiB, 500 and the driver's 400.
+    assert replay.held(path, start_s=5.0).headroom_bytes == TOTAL - 2000 * MiB
+    # Where a scenario's actions begin: its first label, in the trace's seconds.
+    labels = recorder._TraceWriter(recorder.labels_path(path), recorder.LABEL_FORMAT, {},
+                                   recorder.LABEL_COLUMNS)
+    for at_s, event in ((1.5, recorder.START), (3.0, recorder.END)):
+        labels.row(10**12 + int(at_s * 1e9), 0.0, event, "idle")
+    labels.close({"labels": 2, "rejected": 0})
+    assert replay.first_label_s(path) == pytest.approx(1.5)
 
 
 def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path):

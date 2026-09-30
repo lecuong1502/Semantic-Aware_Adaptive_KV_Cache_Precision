@@ -99,6 +99,11 @@ class OthersHeld:
     t_s: np.ndarray
     bytes: np.ndarray
     engine_pid: int | None = None
+    #: The headroom the original had with the others at their least, the
+    #: engine as it stood: the median of free memory and `bytes` over the
+    #: window. A replay that leaves this much, before its schedule takes
+    #: anything, gives the machine the original's headroom throughout.
+    headroom_bytes: int | None = None
 
 
 def _engine_bytes(path: Path, t_ns: np.ndarray, used: np.ndarray,
@@ -174,7 +179,23 @@ def held(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
         raise ValueError(f"{path} has fewer than two samples from {start_s} to {end_s} s"
                          + ("" if engine_pid is None else " that a process sample brackets"))
     used = used[keep]
-    return OthersHeld((t[keep] - t[keep][0]) / 1e9, used - used.min(), engine_pid)
+    above = used - used.min()
+    headroom = int(np.median(samples["free_bytes"][keep] + above))
+    return OthersHeld((t[keep] - t[keep][0]) / 1e9, above, engine_pid, headroom)
+
+
+def first_label_s(path: str | Path) -> float:
+    """When the scenario of the recording at `path` began its first span:
+    its first label, in seconds from the recording's first sample; 0 without
+    labels."""
+    labels_path = recorder.labels_path(path)
+    if not labels_path.exists():
+        return 0.0
+    _, labels = recorder.read_labels(labels_path)
+    _, samples = recorder.read(path)
+    if not len(labels):
+        return 0.0
+    return (int(labels["t_mono_ns"].min()) - int(samples["t_mono_ns"][0])) / 1e9
 
 
 def engine_residual(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
@@ -213,12 +234,12 @@ def engine_residual(path: str | Path, *, start_s: float = 0.0, end_s: float | No
     return spread((np.abs(difference - np.median(difference)) / MIB).tolist())
 
 
-def to_schedule(h: OthersHeld) -> Schedule:
-    """The simulator's schedule for `h`: each sample's level, in whole
-    granules, from its time until the next's, and then 0, one period after
-    the last."""
+def to_schedule(h: OthersHeld, base_bytes: int = 0) -> Schedule:
+    """The simulator's schedule for `h`: each sample's level, on `base_bytes`
+    taken throughout, in whole granules, from its time until the next's, and
+    then 0, one period after the last."""
     end = round(float(h.t_s[-1] + np.median(np.diff(h.t_s))), 6)
-    return Schedule(patterns.sampled(h.t_s, h.bytes).points + [(end, 0)])
+    return Schedule(patterns.sampled(h.t_s, h.bytes + base_bytes).points + [(end, 0)])
 
 
 def from_recording(path: str | Path, **window) -> Schedule:

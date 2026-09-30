@@ -41,6 +41,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import patterns
+from .contention import spread
 from .monitor import POLL_S, RED, Level, PressureEvent, Thresholds
 from .schedule import Schedule
 
@@ -234,3 +235,40 @@ def score_cells(grid: Grid, starts_ns: list[int], end_ns: int, episodes: list[Ep
 def _sum(scores: list[Score]) -> Score:
     return Score(*(sum((getattr(s, f) for s in scores), [] if f.startswith("latencies")
                        else 0) for f in Score.__dataclass_fields__))
+
+
+# -- the summary ---------------------------------------------------------------------------
+
+#: What a summary sums over the entries it takes.
+_COUNTS = ("episodes", "detectable", "missed_detectable", "missed_below_k", "already_red",
+           "false_positives", "red_events")
+
+
+def summarise(entries) -> dict:
+    """RQ2's summary from the benchmark log's `entries`: per workload, the
+    latest "monitor-evaluation" of each grid or recording that no correction
+    supersedes, their counts summed and their latencies pooled, with the sha256
+    of the entries taken."""
+    entries = list(entries)
+    corrected = {sha for e in entries if e.get("kind") == "correction"
+                 for sha in e["results"].get("corrects", [])}
+    latest: dict[tuple[str, str | None], dict] = {}
+    for e in entries:
+        if e.get("kind") == "monitor-evaluation" and e["sha256"] not in corrected:
+            config = e["config"]
+            latest[(config["workload"], config.get("recording"))] = e
+    summary: dict[str, dict] = {}
+    for (workload, _), e in latest.items():
+        into = summary.setdefault(workload, {"entries": [], "latencies_ms": [],
+                                             "latencies_polls": [],
+                                             **{k: 0 for k in _COUNTS}})
+        overall = e["results"]["overall"]
+        into["entries"].append(e["sha256"])
+        into["latencies_ms"] += overall["latencies_ms"]
+        into["latencies_polls"] += overall["latencies_polls"]
+        for k in _COUNTS:
+            into[k] += overall[k]
+    for into in summary.values():
+        into["latency_ms"] = spread(into.pop("latencies_ms"))
+        into["latency_polls"] = spread(into.pop("latencies_polls"))
+    return summary
