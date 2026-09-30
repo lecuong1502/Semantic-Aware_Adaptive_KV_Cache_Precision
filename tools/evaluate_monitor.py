@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Evaluate the pressure monitor on a synthetic grid of spikes (#64).
+"""Evaluate the pressure monitor on a synthetic grid of pulses (#64).
 
     .venv/bin/python tools/evaluate_monitor.py --out data/monitor/grid.csv.gz --issue 64
-        [--amplitudes 768 1152 1408] [--rises 0 0.25 1] [--plateaus 0.1 0.2 0.5 2]
+        [--amplitudes 768 1152 1408] [--ramps 0 0.25 1] [--plateaus 0.1 0.2 0.5 2]
         [--repeats 3] [--gap 3] [--start-headroom 1536]
 
 The engine holds a generation (Engine.hold) with its pressure monitor on,
 recording every event between steps. Once its cache has stopped growing, the
 contention simulator, a process of its own, takes a base, so that headroom
 sits at --start-headroom MiB, in GREEN, and then plays every cell of the grid
-of amplitude (MiB above the base) x rise time (and fall, s) x plateau (s),
+of amplitude (MiB above the base) x ramp, up and down (s) x plateau (s),
 --repeats times, --gap seconds apart and a seeded fraction of a poll more, so
-that the spikes meet the polls at every phase. The recorder records the device
+that the pulses meet the polls at every phase. The recorder records the device
 throughout (microinfer.replay.replay).
 
 The truth is the recorder's trace with the monitor's thresholds applied, and
 the monitor is scored against it (microinfer.evaluation): detection latency,
-false negatives and false positives, overall and per cell. The result is
+false negatives and false positives, overall and per cell. False negatives
+shorter than K + 1 polls are counted apart: ADR-0013's K cannot catch them. The result is
 logged as a "monitor-evaluation" entry with the sha256 of every file.
 
 Close every application first: the desktop moves headroom too, and what it
@@ -51,7 +52,8 @@ SETTLE_S = 2.0
 
 
 def summary(s: evaluation.Score) -> dict:
-    return {**asdict(s), "latency_ms": spread(s.latencies_ms)}
+    return {**asdict(s), "false_negatives": s.false_negatives,
+            "latency_ms": spread(s.latencies_ms), "latency_polls": spread(s.latencies_polls)}
 
 
 def main(argv: list[str]) -> int:
@@ -64,12 +66,15 @@ def main(argv: list[str]) -> int:
                         help="the span the hold decodes again and again")
     parser.add_argument("--amplitudes", type=float, nargs="+", default=[768, 1152, 1408],
                         help="MiB above the base")
-    parser.add_argument("--rises", type=float, nargs="+", default=[0.0, 0.25, 1.0])
-    parser.add_argument("--plateaus", type=float, nargs="+", default=[0.1, 0.2, 0.5, 2.0])
+    parser.add_argument("--ramps", type=float, nargs="+", default=[0.0, 0.25, 1.0],
+                        help="seconds each pulse ramps up, and down")
+    parser.add_argument("--plateaus", type=float, nargs="+", default=[0.1, 0.2, 0.5, 2.0],
+                        help="seconds each pulse is kept at its amplitude: the grid's "
+                             "duration")
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--gap", type=float, default=3.0, help="seconds between spikes")
+    parser.add_argument("--gap", type=float, default=3.0, help="seconds between pulses")
     parser.add_argument("--lead", type=float, default=5.0,
-                        help="seconds on the base before the first spike")
+                        help="seconds on the base before the first pulse")
     parser.add_argument("--start-headroom", type=float, default=1536,
                         help="MiB of headroom the base leaves")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
@@ -113,7 +118,7 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"headroom is {headroom / MIB:.0f} MiB, below the "
                              f"{args.start_headroom:g} MiB the grid starts from")
         cells = [evaluation.Cell(int(a * MIB), r, p)
-                 for a in args.amplitudes for r in args.rises for p in args.plateaus]
+                 for a in args.amplitudes for r in args.ramps for p in args.plateaus]
         grid = evaluation.grid_schedule(cells, base, args.repeats, args.gap, args.lead,
                                         seed=SEED)
         print(f"{len(cells)} cells x {args.repeats} over {grid.schedule.duration_s:.0f} s, "
@@ -128,10 +133,12 @@ def main(argv: list[str]) -> int:
     events = [r.event for r in engine.pressure_events]
     _, samples = recorder.read(args.out)
     episodes = evaluation.true_red(samples["t_mono_ns"], samples["free_bytes"], thresholds)
-    during = [e for e in episodes if e[0] >= started]
-    overall = evaluation.score(during, [e for e in events if e.t_mono_ns >= started],
-                               thresholds)
-    per_cell = evaluation.score_cells(grid, started, episodes, events, thresholds)
+    changes = [json.loads(line) for line
+               in recorder.companion(args.out, ".events.jsonl").read_text().splitlines()]
+    starts = evaluation.applied_starts(grid, started, changes)
+    end = started + int(grid.schedule.duration_s * 1e9)
+    overall = evaluation.score(episodes, events, thresholds, within=(started, end))
+    per_cell = evaluation.score_cells(grid, starts, end, episodes, events, thresholds)
     results = {"overall": summary(overall),
                "cells": [{**asdict(c), "amplitude_mib": c.amplitude_bytes / MIB, **summary(s)}
                          for c, s in zip(cells, per_cell)],
@@ -139,25 +146,26 @@ def main(argv: list[str]) -> int:
                "monitor_error": None if engine.monitor_error is None
                else str(engine.monitor_error),
                "missed_polls": watching.missed}
-    files = [args.out, recorder.processes_path(args.out),
-             recorder.companion(args.out, ".schedule.json"),
-             recorder.companion(args.out, ".events.jsonl"),
-             recorder.companion(args.out, ".replay.json")]
+    files = replay.files(args.out)
     benchlog.append(
         "monitor-evaluation", model=args.model, context_length=context,
         precision_tiers={"FP16": 1.0},
         config={"issue": args.issue, "workload": "synthetic grid", "repeats": args.repeats,
                 "gap_s": args.gap, "lead_s": args.lead, "phase_seed": SEED,
                 "start_headroom_mib": args.start_headroom, "base_bytes": base,
-                "amplitudes_mib": args.amplitudes, "rises_s": args.rises,
-                "plateaus_s": args.plateaus, "poll_s": monitor.POLL_S,
+                "amplitudes_mib": args.amplitudes, "ramps_s": args.ramps,
+                "plateaus_s": args.plateaus,
+                "duration": "a pulse's plateau; it lasts ramp + plateau + ramp",
+                "poll_s": monitor.POLL_S,
                 "thresholds": asdict(thresholds),
                 "min_episode_s": evaluation.MIN_EPISODE_S,
                 "files": {f.name: benchlog.file_sha256(f) for f in files if f.exists()}},
         results=results, log=args.log)
     latency = results["overall"]["latency_ms"]
     print(json.dumps({"episodes": overall.episodes, "latency_ms": latency,
-                      "false_negatives": overall.false_negatives,
+                      "missed_detectable": overall.missed_detectable,
+                      "missed_below_k": overall.missed_below_k,
+                      "already_red": overall.already_red,
                       "false_positives": overall.false_positives}))
     return 0
 

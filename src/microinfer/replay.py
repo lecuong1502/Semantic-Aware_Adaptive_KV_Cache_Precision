@@ -291,6 +291,15 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
     return started
 
 
+def files(out: str | Path) -> list[Path]:
+    """Every file replay() writes for the recording at `out`: the trace, its
+    processes stream, the schedule, the simulator's events and when the
+    schedule began."""
+    out = Path(out)
+    return [out, recorder.processes_path(out), recorder.companion(out, ".schedule.json"),
+            recorder.companion(out, ".events.jsonl"), recorder.companion(out, ".replay.json")]
+
+
 def _applied(events: Path, points: int) -> bool:
     return events.exists() and len(events.read_text().splitlines()) >= points
 
