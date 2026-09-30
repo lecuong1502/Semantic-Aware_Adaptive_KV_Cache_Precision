@@ -184,18 +184,25 @@ def held(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
     return OthersHeld((t[keep] - t[keep][0]) / 1e9, above, engine_pid, headroom)
 
 
-def first_label_s(path: str | Path) -> float:
-    """When the scenario of the recording at `path` began its first span:
-    its first label, in seconds from the recording's first sample; 0 without
-    labels."""
+#: The span a with-engine scenario labels its engine's prefill with
+#: (tools/run_scenario.py): the engine grows through it.
+ENGINE_PREFILL = "engine-prefill"
+
+
+def scenario_start_s(path: str | Path) -> float:
+    """When the scenario of the recording at `path` began its first span
+    after the engine's prefill, in seconds from the recording's first
+    sample: from there the engine holds what it holds. 0 without labels."""
     labels_path = recorder.labels_path(path)
     if not labels_path.exists():
         return 0.0
     _, labels = recorder.read_labels(labels_path)
     _, samples = recorder.read(path)
-    if not len(labels):
+    starts = labels["t_mono_ns"][(labels["event"] == recorder.START)
+                                 & (labels["action"] != ENGINE_PREFILL)]
+    if not len(starts):
         return 0.0
-    return (int(labels["t_mono_ns"].min()) - int(samples["t_mono_ns"][0])) / 1e9
+    return (int(starts.min()) - int(samples["t_mono_ns"][0])) / 1e9
 
 
 def engine_residual(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,

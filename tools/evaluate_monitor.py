@@ -19,8 +19,9 @@ plays a schedule on it while the recorder records the device throughout
   meet the polls at every phase. The base leaves --start-headroom MiB, in
   GREEN.
 - `replay` plays what the other processes held in an RQ1 recording
-  (microinfer.replay.held), from its first label, where the scenario began,
-  unless --from says otherwise. The base leaves the headroom the original
+  (microinfer.replay.held), from its first span after the engine's prefill,
+  unless --from says otherwise: through the prefill the original engine
+  grew, and the headroom it left with it. The base leaves the headroom the original
   had with the others at their least, so that the machine has the
   original's headroom throughout, whatever this engine holds.
 
@@ -99,7 +100,7 @@ def main(argv: list[str]) -> int:
                              help="an RQ1 device trace")
     replay_args.add_argument("--from", dest="start_s", type=float,
                              help="seconds after the recording's first sample; its first "
-                                  "label by default")
+                                  "span after the engine's prefill by default")
     replay_args.add_argument("--to", dest="end_s", type=float, help="the same; its end if omitted")
     args = parser.parse_args(argv)
     if args.out.exists():
@@ -112,7 +113,7 @@ def main(argv: list[str]) -> int:
     original = None
     if args.workload == "replay":
         if args.start_s is None:
-            args.start_s = replay.first_label_s(args.recording)
+            args.start_s = replay.scenario_start_s(args.recording)
         original = replay.held(args.recording, start_s=args.start_s, end_s=args.end_s)
 
     stop = threading.Event()
