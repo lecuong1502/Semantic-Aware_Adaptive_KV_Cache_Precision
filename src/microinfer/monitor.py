@@ -34,8 +34,21 @@ mark. Its values follow the rule #45 proposes, applied roughly to RQ1's
 spikes: RED where a spike at the P90 amplitude would leave nothing, YELLOW
 with room for two, K polls shorter than the shortest rise times.
 
-Attribution (how much of a change was the engine's own) and the engine's
-integration are #62's.
+**Each transition carries its own/others split** (#62, MemorySplit): this
+process's device memory and every other process's, by the driver's account
+of each (nvml.own_used_bytes, others_used_bytes), and how much each changed
+since the transition before, beside the headroom's own change. The monitor
+runs in the engine's process, so "own" is everything that process holds:
+the engine's weights, cache and workspace, and its CUDA context. The split
+is read at transitions only, after the poll that completed one: a process
+query costs far more than a headroom reading, and a poll must stay cheap.
+So its change runs from one transition to the next, not from when the
+change began. Headroom also moves by the driver's own memory, so the two
+changes need not sum to the headroom's. A split the driver cannot give is
+None; it never stops the monitor.
+
+The engine starts a monitor, drains its events between steps and records
+them (Engine.start_monitor); it does not react to them yet.
 """
 
 from __future__ import annotations
@@ -44,7 +57,7 @@ import enum
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from . import nvml, recorder
@@ -108,11 +121,48 @@ class PressureEvent:
     previous: Level | None
     level: Level
     headroom_bytes: int
+    #: Read at the transition; None if the driver could not give it.
+    split: MemorySplit | None = None
+    #: Since the transition before; None for the first.
+    split_change: MemorySplit | None = None
+    headroom_change_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class MemorySplit:
+    """Device memory split between this process, the engine's, and every
+    other process; either None where the driver did not report it."""
+
+    own_bytes: int | None
+    others_bytes: int | None
+
+    def minus(self, before: MemorySplit | None) -> MemorySplit | None:
+        if before is None:
+            return None
+
+        def change(now: int | None, then: int | None) -> int | None:
+            return None if now is None or then is None else now - then
+
+        return MemorySplit(change(self.own_bytes, before.own_bytes),
+                           change(self.others_bytes, before.others_bytes))
 
 
 def nvml_headroom() -> int:
     """The device's free memory, by the driver's account."""
     return nvml.memory().free
+
+
+def nvml_split() -> MemorySplit:
+    """This process's device memory and every other process's. Own is 0 if
+    the driver does not list this process, which then holds nothing on the
+    device; None if it lists it without its memory, or a query fails."""
+    def read(query: Callable[[], int]) -> int | None:
+        try:
+            return query()
+        except Exception:  # noqa: BLE001 - a split the driver cannot give is None
+            return None
+
+    return MemorySplit(read(nvml.own_used_bytes), read(nvml.others_used_bytes))
 
 
 class Hysteresis:
@@ -152,13 +202,16 @@ class Hysteresis:
 
 class Monitor:
     """Polls `reader`, headroom in bytes, every `poll_s` seconds on a thread
-    of its own, from start() until stop(), or as a context manager."""
+    of its own, from start() until stop(), or as a context manager; at each
+    transition, reads `split`, this process's and the others' memory."""
 
     def __init__(self, reader: Callable[[], int] | None = None,
-                 thresholds: Thresholds = PROVISIONAL, poll_s: float = POLL_S):
+                 thresholds: Thresholds = PROVISIONAL, poll_s: float = POLL_S,
+                 split: Callable[[], MemorySplit] | None = None):
         if poll_s <= 0:
             raise ValueError(f"a poll period is > 0; got {poll_s}")
         self.thresholds, self._reader, self._poll_s = thresholds, reader or nvml_headroom, poll_s
+        self._split = split or nvml_split
         self._events: queue.SimpleQueue[PressureEvent] = queue.SimpleQueue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -199,17 +252,31 @@ class Monitor:
             except queue.Empty:
                 break
         if not events and self.error is not None:
-            raise RuntimeError("the pressure monitor stopped: its reader failed") from self.error
+            raise RuntimeError("the pressure monitor stopped: its headroom reader "
+                               "failed") from self.error
         return events
 
     def _run(self) -> None:
         hysteresis = Hysteresis(self.thresholds)
+        last: PressureEvent | None = None
 
         def poll() -> None:
+            nonlocal last
             event = hysteresis.feed(time.monotonic_ns(), self._reader())
-            if event is not None:
-                self.level = event.level
-                self._events.put(event)
+            if event is None:
+                return
+            try:
+                split = self._split()
+            except Exception:  # noqa: BLE001 - a split is information; pressure goes on
+                split = None
+            event = replace(event, split=split)
+            if last is not None:
+                event = replace(
+                    event, split_change=None if split is None else split.minus(last.split),
+                    headroom_change_bytes=event.headroom_bytes - last.headroom_bytes)
+            last = event
+            self.level = event.level
+            self._events.put(event)
 
         try:
             self.missed = recorder.every(1 / self._poll_s, duration=None, stop=self._stop,

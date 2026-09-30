@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -23,6 +24,7 @@ from . import _microinfer, model, weights
 from .config import ConfigMismatch, ModelConfig
 from .footprint import Footprint
 from .models import VERIFIED
+from .monitor import Monitor, PressureEvent
 
 
 def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
@@ -152,6 +154,16 @@ def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16")
 PREFILLING, DECODING = "prefilling", "decoding"
 
 
+@dataclass(frozen=True)
+class PressureRecord:
+    """A pressure event as the engine drained it: how many positions its
+    cache held then, and when, on the monitor's clock (time.monotonic_ns)."""
+
+    event: PressureEvent
+    positions_held: int
+    drained_ns: int
+
+
 class Engine:
     """Seam A. Everything a test or a caller touches goes through here."""
 
@@ -205,6 +217,12 @@ class Engine:
         self._workspace_bytes = 0
         self._cache = None
         self._peak: Footprint | None = None
+        self._monitor: Monitor | None = None
+        #: Every pressure event drained, in order (start_monitor).
+        self.pressure_events: list[PressureRecord] = []
+        #: The error a monitor stopped on, if one did.
+        self.monitor_error: BaseException | None = None
+        self._positions_held = 0  # by the last cache drained beside
 
     # -- loading ------------------------------------------------------------
 
@@ -368,6 +386,7 @@ class Engine:
             while len(out) < max_new_tokens and not (stop_at_eos and out[-1] in self.eos_token_ids):
                 self._model.run(step, cache, np.array(out[-1:], np.int32))
                 out.append(self._model.greedy_last(step, 1))
+                self._drain_pressure(cache)
         return np.asarray(out, dtype=np.int32)
 
     def hold(self, prompt, *, context: int | None = None, stop: threading.Event,
@@ -421,6 +440,7 @@ class Engine:
                     cache.length = len(ids)  # back to the end of the prompt
                 self._model.run(step, cache, np.array([token], np.int32))
                 token = self._model.greedy_last(step, 1)
+                self._drain_pressure(cache)
                 report(DECODING, cache.length, token)
 
     def _first_token(self, cache, ids: np.ndarray, *,
@@ -430,12 +450,54 @@ class Engine:
         chunk; if it says no, prefilling stops there and this returns None."""
         token = None
         for chunk, ws, _, last in self._prefill(cache, ids):
+            self._drain_pressure(cache)
             if go_on is not None and not go_on():
                 return None
             if last:
                 token = self._model.greedy_last(ws, len(chunk))
         # Run out, not left: the prefill notes its peak footprint as it ends.
         return token
+
+    # -- the pressure monitor (#62) -----------------------------------------
+
+    def start_monitor(self, monitor: Monitor | None = None) -> Monitor:
+        """Start `monitor`, a VRAM pressure monitor on NVML by default, and
+        from now on drain its events between steps into pressure_events,
+        which it starts empty, as it does monitor_error. A step is a decoded
+        token, and a prefill chunk too: a 32K-token prefill takes minutes,
+        and its chunks are where it can be interrupted. The engine records
+        the events and does not react to them: that is Milestone 2's.
+        Returns the monitor."""
+        if self._monitor is not None:
+            raise RuntimeError("a pressure monitor is already running; stop it first")
+        self.pressure_events, self.monitor_error, self._positions_held = [], None, 0
+        self._monitor = (monitor or Monitor()).start()
+        return self._monitor
+
+    def stop_monitor(self) -> None:
+        """Stop the monitor and record whatever it left undrained, beside the
+        positions the last cache drained beside held."""
+        if self._monitor is None:
+            return
+        self._monitor.stop()
+        self._drain_pressure(self._cache)
+        self._monitor = None
+
+    def _drain_pressure(self, cache) -> None:
+        """Record the monitor's events, with the positions `cache` holds. A
+        monitor that failed is recorded in monitor_error and let go: the
+        generation it watched goes on."""
+        if self._monitor is None:
+            return
+        try:
+            events = self._monitor.drain()
+        except RuntimeError as exc:
+            self.monitor_error, self._monitor = exc, None
+            return
+        now = time.monotonic_ns()
+        if cache is not None:
+            self._positions_held = cache.length
+        self.pressure_events += [PressureRecord(e, self._positions_held, now) for e in events]
 
     def cached_kv(self, token_ids) -> tuple[np.ndarray, np.ndarray]:
         """What the cache holds after prefilling one sequence: keys and values,

@@ -97,6 +97,14 @@ The thresholds and K are **provisional** (`monitor.PROVISIONAL`) until an ADR
 sets them from RQ1's data (#63).
 _Avoid_: pressure state, memory level
 
+**Pressure event**:
+A transition between pressure levels, as the monitor reports it: when, the
+levels before and after, the headroom that settled it, and its **own/others
+split**, the device memory the engine's process holds and every other
+process holds, with how much each changed since the transition before. The
+engine drains pressure events between steps and records them.
+_Avoid_: attribution (that names the process a spike is laid to), alert
+
 **Headroom**:
 The device's free memory as the driver reports it (NVML): what any process,
 the engine or another, could still allocate. Pressure levels classify it.
