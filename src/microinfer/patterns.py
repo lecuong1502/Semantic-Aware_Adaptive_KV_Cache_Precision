@@ -124,8 +124,8 @@ class Trapezoid:
         return self.rise_s + self.plateau_s + self.fall_s
 
 
-def _render(arrivals: list[tuple[float, Trapezoid]], length_s: float,
-            resolution_s: float) -> Schedule:
+def render(arrivals: list[tuple[float, Trapezoid]], length_s: float,
+           resolution_s: float) -> Schedule:
     """The sum of `arrivals`, sampled every `resolution_s`, over `length_s`
     or until the last has fallen, then 0."""
     if resolution_s <= 0:
@@ -151,7 +151,7 @@ def trapezoids(shape: Trapezoid, count: int = 1, gap_s: float = 0.0, lead_s: flo
     if count < 1 or gap_s < 0 or lead_s < 0:
         raise ValueError("a train has count >= 1, and a gap and a lead >= 0")
     arrivals = [(lead_s + k * (shape.length_s + gap_s), shape) for k in range(count)]
-    return _render(arrivals, 0.0, resolution_s)
+    return render(arrivals, 0.0, resolution_s)
 
 
 # -- distributions -------------------------------------------------------------------
@@ -221,7 +221,7 @@ def poisson(params: ShapeParameters, length_s: float, seed: int,
     while t < length_s:
         arrivals.append((t, params.draw(rng)))
         t += float(rng.exponential(1 / params.rate_per_s))
-    return _render(arrivals, length_s, resolution_s)
+    return render(arrivals, length_s, resolution_s)
 
 
 # -- RQ1's parameters -------------------------------------------------------------------
