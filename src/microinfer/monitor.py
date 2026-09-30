@@ -4,33 +4,35 @@ RQ2 asks whether a runtime that cooperates with no scheduler can see
 pressure coming in time to act. This is what sees it, as #45 decided:
 
 - **A background thread polling device headroom every 50 ms,** the driver's
-  free memory by NVML. NVML is called through ctypes, which releases the
-  GIL, so the thread does not hold up decoding. Polls keep absolute
-  deadlines (recorder.every): a slow read delays only itself.
+  free memory by NVML. Polls keep absolute deadlines (recorder.every): a slow
+  read delays only itself. The thread runs beside decoding because the
+  extension releases the GIL while the device works (ADR-0012); ctypes
+  releasing it during an NVML call is only the other half.
 - **Headroom classified in MiB, not percent,** because spikes are absolute:
   RED below `red_below_bytes`, YELLOW below `yellow_below_bytes`, GREEN
   otherwise. A pressure level is the machine's state (CONTEXT.md), whoever
   took the memory.
-- **Hysteresis over K polls.** A level other than the current one must be
-  read on K polls in a row before it becomes current, so a dip shorter than
-  K polls is never reported and a clean step is reported on its Kth poll,
-  within K + 1 polls of its first reading whatever the phase. The first
-  poll's level is current at once.
+- **Hysteresis over K polls** (Hysteresis). A new level is reported only
+  once K polls in a row have read the same side of the current one, so a
+  drop shorter than K polls is never reported and a clean level change is
+  reported on its Kth poll, within K + 1 polls of its first reading whatever
+  the phase. It becomes the level of those K polls nearest the current one,
+  the level headroom kept throughout: readings that flicker between YELLOW
+  and RED from GREEN report YELLOW, and RED only once RED alone holds for K
+  more. The first poll's level is current at once, and reported, so that a
+  consumer knows where the machine started.
 - **Events go to a queue** that the decode loop drains between steps without
   blocking: each transition once, with when it happened, the level before
-  and after, and the headroom that settled it.
+  and after, and the headroom that settled it. If the reader fails, the
+  thread stops and drain raises its error once the events before it are
+  drained: a monitor that died quietly would read as a machine at GREEN.
 
 **The thresholds and K are provisional.** #63 sets them from RQ1's data by a
-rule recorded in an ADR; until then PROVISIONAL says so, in its name and its
-`provisional` flag, and every event from a monitor using it inherits the
-mark through `Monitor.thresholds`. The provisional values follow the rule
-#45 proposes, from RQ1's 48 uncensored spikes (#55, #56):
-
-- RED below 512 MiB: a spike at RQ1's P90 amplitude, 506 MiB, would leave
-  nothing;
-- YELLOW below 1024 MiB: room for two such spikes, time to downgrade
-  gradually;
-- K = 3 polls, 150 ms: shorter than RQ1's P10 rise time, 242 ms.
+rule recorded in an ADR; until then they are PROVISIONAL, which says so in
+its name and its `provisional` flag, and a monitor's `thresholds` carry the
+mark. Its values follow the rule #45 proposes, applied roughly to RQ1's
+spikes: RED where a spike at the P90 amplitude would leave nothing, YELLOW
+with room for two, K polls shorter than the shortest rise times.
 
 Attribution (how much of a change was the engine's own) and the engine's
 integration are #62's.
@@ -46,8 +48,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 from . import nvml, recorder
+from .footprint import MIB
 
-MiB = 2**20
 POLL_S = 0.05
 
 
@@ -60,6 +62,7 @@ class Level(str, enum.Enum):
 
 
 GREEN, YELLOW, RED = Level.GREEN, Level.YELLOW, Level.RED
+_SEVERITY = {GREEN: 0, YELLOW: 1, RED: 2}
 
 
 @dataclass(frozen=True)
@@ -87,8 +90,10 @@ class Thresholds:
         return GREEN
 
 
-#: PROVISIONAL until the thresholds ADR (#63); see the module's docstring.
-PROVISIONAL = Thresholds(red_below_bytes=512 * MiB, yellow_below_bytes=1024 * MiB,
+#: PROVISIONAL until the thresholds ADR (#63). RQ1's P90 amplitude was 506
+#: MiB and its P10 rise time 242 ms (#55, #56): RED below one such spike,
+#: YELLOW below two, K = 3 polls (150 ms) shorter than the rise.
+PROVISIONAL = Thresholds(red_below_bytes=512 * MIB, yellow_below_bytes=1024 * MIB,
                          persist_polls=3, provisional=True)
 
 
@@ -110,6 +115,41 @@ def nvml_headroom() -> int:
     return nvml.memory().free
 
 
+class Hysteresis:
+    """The levels a series of headroom readings settles on, one poll at a
+    time: feed() returns the transition a reading completes, if any."""
+
+    def __init__(self, thresholds: Thresholds):
+        self.thresholds = thresholds
+        self.level: Level | None = None
+        self._polls = 0
+        self._side = 0  # +1 worse than the current level, -1 better, 0 neither
+        self._run = 0  # the polls in a row on that side
+        self._nearest: Level | None = None  # of those, the level nearest the current
+
+    def feed(self, t_mono_ns: int, headroom_bytes: int) -> PressureEvent | None:
+        poll, self._polls = self._polls, self._polls + 1
+        level = self.thresholds.classify(headroom_bytes)
+        if self.level is None:
+            return self._settle(t_mono_ns, poll, level, headroom_bytes)
+        change = _SEVERITY[level] - _SEVERITY[self.level]
+        side = (change > 0) - (change < 0)
+        if side == 0 or side != self._side:
+            self._side, self._run, self._nearest = side, int(side != 0), level
+        else:
+            self._run += 1
+            self._nearest = min(self._nearest, level,
+                                key=lambda x: abs(_SEVERITY[x] - _SEVERITY[self.level]))
+        if self._run >= self.thresholds.persist_polls:
+            return self._settle(t_mono_ns, poll, self._nearest, headroom_bytes)
+        return None
+
+    def _settle(self, t: int, poll: int, level: Level, headroom: int) -> PressureEvent:
+        event = PressureEvent(t, poll, self.level, level, headroom)
+        self.level, self._side, self._run, self._nearest = level, 0, 0, None
+        return event
+
+
 class Monitor:
     """Polls `reader`, headroom in bytes, every `poll_s` seconds on a thread
     of its own, from start() until stop(), or as a context manager."""
@@ -124,7 +164,7 @@ class Monitor:
         self._thread: threading.Thread | None = None
         self.error: BaseException | None = None
         self.level: Level | None = None
-        self.missed = 0
+        self.missed = 0  # the polls whose deadlines passed unread, once stopped
 
     @property
     def running(self) -> bool:
@@ -163,31 +203,16 @@ class Monitor:
         return events
 
     def _run(self) -> None:
-        polls = 0
-        candidate, held = None, 0  # a level other than the current, and its polls in a row
+        hysteresis = Hysteresis(self.thresholds)
 
         def poll() -> None:
-            nonlocal polls, candidate, held
-            t = time.monotonic_ns()
-            headroom = self._reader()
-            level = self.thresholds.classify(headroom)
-            if self.level is None or level == self.level:
-                candidate, held = None, 0
-                if self.level is None:
-                    self._emit(t, polls, level, headroom)
-            else:
-                held = held + 1 if level == candidate else 1
-                candidate = level
-                if held >= self.thresholds.persist_polls:
-                    self._emit(t, polls, level, headroom)
-                    candidate, held = None, 0
-            polls += 1
+            event = hysteresis.feed(time.monotonic_ns(), self._reader())
+            if event is not None:
+                self.level = event.level
+                self._events.put(event)
 
         try:
-            self.missed = recorder.every(1 / self._poll_s, None, self._stop, poll)
+            self.missed = recorder.every(1 / self._poll_s, duration=None, stop=self._stop,
+                                         sample=poll)
         except Exception as exc:  # noqa: BLE001 - raised by drain, on the caller's thread
             self.error = exc
-
-    def _emit(self, t: int, poll: int, level: Level, headroom: int) -> None:
-        self._events.put(PressureEvent(t, poll, self.level, level, headroom))
-        self.level = level
