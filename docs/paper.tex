@@ -29,8 +29,9 @@ TODO.
 \section{Introduction}
 \label{sec:introduction}
 
-Large language models are increasingly run on personal hardware, for privacy,
-for offline use, and to avoid a per-token bill. That hardware is not doing only
+Large language models are increasingly run on personal hardware, with tools such
+as Ollama \cite{ollama} and llama.cpp \cite{llamacpp}, for privacy, for offline
+use, and to avoid a per-token bill. That hardware is not doing only
 one thing: a laptop also runs a browser with hardware acceleration, a video
 player, an editor. Unlike a datacenter accelerator partitioned by MIG or MPS, a
 consumer GPU offers no memory isolation between the processes that share it.
@@ -81,9 +82,43 @@ semantic-aware quantisation.
 
 \section{Background and Related Work}
 \label{sec:background}
-% TODO: the KV cache and its growth; quantisation and eviction; memory
-% management on consumer GPUs; related work grouped by the assumption each
-% family makes that fails in a single-user local setting.
+% TODO: the KV cache and its growth, and memory management on consumer GPUs,
+% condensed from the thesis's Chapter 2.
+
+Related work falls into four families. Each makes an assumption that does not
+hold for a single user on a shared consumer GPU, and naming it is what locates
+this work.
+
+\paragraph{Adaptive serving under memory pressure.} FineServe
+\cite{fineserve}, MorphServe \cite{morphserve}, Oneiros \cite{mirage} (first
+released as MIRAGE) and eLLM \cite{ellm} adapt memory allocation at runtime and
+show that such adaptation is worthwhile. Each assumes a dedicated accelerator, a
+scheduler that sees the incoming work, and many concurrent requests across which
+to trade. Their memory pressure comes from workload the system itself admits,
+which is not so when the pressure comes from a browser.
+
+\paragraph{Static cache quantisation.} KVQuant \cite{hooper2024kvquant}, KIVI
+\cite{liu2024kivi} and KVTuner \cite{kvtuner} establish how far a key-value
+cache can be compressed. They assign precision once, offline, and leave no lever
+to pull when memory is taken away mid-session. This work uses their kind of
+quantiser and replaces their allocation.
+
+\paragraph{Attention-guided eviction.} H2O \cite{zhang2023h2o}, StreamingLLM
+\cite{xiao2024streamingllm} and Ada-KV \cite{feng2024adakv} use attention
+statistics to decide what to discard, showing that attention identifies the
+cached content that matters. Eviction, however, is irreversible and driven by a
+fixed budget, not by external pressure. This work reuses the signal and makes
+the decision reversible.
+
+\paragraph{Consumer and edge inference.} llama.cpp \cite{llamacpp}, PowerInfer
+\cite{song2024powerinfer} and FlexGen \cite{sheng2023flexgen} target
+constrained hardware and contribute substantial offloading and scheduling. They
+treat memory capacity as fixed: a configuration that does not fit is refused or
+offloaded before generation begins, and none adapts mid-session to contention
+from another process.
+
+No system in these families reallocates cache precision at runtime,
+non-uniformly, in response to pressure it did not cause.
 
 \section{Design}
 \label{sec:design}
@@ -101,7 +136,7 @@ The solution has two layers. The \textbf{engine} runs the model over CUDA kernel
 written for this work and holds the cache on \textit{pages}, the keys and values
 of $P = 32$ consecutive positions of one layer, each at one of four
 \textit{precision tiers}: FP16, INT8, INT4 or INT2. Pages come from the CUDA
-virtual memory management interface, one address range per tier, so that memory
+virtual memory management interface \cite{cudavmm}, one address range per tier, so that memory
 a smaller tier frees returns to the driver instead of staying with the engine.
 The \textbf{control loop} decides, while the engine runs, which page is held at
 which tier. It has four components (Figure~\ref{fig:overview}):
@@ -162,7 +197,7 @@ of policy.
 The monitor answers one question for the rest of the loop: how close the machine
 is to running out of video memory, whoever is taking it. It is a background
 thread that polls the driver's free memory, the \textit{headroom}, every 50\,ms
-through NVML. Its polls keep absolute deadlines, so that a slow reading delays
+through NVML \cite{nvml}. Its polls keep absolute deadlines, so that a slow reading delays
 only itself. The engine releases the Python interpreter lock while the device
 works, so the thread keeps its schedule beside decoding and prefill alike.
 
@@ -220,11 +255,12 @@ and YELLOW lies below 1024\,MiB.
 \subsection{The From-Scratch Boundary}
 \label{sec:boundary}
 
-\textit{MicroInfer} is built from scratch in the sense this thesis depends on:
+\textit{MicroInfer} is built from scratch in the sense this work depends on:
 every kernel that the research contribution touches is hand-written CUDA, and no
-external inference engine --- vLLM, llama.cpp or TensorRT-LLM --- is used at any
-point. The phrase stops at one place, the dense matrix multiplications, which
-call NVIDIA's cuBLAS library. This subsection states that boundary explicitly, so
+external inference engine --- vLLM \cite{kwon2023pagedattention}, llama.cpp
+\cite{llamacpp} or TensorRT-LLM \cite{tensorrtllm} --- is used at any point. The
+phrase stops at one place, the dense matrix multiplications, which call NVIDIA's
+cuBLAS library \cite{cublas}. This subsection states that boundary explicitly, so
 that no later result is read as implying the projections were hand-written.
 
 \paragraph{Hand-written.} The following are CUDA kernels or host code written for
@@ -368,7 +404,8 @@ script played one scenario of everyday actions and labelled each in the trace:
 \item a 2160p video in VLC;
 \item VS Code.
 \end{itemize}
-It closed every application at the end. A video call was part of the first
+It closed every application at the end. The model throughout is from the Qwen2.5
+family \cite{qwen2024report}. A video call was part of the first
 recording only; the call service then refused the scripted sign-in. The scenario was recorded five times
 with \textit{MicroInfer} holding Qwen2.5-1.5B at 32K positions in FP16,
 decoding continuously, and once without it: 2.2 hours of traces in all.
@@ -527,5 +564,8 @@ split costs 0.3\,ms, once per transition.
 \section{Conclusion}
 \label{sec:conclusion}
 % TODO.
+
+\bibliographystyle{plain}
+\bibliography{references}
 
 \end{document}

@@ -10,6 +10,7 @@
 ### Abstract (draft skeleton)
 - Problem: Local, single-user LLM inference on consumer/laptop GPUs faces *unpredictable* VRAM contention from co-running applications (browsers, chat apps, background renderers), unlike datacenter serving where GPU allocation is controlled and workload-aware.
 - Gap: Prior adaptive KV cache work (FineServe, MorphServe, MIRAGE, eLLM, KV-RM) assumes multi-tenant, scheduler-visible environments and optimizes uniformly across the cache.
+  - *Note (2026-09-30): KV-RM (arXiv:2605.09735) was withdrawn by its authors for substantive errors, and is not cited. MIRAGE (arXiv:2507.11507) is now titled Oneiros.*
 - Contribution: (1) An empirical characterization of VRAM contention patterns on consumer laptops during everyday multitasking; (2) a lightweight runtime VRAM-pressure detector requiring no scheduler cooperation; (3) a semantic-aware adaptive precision policy that reallocates KV cache precision (FP16 → INT8 → INT4) guided by attention-derived importance scores rather than uniform degradation; (4) a task-stratified NLP evaluation showing where degradation hurts most (long-document QA, multi-turn dialogue, summarization) and how semantic-aware allocation mitigates it versus uniform quantization and versus the OOM/crash status quo.
 
 ### 1. Introduction
