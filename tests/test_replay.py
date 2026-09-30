@@ -145,3 +145,5 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     result = replay.compare(held, samples, started, processes=(states, procs),
                             simulator_pid=pid)
     assert result["simulator_error_mib"]["p90"] <= 2
+    # Before it takes anything, the simulator holds its CUDA context.
+    assert replay.simulator_context_bytes(tmp_path) > 0

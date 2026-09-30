@@ -143,8 +143,10 @@ def main(argv: list[str]) -> int:
         while not full.wait(0.5):
             if stop.is_set() or not holding.is_alive():
                 raise SystemExit("stopped before the hold's cache was full")
+        context_bytes = replay.simulator_context_bytes(args.out.parent)
         time.sleep(SETTLE_S)
-        headroom = nvml.memory().free
+        # The simulator's context is taken as it starts, after this reading.
+        headroom = nvml.memory().free - context_bytes
         leave = (args.start_headroom * MIB if original is None else original.headroom_bytes)
         base = int(headroom - leave)
         if base < 0:
@@ -178,7 +180,8 @@ def main(argv: list[str]) -> int:
                "monitor_error": None if engine.monitor_error is None
                else str(engine.monitor_error),
                "missed_polls": watching.missed}
-    config = {"issue": args.issue, "base_bytes": base, "poll_s": monitor.POLL_S,
+    config = {"issue": args.issue, "base_bytes": base,
+              "simulator_context_bytes": context_bytes, "poll_s": monitor.POLL_S,
               "thresholds": asdict(thresholds), "min_episode_s": evaluation.MIN_EPISODE_S}
     if grid is not None:
         changes = [json.loads(line) for line

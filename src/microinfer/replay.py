@@ -70,7 +70,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import patterns, recorder, spikes
+from . import nvml, patterns, recorder, spikes
 from .contention import spread
 from .footprint import MIB
 from .schedule import Schedule
@@ -318,6 +318,30 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
     recorder.companion(out, ".replay.json").write_text(json.dumps(
         {"started_ns": started, "simulator_pid": proc.pid, "lead_s": lead_s}) + "\n")
     return started
+
+
+def simulator_context_bytes(tmp: str | Path) -> int:
+    """What the simulator holds before it takes anything: its CUDA context,
+    by NVML's account of its process. Measured by starting it once on a
+    schedule of nothing, with its schedule written in `tmp`. A caller that
+    sets a base from headroom read before the simulator starts must leave
+    this out too: the context is taken as it starts."""
+    path = Path(tmp) / "nothing.schedule.json"
+    Schedule([(0.0, 0)]).save(path)
+    proc = subprocess.Popen([sys.executable, str(SIMULATOR), "--schedule", str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        if proc.stdout.readline().strip() != "ready":
+            raise RuntimeError(f"the simulator did not start: {proc.stderr.read()}")
+        return next((p.used_bytes or 0 for p in nvml.processes() if p.pid == proc.pid), 0)
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=EXIT_WAIT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        path.unlink(missing_ok=True)
 
 
 def files(out: str | Path) -> list[Path]:
