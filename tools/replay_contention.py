@@ -17,15 +17,18 @@ window from --from to --to seconds after the recording's first sample.
 --out, as RQ1 did; the simulator, a process of its own, takes nothing for
 --lead seconds and then follows the schedule. The replay's recording is
 compared with the original, sample by sample and spike by spike, against
-the bounds microinfer.replay states, and the comparison is logged to the
-benchmark log with the sha256 of the recording replayed and of every file
-the replay wrote. Spikes are sought only from a baseline window (5 s) into
-the replay, in both, so start --from 5 s before the first spike to compare;
-it warns of any spike it cannot. Whatever the desktop itself does during the
-replay counts as error, so replay a few minutes around the actions of
-interest rather than a whole recording. The entry also carries how far the
-engine's subtraction strays from the processes stream's own sum
+the bounds microinfer.replay states; from the replay's processes stream, it
+also says how far the simulator itself strayed and how far the rest of the
+desktop moved. The comparison is logged to the benchmark log with the sha256
+of the recording replayed and of every file the replay wrote, and how far
+the engine's subtraction strays from the processes stream's own sum
 (microinfer.replay.engine_residual).
+
+The original's spikes are sought from a baseline window (5 s) into the
+window replayed, so start --from 5 s before the first spike to compare; it
+warns of any spike it cannot. Whatever the desktop itself does during the
+replay counts as error, so replay a few minutes around the actions of
+interest rather than a whole recording.
 
 Run it on an idle desktop: close every application first, as for RQ1's
 scenarios (docs/rq1-protocol.md). What else was on the GPU is in the entry.
@@ -90,7 +93,7 @@ def main(argv: list[str]) -> int:
               if 0 <= x.start_ns / 1e9 - args.start_s < spikes.DEFAULT_WINDOW_S]
     if hidden:
         print(f"warning: spikes begin {hidden} s into the window, before the "
-              f"{spikes.DEFAULT_WINDOW_S:g} s baseline window both comparisons need; start "
+              f"{spikes.DEFAULT_WINDOW_S:g} s baseline window the comparison needs; start "
               f"--from earlier to compare them", file=sys.stderr, flush=True)
 
     stop = threading.Event()
@@ -100,14 +103,18 @@ def main(argv: list[str]) -> int:
     started = replay.replay(schedule, args.out, lead_s=args.lead, stop=stop)
 
     _, samples = recorder.read(args.out)
-    results = replay.compare(original, samples, started)
+    _, states, procs = recorder.read_processes(recorder.processes_path(args.out))
+    pid = json.loads(recorder.companion(args.out, ".replay.json").read_text())["simulator_pid"]
+    results = replay.compare(original, samples, started, processes=(states, procs),
+                             simulator_pid=pid)
     events_path = recorder.companion(args.out, ".events.jsonl")
     results["simulator"] = simulator.summarise(
         [json.loads(line) for line in events_path.read_text().splitlines()])
     results["engine_residual_mib"] = replay.engine_residual(args.recording, **window)
     results["hidden_spikes_s"] = hidden
     files = [args.out, recorder.processes_path(args.out),
-             recorder.companion(args.out, ".schedule.json"), events_path]
+             recorder.companion(args.out, ".schedule.json"), events_path,
+             recorder.companion(args.out, ".replay.json")]
     benchlog.append("contention-replay", model=None, context_length=None, precision_tiers=None,
                     config={"issue": args.issue, "recording": args.recording.name,
                             "recording_sha256": benchlog.file_sha256(args.recording),
@@ -119,10 +126,15 @@ def main(argv: list[str]) -> int:
                     results=results, log=args.log)
 
     error, found = results["error_mib"], results["spikes"]
-    print(f"error {error['median']:.1f} MiB median, {error['p90']:.1f} P90; spikes "
-          f"{found['matched']} of {found['original']} matched, {found['replayed']} in the "
-          f"replay; within: " + ", ".join(f"{k} {'yes' if v else 'NO'}"
-                                          for k, v in results["within"].items()))
+    def p90(key: str) -> str:
+        value = results.get(key)
+        return "-" if value is None else f"{value['p90']:.1f}"
+
+    print(f"error {error['median']:.1f} MiB median, {error['p90']:.1f} P90; "
+          f"{found['original']} spikes, {found['unmeasured']} unmeasured; the simulator "
+          f"{p90('simulator_error_mib')} MiB P90 off its schedule, the desktop moved "
+          f"{p90('desktop_moved_mib')} MiB P90; within: "
+          + ", ".join(f"{k} {'yes' if v else 'NO'}" for k, v in results["within"].items()))
     return 0
 
 

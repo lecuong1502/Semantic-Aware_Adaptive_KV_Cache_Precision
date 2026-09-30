@@ -90,12 +90,14 @@ def test_a_recording_becomes_what_the_others_held_and_a_replay_is_compared_with_
     started = 5 * 10**12
     good = replay.compare(held, replay_samples(held, started), started)
     assert all(good["within"].values()), good
-    assert good["spikes"]["original"] == good["spikes"]["matched"] == 1
+    assert good["spikes"]["original"] == 1 and good["spikes"]["unmeasured"] == 0
+    assert good["spikes"]["amplitude_error_mib"]["max"] == 0
     assert good["error_mib"]["median"] == 0
 
     flat = replay.OthersHeld(held.t_s, np.zeros_like(held.bytes))
     missed = replay.compare(held, replay_samples(flat, started), started)
-    assert not missed["within"]["spikes"] and missed["spikes"]["matched"] == 0
+    assert not missed["within"]["amplitude"]
+    assert missed["spikes"]["amplitude_error_mib"]["max"] == pytest.approx(200, abs=1)
 
     with pytest.raises(ValueError, match="before"):  # no idle lead to measure the desktop by
         replay.compare(held, replay_samples(held, started, lead_s=0.0), started)
@@ -121,4 +123,9 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     used = samples["used_bytes"]
     before, during = np.median(used[(s > 0) & (s < 0.45)]), np.median(used[(s > 0.7) & (s < 1.95)])
     assert abs(during - before - 256 * MiB) <= replay.AMPLITUDE_BOUND_MIB * MiB
-    assert replay.compare(held, samples, started)["samples"] >= 90
+    # The simulator's own memory, by the processes stream, is the schedule's.
+    pid = json.loads(recorder.companion(out, ".replay.json").read_text())["simulator_pid"]
+    _, states, procs = recorder.read_processes(recorder.processes_path(out))
+    result = replay.compare(held, samples, started, processes=(states, procs),
+                            simulator_pid=pid)
+    assert result["simulator_error_mib"]["p90"] <= 2

@@ -36,14 +36,21 @@ held, and states whether it is within these bounds:
 - **sample by sample**, P90 of the error at most ERROR_BOUND_MIB: an idle
   desktop's noise, a few MiB (ADR-0007), in both recordings, and a granule
   of rounding. Most of what is left is a ramp's samples, a few ms apart;
-- **spike by spike**, at spikes.py's definition: the same spikes, each
-  beginning within START_BOUND_MS, two samples, and its amplitude within
-  AMPLITUDE_BOUND_MIB. A spike within that bound of the threshold may be
-  found in one and not the other by an error the bound allows, or paired
-  with the wrong neighbour, so only a spike clear of it must be found in
-  both, and only a pair whose original is clear is held to the bounds. A spike missed, or found alone,
-  can still change the baseline the next is measured against: a replay's
-  spikes are a stricter test than its samples.
+- **spike by spike**: each of the original's spikes, found as spikes.py
+  finds them, measured the same way on both over its own span: its
+  amplitude, the peak above the median of the window before its rise, and
+  its edge, when it first reaches half that amplitude. The replay's edge
+  within START_BOUND_MS, two samples, and its amplitude within
+  AMPLITUDE_BOUND_MIB. The replay's spikes are not sought on their own: a
+  spike that crosses the threshold by a MiB in one crosses it in the other
+  only by chance, and a lasting drop missed moves the baseline every later
+  spike is found against.
+
+The desktop is part of both device traces, so what it does during a replay
+counts as error. Where the replay's processes stream is given, compare()
+also says how far the simulator's own memory strayed from the schedule, and
+how far the rest of the desktop moved: whether a replay that missed its
+bounds was the simulator's fault or the desktop's.
 
 This is measurement, not inference, so it computes in NumPy on the host
 (ADR-0002, amendment on its scope), and the recording process takes no
@@ -71,8 +78,6 @@ from .schedule import Schedule
 ERROR_BOUND_MIB = 16.0
 START_BOUND_MS = 40.0
 AMPLITUDE_BOUND_MIB = 16.0
-#: How far apart a spike and its replay may begin and still be paired.
-MATCH_S = 0.5
 #: The idle lead a replay records before its schedule begins, and the part
 #: of it the desktop's own level is measured over.
 LEAD_S = 3.0
@@ -228,8 +233,9 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
            tail_s: float = TAIL_S, stop: threading.Event | None = None) -> int:
     """Record the device to `out`, as RQ1 did, while the simulator, a process
     of its own, takes `schedule` after `lead_s` of taking nothing; stop
-    `tail_s` after its last point. The schedule and the simulator's events
-    are written beside `out`. Returns when the schedule began, on the
+    `tail_s` after its last point. The schedule, the simulator's events, and
+    when the schedule began with the simulator's pid (.replay.json) are
+    written beside `out`. Returns when the schedule began, on the
     recorder's clock."""
     out = Path(out)
     shifted = Schedule([(0.0, 0)] + [(t + lead_s, b) for t, b in schedule.points])
@@ -279,7 +285,10 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
     if failure:
         raise failure[0]
     first = json.loads(events_path.read_text().splitlines()[0])
-    return first["scheduled_ns"] + int(lead_s * 1e9)
+    started = first["scheduled_ns"] + int(lead_s * 1e9)
+    recorder.companion(out, ".replay.json").write_text(json.dumps(
+        {"started_ns": started, "simulator_pid": proc.pid, "lead_s": lead_s}) + "\n")
+    return started
 
 
 def _applied(events: Path, points: int) -> bool:
@@ -296,29 +305,63 @@ def level_at(h: OthersHeld, s: np.ndarray) -> np.ndarray:
     return np.where(index >= 0, h.bytes[np.clip(index, 0, None)], 0)
 
 
-def _pair(original: list[spikes.Spike], replayed: list[spikes.Spike]):
-    """Each original spike with the unpaired replayed one that began nearest
-    it, within MATCH_S."""
-    free = list(replayed)
-    pairs = []
-    for o in original:
-        near = min(free, key=lambda r: abs(r.start_ns - o.start_ns), default=None)
-        if near is not None and abs(near.start_ns - o.start_ns) <= MATCH_S * 1e9:
-            pairs.append((o, near))
-            free.remove(near)
-    return pairs
+def _measure(t_s: np.ndarray, level: np.ndarray, spike: spikes.Spike,
+             window_s: float) -> tuple[float, float] | None:
+    """`spike`'s amplitude and edge on the series (t_s, level), in bytes and
+    seconds: the peak over its span above the median of the window before
+    its rise, and the first time from its rise it reaches half of that,
+    interpolated. None where the series has no sample before the rise or
+    during the span."""
+    rise, start = spike.rise_start_ns / 1e9, spike.start_ns / 1e9
+    stop = spike.end_ns / 1e9 if spike.end_ns is not None else start + window_s
+    before = level[(t_s >= rise - window_s) & (t_s < rise)]
+    span = (t_s >= rise) & (t_s <= stop)
+    if not len(before) or not span.any():
+        return None
+    base = float(np.median(before))
+    amplitude = float(level[span].max()) - base
+    ts, ls = t_s[span], level[span] - base
+    k = int(np.argmax(ls >= amplitude / 2))
+    if k == 0:
+        return amplitude, float(ts[0])
+    t0, t1, l0, l1 = ts[k - 1], ts[k], ls[k - 1], ls[k]
+    return amplitude, float(t0 + (t1 - t0) * (amplitude / 2 - l0) / (l1 - l0))
+
+
+def _streams(processes, simulator_pid: int, started_ns: int, idle_s: float,
+             original: OthersHeld) -> dict:
+    """From the replay's processes stream: how far the simulator's own
+    memory strayed from the schedule, and how far the rest of the desktop
+    moved from its idle level, over the replay, in MiB."""
+    states, procs = processes
+    times = states["t_mono_ns"]
+    at = np.searchsorted(times, procs["t_mono_ns"])
+    mine = procs["pid"] == simulator_pid
+    simulator = np.zeros(len(times), dtype=np.int64)
+    desktop = np.zeros(len(times), dtype=np.int64)
+    np.add.at(simulator, at[mine], np.maximum(procs["used_bytes"][mine], 0))
+    np.add.at(desktop, at[~mine], np.maximum(procs["used_bytes"][~mine], 0))
+    s = (times - started_ns) / 1e9
+    idle = (s >= -idle_s) & (s < 0)
+    during = (s >= 0) & (s <= original.t_s[-1])
+    if not idle.any() or not during.any():
+        return {"simulator_error_mib": None, "desktop_moved_mib": None}
+    strayed = simulator[during] - np.median(simulator[idle]) - level_at(original, s[during])
+    moved = desktop[during] - np.median(desktop[idle])
+    return {"simulator_error_mib": spread((np.abs(strayed) / MIB).tolist()),
+            "desktop_moved_mib": spread((np.abs(moved) / MIB).tolist())}
 
 
 def compare(original: OthersHeld, samples: np.ndarray, started_ns: int, *,
-            idle_s: float = IDLE_S) -> dict:
+            idle_s: float = IDLE_S, processes=None, simulator_pid: int | None = None) -> dict:
     """The recording of a replay, its device `samples`, against the
     `original` it replayed from `started_ns`. The desktop's own level is the
     median used memory over the `idle_s` before the start; what the replay
     took is the used memory above it, so whatever the desktop itself does
     over the replay counts as error: replay windows of a few minutes, around
-    the actions of interest, rather than whole recordings. Spikes are sought in both over the
-    replayed time alone, so in both from one baseline window (spikes.py)
-    after its start. JSON as it stands, for the log."""
+    the actions of interest, rather than whole recordings. `processes`, the
+    replay's (states, procs), with the simulator's pid, adds the simulator's
+    own error and the desktop's movement. JSON as it stands, for the log."""
     t = samples["t_mono_ns"]
     idle = samples["used_bytes"][(t >= started_ns - idle_s * 1e9) & (t < started_ns)]
     if not len(idle):
@@ -327,35 +370,35 @@ def compare(original: OthersHeld, samples: np.ndarray, started_ns: int, *,
     base = int(np.median(idle))
     s = (t - started_ns) / 1e9
     during = (s >= 0) & (s <= original.t_s[-1])
-    taken = samples["used_bytes"][during] - base
-    error = np.abs(taken - level_at(original, s[during])) / MIB
+    taken = samples["used_bytes"] - base
+    error = np.abs(taken[during] - level_at(original, s[during])) / MIB
 
+    window_s = spikes.DEFAULT_WINDOW_S
     found = spikes.find_spikes((original.t_s * 1e9).astype(np.int64), -original.bytes)
-    again = spikes.find_spikes(t[during] - started_ns, samples["free_bytes"][during])
-    pairs = _pair(found, again)
-    clear = spikes.DEFAULT_THRESHOLD_BYTES + AMPLITUDE_BOUND_MIB * MIB
-    paired = {id(x) for pair in pairs for x in pair}
-    alone = [x for x in found + again if id(x) not in paired and x.amplitude_bytes >= clear]
-    held_to = [(o, r) for o, r in pairs if o.amplitude_bytes >= clear]
-    starts = [abs(r.start_ns - o.start_ns) / 1e6 for o, r in held_to]
-    amplitudes = [abs(r.amplitude_bytes - o.amplitude_bytes) / MIB for o, r in held_to]
-    rises = [abs(r.rise_s - o.rise_s) * 1e3 for o, r in held_to
-             if r.rise_s is not None and o.rise_s is not None]
+    starts, amplitudes, unmeasured = [], [], 0
+    for spike in found:
+        was = _measure(original.t_s, original.bytes, spike, window_s)
+        now = _measure(s, taken, spike, window_s)
+        if was is None or now is None:
+            unmeasured += 1
+            continue
+        amplitudes.append(abs(now[0] - was[0]) / MIB)
+        starts.append(abs(now[1] - was[1]) * 1e3)
     error_mib = spread(error.tolist())
-    return {
+    results = {
         "samples": int(during.sum()), "idle_used_mib": base / MIB,
         "error_mib": error_mib,
-        "spikes": {"original": len(found), "replayed": len(again), "matched": len(pairs),
-                   "unmatched_clear_of_threshold": len(alone),
-                   "matched_clear_of_threshold": len(held_to),
-                   "start_offset_ms": spread(starts),
-                   "amplitude_error_mib": spread(amplitudes),
-                   "rise_error_ms": spread(rises)},
+        "spikes": {"original": len(found), "unmeasured": unmeasured,
+                   "edge_offset_ms": spread(starts),
+                   "amplitude_error_mib": spread(amplitudes)},
         "bounds": {"error_p90_mib": ERROR_BOUND_MIB, "start_ms": START_BOUND_MS,
                    "amplitude_mib": AMPLITUDE_BOUND_MIB},
         "within": {
             "error": error_mib is not None and error_mib["p90"] <= ERROR_BOUND_MIB,
-            "spikes": not alone,
+            "spikes": unmeasured == 0,
             "start": all(x <= START_BOUND_MS for x in starts),
             "amplitude": all(x <= AMPLITUDE_BOUND_MIB for x in amplitudes)},
     }
+    if processes is not None and simulator_pid is not None:
+        results.update(_streams(processes, simulator_pid, started_ns, idle_s, original))
+    return results
