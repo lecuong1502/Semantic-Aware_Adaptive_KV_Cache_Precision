@@ -226,6 +226,18 @@ def analyse(samples: np.ndarray, stream: ProcessStream, labels: np.ndarray | Non
     return results
 
 
+#: RQ1's collection issues: the scenarios without the engine and with it.
+RQ1_ISSUES = (55, 56)
+
+
+def logged_recordings(log: str | Path = benchlog.DEFAULT_LOG, issues=RQ1_ISSUES):
+    """The "contention-trace" entries of the recordings of `issues`, RQ1's by
+    default, in the log's order."""
+    for entry in benchlog.read(log):
+        if entry["kind"] == "contention-trace" and entry["config"].get("issue") in issues:
+            yield entry
+
+
 def log_recording(path: str | Path, *, issue: int, log: str | Path = benchlog.DEFAULT_LOG,
                   window_s: float = spikes.DEFAULT_WINDOW_S,
                   threshold_bytes: int = spikes.DEFAULT_THRESHOLD_BYTES,

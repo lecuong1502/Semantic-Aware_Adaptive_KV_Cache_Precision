@@ -30,8 +30,9 @@ pressure coming in time to act. This is what sees it, as #45 decided:
 **The thresholds and K are ADR-0013's**, DEFAULT: set from RQ1's data by
 the rule pressure_rule applies, which a test holds them to. RED below 512
 MiB, where a spike at RQ1's P90 amplitude could run the machine out; YELLOW
-below 896 MiB, room for what a fast spike takes while it is detected and a
-plan applied; K = 3 polls, detection within RQ1's P10 rise time.
+below 1024 MiB, room for what a fast spike takes while it is detected and a
+plan applied, here the whole spike; K = 3 polls, detection within RQ1's P10
+rise time.
 
 **Each transition carries its own/others split** (#62, MemorySplit): this
 process's device memory and every other process's, by the driver's account
@@ -102,7 +103,7 @@ class Thresholds:
 
 
 #: ADR-0013's, the rule of pressure_rule applied to RQ1's log entries.
-DEFAULT = Thresholds(red_below_bytes=512 * MIB, yellow_below_bytes=896 * MIB, persist_polls=3)
+DEFAULT = Thresholds(red_below_bytes=512 * MIB, yellow_below_bytes=1024 * MIB, persist_polls=3)
 
 
 @dataclass(frozen=True)

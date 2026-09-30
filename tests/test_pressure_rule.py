@@ -41,10 +41,10 @@ def test_the_rule_gives_red_k_and_yellow_from_amplitude_rise_and_bandwidth():
 
 def test_the_monitors_defaults_are_the_rule_applied_to_rq1s_log():
     """ADR-0013's values: RQ1's 48 spikes, the 1.5B model's decode bandwidth
-    and INT8's effective bits, as the log holds them. If an entry is logged
+    at 32K positions and INT8's effective bits, as the log holds them. If an entry is logged
     again, this fails until the ADR and the defaults are brought up to date."""
     measures = pressure_rule.measures_from_log()
     assert len(measures.amplitudes_bytes) == 48
     assert pressure_rule.derive(measures).thresholds == monitor.DEFAULT
     assert (monitor.DEFAULT.red_below_bytes, monitor.DEFAULT.yellow_below_bytes,
-            monitor.DEFAULT.persist_polls) == (512 * MIB, 896 * MIB, 3)
+            monitor.DEFAULT.persist_polls) == (512 * MIB, 1024 * MIB, 3)
