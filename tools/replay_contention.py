@@ -112,9 +112,7 @@ def main(argv: list[str]) -> int:
         [json.loads(line) for line in events_path.read_text().splitlines()])
     results["engine_residual_mib"] = replay.engine_residual(args.recording, **window)
     results["hidden_spikes_s"] = hidden
-    files = [args.out, recorder.processes_path(args.out),
-             recorder.companion(args.out, ".schedule.json"), events_path,
-             recorder.companion(args.out, ".replay.json")]
+    files = replay.files(args.out)
     benchlog.append("contention-replay", model=None, context_length=None, precision_tiers=None,
                     config={"issue": args.issue, "recording": args.recording.name,
                             "recording_sha256": benchlog.file_sha256(args.recording),

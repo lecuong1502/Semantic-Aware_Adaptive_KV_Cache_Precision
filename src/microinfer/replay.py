@@ -238,6 +238,7 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
     written beside `out`. Returns when the schedule began, on the
     recorder's clock."""
     out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     shifted = Schedule([(0.0, 0)] + [(t + lead_s, b) for t, b in schedule.points])
     schedule_path = recorder.companion(out, ".schedule.json")
     events_path = recorder.companion(out, ".events.jsonl")
@@ -289,6 +290,15 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
     recorder.companion(out, ".replay.json").write_text(json.dumps(
         {"started_ns": started, "simulator_pid": proc.pid, "lead_s": lead_s}) + "\n")
     return started
+
+
+def files(out: str | Path) -> list[Path]:
+    """Every file replay() writes for the recording at `out`: the trace, its
+    processes stream, the schedule, the simulator's events and when the
+    schedule began."""
+    out = Path(out)
+    return [out, recorder.processes_path(out), recorder.companion(out, ".schedule.json"),
+            recorder.companion(out, ".events.jsonl"), recorder.companion(out, ".replay.json")]
 
 
 def _applied(events: Path, points: int) -> bool:

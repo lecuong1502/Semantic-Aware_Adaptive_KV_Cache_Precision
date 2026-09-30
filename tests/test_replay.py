@@ -112,7 +112,7 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     recorder records; the recording of the replay shows its step when the
     schedule says. Only that is asserted: how well a replay matches is
     measured on an idle desktop, and logged (tools/replay_contention.py)."""
-    out = tmp_path / "replay.csv.gz"
+    out = tmp_path / "new" / "replay.csv.gz"  # its directory made as it is written
     steps = np.arange(100)
     held = replay.OthersHeld(steps * 0.02, np.where(steps >= 25, 256 * MiB, 0).astype(np.int64))
     started = replay.replay(replay.to_schedule(held), out, lead_s=1.0, tail_s=0.5)

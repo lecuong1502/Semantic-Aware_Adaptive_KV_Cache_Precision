@@ -162,6 +162,29 @@ as real contention is. Its schedules come from synthetic patterns or from a
 contention trace. It *takes* memory; *holding* is the engine's (Hold).
 _Avoid_: load generator, stress test (it runs no kernels)
 
+**Pulse**:
+A trapezoid of memory the contention simulator takes and gives back on a
+schedule: an amplitude, a linear ramp up and down, and a plateau between. It
+is what the simulator plays; a spike is what is found in a trace.
+_Avoid_: spike (for what the simulator plays), burst
+
+**True RED episode**:
+A run of the recorder's samples whose headroom is below the monitor's RED
+threshold, from the first below to the first back at or above: the ground
+truth the monitor is evaluated against, never its own events.
+_Avoid_: RED event (that is the monitor's report of one)
+
+**Detection latency**:
+From a true RED episode's start to the first RED event that detects it, in
+ms and in polls. Only episodes of 100 ms or more are counted.
+
+**False negative / false positive**:
+A true RED episode of 100 ms or more with no RED event; a RED event with no
+true RED over the polls that settled it. False negatives shorter than K + 1
+polls and a recorder sample are counted apart, as ones the monitor cannot be
+sure to catch by design.
+_Avoid_: miss, false alarm
+
 **Replay**:
 Simulated contention whose schedule comes from a contention trace: the device
 stream's used memory, less the engine's where the trace ran beside it, above
