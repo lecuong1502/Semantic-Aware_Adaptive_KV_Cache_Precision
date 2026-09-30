@@ -81,6 +81,16 @@ def _executable(name: str | None) -> str | None:
     return os.path.basename(name.split()[0]) if name else None
 
 
+def file_sha256(path: str | Path) -> str:
+    """The sha256 of a file's bytes, read a MiB at a time: what an entry
+    names a file by."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def environment(log: str | Path = DEFAULT_LOG) -> dict[str, Any]:
     """Everything about the machine that a result depends on, read now.
 

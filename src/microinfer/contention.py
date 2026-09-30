@@ -29,7 +29,6 @@ This is measurement, not inference, so it computes in NumPy on the host
 from __future__ import annotations
 
 import enum
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import get_args
@@ -227,14 +226,6 @@ def analyse(samples: np.ndarray, stream: ProcessStream, labels: np.ndarray | Non
     return results
 
 
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
 def log_recording(path: str | Path, *, issue: int, log: str | Path = benchlog.DEFAULT_LOG,
                   window_s: float = spikes.DEFAULT_WINDOW_S,
                   threshold_bytes: int = spikes.DEFAULT_THRESHOLD_BYTES,
@@ -271,7 +262,7 @@ def log_recording(path: str | Path, *, issue: int, log: str | Path = benchlog.DE
         context_length=int(context) if context.isdigit() else None,
         precision_tiers=None,
         config={"issue": issue, "trace": path.name,
-                "files": {f.name: _sha256(f) for f in files},
+                "files": {f.name: benchlog.file_sha256(f) for f in files},
                 "recording": {k: v for k, v in meta.items()
                               if k not in ("complete", "samples", "missed")},
                 "window_s": window_s, "threshold_mib": threshold_bytes / MIB,

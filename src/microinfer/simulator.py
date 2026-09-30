@@ -131,6 +131,16 @@ def run(schedule: Schedule, reservation: Reservation, stop: threading.Event,
     return events
 
 
+def summarise(events: list[dict]) -> dict:
+    """What a run's changes (run's events) came to: how many, how late
+    they began and how long until NVML showed them, as median, P90 and max;
+    how many NVML never showed; and the largest shortfall."""
+    return {"changes": len(events), "late_s": spread([e["late_s"] for e in events]),
+            "nvml_ms": spread([e["nvml_ms"] for e in events]),
+            "unseen": sum(not e["seen"] for e in events),
+            "shortfall_bytes_max": max((e["shortfall_bytes"] for e in events), default=0)}
+
+
 #: The steps a calibration takes, each then given back: one granule to 1 GiB.
 CALIBRATION_BYTES = (GRANULE, 64 * 2**20, 256 * 2**20, 1024 * 2**20)
 CALIBRATION_STEP_S = 0.5
