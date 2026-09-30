@@ -115,11 +115,13 @@ def test_a_recording_becomes_what_the_others_held_and_a_replay_is_compared_with_
     # Where a scenario begins: its first span after the engine's prefill.
     labels = recorder._TraceWriter(recorder.labels_path(path), recorder.LABEL_FORMAT, {},
                                    recorder.LABEL_COLUMNS)
+    # A span that begins before the prefill ends is not where it begins.
     for at_s, event, action in ((0.0, recorder.START, replay.ENGINE_PREFILL),
+                                (0.5, recorder.START, "early"), (1.0, recorder.END, "early"),
                                 (1.5, recorder.END, replay.ENGINE_PREFILL),
                                 (1.5, recorder.START, "idle"), (3.0, recorder.END, "idle")):
         labels.row(10**12 + int(at_s * 1e9), 0.0, event, action)
-    labels.close({"labels": 4, "rejected": 0})
+    labels.close({"labels": 6, "rejected": 0})
     assert replay.scenario_start_s(path) == pytest.approx(1.5)
 
 
@@ -145,5 +147,5 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     result = replay.compare(held, samples, started, processes=(states, procs),
                             simulator_pid=pid)
     assert result["simulator_error_mib"]["p90"] <= 2
-    # Before it takes anything, the simulator holds its CUDA context.
+    # Before it takes anything, the simulator has its CUDA context.
     assert replay.simulator_context_bytes(tmp_path) > 0

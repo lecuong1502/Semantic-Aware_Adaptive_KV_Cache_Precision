@@ -104,6 +104,8 @@ class OthersHeld:
     #: window. A replay that leaves this much, before its schedule takes
     #: anything, gives the machine the original's headroom throughout.
     headroom_bytes: int | None = None
+    #: The samples' times on the original's clock, to find them there again.
+    t_mono_ns: np.ndarray | None = None
 
 
 def _engine_bytes(path: Path, t_ns: np.ndarray, used: np.ndarray,
@@ -181,7 +183,7 @@ def held(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
     used = used[keep]
     above = used - used.min()
     headroom = int(np.median(samples["free_bytes"][keep] + above))
-    return OthersHeld((t[keep] - t[keep][0]) / 1e9, above, engine_pid, headroom)
+    return OthersHeld((t[keep] - t[keep][0]) / 1e9, above, engine_pid, headroom, t[keep])
 
 
 #: The span a with-engine scenario labels its engine's prefill with
@@ -191,18 +193,19 @@ ENGINE_PREFILL = "engine-prefill"
 
 def scenario_start_s(path: str | Path) -> float:
     """When the scenario of the recording at `path` began its first span
-    after the engine's prefill, in seconds from the recording's first
-    sample: from there the engine holds what it holds. 0 without labels."""
+    after the engine's prefill had ended, in seconds from the recording's
+    first sample: from there the engine holds what it holds. 0 without
+    labels, or a prefill."""
     labels_path = recorder.labels_path(path)
     if not labels_path.exists():
         return 0.0
     _, labels = recorder.read_labels(labels_path)
     _, samples = recorder.read(path)
-    starts = labels["t_mono_ns"][(labels["event"] == recorder.START)
-                                 & (labels["action"] != ENGINE_PREFILL)]
-    if not len(starts):
-        return 0.0
-    return (int(starts.min()) - int(samples["t_mono_ns"][0])) / 1e9
+    t, event, action = labels["t_mono_ns"], labels["event"], labels["action"]
+    prefilled = t[(event == recorder.END) & (action == ENGINE_PREFILL)]
+    after = int(prefilled.max()) if len(prefilled) else int(samples["t_mono_ns"][0])
+    starts = t[(event == recorder.START) & (action != ENGINE_PREFILL) & (t >= after)]
+    return (int(starts.min() if len(starts) else after) - int(samples["t_mono_ns"][0])) / 1e9
 
 
 def engine_residual(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
@@ -321,7 +324,7 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
 
 
 def simulator_context_bytes(tmp: str | Path) -> int:
-    """What the simulator holds before it takes anything: its CUDA context,
+    """What the simulator has before it takes anything: its CUDA context,
     by NVML's account of its process. Measured by starting it once on a
     schedule of nothing, with its schedule written in `tmp`. A caller that
     sets a base from headroom read before the simulator starts must leave

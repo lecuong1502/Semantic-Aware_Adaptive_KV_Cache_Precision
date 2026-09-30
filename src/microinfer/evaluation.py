@@ -29,6 +29,10 @@ grid_schedule makes it, on a base the simulator takes first so that
 headroom starts in GREEN, and tools/evaluate_monitor.py runs it beside the
 engine decoding with its monitor on. A **pulse** is a trapezoid the
 simulator plays, not a spike: a spike is what spikes.py finds in a trace.
+#65 applies them to RQ1's recordings replayed on a base that leaves the
+original's headroom (tools/evaluate_monitor.py replay), and summarise pools
+the latest evaluation of each, per workload, for RQ2
+(tools/summarise_monitor.py).
 
 This is measurement, not inference, so it computes in NumPy on the host
 (ADR-0002, amendment on its scope).
@@ -239,24 +243,30 @@ def _sum(scores: list[Score]) -> Score:
 
 # -- the summary ---------------------------------------------------------------------------
 
-#: What a summary sums over the entries it takes.
-_COUNTS = ("episodes", "detectable", "missed_detectable", "missed_below_k", "already_red",
-           "false_positives", "red_events")
+#: What a summary sums over the entries it takes: every count of a Score.
+_COUNTS = tuple(f for f, kind in Score.__annotations__.items() if kind == "int")
 
 
 def summarise(entries) -> dict:
     """RQ2's summary from the benchmark log's `entries`: per workload, the
-    latest "monitor-evaluation" of each grid or recording that no correction
-    supersedes, their counts summed and their latencies pooled, with the sha256
-    of the entries taken."""
+    latest "monitor-evaluation" of the grid, and of each recording replayed
+    whole, that no correction supersedes, their counts summed and their
+    latencies pooled, with the sha256 of the entries taken. A replay of part
+    of a recording is left out: it is not that recording's replay. A
+    correction supersedes the entries it corrects unless it says it does not
+    ("supersedes": false), as one that amends what an entry's config says."""
     entries = list(entries)
-    corrected = {sha for e in entries if e.get("kind") == "correction"
-                 for sha in e["results"].get("corrects", [])}
+    superseded = {sha for e in entries if e.get("kind") == "correction"
+                  and e["results"].get("supersedes", True)
+                  for sha in e["results"].get("corrects", [])}
     latest: dict[tuple[str, str | None], dict] = {}
     for e in entries:
-        if e.get("kind") == "monitor-evaluation" and e["sha256"] not in corrected:
-            config = e["config"]
-            latest[(config["workload"], config.get("recording"))] = e
+        if e.get("kind") != "monitor-evaluation" or e["sha256"] in superseded:
+            continue
+        config = e["config"]
+        if config.get("to_s") is not None:
+            continue
+        latest[(config["workload"], config.get("recording"))] = e
     summary: dict[str, dict] = {}
     for (workload, _), e in latest.items():
         into = summary.setdefault(workload, {"entries": [], "latencies_ms": [],

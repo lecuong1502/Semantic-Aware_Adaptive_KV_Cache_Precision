@@ -59,6 +59,7 @@ from microinfer import Engine, benchlog, evaluation, monitor, nvml, recorder, re
 from microinfer.contention import spread  # noqa: E402
 from microinfer.engine import DECODING  # noqa: E402
 from microinfer.footprint import MIB  # noqa: E402
+from microinfer.schedule import Schedule  # noqa: E402
 
 SEED = 64
 #: How long headroom settles after the engine's cache stops growing.
@@ -68,6 +69,79 @@ SETTLE_S = 2.0
 def summary(s: evaluation.Score) -> dict:
     return {**asdict(s), "false_negatives": s.false_negatives,
             "latency_ms": spread(s.latencies_ms), "latency_polls": spread(s.latencies_polls)}
+
+
+class GridWorkload:
+    """A grid of pulses on a base that leaves --start-headroom (#64)."""
+
+    def __init__(self, args):
+        self.args = args
+        self.cells = [evaluation.Cell(int(a * MIB), r, p) for a in args.amplitudes
+                      for r in args.ramps for p in args.plateaus]
+        self.grid = None
+
+    def leave_bytes(self) -> int:
+        return int(self.args.start_headroom * MIB)
+
+    def schedule(self, base: int) -> Schedule:
+        a = self.args
+        self.grid = evaluation.grid_schedule(self.cells, base, a.repeats, a.gap, a.lead,
+                                             seed=SEED)
+        print(f"{len(self.cells)} cells x {a.repeats} over "
+              f"{self.grid.schedule.duration_s:.0f} s, on a base of {base / MIB:.0f} MiB",
+              flush=True)
+        return self.grid.schedule
+
+    def config(self) -> dict:
+        a = self.args
+        return {"workload": "synthetic grid", "repeats": a.repeats, "gap_s": a.gap,
+                "lead_s": a.lead, "phase_seed": SEED, "start_headroom_mib": a.start_headroom,
+                "amplitudes_mib": a.amplitudes, "ramps_s": a.ramps, "plateaus_s": a.plateaus,
+                "duration": "a pulse's plateau; it lasts ramp + plateau + ramp"}
+
+    def results(self, started: int, end: int, episodes, events, thresholds) -> dict:
+        changes = [json.loads(line) for line in recorder.companion(
+            self.args.out, ".events.jsonl").read_text().splitlines()]
+        starts = evaluation.applied_starts(self.grid, started, changes)
+        per_cell = evaluation.score_cells(self.grid, starts, end, episodes, events, thresholds)
+        return {"cells": [{**asdict(c), "amplitude_mib": c.amplitude_bytes / MIB, **summary(s)}
+                          for c, s in zip(self.cells, per_cell)]}
+
+
+class ReplayWorkload:
+    """What the other processes held in an RQ1 recording, on a base that
+    leaves the original's headroom (#65)."""
+
+    def __init__(self, args):
+        self.args = args
+        if args.start_s is None:
+            args.start_s = replay.scenario_start_s(args.recording)
+        self.original = replay.held(args.recording, start_s=args.start_s, end_s=args.end_s)
+
+    def leave_bytes(self) -> int:
+        return self.original.headroom_bytes
+
+    def schedule(self, base: int) -> Schedule:
+        schedule = replay.to_schedule(self.original, base_bytes=base)
+        print(f"replaying {self.args.recording.name} from {self.args.start_s:.0f} s, "
+              f"{schedule.duration_s:.0f} s, on a base of {base / MIB:.0f} MiB", flush=True)
+        return schedule
+
+    def config(self) -> dict:
+        a = self.args
+        return {"workload": "replayed RQ1 recording", "recording": a.recording.name,
+                "recording_sha256": benchlog.file_sha256(a.recording),
+                "from_s": a.start_s, "to_s": a.end_s, "engine_pid": self.original.engine_pid,
+                "original_headroom_mib": self.original.headroom_bytes / MIB}
+
+    def results(self, started: int, end: int, episodes, events, thresholds) -> dict:
+        # The original's own true RED, over the samples replayed.
+        _, samples = recorder.read(self.args.recording)
+        kept = np.isin(samples["t_mono_ns"], self.original.t_mono_ns)
+        original = evaluation.true_red(samples["t_mono_ns"][kept],
+                                       samples["free_bytes"][kept], thresholds)
+        return {"original_red_episodes": sum(e.duration_s >= evaluation.MIN_EPISODE_S
+                                             for e in original)}
 
 
 def main(argv: list[str]) -> int:
@@ -101,7 +175,9 @@ def main(argv: list[str]) -> int:
     replay_args.add_argument("--from", dest="start_s", type=float,
                              help="seconds after the recording's first sample; its first "
                                   "span after the engine's prefill by default")
-    replay_args.add_argument("--to", dest="end_s", type=float, help="the same; its end if omitted")
+    replay_args.add_argument("--to", dest="end_s", type=float,
+                             help="the same; its end if omitted, and only a replay to the "
+                                  "end enters the summary")
     args = parser.parse_args(argv)
     if args.out.exists():
         parser.error(f"{args.out} exists; an evaluation does not overwrite a recording")
@@ -109,12 +185,7 @@ def main(argv: list[str]) -> int:
     if benchlog.environment(args.log)["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first, so that the "
                      "entry names the code that produced it")
-
-    original = None
-    if args.workload == "replay":
-        if args.start_s is None:
-            args.start_s = replay.scenario_start_s(args.recording)
-        original = replay.held(args.recording, start_s=args.start_s, end_s=args.end_s)
+    workload = GridWorkload(args) if args.workload == "grid" else ReplayWorkload(args)
 
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -138,7 +209,6 @@ def main(argv: list[str]) -> int:
         name="hold")
     watching = engine.start_monitor()
     holding.start()
-    grid = None
     try:
         while not full.wait(0.5):
             if stop.is_set() or not holding.is_alive():
@@ -147,23 +217,12 @@ def main(argv: list[str]) -> int:
         time.sleep(SETTLE_S)
         # The simulator's context is taken as it starts, after this reading.
         headroom = nvml.memory().free - context_bytes
-        leave = (args.start_headroom * MIB if original is None else original.headroom_bytes)
-        base = int(headroom - leave)
+        base = int(headroom - workload.leave_bytes())
         if base < 0:
             raise SystemExit(f"headroom is {headroom / MIB:.0f} MiB, below the "
-                             f"{leave / MIB:.0f} MiB the evaluation starts from")
-        if original is None:
-            cells = [evaluation.Cell(int(a * MIB), r, p)
-                     for a in args.amplitudes for r in args.ramps for p in args.plateaus]
-            grid = evaluation.grid_schedule(cells, base, args.repeats, args.gap, args.lead,
-                                            seed=SEED)
-            schedule = grid.schedule
-            print(f"{len(cells)} cells x {args.repeats} over {schedule.duration_s:.0f} s, "
-                  f"on a base of {base / MIB:.0f} MiB", flush=True)
-        else:
-            schedule = replay.to_schedule(original, base_bytes=base)
-            print(f"replaying {args.recording.name} from {args.start_s:.0f} s, "
-                  f"{schedule.duration_s:.0f} s, on a base of {base / MIB:.0f} MiB", flush=True)
+                             f"{workload.leave_bytes() / MIB:.0f} MiB the evaluation "
+                             f"starts from")
+        schedule = workload.schedule(base)
         started = replay.replay(schedule, args.out, stop=stop)
     finally:
         halt.set()
@@ -179,32 +238,8 @@ def main(argv: list[str]) -> int:
     results = {"overall": summary(overall), "events_recorded": len(events),
                "monitor_error": None if engine.monitor_error is None
                else str(engine.monitor_error),
-               "missed_polls": watching.missed}
-    config = {"issue": args.issue, "base_bytes": base,
-              "simulator_context_bytes": context_bytes, "poll_s": monitor.POLL_S,
-              "thresholds": asdict(thresholds), "min_episode_s": evaluation.MIN_EPISODE_S}
-    if grid is not None:
-        changes = [json.loads(line) for line
-                   in recorder.companion(args.out, ".events.jsonl").read_text().splitlines()]
-        starts = evaluation.applied_starts(grid, started, changes)
-        per_cell = evaluation.score_cells(grid, starts, end, episodes, events, thresholds)
-        results["cells"] = [{**asdict(c), "amplitude_mib": c.amplitude_bytes / MIB,
-                             **summary(s)} for c, s in zip(grid.cells, per_cell)]
-        config.update({
-            "workload": "synthetic grid", "repeats": args.repeats, "gap_s": args.gap,
-            "lead_s": args.lead, "phase_seed": SEED, "start_headroom_mib": args.start_headroom,
-            "amplitudes_mib": args.amplitudes, "ramps_s": args.ramps,
-            "plateaus_s": args.plateaus,
-            "duration": "a pulse's plateau; it lasts ramp + plateau + ramp"})
-    else:
-        original_episodes = evaluation.true_red(*_original_trace(args), thresholds)
-        results["original_red_episodes"] = sum(e.duration_s >= evaluation.MIN_EPISODE_S
-                                               for e in original_episodes)
-        config.update({
-            "workload": "replayed RQ1 recording", "recording": args.recording.name,
-            "recording_sha256": benchlog.file_sha256(args.recording),
-            "from_s": args.start_s, "to_s": args.end_s, "engine_pid": original.engine_pid,
-            "original_headroom_mib": original.headroom_bytes / MIB})
+               "missed_polls": watching.missed,
+               **workload.results(started, end, episodes, events, thresholds)}
 
     # The monitor's events, as the engine recorded them, beside the trace:
     # the truth can be scored again without running again.
@@ -213,27 +248,21 @@ def main(argv: list[str]) -> int:
         json.dumps({**asdict(r.event), "positions_held": r.positions_held,
                     "drained_ns": r.drained_ns}) + "\n" for r in engine.pressure_events))
     files = replay.files(args.out) + [pressure]
-    config["files"] = {f.name: benchlog.file_sha256(f) for f in files if f.exists()}
+    config = {"issue": args.issue, "base_bytes": base,
+              "simulator_context_bytes": context_bytes, "poll_s": monitor.POLL_S,
+              "thresholds": asdict(thresholds), "min_episode_s": evaluation.MIN_EPISODE_S,
+              **workload.config(),
+              "files": {f.name: benchlog.file_sha256(f) for f in files if f.exists()}}
     benchlog.append("monitor-evaluation", model=args.model, context_length=context,
                     precision_tiers={"FP16": 1.0}, config=config, results=results,
                     log=args.log)
     print(json.dumps({"episodes": overall.episodes, "latency_ms": spread(overall.latencies_ms),
-                      "missed_detectable": overall.missed_detectable,
-                      "missed_below_k": overall.missed_below_k,
+                      "false_negatives_detectable": overall.missed_detectable,
+                      "false_negatives_below_k": overall.missed_below_k,
                       "already_red": overall.already_red,
                       "false_positives": overall.false_positives,
-                      **({"original_red_episodes": results["original_red_episodes"]}
-                         if grid is None else {})}))
+                      **{k: v for k, v in results.items() if k == "original_red_episodes"}}))
     return 0
-
-
-def _original_trace(args) -> tuple[np.ndarray, np.ndarray]:
-    """The replayed window of the original recording: its times and free memory."""
-    _, samples = recorder.read(args.recording)
-    t = samples["t_mono_ns"]
-    s = (t - t[0]) / 1e9
-    keep = (s >= args.start_s) & (s <= (np.inf if args.end_s is None else args.end_s))
-    return t[keep], samples["free_bytes"][keep]
 
 
 if __name__ == "__main__":

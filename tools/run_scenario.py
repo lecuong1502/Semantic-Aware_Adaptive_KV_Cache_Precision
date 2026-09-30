@@ -58,7 +58,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import benchlog, recorder, scenario  # noqa: E402
+from microinfer import benchlog, recorder, replay, scenario  # noqa: E402
 from microinfer.browser import end_process  # noqa: E402
 from microinfer.engine import DECODING  # noqa: E402
 
@@ -185,7 +185,7 @@ def main(argv: list[str]) -> int:
             engine = child([sys.executable, str(REPO / "tools" / "hold_engine.py"),
                             "--model", args.model, "--status", str(status_path)])
             children.append(engine)
-            send(recorder.START, "engine-prefill")
+            send(recorder.START, replay.ENGINE_PREFILL)
             end = time.monotonic() + ENGINE_READY_TIMEOUT_S
             status = None
             while not stop.is_set() and engine.poll() is None and time.monotonic() < end:
@@ -193,7 +193,7 @@ def main(argv: list[str]) -> int:
                 if status is not None and status["state"] == DECODING:
                     break
                 stop.wait(0.5)
-            send(recorder.END, "engine-prefill")
+            send(recorder.END, replay.ENGINE_PREFILL)
             log["engine_ready"] = status
             if not stop.is_set() and (status is None or status["state"] != DECODING):
                 raise SystemExit(f"the engine did not start decoding: {status}")
