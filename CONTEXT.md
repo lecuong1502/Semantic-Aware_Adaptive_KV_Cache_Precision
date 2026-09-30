@@ -93,8 +93,8 @@ The VRAM Monitor's classification of currently available device memory, as
 `GREEN`, `YELLOW`, or `RED`. It describes the *machine's* state, never a
 page's. It is set from headroom by thresholds in MiB, and a new level is
 reported only once K polls in a row have read that side of the current one.
-The thresholds and K are **provisional** (`monitor.PROVISIONAL`) until an ADR
-sets them from RQ1's data (#63).
+The thresholds and K are ADR-0013's (`monitor.DEFAULT`), set from RQ1's data
+by a rule.
 _Avoid_: pressure state, memory level
 
 **Pressure event**:
