@@ -83,6 +83,11 @@ def test_the_grid_schedule_takes_a_base_then_each_cell_in_turn():
     assert s.at(5.0 + 0.2 + 0.05) == 1536 * MIB
     assert s.points[-1][1] == 0 and s.duration_s > starts[-1] + 0.6
     assert all(b % patterns.granule_bytes() == 0 for _, b in s.points)
+    # Seeded, each gap is longer by less than a poll, the same for the same seed.
+    jittered = [t for _, t in evaluation.grid_schedule(
+        cells, 1024 * MIB, repeats=2, gap_s=1.0, lead_s=2.0, seed=7).spikes]
+    extra = np.diff(jittered) - np.diff(starts)
+    assert all(0 <= x < 0.05 for x in extra) and len(set(np.round(extra, 9))) > 1
     # Scored per cell: each spike's episodes and events, to the next spike's start.
     started = 10**12
     at = [started + int(t * 1e9) for _, t in grid.spikes]

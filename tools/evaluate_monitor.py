@@ -10,7 +10,8 @@ recording every event between steps. Once its cache has stopped growing, the
 contention simulator, a process of its own, takes a base, so that headroom
 sits at --start-headroom MiB, in GREEN, and then plays every cell of the grid
 of amplitude (MiB above the base) x rise time (and fall, s) x plateau (s),
---repeats times, --gap seconds apart. The recorder records the device
+--repeats times, --gap seconds apart and a seeded fraction of a poll more, so
+that the spikes meet the polls at every phase. The recorder records the device
 throughout (microinfer.replay.replay).
 
 The truth is the recorder's trace with the monitor's thresholds applied, and
@@ -113,7 +114,8 @@ def main(argv: list[str]) -> int:
                              f"{args.start_headroom:g} MiB the grid starts from")
         cells = [evaluation.Cell(int(a * MIB), r, p)
                  for a in args.amplitudes for r in args.rises for p in args.plateaus]
-        grid = evaluation.grid_schedule(cells, base, args.repeats, args.gap, args.lead)
+        grid = evaluation.grid_schedule(cells, base, args.repeats, args.gap, args.lead,
+                                        seed=SEED)
         print(f"{len(cells)} cells x {args.repeats} over {grid.schedule.duration_s:.0f} s, "
               f"on a base of {base / MIB:.0f} MiB", flush=True)
         started = replay.replay(grid.schedule, args.out, stop=stop)
@@ -145,7 +147,7 @@ def main(argv: list[str]) -> int:
         "monitor-evaluation", model=args.model, context_length=context,
         precision_tiers={"FP16": 1.0},
         config={"issue": args.issue, "workload": "synthetic grid", "repeats": args.repeats,
-                "gap_s": args.gap, "lead_s": args.lead,
+                "gap_s": args.gap, "lead_s": args.lead, "phase_seed": SEED,
                 "start_headroom_mib": args.start_headroom, "base_bytes": base,
                 "amplitudes_mib": args.amplitudes, "rises_s": args.rises,
                 "plateaus_s": args.plateaus, "poll_s": monitor.POLL_S,

@@ -107,19 +107,26 @@ class Grid:
 
 
 def grid_schedule(cells: list[Cell], base_bytes: int, repeats: int, gap_s: float,
-                  lead_s: float, resolution_s: float = 0.02) -> Grid:
+                  lead_s: float, resolution_s: float = 0.02, seed: int | None = None,
+                  poll_s: float = POLL_S) -> Grid:
     """`base_bytes` taken at once and kept; after `lead_s`, each cell's spike
     `repeats` times on top of it, cell after cell, each `gap_s` after the one
-    before has fallen; and, `gap_s` after the last, everything given back."""
+    before has fallen; and, `gap_s` after the last, everything given back.
+
+    With a `seed`, each gap is longer by a draw from [0, poll_s), so that
+    the spikes fall at every phase of the monitor's polls: without it, a
+    grid whose times are whole polls would meet them at one phase, and
+    every repeat would measure the same latency."""
     if repeats < 1 or gap_s <= 0 or lead_s < 0 or base_bytes < 0:
         raise ValueError("a grid repeats each cell at least once, with a gap > 0, and a "
                          "lead and a base >= 0")
+    rng = None if seed is None else np.random.default_rng(seed)
     arrivals, spikes, t = [], [], 0.0
     for index, cell in enumerate(cells):
         for _ in range(repeats):
             arrivals.append((t, cell.shape))
             spikes.append((index, lead_s + t))
-            t += cell.shape.length_s + gap_s
+            t += cell.shape.length_s + gap_s + (0.0 if rng is None else rng.uniform(0, poll_s))
     rendered = patterns.render(arrivals, 0.0, resolution_s)
     points = [(0.0, base_bytes)] + [(lead_s + s, base_bytes + b) for s, b in rendered.points
                                     if lead_s + s > 0]
