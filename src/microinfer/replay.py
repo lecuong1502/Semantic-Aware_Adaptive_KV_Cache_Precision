@@ -238,6 +238,7 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
     written beside `out`. Returns when the schedule began, on the
     recorder's clock."""
     out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     shifted = Schedule([(0.0, 0)] + [(t + lead_s, b) for t, b in schedule.points])
     schedule_path = recorder.companion(out, ".schedule.json")
     events_path = recorder.companion(out, ".events.jsonl")

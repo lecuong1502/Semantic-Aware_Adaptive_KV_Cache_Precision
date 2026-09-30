@@ -81,6 +81,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.out.exists():
         parser.error(f"{args.out} exists; an evaluation does not overwrite a recording")
+    args.out.parent.mkdir(parents=True, exist_ok=True)  # before minutes of loading
     if benchlog.environment(args.log)["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first, so that the "
                      "entry names the code that produced it")
