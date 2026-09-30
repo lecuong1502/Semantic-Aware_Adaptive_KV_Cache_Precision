@@ -69,7 +69,7 @@ def _granules(level: float) -> int:
     return int(np.floor(max(level, 0.0) / g + 0.5)) * g
 
 
-def _schedule(times, levels, end_s: float | None = None) -> Schedule:
+def sampled(times, levels, end_s: float | None = None) -> Schedule:
     """A schedule from sampled levels, keeping only the changes, and a last
     point at `end_s` if given, so that the schedule says how long it is."""
     points = []
@@ -104,7 +104,7 @@ def sawtooth(peak_bytes: int, period_s: float, cycles: int,
         for k in range(steps):
             times.append(cycle * period_s + k * period_s / steps)
             levels.append(peak_bytes * k / (steps - 1))
-    return _schedule(times + [cycles * period_s], levels + [0])
+    return sampled(times + [cycles * period_s], levels + [0])
 
 
 # -- shapes --------------------------------------------------------------------------
@@ -142,7 +142,7 @@ def _render(arrivals: list[tuple[float, Trapezoid]], length_s: float,
                     else (after >= 0).astype(float))
         level += shape.amplitude_bytes * np.where(s < 0, 0.0, np.minimum(up, down))
     level[-1] = 0.0
-    return _schedule(times, level, end_s=end)
+    return sampled(times, level, end_s=end)
 
 
 def trapezoids(shape: Trapezoid, count: int = 1, gap_s: float = 0.0, lead_s: float = 0.0,

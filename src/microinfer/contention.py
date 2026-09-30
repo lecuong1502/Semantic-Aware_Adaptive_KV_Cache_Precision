@@ -227,7 +227,7 @@ def analyse(samples: np.ndarray, stream: ProcessStream, labels: np.ndarray | Non
     return results
 
 
-def _sha256(path: Path) -> str:
+def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
@@ -271,7 +271,7 @@ def log_recording(path: str | Path, *, issue: int, log: str | Path = benchlog.DE
         context_length=int(context) if context.isdigit() else None,
         precision_tiers=None,
         config={"issue": issue, "trace": path.name,
-                "files": {f.name: _sha256(f) for f in files},
+                "files": {f.name: sha256(f) for f in files},
                 "recording": {k: v for k, v in meta.items()
                               if k not in ("complete", "samples", "missed")},
                 "window_s": window_s, "threshold_mib": threshold_bytes / MIB,

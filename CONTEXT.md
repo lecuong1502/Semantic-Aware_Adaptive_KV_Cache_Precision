@@ -141,6 +141,15 @@ as real contention is. Its schedules come from synthetic patterns or from a
 contention trace. It *takes* memory; *holding* is the engine's (Hold).
 _Avoid_: load generator, stress test (it runs no kernels)
 
+**Replay**:
+Simulated contention whose schedule comes from a contention trace: the device
+stream's used memory, less the engine's where the trace ran beside it, above
+its least over the window replayed, sample by sample at 50 Hz. It reproduces
+every other process, desktop noise included, not only those a spike names. A
+replay is recorded as the trace was, and compared with it sample by sample and
+spike by spike.
+_Avoid_: playback, re-run (a scenario run again is a new trace, not a replay)
+
 **Contention trace**:
 A recording of contention as the recorder takes it, in two streams on one
 monotonic clock: the **device stream**, the driver's free and used memory at
