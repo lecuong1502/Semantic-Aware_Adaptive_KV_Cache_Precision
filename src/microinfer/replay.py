@@ -38,7 +38,11 @@ held, and states whether it is within these bounds:
   of rounding. Most of what is left is a ramp's samples, a few ms apart;
 - **spike by spike**, at spikes.py's definition: the same spikes, each
   beginning within START_BOUND_MS, two samples, and its amplitude within
-  AMPLITUDE_BOUND_MIB.
+  AMPLITUDE_BOUND_MIB. A spike within that bound of the threshold may be
+  found in one and not the other by an error the bound allows, so only a
+  spike clear of it must be found in both. A spike missed, or found alone,
+  can still change the baseline the next is measured against: a replay's
+  spikes are a stricter test than its samples.
 
 This is measurement, not inference, so it computes in NumPy on the host
 (ADR-0002, amendment on its scope), and the recording process takes no
@@ -274,6 +278,9 @@ def compare(original: Held, samples: np.ndarray, started_ns: int, *,
     found = spikes.find_spikes((original.t_s * 1e9).astype(np.int64), -original.bytes)
     again = spikes.find_spikes(t[during] - started_ns, samples["free_bytes"][during])
     pairs = _pair(found, again)
+    clear = spikes.DEFAULT_THRESHOLD_BYTES + AMPLITUDE_BOUND_MIB * MIB
+    paired = {id(x) for pair in pairs for x in pair}
+    alone = [x for x in found + again if id(x) not in paired and x.amplitude_bytes >= clear]
     starts = [abs(r.start_ns - o.start_ns) / 1e6 for o, r in pairs]
     amplitudes = [abs(r.amplitude_bytes - o.amplitude_bytes) / MIB for o, r in pairs]
     rises = [abs(r.rise_s - o.rise_s) * 1e3 for o, r in pairs
@@ -283,6 +290,7 @@ def compare(original: Held, samples: np.ndarray, started_ns: int, *,
         "samples": int(during.sum()), "idle_used_mib": base / MIB,
         "error_mib": error_mib,
         "spikes": {"original": len(found), "replayed": len(again), "matched": len(pairs),
+                   "unmatched_clear_of_threshold": len(alone),
                    "start_offset_ms": spread(starts),
                    "amplitude_error_mib": spread(amplitudes),
                    "rise_error_ms": spread(rises)},
@@ -290,7 +298,7 @@ def compare(original: Held, samples: np.ndarray, started_ns: int, *,
                    "amplitude_mib": AMPLITUDE_BOUND_MIB},
         "within": {
             "error": error_mib is not None and error_mib["p90"] <= ERROR_BOUND_MIB,
-            "spikes": len(pairs) == len(found) == len(again),
+            "spikes": not alone,
             "start": all(x <= START_BOUND_MS for x in starts),
             "amplitude": all(x <= AMPLITUDE_BOUND_MIB for x in amplitudes)},
     }
