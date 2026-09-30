@@ -91,7 +91,9 @@ context window)
 **Pressure level**:
 The VRAM Monitor's classification of currently available device memory, as
 `GREEN`, `YELLOW`, or `RED`. It describes the *machine's* state, never a
-page's.
+page's. It is set by thresholds in MiB of headroom, and a new level must hold
+for K polls before it is reported. The thresholds and K are **provisional**
+(512 and 1024 MiB, K = 3) until an ADR sets them from RQ1's data (#63).
 _Avoid_: pressure state, memory level
 
 **Importance score**:

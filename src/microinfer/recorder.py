@@ -187,8 +187,8 @@ def labels_path(path: str | Path) -> Path:
 # -- the schedule and the files, shared by both streams ------------------------------------
 
 
-def _schedule(rate_hz: float, duration: float | None, stop: threading.Event | None,
-              sample: Callable[[], None]) -> int:
+def every(rate_hz: float, duration: float | None, stop: threading.Event | None,
+          sample: Callable[[], None]) -> int:
     """Call `sample` at start + k / rate_hz seconds, k = 0, 1, ..., until
     `duration` has passed or `stop` is set. Returns the deadlines missed:
     every deadline in [0, duration) is either sampled or missed."""
@@ -352,7 +352,7 @@ def record(path: str | Path | None, rate_hz: float = 50.0, *, duration: float | 
             streams.append(_LabelStream(labels, labels_path(path), meta))
         for st in streams:
             st.start()
-        missed = _schedule(rate_hz, duration, stop, sample)
+        missed = every(rate_hz, duration, stop, sample)
     finally:
         for st in streams:
             st.end()
@@ -466,7 +466,7 @@ class _ProcessStream(_SideStream):
                             p.name or "")
                     process_rows += 1
 
-        missed = _schedule(self._rate_hz, self._duration, self._done, sample)
+        missed = every(self._rate_hz, self._duration, self._done, sample)
         self._counts = {"samples": len(query_ns), "missed": missed, "process_rows": process_rows}
         query_ms = np.array(query_ns) / 1e6
         self.summary = {"samples": len(query_ms), "missed": missed, "rate_hz": self._rate_hz}
