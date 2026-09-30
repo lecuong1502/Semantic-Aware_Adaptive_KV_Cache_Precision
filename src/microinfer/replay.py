@@ -70,7 +70,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import patterns, recorder, spikes
+from . import nvml, patterns, recorder, spikes
 from .contention import spread
 from .footprint import MIB
 from .schedule import Schedule
@@ -99,6 +99,13 @@ class OthersHeld:
     t_s: np.ndarray
     bytes: np.ndarray
     engine_pid: int | None = None
+    #: The headroom the original had with the others at their least, the
+    #: engine as it stood: the median of free memory and `bytes` over the
+    #: window. A replay that leaves this much, before its schedule takes
+    #: anything, gives the machine the original's headroom throughout.
+    headroom_bytes: int | None = None
+    #: The samples' times on the original's clock, to find them there again.
+    t_mono_ns: np.ndarray | None = None
 
 
 def _engine_bytes(path: Path, t_ns: np.ndarray, used: np.ndarray,
@@ -174,7 +181,31 @@ def held(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
         raise ValueError(f"{path} has fewer than two samples from {start_s} to {end_s} s"
                          + ("" if engine_pid is None else " that a process sample brackets"))
     used = used[keep]
-    return OthersHeld((t[keep] - t[keep][0]) / 1e9, used - used.min(), engine_pid)
+    above = used - used.min()
+    headroom = int(np.median(samples["free_bytes"][keep] + above))
+    return OthersHeld((t[keep] - t[keep][0]) / 1e9, above, engine_pid, headroom, t[keep])
+
+
+#: The span a with-engine scenario labels its engine's prefill with
+#: (tools/run_scenario.py): the engine grows through it.
+ENGINE_PREFILL = "engine-prefill"
+
+
+def scenario_start_s(path: str | Path) -> float:
+    """When the scenario of the recording at `path` began its first span
+    after the engine's prefill had ended, in seconds from the recording's
+    first sample: from there the engine holds what it holds. 0 without
+    labels, or a prefill."""
+    labels_path = recorder.labels_path(path)
+    if not labels_path.exists():
+        return 0.0
+    _, labels = recorder.read_labels(labels_path)
+    _, samples = recorder.read(path)
+    t, event, action = labels["t_mono_ns"], labels["event"], labels["action"]
+    prefilled = t[(event == recorder.END) & (action == ENGINE_PREFILL)]
+    after = int(prefilled.max()) if len(prefilled) else int(samples["t_mono_ns"][0])
+    starts = t[(event == recorder.START) & (action != ENGINE_PREFILL) & (t >= after)]
+    return (int(starts.min() if len(starts) else after) - int(samples["t_mono_ns"][0])) / 1e9
 
 
 def engine_residual(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
@@ -213,12 +244,12 @@ def engine_residual(path: str | Path, *, start_s: float = 0.0, end_s: float | No
     return spread((np.abs(difference - np.median(difference)) / MIB).tolist())
 
 
-def to_schedule(h: OthersHeld) -> Schedule:
-    """The simulator's schedule for `h`: each sample's level, in whole
-    granules, from its time until the next's, and then 0, one period after
-    the last."""
+def to_schedule(h: OthersHeld, base_bytes: int = 0) -> Schedule:
+    """The simulator's schedule for `h`: each sample's level, on `base_bytes`
+    taken throughout, in whole granules, from its time until the next's, and
+    then 0, one period after the last."""
     end = round(float(h.t_s[-1] + np.median(np.diff(h.t_s))), 6)
-    return Schedule(patterns.sampled(h.t_s, h.bytes).points + [(end, 0)])
+    return Schedule(patterns.sampled(h.t_s, h.bytes + base_bytes).points + [(end, 0)])
 
 
 def from_recording(path: str | Path, **window) -> Schedule:
@@ -290,6 +321,30 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
     recorder.companion(out, ".replay.json").write_text(json.dumps(
         {"started_ns": started, "simulator_pid": proc.pid, "lead_s": lead_s}) + "\n")
     return started
+
+
+def simulator_context_bytes(tmp: str | Path) -> int:
+    """What the simulator has before it takes anything: its CUDA context,
+    by NVML's account of its process. Measured by starting it once on a
+    schedule of nothing, with its schedule written in `tmp`. A caller that
+    sets a base from headroom read before the simulator starts must leave
+    this out too: the context is taken as it starts."""
+    path = Path(tmp) / "nothing.schedule.json"
+    Schedule([(0.0, 0)]).save(path)
+    proc = subprocess.Popen([sys.executable, str(SIMULATOR), "--schedule", str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        if proc.stdout.readline().strip() != "ready":
+            raise RuntimeError(f"the simulator did not start: {proc.stderr.read()}")
+        return next((p.used_bytes or 0 for p in nvml.processes() if p.pid == proc.pid), 0)
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=EXIT_WAIT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        path.unlink(missing_ok=True)
 
 
 def files(out: str | Path) -> list[Path]:

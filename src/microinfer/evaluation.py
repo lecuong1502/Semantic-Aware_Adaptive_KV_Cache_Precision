@@ -29,6 +29,10 @@ grid_schedule makes it, on a base the simulator takes first so that
 headroom starts in GREEN, and tools/evaluate_monitor.py runs it beside the
 engine decoding with its monitor on. A **pulse** is a trapezoid the
 simulator plays, not a spike: a spike is what spikes.py finds in a trace.
+#65 applies them to RQ1's recordings replayed on a base that leaves the
+original's headroom (tools/evaluate_monitor.py replay), and summarise pools
+the latest evaluation of each, per workload, for RQ2
+(tools/summarise_monitor.py).
 
 This is measurement, not inference, so it computes in NumPy on the host
 (ADR-0002, amendment on its scope).
@@ -41,6 +45,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import patterns
+from .contention import spread
 from .monitor import POLL_S, RED, Level, PressureEvent, Thresholds
 from .schedule import Schedule
 
@@ -234,3 +239,46 @@ def score_cells(grid: Grid, starts_ns: list[int], end_ns: int, episodes: list[Ep
 def _sum(scores: list[Score]) -> Score:
     return Score(*(sum((getattr(s, f) for s in scores), [] if f.startswith("latencies")
                        else 0) for f in Score.__dataclass_fields__))
+
+
+# -- the summary ---------------------------------------------------------------------------
+
+#: What a summary sums over the entries it takes: every count of a Score.
+_COUNTS = tuple(f for f, kind in Score.__annotations__.items() if kind == "int")
+
+
+def summarise(entries) -> dict:
+    """RQ2's summary from the benchmark log's `entries`: per workload, the
+    latest "monitor-evaluation" of the grid, and of each recording replayed
+    whole, that no correction supersedes, their counts summed and their
+    latencies pooled, with the sha256 of the entries taken. A replay of part
+    of a recording is left out: it is not that recording's replay. A
+    correction supersedes the entries it corrects unless it says it does not
+    ("supersedes": false), as one that amends what an entry's config says."""
+    entries = list(entries)
+    superseded = {sha for e in entries if e.get("kind") == "correction"
+                  and e["results"].get("supersedes", True)
+                  for sha in e["results"].get("corrects", [])}
+    latest: dict[tuple[str, str | None], dict] = {}
+    for e in entries:
+        if e.get("kind") != "monitor-evaluation" or e["sha256"] in superseded:
+            continue
+        config = e["config"]
+        if config.get("to_s") is not None:
+            continue
+        latest[(config["workload"], config.get("recording"))] = e
+    summary: dict[str, dict] = {}
+    for (workload, _), e in latest.items():
+        into = summary.setdefault(workload, {"entries": [], "latencies_ms": [],
+                                             "latencies_polls": [],
+                                             **{k: 0 for k in _COUNTS}})
+        overall = e["results"]["overall"]
+        into["entries"].append(e["sha256"])
+        into["latencies_ms"] += overall["latencies_ms"]
+        into["latencies_polls"] += overall["latencies_polls"]
+        for k in _COUNTS:
+            into[k] += overall[k]
+    for into in summary.values():
+        into["latency_ms"] = spread(into.pop("latencies_ms"))
+        into["latency_polls"] = spread(into.pop("latencies_polls"))
+    return summary

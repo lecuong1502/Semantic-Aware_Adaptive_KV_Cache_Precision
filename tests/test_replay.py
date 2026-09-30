@@ -81,6 +81,9 @@ def test_a_recording_becomes_what_the_others_held_and_a_replay_is_compared_with_
     assert schedule.points[0] == (0.0, 0) and schedule.points[-1][1] == 0
     assert schedule.at(7.0) == 200 * MiB and schedule.at(5.9) == 0 and schedule.at(8.1) == 0
     assert schedule.duration_s == pytest.approx(13.02, abs=0.001)
+    on_base = replay.to_schedule(held, base_bytes=1024 * MiB)
+    assert on_base.at(0.0) == 1024 * MiB and on_base.at(7.0) == 1224 * MiB
+    assert on_base.points[-1] == (schedule.duration_s, 0)
 
     everything = replay.held(path)  # no window; the engine's pid from the hold's status
     assert everything.bytes.min() == 0 and everything.bytes.max() == 200 * MiB
@@ -106,6 +109,21 @@ def test_a_recording_becomes_what_the_others_held_and_a_replay_is_compared_with_
     # The processes stream agrees with what is left once the engine is off.
     assert replay.engine_residual(path)["max"] == 0
 
+    # The headroom the original had with the others at their least, the
+    # engine as it stood: 6 GiB less 1100 MiB, 500 and the driver's 400.
+    assert replay.held(path, start_s=5.0).headroom_bytes == TOTAL - 2000 * MiB
+    # Where a scenario begins: its first span after the engine's prefill.
+    labels = recorder._TraceWriter(recorder.labels_path(path), recorder.LABEL_FORMAT, {},
+                                   recorder.LABEL_COLUMNS)
+    # A span that begins before the prefill ends is not where it begins.
+    for at_s, event, action in ((0.0, recorder.START, replay.ENGINE_PREFILL),
+                                (0.5, recorder.START, "early"), (1.0, recorder.END, "early"),
+                                (1.5, recorder.END, replay.ENGINE_PREFILL),
+                                (1.5, recorder.START, "idle"), (3.0, recorder.END, "idle")):
+        labels.row(10**12 + int(at_s * 1e9), 0.0, event, action)
+    labels.close({"labels": 6, "rejected": 0})
+    assert replay.scenario_start_s(path) == pytest.approx(1.5)
+
 
 def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path):
     """The simulator, a process of its own, takes the schedule while the
@@ -129,3 +147,5 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     result = replay.compare(held, samples, started, processes=(states, procs),
                             simulator_pid=pid)
     assert result["simulator_error_mib"]["p90"] <= 2
+    # Before it takes anything, the simulator has its CUDA context.
+    assert replay.simulator_context_bytes(tmp_path) > 0

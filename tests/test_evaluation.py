@@ -1,4 +1,5 @@
-"""Evaluating the pressure monitor on synthetic contention (#64).
+"""Evaluating the pressure monitor on synthetic and replayed contention, and
+the summary across both (#64, #65).
 
 Ground truth is the recorder's trace with the monitor's thresholds applied,
 never the monitor's own events. Tested on traces and events written here,
@@ -125,3 +126,39 @@ def test_the_grid_schedule_takes_a_base_then_each_cell_in_turn_and_is_scored_per
                                            episodes, events, T)
     assert (first.episodes, first.latencies_ms, first.false_positives) == (1, [150.0], 1)
     assert (second.episodes, second.missed_detectable, second.red_events) == (1, 1, 0)
+
+
+def test_the_summary_pools_the_latest_uncorrected_evaluation_of_each_workload():
+    """Per workload, the latest entry of the grid and of each recording
+    replayed whole that no correction supersedes: their episodes, false
+    negatives and false positives summed, their latencies pooled. A
+    correction that amends, and says it does not supersede, leaves it in; a
+    replay of part of a recording is not that recording's."""
+    def entry(sha, workload, recording=None, latencies=(), missed=0, false=0, to_s=None):
+        return {"sha256": sha, "kind": "monitor-evaluation",
+                "config": {"workload": workload, "recording": recording, "to_s": to_s},
+                "results": {"overall": {"episodes": len(latencies) + missed,
+                                        "detectable": len(latencies) + missed,
+                                        "latencies_ms": list(latencies),
+                                        "latencies_polls": [x / 50 for x in latencies],
+                                        "missed_detectable": missed, "missed_below_k": 0,
+                                        "already_red": 0, "false_positives": false,
+                                        "red_events": len(latencies) + false}}}
+
+    entries = [
+        entry("a", "synthetic grid", latencies=[100], missed=1),
+        {"kind": "correction", "results": {"corrects": ["a"]}},
+        entry("b", "synthetic grid", latencies=[110, 130]),
+        entry("c", "replayed RQ1 recording", "r1.csv.gz", latencies=[400]),
+        entry("d", "replayed RQ1 recording", "r1.csv.gz", latencies=[150], false=1),
+        entry("e", "replayed RQ1 recording", "r2.csv.gz", latencies=[90, 170]),
+        {"kind": "correction", "results": {"corrects": ["b"], "supersedes": False}},
+        entry("g", "replayed RQ1 recording", "r2.csv.gz", latencies=[5], to_s=60.0),
+        {"kind": "decode-throughput", "sha256": "f"},
+    ]
+    s = evaluation.summarise(entries)
+    grid, replays = s["synthetic grid"], s["replayed RQ1 recording"]
+    assert grid["entries"] == ["b"] and grid["episodes"] == 2 and grid["missed_detectable"] == 0
+    assert replays["entries"] == ["d", "e"] and replays["episodes"] == 3
+    assert replays["false_positives"] == 1
+    assert replays["latency_ms"]["median"] == 150 and replays["latency_ms"]["max"] == 170
