@@ -91,8 +91,21 @@ context window)
 **Pressure level**:
 The VRAM Monitor's classification of currently available device memory, as
 `GREEN`, `YELLOW`, or `RED`. It describes the *machine's* state, never a
-page's.
+page's. It is set from headroom by thresholds in MiB, and a new level is
+reported only once K polls in a row have read that side of the current one.
+The thresholds and K are **provisional** (`monitor.PROVISIONAL`) until an ADR
+sets them from RQ1's data (#63).
 _Avoid_: pressure state, memory level
+
+**Headroom**:
+The device's free memory as the driver reports it (NVML): what any process,
+the engine or another, could still allocate. Pressure levels classify it.
+_Avoid_: free VRAM percentage (thresholds are absolute), available memory
+
+**Poll**:
+One reading of headroom by the pressure monitor, on its fixed schedule, every
+50 ms. Hysteresis and detection latency are counted in polls.
+_Avoid_: sample (the recorder's word), tick
 
 **Importance score**:
 A page's accumulated share of attention mass, as maintained by the Attention
