@@ -10,6 +10,7 @@
 ### Abstract (khung nháp)
 - Vấn đề: Inference LLM cục bộ, single-user trên laptop/consumer GPU gặp phải tình trạng **VRAM bị chiếm dụng không thể đoán trước** bởi các ứng dụng chạy song song (trình duyệt, app chat, phần mềm render nền) — khác hẳn datacenter serving nơi việc cấp phát GPU được kiểm soát và có thể dự đoán theo workload.
 - Khoảng trống: Các công trình adaptive KV cache trước đây (FineServe, MorphServe, MIRAGE, eLLM, KV-RM) đều giả định môi trường multi-tenant, có scheduler nhìn thấy toàn bộ workload, và tối ưu đồng đều trên toàn bộ cache.
+  - *Note (2026-09-30): KV-RM (arXiv:2605.09735) was withdrawn by its authors for substantive errors, and is not cited. MIRAGE (arXiv:2507.11507) is now titled Oneiros.*
 - Đóng góp: (1) Khảo sát thực nghiệm pattern VRAM contention trên laptop khi dùng đa nhiệm thông thường; (2) một cơ chế phát hiện áp lực VRAM tại runtime, nhẹ, không cần scheduler hợp tác; (3) chính sách phân bổ precision KV cache thích ứng theo ngữ nghĩa (FP16 → INT8 → INT4), dựa trên importance score suy ra từ attention thay vì giảm đồng đều; (4) đánh giá NLP theo từng loại tác vụ, cho thấy chỗ nào bị ảnh hưởng nặng nhất (QA văn bản dài, hội thoại nhiều lượt, tóm tắt) và mức độ semantic-aware allocation giảm thiểu tác động này so với uniform quantization và so với hiện trạng OOM/crash.
 
 ### 1. Giới thiệu
