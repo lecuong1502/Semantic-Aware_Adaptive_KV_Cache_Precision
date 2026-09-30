@@ -6,13 +6,15 @@ tested poll by poll on scripts of readings; the thread that polls, with an
 injected reader, so that no GPU is needed.
 """
 
+import itertools
 import threading
 import time
 
+import numpy as np
 import pytest
 
-from conftest import each
-from microinfer import monitor
+from conftest import each, require_model
+from microinfer import Engine, monitor
 from microinfer.footprint import MIB
 from microinfer.monitor import GREEN, RED, YELLOW, Thresholds
 
@@ -94,3 +96,62 @@ def test_the_thread_reports_a_change_in_time_drains_without_blocking_and_fails_l
     with pytest.raises(RuntimeError, match="the pressure monitor stopped") as failed:
         failing.drain()
     assert isinstance(failed.value.__cause__, OSError)
+
+
+def test_each_transition_says_how_much_of_the_change_was_the_engines_and_the_others():
+    """Read only at a transition: the engine's own memory and the other
+    processes', and how much each changed since the transition before, with
+    the headroom's change; the first transition has nothing to change from."""
+    readings = iter([G] * 3 + [R] * 20)
+    held = iter([(1000 * MIB, 500 * MIB), (1200 * MIB, 1700 * MIB)])
+    with monitor.Monitor(reader=lambda: next(readings, R), attribution=lambda: next(held),
+                         thresholds=T, poll_s=0.001) as m:
+        while m.level != RED:
+            time.sleep(0.005)
+    first, red = m.drain()
+    assert (first.own_used_bytes, first.others_used_bytes) == (1000 * MIB, 500 * MIB)
+    assert first.own_change_bytes is first.others_change_bytes is first.headroom_change_bytes \
+        is None
+    assert (red.own_change_bytes, red.others_change_bytes) == (200 * MIB, 1200 * MIB)
+    assert red.headroom_change_bytes == R - G
+
+
+def test_the_engine_records_events_between_steps_and_decodes_as_it_would_without():
+    """Started by the engine, the monitor's events are drained between steps
+    and recorded with the position the cache had reached and when they were
+    drained; the tokens are the same as without it, for the engine does not
+    react. A monitor that fails is recorded, and generation goes on."""
+    engine = Engine(require_model("qwen2.5-0.5b-instruct"))
+    engine.load_weights()
+    prompt = engine.encode("The pressure monitor watches device memory while the engine")
+    steps = 24
+    plain = engine.generate(prompt, steps, stop_at_eos=False)
+
+    polls = itertools.count()
+    watching = monitor.Monitor(reader=lambda: G if next(polls) < 5 else R,
+                               attribution=lambda: (0, 0), thresholds=T, poll_s=0.001)
+    assert engine.start_monitor(watching) is watching
+    with pytest.raises(RuntimeError, match="already"):
+        engine.start_monitor()
+    try:
+        while watching.level != RED:
+            time.sleep(0.005)
+        watched = engine.generate(prompt, steps, stop_at_eos=False)
+    finally:
+        engine.stop_monitor()
+    assert np.array_equal(plain, watched)
+    records = engine.pressure_events
+    assert [r.event.level for r in records] == [GREEN, RED]
+    for r in records:
+        assert 1 <= r.position <= len(prompt) + steps and r.drained_ns >= r.event.t_mono_ns
+
+    def broken():
+        raise OSError("NVML went away")
+
+    engine.start_monitor(monitor.Monitor(reader=broken, thresholds=T, poll_s=0.001))
+    try:
+        time.sleep(0.02)
+        assert np.array_equal(engine.generate(prompt, steps, stop_at_eos=False), plain)
+    finally:
+        engine.stop_monitor()
+    assert isinstance(engine.monitor_error.__cause__, OSError)

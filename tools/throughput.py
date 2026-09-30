@@ -4,6 +4,7 @@
     .venv/bin/python tools/throughput.py --model qwen2.5-0.5b-instruct --lengths 512 2048 8192
     .venv/bin/python tools/throughput.py --model qwen2.5-1.5b-instruct --lengths 32768 --repeat 1
     .venv/bin/python tools/throughput.py --kv-tier INT4 ...
+    .venv/bin/python tools/throughput.py --monitor --lengths 512 --repeat 10
 
 They are two different regimes, so they are two entries per length:
 - **Prefill** runs many positions through each projection at once and is
@@ -19,6 +20,13 @@ Each prefill entry also records the peak footprint, which is how a 32K-token
 prompt on the 1.5B model is shown to fit on a 6 GiB card. Prompts are
 random token ids: throughput depends on length, not content. Refuses a dirty
 tree, as the checkpoint recorder does.
+
+--monitor measures what the VRAM pressure monitor costs decoding (#62)
+instead: decode throughput with the engine's monitor running and without,
+--repeat times each, interleaved and in alternating order so that drift
+falls on both alike. It logs one "monitor-overhead" entry per length, with
+both distributions and whether the difference of their means is within
+noise: no more than twice its standard error, sqrt(s_on^2/n + s_off^2/n).
 """
 
 from __future__ import annotations
@@ -34,7 +42,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import Engine, benchlog  # noqa: E402
+from microinfer import Engine, benchlog, monitor  # noqa: E402
 
 SEED = 15
 DECODE_STEPS = 32
@@ -55,6 +63,46 @@ def timed(fn, repeat: int, warmup: int) -> float:
     return statistics.median(times)
 
 
+def decode_rate(engine: Engine, prompt: np.ndarray) -> float:
+    """Decode tokens per second after `prompt`: DECODE_STEPS more tokens
+    timed, less the prefill and first token timed alone."""
+    start = time.perf_counter()
+    engine.generate(prompt, 1, stop_at_eos=False)
+    first = time.perf_counter() - start
+    start = time.perf_counter()
+    engine.generate(prompt, DECODE_STEPS + 1, stop_at_eos=False)
+    return DECODE_STEPS / max(time.perf_counter() - start - first, 1e-9)
+
+
+def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: int) -> dict:
+    """Decode throughput with the pressure monitor on and off, `repeat`
+    times each, interleaved, the order alternating."""
+    for _ in range(warmup):
+        decode_rate(engine, prompt)
+    rates: dict[bool, list[float]] = {False: [], True: []}
+    for r in range(repeat):
+        for on in ((False, True) if r % 2 == 0 else (True, False)):
+            if on:
+                engine.start_monitor()
+            try:
+                rates[on].append(decode_rate(engine, prompt))
+            finally:
+                engine.stop_monitor()
+
+    def summary(values: list[float]) -> dict:
+        return {"runs": values, "mean": statistics.mean(values),
+                "stdev": statistics.stdev(values) if len(values) > 1 else 0.0}
+
+    off, on = summary(rates[False]), summary(rates[True])
+    noise = 2 * (off["stdev"] ** 2 / repeat + on["stdev"] ** 2 / repeat) ** 0.5
+    difference = on["mean"] - off["mean"]
+    return {"steps": DECODE_STEPS, "off": off, "on": on, "difference": difference,
+            "difference_percent": 100 * difference / off["mean"], "noise": noise,
+            "within_noise": abs(difference) <= noise,
+            "events_recorded": len(engine.pressure_events),
+            "monitor_error": None if engine.monitor_error is None else str(engine.monitor_error)}
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default="qwen2.5-0.5b-instruct")
@@ -66,8 +114,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--prefill-only", action="store_true",
                         help="log prefill alone; at 32K each decode timing costs two "
                              "more prefills")
+    parser.add_argument("--monitor", action="store_true",
+                        help="measure the pressure monitor's cost to decoding, instead")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
+    if args.monitor and args.repeat < 2:
+        parser.error("--monitor compares spreads, and needs --repeat 2 or more")
 
     if benchlog.environment(args.log)["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first")
@@ -75,13 +127,33 @@ def main(argv: list[str]) -> int:
     engine = Engine(REPO / "models" / args.model, kv_tier=args.kv_tier)
     engine.load_weights()
     rng = np.random.default_rng(SEED)
-    method = {"repeat": args.repeat, "warmup": args.warmup, "statistic": "median", "seed": SEED,
+    method = {"repeat": args.repeat, "warmup": args.warmup,
+              "statistic": "mean" if args.monitor else "median", "seed": SEED,
               "prompt": "random token ids", "prefill_chunk": engine.prefill_chunk,
               "kv_cache": engine.kv_cache, "kv_tier": engine.kv_tier}
     tiers = {engine.kv_tier: 1.0}
 
     for length in args.lengths:
         ids = rng.integers(1000, engine.config.vocab_size - 1000, length).astype(np.int32)
+
+        if args.monitor:
+            prompt = ids[: min(length, engine.config.max_position_embeddings - DECODE_STEPS)]
+            results = monitor_overhead(engine, prompt, args.repeat, args.warmup)
+            p = monitor.PROVISIONAL
+            config = {**method, "steps": DECODE_STEPS, "order": "interleaved, alternating",
+                      "poll_s": monitor.POLL_S,
+                      "thresholds": {"red_below_bytes": p.red_below_bytes,
+                                     "yellow_below_bytes": p.yellow_below_bytes,
+                                     "persist_polls": p.persist_polls,
+                                     "provisional": p.provisional}}
+            print(f"decode after {len(prompt):6}: {results['off']['mean']:8.1f} tok/s without "
+                  f"the monitor, {results['on']['mean']:8.1f} with "
+                  f"({results['difference_percent']:+.2f}%, noise +-{results['noise']:.1f}): "
+                  f"{'within' if results['within_noise'] else 'OUTSIDE'} noise")
+            benchlog.append("monitor-overhead", model=args.model,
+                            context_length=len(prompt) + DECODE_STEPS, precision_tiers=tiers,
+                            config=config, results=results, log=args.log)
+            continue
 
         # Prefill, and the one greedy choice after it: no logits for every
         # position, which at 32K tokens would be 20 GB of host memory.
