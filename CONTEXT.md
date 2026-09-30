@@ -181,7 +181,8 @@ ms and in polls. Only episodes of 100 ms or more are counted.
 **False negative / false positive**:
 A true RED episode of 100 ms or more with no RED event; a RED event with no
 true RED over the polls that settled it. False negatives shorter than K + 1
-polls are counted apart, as ones the monitor cannot catch by design.
+polls and a recorder sample are counted apart, as ones the monitor cannot be
+sure to catch by design.
 _Avoid_: miss, false alarm
 
 **Replay**:

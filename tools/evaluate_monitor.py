@@ -17,8 +17,11 @@ throughout (microinfer.replay.replay).
 The truth is the recorder's trace with the monitor's thresholds applied, and
 the monitor is scored against it (microinfer.evaluation): detection latency,
 false negatives and false positives, overall and per cell. False negatives
-shorter than K + 1 polls are counted apart: ADR-0013's K cannot catch them. The result is
-logged as a "monitor-evaluation" entry with the sha256 of every file.
+shorter than K + 1 polls and a recorder sample are counted apart: ADR-0013's
+K cannot be sure to catch them. The result is
+logged as a "monitor-evaluation" entry with the sha256 of every file, the
+monitor's events among them (.pressure.jsonl), so that it can be scored
+again without running again.
 
 Close every application first: the desktop moves headroom too, and what it
 does counts against the monitor as if the simulator had done it. Refuses a
@@ -147,7 +150,13 @@ def main(argv: list[str]) -> int:
                "monitor_error": None if engine.monitor_error is None
                else str(engine.monitor_error),
                "missed_polls": watching.missed}
-    files = replay.files(args.out)
+    # The monitor's events, as the engine recorded them, beside the trace:
+    # the truth can be scored again without running again.
+    pressure = recorder.companion(args.out, ".pressure.jsonl")
+    pressure.write_text("".join(
+        json.dumps({**asdict(r.event), "positions_held": r.positions_held,
+                    "drained_ns": r.drained_ns}) + "\n" for r in engine.pressure_events))
+    files = replay.files(args.out) + [pressure]
     benchlog.append(
         "monitor-evaluation", model=args.model, context_length=context,
         precision_tiers={"FP16": 1.0},

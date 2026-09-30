@@ -82,6 +82,9 @@ def test_latency_false_negatives_and_false_positives_are_counted_against_the_tru
         ([red(1150)], [150], 0, 0, 2, 0),
         ([red(1150), red(3160)] + recovered, [160], 0, 0, 0, 0, (2000 * MS, 4000 * MS)),
     ], scores)
+    # Measured at exactly K + 1 polls, an episode may have been a sample shorter.
+    edge = evaluation.score([episode(0, 200), episode(1000, 1220)], [], T)
+    assert (edge.missed_below_k, edge.missed_detectable) == (1, 1)
 
 
 def test_the_grid_schedule_takes_a_base_then_each_cell_in_turn_and_is_scored_per_cell():

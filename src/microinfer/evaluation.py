@@ -15,9 +15,11 @@ the monitor has no part in (CONTEXT.md names each):
   begins while the monitor is still RED from the one before needs no event:
   it is counted apart, as already RED, with no latency.
 - **A false negative** is such an episode with no RED event. Those shorter
-  than K + 1 polls are counted apart: the monitor reports a level only once
-  it has held for K polls (ADR-0013), so an episode of 100 ms that ends
-  before then is missed by design, not by fault.
+  than K + 1 polls, and one of the recorder's periods, are counted apart:
+  the monitor reports a level only once it has held for K polls (ADR-0013),
+  so an episode of 100 ms that ends before then is missed by design, not by
+  fault; and an episode's length is known only to within a recorder sample,
+  so one measured at exactly K + 1 polls may have been shorter.
 - **A false positive** is a RED event with no true RED over the K polls that
   settled it, one poll either side. An episode shorter than 100 ms is
   neither missed nor, if caught, false: it was RED.
@@ -44,6 +46,9 @@ from .schedule import Schedule
 
 #: The shortest true RED episode a monitor is expected to catch (#45).
 MIN_EPISODE_S = 0.1
+#: The recorder's period at its default 50 Hz: an episode's length is known
+#: to within it.
+RECORDER_PERIOD_S = 0.02
 _NS = 1_000_000_000
 
 
@@ -75,11 +80,11 @@ def true_red(t_mono_ns: np.ndarray, free_bytes: np.ndarray,
 @dataclass(frozen=True)
 class Score:
     episodes: int  # true RED episodes of MIN_EPISODE_S or more
-    detectable: int  # of those, the ones lasting K + 1 polls or more
+    detectable: int  # of those, the ones lasting K + 1 polls and a sample or more
     latencies_ms: list[float]
     latencies_polls: list[float]
     missed_detectable: int  # false negatives the monitor could have caught
-    missed_below_k: int  # false negatives shorter than K + 1 polls
+    missed_below_k: int  # false negatives shorter than that
     already_red: int  # episodes that began with the monitor still RED
     false_positives: int
     red_events: int
@@ -96,7 +101,8 @@ def _level_at(events: list[PressureEvent], t_ns: int) -> Level | None:
 
 
 def score(episodes: list[Episode], events: list[PressureEvent], thresholds: Thresholds,
-          poll_s: float = POLL_S, within: tuple[int, int] | None = None) -> Score:
+          poll_s: float = POLL_S, within: tuple[int, int] | None = None,
+          sample_s: float = RECORDER_PERIOD_S) -> Score:
     """The monitor's `events` against the true `episodes` (see the module):
     those that begin, and the RED events, `within` [from, to) ns if given.
     The monitor's level is read from all its events."""
@@ -107,7 +113,7 @@ def score(episodes: list[Episode], events: list[PressureEvent], thresholds: Thre
     events = sorted(events, key=lambda e: e.t_mono_ns)
     reds = [e.t_mono_ns for e in events if e.level == RED and inside(e.t_mono_ns)]
     counted = [e for e in episodes if inside(e.start_ns) and e.duration_s >= MIN_EPISODE_S]
-    detectable_s = (thresholds.persist_polls + 1) * poll_s
+    detectable_s = (thresholds.persist_polls + 1) * poll_s + sample_s
     used: set[int] = set()
     latencies, missed_detectable, missed_below_k, already = [], 0, 0, 0
     for episode in counted:
