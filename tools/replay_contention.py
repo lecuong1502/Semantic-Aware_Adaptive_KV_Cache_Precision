@@ -20,7 +20,12 @@ compared with the original, sample by sample and spike by spike, against
 the bounds microinfer.replay states, and the comparison is logged to the
 benchmark log with the sha256 of the recording replayed and of every file
 the replay wrote. Spikes are sought only from a baseline window (5 s) into
-the replay, in both, so start --from 5 s before the first spike to compare.
+the replay, in both, so start --from 5 s before the first spike to compare;
+it warns of any spike it cannot. Whatever the desktop itself does during the
+replay counts as error, so replay a few minutes around the actions of
+interest rather than a whole recording. The entry also carries how far the
+engine's subtraction strays from the processes stream's own sum
+(microinfer.replay.engine_residual).
 
 Run it on an idle desktop: close every application first, as for RQ1's
 scenarios (docs/rq1-protocol.md). What else was on the GPU is in the entry.
@@ -39,8 +44,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import benchlog, recorder, replay  # noqa: E402
-from microinfer.contention import sha256, spread  # noqa: E402
+from microinfer import benchlog, recorder, replay, simulator, spikes  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
@@ -80,6 +84,14 @@ def main(argv: list[str]) -> int:
                   "names the code that produced it")
     original = replay.held(args.recording, **window)
     schedule = replay.to_schedule(original)
+    whole = replay.held(args.recording, engine_pid=args.engine_pid)
+    hidden = [round(x.start_ns / 1e9 - args.start_s, 2)
+              for x in spikes.find_spikes((whole.t_s * 1e9).astype("int64"), -whole.bytes)
+              if 0 <= x.start_ns / 1e9 - args.start_s < spikes.DEFAULT_WINDOW_S]
+    if hidden:
+        print(f"warning: spikes begin {hidden} s into the window, before the "
+              f"{spikes.DEFAULT_WINDOW_S:g} s baseline window both comparisons need; start "
+              f"--from earlier to compare them", file=sys.stderr, flush=True)
 
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -90,21 +102,20 @@ def main(argv: list[str]) -> int:
     _, samples = recorder.read(args.out)
     results = replay.compare(original, samples, started)
     events_path = recorder.companion(args.out, ".events.jsonl")
-    events = [json.loads(line) for line in events_path.read_text().splitlines()]
-    results["simulator"] = {
-        "changes": len(events), "late_s": spread([e["late_s"] for e in events]),
-        "nvml_ms": spread([e["nvml_ms"] for e in events]),
-        "unseen": sum(not e["seen"] for e in events),
-        "shortfall_bytes_max": max(e["shortfall_bytes"] for e in events)}
+    results["simulator"] = simulator.summarise(
+        [json.loads(line) for line in events_path.read_text().splitlines()])
+    results["engine_residual_mib"] = replay.engine_residual(args.recording, **window)
+    results["hidden_spikes_s"] = hidden
     files = [args.out, recorder.processes_path(args.out),
              recorder.companion(args.out, ".schedule.json"), events_path]
     benchlog.append("contention-replay", model=None, context_length=None, precision_tiers=None,
                     config={"issue": args.issue, "recording": args.recording.name,
-                            "recording_sha256": sha256(args.recording),
+                            "recording_sha256": benchlog.file_sha256(args.recording),
                             "from_s": args.start_s, "to_s": args.end_s,
                             "engine_pid": original.engine_pid, "lead_s": args.lead,
                             "idle_s": replay.IDLE_S,
-                            "files": {f.name: sha256(f) for f in files if f.exists()}},
+                            "files": {f.name: benchlog.file_sha256(f)
+                                      for f in files if f.exists()}},
                     results=results, log=args.log)
 
     error, found = results["error_mib"], results["spikes"]

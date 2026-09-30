@@ -12,9 +12,9 @@ pid comes from the hold's status beside the recording. The process samples
 that say what it held come at 5 Hz, and taken off as they stand they would
 leave its every change, its weights' 3 GB among them, in the others' memory
 for up to 200 ms. So between the two process samples that saw a change, the
-device's own steps in its direction are the engine's, until the change is
-spent; another process's step in that window, if the same way, is taken for
-the engine's, an error no larger than the change and no longer than 200 ms.
+device's own changes in its direction are the engine's, until the engine's
+is spent; another process's change in that window, if the same way, is
+taken for the engine's, an error no larger than the change and no longer than 200 ms.
 Before the first process sample and after the last, what the engine held is
 not known, and those device samples are left out: the engine's exit, when a
 recording ends, falls there. What is left is every
@@ -39,8 +39,9 @@ held, and states whether it is within these bounds:
 - **spike by spike**, at spikes.py's definition: the same spikes, each
   beginning within START_BOUND_MS, two samples, and its amplitude within
   AMPLITUDE_BOUND_MIB. A spike within that bound of the threshold may be
-  found in one and not the other by an error the bound allows, so only a
-  spike clear of it must be found in both. A spike missed, or found alone,
+  found in one and not the other by an error the bound allows, or paired
+  with the wrong neighbour, so only a spike clear of it must be found in
+  both, and only a pair whose original is clear is held to the bounds. A spike missed, or found alone,
   can still change the baseline the next is measured against: a replay's
   spikes are a stricter test than its samples.
 
@@ -77,11 +78,16 @@ MATCH_S = 0.5
 LEAD_S = 3.0
 IDLE_S = 1.0
 TAIL_S = 2.0
+#: How long past its schedule's end a replay waits for the simulator's last
+#: change, how long for it to exit once stopped, and how often it looks.
+REPLAY_SLACK_S = 30.0
+EXIT_WAIT_S = 30.0
+POLL_S = 0.05
 SIMULATOR = Path(__file__).resolve().parents[2] / "tools" / "simulate_contention.py"
 
 
 @dataclass(frozen=True)
-class Held:
+class OthersHeld:
     """What the other processes held above their least, per device sample,
     at seconds from the window's start, and the engine taken off, if any."""
 
@@ -95,8 +101,8 @@ def _engine_bytes(path: Path, t_ns: np.ndarray, used: np.ndarray,
     """The engine's memory at each device sample, 0 where the process
     samples do not list it, and where it is known: between the first process
     sample and the last. Between two process samples that disagree, the
-    engine's change is the device's own steps in its direction, taken in
-    turn until the change is spent: most of what the device did then was
+    engine's change is the device's own changes in its direction, taken in
+    turn until the engine's is spent: most of what the device did then was
     the engine's."""
     procs_path = recorder.processes_path(path)
     if not procs_path.exists():
@@ -118,33 +124,44 @@ def _engine_bytes(path: Path, t_ns: np.ndarray, used: np.ndarray,
         # The device samples after the process query that saw the old value
         # began, up to the end of the one that saw the new.
         lo, hi = np.searchsorted(t_ns, [times[k - 1], seen[k]], side="right")
-        change, level = int(per_state[k] - per_state[k - 1]), int(per_state[k - 1])
+        left, level = int(per_state[k] - per_state[k - 1]), int(per_state[k - 1])
         for i in range(lo, hi):
-            step = int(used[i] - used[i - 1]) if i else 0
-            if (step > 0) == (change > 0):
-                took = min(abs(step), abs(change)) * (1 if change > 0 else -1)
-                level, change = level + took, change - took
+            moved = int(used[i] - used[i - 1]) if i else 0
+            if moved and (moved > 0) == (left > 0):
+                took = min(abs(moved), abs(left)) * (1 if left > 0 else -1)
+                level, left = level + took, left - took
             out[i] = level
         if hi > lo:
             out[hi - 1] = per_state[k]  # whatever the device did not show, by the new sample
     return out, (t_ns >= seen[0]) & (t_ns <= seen[-1])
 
 
+def _engine_pid(path: Path, engine_pid: int | None) -> int | None:
+    """The engine's pid: the one given, or the hold's status beside the
+    recording's; None if neither."""
+    if engine_pid is None and (status := recorder.companion(path, ".hold.json")).exists():
+        engine_pid = int(json.loads(status.read_text())["pid"])
+    return engine_pid
+
+
+def _window(t_ns: np.ndarray, start_s: float, end_s: float | None) -> np.ndarray:
+    if end_s is not None and end_s <= start_s:
+        raise ValueError(f"a window ends after it starts; got {start_s} to {end_s} s")
+    s = (t_ns - t_ns[0]) / 1e9 if len(t_ns) else np.zeros(0)
+    return (s >= start_s) & (s <= (np.inf if end_s is None else end_s))
+
+
 def held(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
-         engine_pid: int | None = None) -> Held:
+         engine_pid: int | None = None) -> OthersHeld:
     """What the processes other than the engine held over the recording at
     `path`, from `start_s` to `end_s` seconds after its first sample. The
     engine is the pid given, or the one in the hold's status beside the
     recording; without either, nothing is taken off."""
     path = Path(path)
     _, samples = recorder.read(path)
-    if end_s is not None and end_s <= start_s:
-        raise ValueError(f"a window ends after it starts; got {start_s} to {end_s} s")
-    if engine_pid is None and (status := recorder.companion(path, ".hold.json")).exists():
-        engine_pid = int(json.loads(status.read_text())["pid"])
+    engine_pid = _engine_pid(path, engine_pid)
     t, used = samples["t_mono_ns"], samples["used_bytes"]
-    s = (t - t[0]) / 1e9 if len(t) else np.zeros(0)
-    keep = (s >= start_s) & (s <= (np.inf if end_s is None else end_s))
+    keep = _window(t, start_s, end_s)
     if engine_pid is not None:
         engine, known = _engine_bytes(path, t, used, engine_pid)
         used, keep = used - engine, keep & known
@@ -152,10 +169,46 @@ def held(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
         raise ValueError(f"{path} has fewer than two samples from {start_s} to {end_s} s"
                          + ("" if engine_pid is None else " that a process sample brackets"))
     used = used[keep]
-    return Held((t[keep] - t[keep][0]) / 1e9, used - used.min(), engine_pid)
+    return OthersHeld((t[keep] - t[keep][0]) / 1e9, used - used.min(), engine_pid)
 
 
-def to_schedule(h: Held) -> Schedule:
+def engine_residual(path: str | Path, *, start_s: float = 0.0, end_s: float | None = None,
+                    engine_pid: int | None = None) -> dict | None:
+    """How far what held() leaves once the engine is taken off strays from
+    the sum of the other processes the 5 Hz stream lists, at each of its
+    samples in the window: the difference less its median, the driver's own
+    memory, in MiB as median, P90 and max. A check on the engine's
+    subtraction, on the recording itself; None where nothing is taken off.
+    Samples with a process the driver did not report are left out."""
+    path = Path(path)
+    engine_pid = _engine_pid(path, engine_pid)
+    if engine_pid is None:
+        return None
+    _, samples = recorder.read(path)
+    t, used = samples["t_mono_ns"], samples["used_bytes"]
+    engine, known = _engine_bytes(path, t, used, engine_pid)
+    _, states, procs = recorder.read_processes(recorder.processes_path(path))
+    times = states["t_mono_ns"]
+    others = procs[procs["pid"] != engine_pid]
+    at = np.searchsorted(times, others["t_mono_ns"])
+    listed = np.zeros(len(times), dtype=np.int64)
+    np.add.at(listed, at, np.maximum(others["used_bytes"], 0))
+    unreported = np.zeros(len(times), dtype=bool)
+    unreported[at[others["used_bytes"] < 0]] = True
+    # The device sample nearest the middle of each process query.
+    middle = times + states["query_ns"] // 2
+    after = np.clip(np.searchsorted(t, middle), 1, len(t) - 1)
+    nearest = np.where(middle - t[after - 1] <= t[after] - middle, after - 1, after)
+    rel = (times - t[0]) / 1e9
+    take = (~unreported & known[nearest] & (rel >= start_s)
+            & (rel <= (np.inf if end_s is None else end_s)))
+    if not take.any():
+        return None
+    difference = (used - engine)[nearest[take]] - listed[take]
+    return spread((np.abs(difference - np.median(difference)) / MIB).tolist())
+
+
+def to_schedule(h: OthersHeld) -> Schedule:
     """The simulator's schedule for `h`: each sample's level, in whole
     granules, from its time until the next's, and then 0, one period after
     the last."""
@@ -204,19 +257,19 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
     try:
         if proc.stdout.readline().strip() != "ready":
             raise RuntimeError(f"the simulator did not start: {proc.stderr.read()}")
-        deadline = time.monotonic() + shifted.duration_s + 30.0
+        deadline = time.monotonic() + shifted.duration_s + REPLAY_SLACK_S
         while not _applied(events_path, len(shifted.points)):
             if failure or proc.poll() is not None or time.monotonic() > deadline or (
                     stop is not None and stop.is_set()):
                 raise RuntimeError("the replay stopped before its schedule ended" +
                                    (f": {failure[0]}" if failure else ""))
-            time.sleep(0.05)
+            time.sleep(POLL_S)
         (stop or threading.Event()).wait(tail_s)
     finally:
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
         try:
-            proc.wait(timeout=30)
+            proc.wait(timeout=EXIT_WAIT_S)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
@@ -236,7 +289,7 @@ def _applied(events: Path, points: int) -> bool:
 # -- comparing -----------------------------------------------------------------------------
 
 
-def _step_at(h: Held, s: np.ndarray) -> np.ndarray:
+def level_at(h: OthersHeld, s: np.ndarray) -> np.ndarray:
     """`h`'s level at each of `s` seconds, from its last sample at or before;
     0 before its first."""
     index = np.searchsorted(h.t_s, s, side="right") - 1
@@ -256,12 +309,14 @@ def _pair(original: list[spikes.Spike], replayed: list[spikes.Spike]):
     return pairs
 
 
-def compare(original: Held, samples: np.ndarray, started_ns: int, *,
+def compare(original: OthersHeld, samples: np.ndarray, started_ns: int, *,
             idle_s: float = IDLE_S) -> dict:
     """The recording of a replay, its device `samples`, against the
     `original` it replayed from `started_ns`. The desktop's own level is the
     median used memory over the `idle_s` before the start; what the replay
-    took is the used memory above it. Spikes are sought in both over the
+    took is the used memory above it, so whatever the desktop itself does
+    over the replay counts as error: replay windows of a few minutes, around
+    the actions of interest, rather than whole recordings. Spikes are sought in both over the
     replayed time alone, so in both from one baseline window (spikes.py)
     after its start. JSON as it stands, for the log."""
     t = samples["t_mono_ns"]
@@ -273,7 +328,7 @@ def compare(original: Held, samples: np.ndarray, started_ns: int, *,
     s = (t - started_ns) / 1e9
     during = (s >= 0) & (s <= original.t_s[-1])
     taken = samples["used_bytes"][during] - base
-    error = np.abs(taken - _step_at(original, s[during])) / MIB
+    error = np.abs(taken - level_at(original, s[during])) / MIB
 
     found = spikes.find_spikes((original.t_s * 1e9).astype(np.int64), -original.bytes)
     again = spikes.find_spikes(t[during] - started_ns, samples["free_bytes"][during])
@@ -281,9 +336,10 @@ def compare(original: Held, samples: np.ndarray, started_ns: int, *,
     clear = spikes.DEFAULT_THRESHOLD_BYTES + AMPLITUDE_BOUND_MIB * MIB
     paired = {id(x) for pair in pairs for x in pair}
     alone = [x for x in found + again if id(x) not in paired and x.amplitude_bytes >= clear]
-    starts = [abs(r.start_ns - o.start_ns) / 1e6 for o, r in pairs]
-    amplitudes = [abs(r.amplitude_bytes - o.amplitude_bytes) / MIB for o, r in pairs]
-    rises = [abs(r.rise_s - o.rise_s) * 1e3 for o, r in pairs
+    held_to = [(o, r) for o, r in pairs if o.amplitude_bytes >= clear]
+    starts = [abs(r.start_ns - o.start_ns) / 1e6 for o, r in held_to]
+    amplitudes = [abs(r.amplitude_bytes - o.amplitude_bytes) / MIB for o, r in held_to]
+    rises = [abs(r.rise_s - o.rise_s) * 1e3 for o, r in held_to
              if r.rise_s is not None and o.rise_s is not None]
     error_mib = spread(error.tolist())
     return {
@@ -291,6 +347,7 @@ def compare(original: Held, samples: np.ndarray, started_ns: int, *,
         "error_mib": error_mib,
         "spikes": {"original": len(found), "replayed": len(again), "matched": len(pairs),
                    "unmatched_clear_of_threshold": len(alone),
+                   "matched_clear_of_threshold": len(held_to),
                    "start_offset_ms": spread(starts),
                    "amplitude_error_mib": spread(amplitudes),
                    "rise_error_ms": spread(rises)},

@@ -14,7 +14,6 @@ matches.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import sys
 from pathlib import Path
 
@@ -34,14 +33,6 @@ def logged_hashes(log: Path) -> dict[str, str]:
     return hashes
 
 
-def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("files", type=Path, nargs="+")
@@ -56,7 +47,7 @@ def main(argv: list[str]) -> int:
         if want is None:
             print(f"UNLOGGED  {path}")
             bad += 1
-        elif sha256(path) != want:
+        elif benchlog.file_sha256(path) != want:
             print(f"MISMATCH  {path}")
             bad += 1
         else:

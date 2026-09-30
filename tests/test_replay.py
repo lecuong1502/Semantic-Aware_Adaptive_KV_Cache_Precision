@@ -57,10 +57,7 @@ def replay_samples(held, started_ns, idle_bytes=700 * MiB, lead_s=2.0, phase_ns=
     desktop's `idle_bytes`, and from `started_ns` what the schedule takes."""
     t = started_ns - int(lead_s * 1e9) + phase_ns + np.arange(
         int((lead_s + held.t_s[-1] + 1) * 50)) * PERIOD_NS
-    s = (t - started_ns) / 1e9
-    index = np.searchsorted(held.t_s, s, side="right") - 1
-    taken = np.where(index >= 0, held.bytes[np.clip(index, 0, None)], 0)
-    used = idle_bytes + taken
+    used = idle_bytes + replay.level_at(held, (t - started_ns) / 1e9)
     samples = np.zeros(len(t), dtype=recorder.DEVICE_DTYPE)
     samples["t_mono_ns"], samples["used_bytes"], samples["free_bytes"] = t, used, TOTAL - used
     return samples
@@ -96,14 +93,16 @@ def test_a_recording_becomes_what_the_others_held_and_a_replay_is_compared_with_
     assert good["spikes"]["original"] == good["spikes"]["matched"] == 1
     assert good["error_mib"]["median"] == 0
 
-    flat = replay.Held(held.t_s, np.zeros_like(held.bytes))
+    flat = replay.OthersHeld(held.t_s, np.zeros_like(held.bytes))
     missed = replay.compare(held, replay_samples(flat, started), started)
     assert not missed["within"]["spikes"] and missed["spikes"]["matched"] == 0
 
     with pytest.raises(ValueError, match="before"):  # no idle lead to measure the desktop by
         replay.compare(held, replay_samples(held, started, lead_s=0.0), started)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="ends after it starts"):
         replay.held(path, start_s=12.0, end_s=11.0)
+    # The processes stream agrees with what is left once the engine is off.
+    assert replay.engine_residual(path)["max"] == 0
 
 
 def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path):
@@ -113,7 +112,7 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     measured on an idle desktop, and logged (tools/replay_contention.py)."""
     out = tmp_path / "replay.csv.gz"
     steps = np.arange(100)
-    held = replay.Held(steps * 0.02, np.where(steps >= 25, 256 * MiB, 0).astype(np.int64))
+    held = replay.OthersHeld(steps * 0.02, np.where(steps >= 25, 256 * MiB, 0).astype(np.int64))
     started = replay.replay(replay.to_schedule(held), out, lead_s=1.0, tail_s=0.5)
     # The lead's two points, the step, and the end.
     assert len(recorder.companion(out, ".events.jsonl").read_text().splitlines()) == 4
@@ -121,5 +120,5 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     s = (samples["t_mono_ns"] - started) / 1e9
     used = samples["used_bytes"]
     before, during = np.median(used[(s > 0) & (s < 0.45)]), np.median(used[(s > 0.7) & (s < 1.95)])
-    assert abs(during - before - 256 * MiB) <= 16 * MiB
+    assert abs(during - before - 256 * MiB) <= replay.AMPLITUDE_BOUND_MIB * MiB
     assert replay.compare(held, samples, started)["samples"] >= 90

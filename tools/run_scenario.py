@@ -42,7 +42,6 @@ recorder failed, since the trace is then not whole.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
@@ -59,7 +58,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import recorder, scenario  # noqa: E402
+from microinfer import benchlog, recorder, scenario  # noqa: E402
 from microinfer.browser import end_process  # noqa: E402
 from microinfer.engine import DECODING  # noqa: E402
 
@@ -86,12 +85,9 @@ def fetch_video() -> Path:
         print(f"fetching {VIDEO_URL} (632 MB)", flush=True)
         urllib.request.urlretrieve(VIDEO_URL, _part(VIDEO_ZIP))
         os.replace(_part(VIDEO_ZIP), VIDEO_ZIP)
-    h = hashlib.sha256()
-    with open(VIDEO_ZIP, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    if h.hexdigest() != VIDEO_SHA256:
-        raise SystemExit(f"{VIDEO_ZIP} has sha256 {h.hexdigest()}, not {VIDEO_SHA256}; "
+    digest = benchlog.file_sha256(VIDEO_ZIP)
+    if digest != VIDEO_SHA256:
+        raise SystemExit(f"{VIDEO_ZIP} has sha256 {digest}, not {VIDEO_SHA256}; "
                          "delete it to fetch again")
     with zipfile.ZipFile(VIDEO_ZIP) as z, z.open(VIDEO.name) as src, \
             open(_part(VIDEO), "wb") as dst:
