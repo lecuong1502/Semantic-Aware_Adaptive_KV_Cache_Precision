@@ -18,16 +18,15 @@ from microinfer import Engine, monitor
 from microinfer.footprint import MIB
 from microinfer.monitor import GREEN, RED, YELLOW, Thresholds
 
-T = Thresholds(red_below_bytes=512 * MIB, yellow_below_bytes=1024 * MIB, persist_polls=3,
-               provisional=False)
+T = Thresholds(red_below_bytes=512 * MIB, yellow_below_bytes=1024 * MIB, persist_polls=3)
 K = T.persist_polls
 G, Y, R = 2000 * MIB, 800 * MIB, 100 * MIB  # a reading at each level
 
 
 def test_headroom_is_classified_by_thresholds_in_mib():
     """Below the red threshold RED, below the yellow YELLOW, else GREEN;
-    thresholds that do not nest, or K below 1, are refused. The defaults
-    say they are provisional."""
+    thresholds that do not nest, or K below 1, are refused; a monitor uses
+    ADR-0013's by default."""
     each([(0, RED), (512 * MIB - 1, RED), (512 * MIB, YELLOW), (1024 * MIB - 1, YELLOW),
           (1024 * MIB, GREEN), (6 * 2**30, GREEN)],
          lambda headroom, level: T.classify(headroom) == level or pytest.fail(
@@ -39,8 +38,7 @@ def test_headroom_is_classified_by_thresholds_in_mib():
                           **kwargs})
 
     each([{"red_below_bytes": 2}, {"red_below_bytes": -1}, {"persist_polls": 0}], refused)
-    assert monitor.PROVISIONAL.provisional
-    assert monitor.Monitor(reader=lambda: 0).thresholds == monitor.PROVISIONAL
+    assert monitor.Monitor(reader=lambda: 0).thresholds == monitor.DEFAULT
 
 
 def test_a_level_change_is_reported_on_its_kth_poll_and_a_shorter_drop_is_not():

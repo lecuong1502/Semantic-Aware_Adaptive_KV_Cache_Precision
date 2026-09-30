@@ -27,12 +27,12 @@ pressure coming in time to act. This is what sees it, as #45 decided:
   thread stops and drain raises its error once the events before it are
   drained: a monitor that died quietly would read as a machine at GREEN.
 
-**The thresholds and K are provisional.** #63 sets them from RQ1's data by a
-rule recorded in an ADR; until then they are PROVISIONAL, which says so in
-its name and its `provisional` flag, and a monitor's `thresholds` carry the
-mark. Its values follow the rule #45 proposes, applied roughly to RQ1's
-spikes: RED where a spike at the P90 amplitude would leave nothing, YELLOW
-with room for two, K polls shorter than the shortest rise times.
+**The thresholds and K are ADR-0013's**, DEFAULT: set from RQ1's data by
+the rule pressure_rule applies, which a test holds them to. RED below 512
+MiB, where a spike at RQ1's P90 amplitude could run the machine out; YELLOW
+below 1024 MiB, room for what a fast spike takes while it is detected and a
+plan applied, here the whole spike; K = 3 polls, detection within RQ1's P10
+rise time.
 
 **Each transition carries its own/others split** (#62, MemorySplit): this
 process's device memory and every other process's, by the driver's account
@@ -81,12 +81,11 @@ _SEVERITY = {GREEN: 0, YELLOW: 1, RED: 2}
 @dataclass(frozen=True)
 class Thresholds:
     """Where headroom turns YELLOW and RED, in bytes, and K, the polls a new
-    level must hold for. `provisional` until #63's ADR sets them."""
+    level must hold for."""
 
     red_below_bytes: int
     yellow_below_bytes: int
     persist_polls: int
-    provisional: bool = True
 
     def __post_init__(self):
         if not 0 <= self.red_below_bytes < self.yellow_below_bytes:
@@ -103,11 +102,8 @@ class Thresholds:
         return GREEN
 
 
-#: PROVISIONAL until the thresholds ADR (#63). RQ1's P90 amplitude was 506
-#: MiB and its P10 rise time 242 ms (#55, #56): RED below one such spike,
-#: YELLOW below two, K = 3 polls (150 ms) shorter than the rise.
-PROVISIONAL = Thresholds(red_below_bytes=512 * MIB, yellow_below_bytes=1024 * MIB,
-                         persist_polls=3, provisional=True)
+#: ADR-0013's, the rule of pressure_rule applied to RQ1's log entries.
+DEFAULT = Thresholds(red_below_bytes=512 * MIB, yellow_below_bytes=1024 * MIB, persist_polls=3)
 
 
 @dataclass(frozen=True)
@@ -206,7 +202,7 @@ class Monitor:
     transition, reads `split`, this process's and the others' memory."""
 
     def __init__(self, reader: Callable[[], int] | None = None,
-                 thresholds: Thresholds = PROVISIONAL, poll_s: float = POLL_S,
+                 thresholds: Thresholds = DEFAULT, poll_s: float = POLL_S,
                  split: Callable[[], MemorySplit] | None = None):
         if poll_s <= 0:
             raise ValueError(f"a poll period is > 0; got {poll_s}")

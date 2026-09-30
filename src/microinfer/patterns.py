@@ -44,14 +44,13 @@ from pathlib import Path
 import numpy as np
 
 from . import benchlog, recorder
+from .contention import RQ1_ISSUES, logged_recordings
 from .schedule import Schedule
+from .spikes import MEASURED_SHARE
 
 MiB = 2**20
-#: The share of a linear ramp that 10% to 90% of it takes.
-_MEASURED_SHARE = 0.8
 #: Where RQ1's recordings are kept (docs/rq1-protocol.md).
 TRACES = Path(__file__).resolve().parents[2] / "data" / "rq1"
-RQ1_ISSUES = (55, 56)
 
 
 @functools.cache
@@ -264,9 +263,7 @@ def from_rq1(kind: str = "spikes", action: str | None = None,
         raise ValueError("RQ1 cannot say how long a lasting drop is kept: give kept_s")
     ending = "recovered" if kind == "spikes" else "lasting"
     chosen, seconds = [], 0.0
-    for entry in benchlog.read(log):
-        if entry["kind"] != "contention-trace" or entry["config"].get("issue") not in issues:
-            continue
+    for entry in logged_recordings(log, issues):
         results = entry["results"]
         spikes = [s for s in results["spikes"] if s["ending"] == ending
                   and (action is None or s.get("action") == action)]
@@ -288,7 +285,7 @@ def from_rq1(kind: str = "spikes", action: str | None = None,
         raise ValueError(f"no {kind} of {action or 'any action'} in the recordings of {issues}")
 
     def ramp(ms):
-        return None if ms is None else ms * 1e-3 / _MEASURED_SHARE
+        return None if ms is None else ms * 1e-3 / MEASURED_SHARE
 
     def measured(values):
         values = tuple(v for v in values if v is not None)

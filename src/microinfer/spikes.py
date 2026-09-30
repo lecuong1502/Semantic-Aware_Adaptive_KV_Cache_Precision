@@ -66,6 +66,9 @@ DEFAULT_MAX_GAP_S = 0.1
 
 #: The levels, as shares of the amplitude, that rise time and recovery run between.
 _LOW, _HIGH = 0.1, 0.9
+#: The share of a linear ramp that a rise or a recovery, so measured, spans:
+#: a ramp is its measure over this.
+MEASURED_SHARE = _HIGH - _LOW
 
 Ending = Literal["recovered", "lasting", "censored"]
 

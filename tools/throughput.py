@@ -134,13 +134,13 @@ def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
     """Measure and log what the pressure monitor costs decoding after `ids`."""
     prompt = decode_prompt(engine, ids)
     results = monitor_overhead(engine, prompt, args.repeat, args.warmup)
-    thresholds = monitor.PROVISIONAL
+    thresholds = monitor.DEFAULT
     config = {**method, "statistic": "mean", "steps": DECODE_STEPS,
               "order": "interleaved, alternating", "poll_s": monitor.POLL_S,
               "thresholds": {"red_below_bytes": thresholds.red_below_bytes,
                              "yellow_below_bytes": thresholds.yellow_below_bytes,
                              "persist_polls": thresholds.persist_polls,
-                             "provisional": thresholds.provisional}}
+                             "thresholds_adr": 13}}
     print(f"decode after {len(prompt):6}: {results['off']['mean']:8.1f} tok/s without "
           f"the monitor, {results['on']['mean']:8.1f} with "
           f"({results['difference_percent']:+.2f}%, noise +-{results['noise']:.1f}): "

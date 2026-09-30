@@ -141,8 +141,8 @@
   - `YELLOW`: `T_low` < free VRAM ≤ `T_high` (e.g., 10–20%)
   - `RED`: free VRAM ≤ `T_low` (e.g., < 10%) — imminent OOM risk
   - *Superseded by Milestone 1 (#45, #61):* thresholds are absolute, in MiB of
-    headroom, since spikes are absolute. The values in use are provisional
-    (`monitor.PROVISIONAL`) until the thresholds ADR (#63).
+    headroom, since spikes are absolute. The values in use are set from RQ1's
+    data by the rule of ADR-0013 (`monitor.DEFAULT`).
 - **Debounce/hysteresis**: require the level to persist for `K` consecutive polls (e.g., 3 polls at 50 ms = 150 ms) before firing a transition event, to avoid thrashing on transient spikes.
 - **Output**: an event queue the Orchestrator drains between decode steps; never blocks the decode loop.
 
