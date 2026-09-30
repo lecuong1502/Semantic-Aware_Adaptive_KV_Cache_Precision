@@ -21,10 +21,10 @@ from typing import Callable
 import numpy as np
 
 from . import _microinfer, model, weights
-from .monitor import Monitor, PressureEvent
 from .config import ConfigMismatch, ModelConfig
 from .footprint import Footprint
 from .models import VERIFIED
+from .monitor import Monitor, PressureEvent
 
 
 def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
@@ -156,11 +156,11 @@ PREFILLING, DECODING = "prefilling", "decoding"
 
 @dataclass(frozen=True)
 class PressureRecord:
-    """A pressure event as the engine drained it: the positions its cache
-    held then, and when, on the monitor's clock (time.monotonic_ns)."""
+    """A pressure event as the engine drained it: how many positions its
+    cache held then, and when, on the monitor's clock (time.monotonic_ns)."""
 
     event: PressureEvent
-    position: int
+    positions_held: int
     drained_ns: int
 
 
@@ -222,6 +222,7 @@ class Engine:
         self.pressure_events: list[PressureRecord] = []
         #: The error a monitor stopped on, if one did.
         self.monitor_error: BaseException | None = None
+        self._positions_held = 0  # by the last cache drained beside
 
     # -- loading ------------------------------------------------------------
 
@@ -461,17 +462,21 @@ class Engine:
 
     def start_monitor(self, monitor: Monitor | None = None) -> Monitor:
         """Start `monitor`, a VRAM pressure monitor on NVML by default, and
-        from now on drain its events between steps, after every prefill chunk
-        and every decoded token, into pressure_events. The engine records
-        them and does not react to them: that is Milestone 2's. Returns the
-        monitor."""
+        from now on drain its events between steps into pressure_events,
+        which it starts empty, as it does monitor_error. A step is a decoded
+        token, and a prefill chunk too: a 32K-token prefill takes minutes,
+        and its chunks are where it can be interrupted. The engine records
+        the events and does not react to them: that is Milestone 2's.
+        Returns the monitor."""
         if self._monitor is not None:
             raise RuntimeError("a pressure monitor is already running; stop it first")
+        self.pressure_events, self.monitor_error, self._positions_held = [], None, 0
         self._monitor = (monitor or Monitor()).start()
         return self._monitor
 
     def stop_monitor(self) -> None:
-        """Stop the monitor and record whatever it left undrained."""
+        """Stop the monitor and record whatever it left undrained, beside the
+        positions the last cache drained beside held."""
         if self._monitor is None:
             return
         self._monitor.stop()
@@ -490,8 +495,9 @@ class Engine:
             self.monitor_error, self._monitor = exc, None
             return
         now = time.monotonic_ns()
-        position = 0 if cache is None else cache.length
-        self.pressure_events += [PressureRecord(e, position, now) for e in events]
+        if cache is not None:
+            self._positions_held = cache.length
+        self.pressure_events += [PressureRecord(e, self._positions_held, now) for e in events]
 
     def cached_kv(self, token_ids) -> tuple[np.ndarray, np.ndarray]:
         """What the cache holds after prefilling one sequence: keys and values,

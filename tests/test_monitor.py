@@ -80,8 +80,7 @@ def test_the_thread_reports_a_change_in_time_drains_without_blocking_and_fails_l
                         thresholds=T)
     assert m.drain() == []  # not started: nothing
     with m:
-        while m.level != RED and time.monotonic_ns() < changed_at + 2e9:
-            time.sleep(0.01)
+        wait_for(lambda: m.level == RED)
     events = m.drain()
     assert [e.level for e in events] == [GREEN, RED] and m.drain() == [] and not m.running
     late_s = (events[1].t_mono_ns - changed_at) / 1e9
@@ -98,22 +97,47 @@ def test_the_thread_reports_a_change_in_time_drains_without_blocking_and_fails_l
     assert isinstance(failed.value.__cause__, OSError)
 
 
-def test_each_transition_says_how_much_of_the_change_was_the_engines_and_the_others():
-    """Read only at a transition: the engine's own memory and the other
+def wait_for(condition, timeout=10.0):
+    """Wait until `condition()` holds, and fail if it never does."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.002)
+
+
+def test_each_transition_carries_the_own_others_split_and_its_change():
+    """Read only at a transition: this process's memory and the other
     processes', and how much each changed since the transition before, with
-    the headroom's change; the first transition has nothing to change from."""
-    readings = iter([G] * 3 + [R] * 20)
-    held = iter([(1000 * MIB, 500 * MIB), (1200 * MIB, 1700 * MIB)])
-    with monitor.Monitor(reader=lambda: next(readings, R), attribution=lambda: next(held),
-                         thresholds=T, poll_s=0.001) as m:
-        while m.level != RED:
-            time.sleep(0.005)
-    first, red = m.drain()
-    assert (first.own_used_bytes, first.others_used_bytes) == (1000 * MIB, 500 * MIB)
-    assert first.own_change_bytes is first.others_change_bytes is first.headroom_change_bytes \
-        is None
-    assert (red.own_change_bytes, red.others_change_bytes) == (200 * MIB, 1200 * MIB)
-    assert red.headroom_change_bytes == R - G
+    the headroom's change; the first has nothing to change from. A split the
+    driver cannot give is None, and the monitor goes on."""
+    def splits(held, expected):
+        readings = iter([G] * 3 + [R] * 5 + [G] * 20)
+        held, calls = iter(held), []
+
+        def split():
+            calls.append(1)
+            value = next(held)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with monitor.Monitor(reader=lambda: next(readings, G), split=split, thresholds=T,
+                             poll_s=0.001) as m:
+            wait_for(lambda: len(calls) >= 3)
+        events = m.drain()
+        assert [(e.split, e.split_change, e.headroom_change_bytes) for e in events] == expected
+
+    Split = monitor.MemorySplit
+    each([
+        ([Split(1000 * MIB, 500 * MIB), Split(1200 * MIB, 1700 * MIB),
+          Split(1200 * MIB, 500 * MIB)],
+         [(Split(1000 * MIB, 500 * MIB), None, None),
+          (Split(1200 * MIB, 1700 * MIB), Split(200 * MIB, 1200 * MIB), R - G),
+          (Split(1200 * MIB, 500 * MIB), Split(0, -1200 * MIB), G - R)]),
+        ([Split(None, 500 * MIB), OSError("no processes"), Split(1000 * MIB, 700 * MIB)],
+         [(Split(None, 500 * MIB), None, None), (None, None, R - G),
+          (Split(1000 * MIB, 700 * MIB), None, G - R)]),
+    ], splits)
 
 
 def test_the_engine_records_events_between_steps_and_decodes_as_it_would_without():
@@ -129,13 +153,13 @@ def test_the_engine_records_events_between_steps_and_decodes_as_it_would_without
 
     polls = itertools.count()
     watching = monitor.Monitor(reader=lambda: G if next(polls) < 5 else R,
-                               attribution=lambda: (0, 0), thresholds=T, poll_s=0.001)
+                               split=lambda: monitor.MemorySplit(0, 0), thresholds=T,
+                               poll_s=0.001)
     assert engine.start_monitor(watching) is watching
     with pytest.raises(RuntimeError, match="already"):
         engine.start_monitor()
     try:
-        while watching.level != RED:
-            time.sleep(0.005)
+        wait_for(lambda: watching.level == RED)
         watched = engine.generate(prompt, steps, stop_at_eos=False)
     finally:
         engine.stop_monitor()
@@ -143,14 +167,16 @@ def test_the_engine_records_events_between_steps_and_decodes_as_it_would_without
     records = engine.pressure_events
     assert [r.event.level for r in records] == [GREEN, RED]
     for r in records:
-        assert 1 <= r.position <= len(prompt) + steps and r.drained_ns >= r.event.t_mono_ns
+        assert 1 <= r.positions_held <= len(prompt) + steps
+        assert r.drained_ns >= r.event.t_mono_ns
 
     def broken():
         raise OSError("NVML went away")
 
-    engine.start_monitor(monitor.Monitor(reader=broken, thresholds=T, poll_s=0.001))
+    failing = engine.start_monitor(monitor.Monitor(reader=broken, thresholds=T, poll_s=0.001))
+    assert engine.pressure_events == []  # a new monitor starts a new record
     try:
-        time.sleep(0.02)
+        wait_for(lambda: failing.error is not None)
         assert np.array_equal(engine.generate(prompt, steps, stop_at_eos=False), plain)
     finally:
         engine.stop_monitor()
