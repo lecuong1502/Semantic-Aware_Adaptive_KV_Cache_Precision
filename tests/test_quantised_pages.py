@@ -313,10 +313,11 @@ def test_each_page_records_its_own_tier_in_the_page_table():
         stored = tier if halves == Halves.Both else Tier.FP16
         for layer in range(LAYERS):
             for page in range(cache.pages_per_layer):
-                assert cache.page_tier(layer, page) == stored == allocator.locate(layer, page)[0]
+                assert cache.page_tier(layer, page) == stored, (layer, page)
+                assert allocator.locate(layer, page)[0] == stored, (layer, page)
             if tier != Tier.FP16:
                 assert all(cache.page_tier(layer, p) == Tier.FP16 for p in device.open_pages)
-        with pytest.raises(KeyError):
+        with pytest.raises(_microinfer.PageNotFound):
             cache.page_tier(0, cache.pages_per_layer + 5)
 
     each([(p, *case) for p in PAGE_TOKENS

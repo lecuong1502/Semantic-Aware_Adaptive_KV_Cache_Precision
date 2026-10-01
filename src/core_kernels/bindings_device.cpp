@@ -600,9 +600,12 @@ void bind_device(py::module_ &parent)
           py::arg("keys") = py::none(), py::arg("values") = py::none(),
           "At a quantised tier, keys and values are the rows the queries "
           "stored, from which each query reads its own page.")
-      .def("page_tier", &KVPages::page_tier, py::arg("layer"), py::arg("page"),
-           "The tier the page table records for the page; the open pages are "
-           "(layer, p) for p in open_pages.")
+      .def(
+          "page_tier", [](const KVPages &c, int layer, int page)
+          { return c.page_tier({layer, page}); }, py::arg("layer"),
+          py::arg("page"),
+          "The tier the page table records for the page; the open pages are "
+          "(layer, p) for p in open_pages.")
       .def_property_readonly("page_tokens", &KVPages::page_tokens)
       .def_property_readonly("pages_per_layer", &KVPages::pages_per_layer)
       .def_property_readonly("capacity_tokens", &KVPages::capacity_tokens)

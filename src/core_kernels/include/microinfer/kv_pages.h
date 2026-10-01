@@ -67,10 +67,13 @@ namespace microinfer
   // first before attention has read it.
   //
   // A page's tier is the page table's: the allocator records it for every
-  // (layer, page), and this class reads it there whenever it addresses or
-  // seals a page, never assuming the cache's. The cache's own tier is the
-  // tier its pages of positions are born at. Attention still reads a whole
-  // layer at that one tier until it reads each page at its own (#91).
+  // (layer, page). This class reads it there to address a page, at its own
+  // tier's size, and to seal a page of positions, at its own tier. The open
+  // pages are always FP16. The cache's own tier is the tier its pages of
+  // positions are born at, and two things still go by it: attention, which
+  // reads a whole layer at that one tier until it reads each page at its
+  // own (#91), and the diagnostic Halves' round trip, whose tier is the
+  // cache's by definition.
   //
   // The allocator may move any page whenever it frees one (ADR-0007), so this
   // class never keeps a page's address. store() and attention() each resolve
@@ -123,9 +126,9 @@ namespace microinfer
                    int heads, int kv_heads, int head_dim, const __half *keys,
                    const __half *values);
 
-    // The tier the page table records for page `page` of `layer`; the open
-    // pages are kOpenPages. PageNotFound if the table holds no such page.
-    Tier page_tier(int layer, int page) const;
+    // The tier the page table records for a page; the open pages are
+    // (layer, kOpenPages[k]). PageNotFound if the table holds no such page.
+    Tier page_tier(PageKey key) const;
 
     int page_tokens() const { return page_tokens_; }
     // Pages of positions held in each layer; the open pages are not counted.
@@ -153,9 +156,15 @@ namespace microinfer
     // of keys and of values, into its place.
     void seal(int layer, int span, const __half *keys, const __half *values);
     __half *open_page(int layer, int which);
-    // A page's address now, at the size its own tier gives it. Valid until
-    // the allocator's next operation.
-    CUdeviceptr page_address(PageKey key) const;
+    // A page as the page table holds it now: its tier, and its address at
+    // the size that tier gives it, valid until the allocator's next
+    // operation. The one place a page is looked up.
+    struct ResolvedPage
+    {
+      Tier tier;
+      CUdeviceptr address;
+    };
+    ResolvedPage resolve_page(PageKey key) const;
 
     // The layer's table of pages of positions on the device, for the pages
     // held now. Every layer's table is resolved at once, and again whenever
