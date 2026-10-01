@@ -92,8 +92,15 @@ namespace microinfer
     // the open pages are FP16, so its FP16 pages must be FP16-sized too; with
     // Halves other than Both, the pages themselves are stored at FP16. The
     // allocator must outlive this.
+    //
+    // `tier_map`, if given, names the tier each page of positions is born
+    // at: tier_map[l][i] for page i of layer l, and `tier` beyond the end of
+    // a layer's row. It needs a row per layer, and no diagnostic Halves, and
+    // the allocator's page size at every tier it names must be a page's
+    // there.
     KVPages(PagedKVCache &allocator, int layers, int page_tokens, int kv_heads,
-            int head_dim, Tier tier, Halves halves = Halves::Both);
+            int head_dim, Tier tier, Halves halves = Halves::Both,
+            std::vector<std::vector<Tier>> tier_map = {});
     // Frees every page this cache holds, newest first, so that each free is
     // of a tail page and moves nothing.
     ~KVPages();
@@ -135,13 +142,21 @@ namespace microinfer
     int pages_per_layer() const { return pages_; }
     int capacity_tokens() const
     {
-      return (pages_ + (quantised() ? 1 : 0)) * page_tokens_;
+      return (pages_ + (seals() ? 1 : 0)) * page_tokens_;
     }
     // The size of one page of positions as it is born, at storage_tier().
     std::size_t page_bytes() const { return page_bytes_; }
     Tier tier() const { return tier_; }
     Halves halves() const { return halves_; }
-    bool quantised() const { return tier_ != Tier::FP16; }
+    // Whether pages of positions are sealed (ADR-0011): whenever any is
+    // born at a quantised tier. A page is then allocated once all its
+    // positions are reserved, and filled in an open page until then, at
+    // every tier, FP16 included, so that one rule holds for the whole cache.
+    bool seals() const { return seals_; }
+    // The tier page `page` of `layer` is born at: the map's, or the cache's.
+    Tier birth_tier(int layer, int page) const;
+    // Whether the pages of positions are born at more than one tier.
+    bool mixed() const { return mixed_; }
     // The tier the pages of positions are allocated at: the cache's own,
     // except under a diagnostic Halves, where it is FP16.
     Tier storage_tier() const { return storage_tier_; }
@@ -182,6 +197,9 @@ namespace microinfer
     Tier tier_;
     Halves halves_;
     Tier storage_tier_;
+    std::vector<std::vector<Tier>> tier_map_;
+    bool seals_ = false;
+    bool mixed_ = false;
     std::size_t page_bytes_;
     int pages_ = 0;
     bool open_pages_ = false;

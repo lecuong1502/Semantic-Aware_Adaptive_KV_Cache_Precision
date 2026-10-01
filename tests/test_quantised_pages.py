@@ -37,16 +37,18 @@ Halves = device.Halves
 QUANTISED = (Tier.INT8, Tier.INT4, Tier.INT2)
 
 
-def pages_for(cfg, page_tokens, tier, halves=Halves.Both, capacity_pages=4096):
-    """A cache at `tier`, and an allocator with a range for its pages of
-    positions and one for its open pages at FP16."""
+def pages_for(cfg, page_tokens, tier, halves=Halves.Both, capacity_pages=4096, tier_map=None):
+    """A cache at `tier`, or built from `tier_map`, and an allocator with a
+    range for its pages of positions, at every tier for a map, and one for
+    its open pages at FP16."""
     storage = tier if halves == Halves.Both else Tier.FP16
     capacity = [0] * 4
-    capacity[int(storage)] = capacity_pages
+    for t in (Tier.__members__.values() if tier_map is not None else (storage,)):
+        capacity[int(t)] = capacity_pages
     capacity[int(Tier.FP16)] += LAYERS * len(device.open_pages)
     allocator = PagedKVCache(tier_page_bytes(cfg, page_tokens), capacity)
     return allocator, device.KVPages(allocator, LAYERS, page_tokens, cfg.num_key_value_heads,
-                                     cfg.head_dim, tier, halves)
+                                     cfg.head_dim, tier, halves, tier_map or [])
 
 
 def sealed(allocator, cfg, layer, pages, page_tokens, tier, halves=Halves.Both):
@@ -323,3 +325,68 @@ def test_each_page_records_its_own_tier_in_the_page_table():
     each([(p, *case) for p in PAGE_TOKENS
           for case in ((Tier.FP16,), (Tier.INT8,), (Tier.INT4,), (Tier.INT2,),
                        (Tier.INT4, Halves.Keys))], records)
+
+
+def test_a_cache_built_from_a_tier_map_seals_each_page_at_its_tier():
+    """Page i of layer l is sealed at the map's tier for it, or at the
+    cache's beyond the map: its bytes are quantise_page's at that tier, or
+    its FP16 rows as they came. A map with one tier everywhere builds what
+    the static path builds, byte for byte. A map that does not name every
+    layer, one with a diagnostic, and attention over pages at more than one
+    tier (until #91) are refused."""
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    mixed = [[Tier.INT8, Tier.FP16, Tier.INT4, Tier.INT2], [Tier.FP16, Tier.INT2]]
+
+    def stored(page_tokens, tier, tier_map):
+        rng = np.random.default_rng(page_tokens)
+        seq = 5 * page_tokens + 3
+        k = [normal(rng, seq, kv_heads, hd) for _ in range(LAYERS)]
+        v = [normal(rng, seq, kv_heads, hd) for _ in range(LAYERS)]
+        allocator, cache = pages_for(CFG, page_tokens, tier, tier_map=tier_map)
+        runs = [7, page_tokens, 1, 2 * page_tokens - 9]
+        runs.append(seq - sum(runs))
+        for layer in range(LAYERS):
+            start = 0
+            for n in runs:
+                cache.reserve(start + n)
+                cache.store(layer, put(k[layer][start:start + n]),
+                            put(v[layer][start:start + n]), start, n)
+                start += n
+        return allocator, cache, k, v
+
+    def seals(page_tokens, tier):
+        allocator, cache, k, v = stored(page_tokens, tier, mixed)
+        for layer in range(LAYERS):
+            for i in range(cache.pages_per_layer):
+                want = mixed[layer][i] if i < len(mixed[layer]) else tier
+                assert cache.page_tier(layer, i) == want, (layer, i)
+                span = slice(i * page_tokens, (i + 1) * page_tokens)
+                expected = (np.concatenate([k[layer][span], v[layer][span]]).astype(np.float16)
+                            .view(np.uint8).ravel() if want == Tier.FP16 else
+                            _microinfer.quantise_page(k[layer][span], v[layer][span], want,
+                                                      page_tokens))
+                np.testing.assert_array_equal(allocator.read(layer, i), expected,
+                                              err_msg=f"layer {layer} page {i} at {want.name}")
+
+    def as_static(page_tokens, tier):
+        uniform = [[tier] * 6 for _ in range(LAYERS)]
+        mapped, cache, _, _ = stored(page_tokens, tier, uniform)
+        static, kept, _, _ = stored(page_tokens, tier, None)  # kept: it frees its pages
+        assert kept.pages_per_layer == cache.pages_per_layer
+        for layer in range(LAYERS):
+            for i in range(cache.pages_per_layer):
+                np.testing.assert_array_equal(mapped.read(layer, i), static.read(layer, i),
+                                              err_msg=f"layer {layer} page {i}")
+
+    each([(f, p, t) for f in (seals, as_static) for p in PAGE_TOKENS
+          for t in (Tier.FP16, Tier.INT4)],
+         lambda f, p, t: f(p, t), name=lambda c: f"{c[0].__name__} P={c[1]} {c[2].name}")
+
+    with pytest.raises(ValueError, match="layer"):
+        pages_for(CFG, 16, Tier.FP16, tier_map=[[Tier.INT8]])
+    with pytest.raises(ValueError, match="diagnostic"):
+        pages_for(CFG, 16, Tier.INT4, Halves.Keys, tier_map=mixed)
+    _, cache, k, v = stored(16, Tier.FP16, mixed)
+    with pytest.raises(RuntimeError, match="#91"):
+        attend(CFG, cache, 0, normal(np.random.default_rng(0), 1, CFG.num_attention_heads, hd),
+               k[0], v[0], None, len(k[0]) - 1)
