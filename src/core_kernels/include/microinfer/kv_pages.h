@@ -66,6 +66,12 @@ namespace microinfer
   // two open pages are for those two, so the second never overwrites the
   // first before attention has read it.
   //
+  // A page's tier is the page table's: the allocator records it for every
+  // (layer, page), and this class reads it there whenever it addresses or
+  // seals a page, never assuming the cache's. The cache's own tier is the
+  // tier its pages of positions are born at. Attention still reads a whole
+  // layer at that one tier until it reads each page at its own (#91).
+  //
   // The allocator may move any page whenever it frees one (ADR-0007), so this
   // class never keeps a page's address. store() and attention() each resolve
   // what they need immediately before their launches.
@@ -117,6 +123,10 @@ namespace microinfer
                    int heads, int kv_heads, int head_dim, const __half *keys,
                    const __half *values);
 
+    // The tier the page table records for page `page` of `layer`; the open
+    // pages are kOpenPages. PageNotFound if the table holds no such page.
+    Tier page_tier(int layer, int page) const;
+
     int page_tokens() const { return page_tokens_; }
     // Pages of positions held in each layer; the open pages are not counted.
     int pages_per_layer() const { return pages_; }
@@ -124,7 +134,7 @@ namespace microinfer
     {
       return (pages_ + (quantised() ? 1 : 0)) * page_tokens_;
     }
-    // The size of one page of positions, as it is stored.
+    // The size of one page of positions as it is born, at storage_tier().
     std::size_t page_bytes() const { return page_bytes_; }
     Tier tier() const { return tier_; }
     Halves halves() const { return halves_; }
@@ -143,6 +153,9 @@ namespace microinfer
     // of keys and of values, into its place.
     void seal(int layer, int span, const __half *keys, const __half *values);
     __half *open_page(int layer, int which);
+    // A page's address now, at the size its own tier gives it. Valid until
+    // the allocator's next operation.
+    CUdeviceptr page_address(PageKey key) const;
 
     // The layer's table of pages of positions on the device, for the pages
     // held now. Every layer's table is resolved at once, and again whenever

@@ -193,6 +193,17 @@ namespace microinfer
     }
   }
 
+  Tier KVPages::page_tier(int layer, int page) const
+  {
+    return allocator_.locate({layer, page}).tier;
+  }
+
+  CUdeviceptr KVPages::page_address(PageKey key) const
+  {
+    return allocator_.address(
+        key, allocator_.page_bytes(allocator_.locate(key).tier));
+  }
+
   const unsigned long long *KVPages::resolve(int layer)
   {
     if (layer < 0 || layer >= layers_)
@@ -225,7 +236,7 @@ namespace microinfer
         for (int page = 0; page < pages_; ++page)
         {
           host[static_cast<size_t>(l) * table_stride_ + page] =
-              allocator_.address({l, page}, page_bytes_);
+              page_address({l, page});
         }
       }
       // On the legacy default stream, so ordered after every launch already
@@ -280,13 +291,13 @@ namespace microinfer
                      const __half *values)
   {
     // Resolved here, between allocator operations, and used at once: nothing
-    // below allocates or frees.
-    auto *page = reinterpret_cast<std::uint8_t *>(
-        allocator_.address({layer, span}, page_bytes_));
+    // below allocates or frees. The page is sealed at the tier the page
+    // table records for it.
+    auto *page = reinterpret_cast<std::uint8_t *>(page_address({layer, span}));
     if (halves_ == Halves::Both)
     {
-      device::quantise_page(keys, values, page, tier_, page_tokens_,
-                            page_tokens_, kv_heads_, head_dim_);
+      device::quantise_page(keys, values, page, page_tier(layer, span),
+                            page_tokens_, page_tokens_, kv_heads_, head_dim_);
       return;
     }
     // The diagnostic: the tier's round trip for one half, the other as it
