@@ -294,3 +294,32 @@ def test_the_rest_of_the_contract():
         with pytest.raises(ValueError, match="rows"):
             cache.attention(0, device.empty(heads * hd), None, None, device.empty(heads * hd),
                             1, 4, heads, kv_heads, hd)
+
+
+def test_each_page_records_its_own_tier_in_the_page_table():
+    """A page's tier is the page table's record of it, not the cache's: each
+    page of positions at the tier it was stored at, the open pages at FP16,
+    and the pages of a diagnostic at FP16. A page the table does not hold
+    has no tier."""
+    def records(page_tokens, tier, halves=Halves.Both):
+        allocator, cache = pages_for(CFG, page_tokens, tier, halves)
+        positions = 2 * page_tokens + 3  # two pages sealed, one being filled
+        rng = np.random.default_rng(89)
+        cache.reserve(positions)
+        for layer in range(LAYERS):
+            k, v = (normal(rng, positions, CFG.num_key_value_heads, CFG.head_dim)
+                    for _ in range(2))
+            cache.store(layer, put(k), put(v), 0, positions)
+        stored = tier if halves == Halves.Both else Tier.FP16
+        for layer in range(LAYERS):
+            for page in range(cache.pages_per_layer):
+                assert cache.page_tier(layer, page) == stored, (layer, page)
+                assert allocator.locate(layer, page)[0] == stored, (layer, page)
+            if tier != Tier.FP16:
+                assert all(cache.page_tier(layer, p) == Tier.FP16 for p in device.open_pages)
+        with pytest.raises(_microinfer.PageNotFound):
+            cache.page_tier(0, cache.pages_per_layer + 5)
+
+    each([(p, *case) for p in PAGE_TOKENS
+          for case in ((Tier.FP16,), (Tier.INT8,), (Tier.INT4,), (Tier.INT2,),
+                       (Tier.INT4, Halves.Keys))], records)

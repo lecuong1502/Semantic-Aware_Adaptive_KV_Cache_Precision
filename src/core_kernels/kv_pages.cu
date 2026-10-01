@@ -193,6 +193,17 @@ namespace microinfer
     }
   }
 
+  Tier KVPages::page_tier(PageKey key) const
+  {
+    return allocator_.locate(key).tier;
+  }
+
+  KVPages::ResolvedPage KVPages::resolve_page(PageKey key) const
+  {
+    const Tier tier = allocator_.locate(key).tier;
+    return {tier, allocator_.address(key, allocator_.page_bytes(tier))};
+  }
+
   const unsigned long long *KVPages::resolve(int layer)
   {
     if (layer < 0 || layer >= layers_)
@@ -225,7 +236,7 @@ namespace microinfer
         for (int page = 0; page < pages_; ++page)
         {
           host[static_cast<size_t>(l) * table_stride_ + page] =
-              allocator_.address({l, page}, page_bytes_);
+              resolve_page({l, page}).address;
         }
       }
       // On the legacy default stream, so ordered after every launch already
@@ -244,8 +255,8 @@ namespace microinfer
 
   __half *KVPages::open_page(int layer, int which)
   {
-    return reinterpret_cast<__half *>(allocator_.address(
-        {layer, kOpenPages[which]}, page_bytes_for(page_tokens_, kv_width_)));
+    return reinterpret_cast<__half *>(
+        resolve_page({layer, kOpenPages[which]}).address);
   }
 
   void KVPages::store(int layer, const __half *keys, const __half *values,
@@ -280,17 +291,19 @@ namespace microinfer
                      const __half *values)
   {
     // Resolved here, between allocator operations, and used at once: nothing
-    // below allocates or frees.
-    auto *page = reinterpret_cast<std::uint8_t *>(
-        allocator_.address({layer, span}, page_bytes_));
+    // below allocates or frees. The page is sealed at the tier the page
+    // table records for it.
+    const ResolvedPage resolved = resolve_page({layer, span});
+    auto *page = reinterpret_cast<std::uint8_t *>(resolved.address);
     if (halves_ == Halves::Both)
     {
-      device::quantise_page(keys, values, page, tier_, page_tokens_,
+      device::quantise_page(keys, values, page, resolved.tier, page_tokens_,
                             page_tokens_, kv_heads_, head_dim_);
       return;
     }
     // The diagnostic: the tier's round trip for one half, the other as it
-    // came, both into an FP16 page.
+    // came, both into an FP16 page. The round trip's tier is the cache's,
+    // tier_, by definition of the diagnostic; the page it writes is FP16.
     const std::size_t half = static_cast<std::size_t>(page_tokens_) * kv_width_;
     auto *round_trip = scratch_halves_->as<__half>();
     device::quantise_page(keys, values, scratch_page_->as<std::uint8_t>(),
