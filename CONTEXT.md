@@ -54,11 +54,23 @@ layer's last page; at a quantised tier it is one of two FP16 pages of the
 layer's own, `(layer, -1)` and `(layer, -2)`, reused span after span, so that
 every other page is written once, at its tier (ADR-0011).
 
+**Tier map**:
+The tier each page of positions of a cache is born at, by (layer, page):
+row l for layer l, page i at [l][i], and the cache's own tier beyond a row.
+_Avoid_: precision map, quantisation plan (a requantisation plan moves pages
+that exist)
+
+**Birth tier**:
+The tier a page of positions is allocated and sealed at: its tier map's, or
+its cache's. It is where a page starts; a requantisation plan may move it
+later (#88).
+
 **Seal**:
-To write a page of positions at a quantised tier, once and for good, when its
+To write a page of positions at its birth tier, once and for good, when its
 last position arrives: quantised from the rows that brought it, or from the
-open page it filled. A sealed page is never written again, and never changes
-tier (ADR-0011).
+open page it filled, or, for a page born at FP16 in a cache that seals,
+copied as it came. A cache seals when any of its pages is born at a quantised
+tier (ADR-0011 and its amendment). A sealed page is never written again.
 _Avoid_: flush, commit, finalise, close
 _Avoid_: partial page, current block, tail page (the tail is the allocator's
 last slot, ADR-0007)

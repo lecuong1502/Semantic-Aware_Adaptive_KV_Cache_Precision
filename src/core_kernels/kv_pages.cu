@@ -65,7 +65,7 @@ namespace microinfer
 
   KVPages::KVPages(PagedKVCache &allocator, int layers, int page_tokens,
                    int kv_heads, int head_dim, Tier tier, Halves halves,
-                   std::vector<std::vector<Tier>> tier_map)
+                   TierMap tier_map)
       : allocator_(allocator), layers_(layers), page_tokens_(page_tokens),
         kv_heads_(kv_heads), head_dim_(head_dim),
         kv_width_(static_cast<std::size_t>(kv_heads) * head_dim), tier_(tier),
@@ -93,6 +93,8 @@ namespace microinfer
                                   " rows for " + std::to_string(layers) +
                                   " layers");
     }
+    // A diagnostic's round trip is at the cache's one tier by its
+    // definition, so a map has nothing to say to it.
     if (!tier_map_.empty() && halves != Halves::Both)
     {
       throw std::invalid_argument(
@@ -198,8 +200,8 @@ namespace microinfer
           }
         }
       }
-      // At a quantised tier a page is taken only once all its positions are
-      // coming: until then they are an open page's.
+      // In a cache that seals, a page is taken only once all its positions
+      // are coming: until then they are an open page's.
       const int needed = seals() ? tokens / page_tokens_
                                  : (tokens + page_tokens_ - 1) / page_tokens_;
       for (int page = pages_; page < needed; ++page)
@@ -324,7 +326,7 @@ namespace microinfer
     }
     if (seals())
     {
-      store_quantised(layer, keys, values, start, n);
+      store_sealed(layer, keys, values, start, n);
       return;
     }
     device::store_pages(keys, values, resolve(layer), page_tokens_, kv_width_,
@@ -339,18 +341,11 @@ namespace microinfer
     // table records for it.
     const ResolvedPage resolved = resolve_page({layer, span});
     auto *page = reinterpret_cast<std::uint8_t *>(resolved.address);
-    const std::size_t half = static_cast<std::size_t>(page_tokens_) * kv_width_;
     if (halves_ == Halves::Both && resolved.tier == Tier::FP16)
     {
       // A page born at FP16 in a cache that seals: its rows as they came,
-      // keys then values, as the FP16 layout holds them.
-      auto *out = reinterpret_cast<__half *>(page);
-      const std::size_t bytes = half * sizeof(__half);
-      cuda_check(cudaMemcpy(out, keys, bytes, cudaMemcpyDeviceToDevice),
-                 "cudaMemcpy sealed FP16 keys");
-      cuda_check(
-          cudaMemcpy(out + half, values, bytes, cudaMemcpyDeviceToDevice),
-          "cudaMemcpy sealed FP16 values");
+      // as the FP16 layout holds them.
+      copy_rows(reinterpret_cast<__half *>(page), keys, values);
       return;
     }
     if (halves_ == Halves::Both)
@@ -362,6 +357,7 @@ namespace microinfer
     // The diagnostic: the tier's round trip for one half, the other as it
     // came, both into an FP16 page. The round trip's tier is the cache's,
     // tier_, by definition of the diagnostic; the page it writes is FP16.
+    const std::size_t half = static_cast<std::size_t>(page_tokens_) * kv_width_;
     auto *round_trip = scratch_halves_->as<__half>();
     device::quantise_page(keys, values, scratch_page_->as<std::uint8_t>(),
                           tier_, page_tokens_, page_tokens_, kv_heads_,
@@ -371,16 +367,22 @@ namespace microinfer
                             head_dim_);
     const __half *k = halves_ == Halves::Keys ? round_trip : keys;
     const __half *v = halves_ == Halves::Values ? round_trip + half : values;
-    auto *out = reinterpret_cast<__half *>(page);
+    copy_rows(reinterpret_cast<__half *>(page), k, v);
+  }
+
+  void KVPages::copy_rows(__half *page, const __half *keys,
+                          const __half *values)
+  {
+    const std::size_t half = static_cast<std::size_t>(page_tokens_) * kv_width_;
     const std::size_t bytes = half * sizeof(__half);
-    cuda_check(cudaMemcpy(out, k, bytes, cudaMemcpyDeviceToDevice),
+    cuda_check(cudaMemcpy(page, keys, bytes, cudaMemcpyDeviceToDevice),
                "cudaMemcpy sealed keys");
-    cuda_check(cudaMemcpy(out + half, v, bytes, cudaMemcpyDeviceToDevice),
+    cuda_check(cudaMemcpy(page + half, values, bytes, cudaMemcpyDeviceToDevice),
                "cudaMemcpy sealed values");
   }
 
-  void KVPages::store_quantised(int layer, const __half *keys,
-                                const __half *values, int start, int n)
+  void KVPages::store_sealed(int layer, const __half *keys,
+                             const __half *values, int start, int n)
   {
     const std::size_t half = static_cast<std::size_t>(page_tokens_) * kv_width_;
     const int first = start / page_tokens_;

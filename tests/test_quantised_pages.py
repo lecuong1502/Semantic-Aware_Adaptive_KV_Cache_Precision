@@ -328,10 +328,11 @@ def test_each_page_records_its_own_tier_in_the_page_table():
 
 
 def test_a_cache_built_from_a_tier_map_seals_each_page_at_its_tier():
-    """Page i of layer l is sealed at the map's tier for it, or at the
-    cache's beyond the map: its bytes are quantise_page's at that tier, or
-    its FP16 rows as they came. A map with one tier everywhere builds what
-    the static path builds, byte for byte. A map that does not name every
+    """Page i of layer l is born and sealed at the map's tier for it, or at
+    the cache's beyond the map: its bytes are quantise_page's at that tier,
+    or, born at FP16, its rows as they came (quantise_page has no FP16
+    layout; the FP16 page is the rows). A map with one tier everywhere builds
+    what the static path builds, byte for byte, open pages included. A map that does not name every
     layer, one with a diagnostic, and attention over pages at more than one
     tier (until #91) are refused."""
     kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
@@ -346,19 +347,16 @@ def test_a_cache_built_from_a_tier_map_seals_each_page_at_its_tier():
         runs = [7, page_tokens, 1, 2 * page_tokens - 9]
         runs.append(seq - sum(runs))
         for layer in range(LAYERS):
-            start = 0
-            for n in runs:
-                cache.reserve(start + n)
-                cache.store(layer, put(k[layer][start:start + n]),
-                            put(v[layer][start:start + n]), start, n)
-                start += n
+            store_in_runs(cache, layer, k[layer], v[layer], runs)
         return allocator, cache, k, v
 
     def seals(page_tokens, tier):
         allocator, cache, k, v = stored(page_tokens, tier, mixed)
+        assert cache.seals and not cache.born_at_one_tier
         for layer in range(LAYERS):
             for i in range(cache.pages_per_layer):
                 want = mixed[layer][i] if i < len(mixed[layer]) else tier
+                assert cache.birth_tier(layer, i) == want, (layer, i)
                 assert cache.page_tier(layer, i) == want, (layer, i)
                 span = slice(i * page_tokens, (i + 1) * page_tokens)
                 expected = (np.concatenate([k[layer][span], v[layer][span]]).astype(np.float16)
@@ -372,9 +370,13 @@ def test_a_cache_built_from_a_tier_map_seals_each_page_at_its_tier():
         uniform = [[tier] * 6 for _ in range(LAYERS)]
         mapped, cache, _, _ = stored(page_tokens, tier, uniform)
         static, kept, _, _ = stored(page_tokens, tier, None)  # kept: it frees its pages
-        assert kept.pages_per_layer == cache.pages_per_layer
+        assert cache.born_at_one_tier
+        for what in ("pages_per_layer", "capacity_tokens", "seals", "page_bytes"):
+            assert getattr(cache, what) == getattr(kept, what), what
+        open_pages = list(device.open_pages) if cache.seals else []
         for layer in range(LAYERS):
-            for i in range(cache.pages_per_layer):
+            for i in list(range(cache.pages_per_layer)) + open_pages:
+                assert cache.page_tier(layer, i) == kept.page_tier(layer, i), (layer, i)
                 np.testing.assert_array_equal(mapped.read(layer, i), static.read(layer, i),
                                               err_msg=f"layer {layer} page {i}")
 
