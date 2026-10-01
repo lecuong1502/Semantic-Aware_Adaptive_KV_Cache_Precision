@@ -2,8 +2,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "microinfer/check.h"
@@ -62,13 +64,15 @@ namespace microinfer
   }
 
   KVPages::KVPages(PagedKVCache &allocator, int layers, int page_tokens,
-                   int kv_heads, int head_dim, Tier tier, Halves halves)
+                   int kv_heads, int head_dim, Tier tier, Halves halves,
+                   TierMap tier_map)
       : allocator_(allocator), layers_(layers), page_tokens_(page_tokens),
         kv_heads_(kv_heads), head_dim_(head_dim),
         kv_width_(static_cast<std::size_t>(kv_heads) * head_dim), tier_(tier),
         halves_(halves),
         storage_tier_(tier != Tier::FP16 && halves != Halves::Both ? Tier::FP16
                                                                    : tier),
+        tier_map_(std::move(tier_map)),
         current_open_(layers > 0 ? layers : 0, 0),
         attend_open_(layers > 0 ? layers : 0, 0)
   {
@@ -82,16 +86,42 @@ namespace microinfer
       throw std::invalid_argument(
           "only a quantised tier can quantise one half of a page");
     }
-    const std::size_t fp16_bytes = page_bytes_for(page_tokens, kv_width_);
-    const QuantisedPageLayout *layout = nullptr;
-    QuantisedPageLayout quantised_layout{};
-    if (quantised())
+    if (!tier_map_.empty() && static_cast<int>(tier_map_.size()) != layers)
     {
-      quantised_layout =
-          quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
-      layout = &quantised_layout;
+      throw std::invalid_argument("a tier map needs a row for every layer: " +
+                                  std::to_string(tier_map_.size()) +
+                                  " rows for " + std::to_string(layers) +
+                                  " layers");
     }
-    page_bytes_ = storage_tier_ == Tier::FP16 ? fp16_bytes : layout->page_bytes;
+    // A diagnostic's round trip is at the cache's one tier by its
+    // definition, so a map has nothing to say to it.
+    if (!tier_map_.empty() && halves != Halves::Both)
+    {
+      throw std::invalid_argument(
+          "a diagnostic Halves rounds every page at the cache's one tier, and "
+          "takes no tier map");
+    }
+    // Every tier a page of positions is born at: the cache's, and the map's.
+    std::array<bool, kTierCount> born{};
+    born[static_cast<int>(storage_tier_)] = true;
+    for (const auto &row : tier_map_)
+    {
+      for (Tier t : row)
+      {
+        born[static_cast<int>(t)] = true;
+        mixed_ = mixed_ || t != tier;
+      }
+    }
+    seals_ = tier != Tier::FP16 || mixed_;
+    const std::size_t fp16_bytes = page_bytes_for(page_tokens, kv_width_);
+    const auto bytes_at = [&](Tier t)
+    {
+      return t == Tier::FP16
+                 ? fp16_bytes
+                 : quantised_page_layout(t, page_tokens, kv_heads, head_dim)
+                       .page_bytes;
+    };
+    page_bytes_ = bytes_at(storage_tier_);
     const auto check = [&](Tier t, std::size_t needed, const char *what)
     {
       if (allocator.page_bytes(t) != needed)
@@ -104,14 +134,21 @@ namespace microinfer
             std::to_string(needed));
       }
     };
-    check(storage_tier_, page_bytes_, "a page of positions");
-    if (quantised())
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      if (born[t])
+      {
+        check(static_cast<Tier>(t), bytes_at(static_cast<Tier>(t)),
+              "a page of positions");
+      }
+    }
+    if (seals_)
     {
       check(Tier::FP16, fp16_bytes, "an open page");
     }
-    if (quantised() && halves != Halves::Both)
+    if (halves != Halves::Both)
     {
-      scratch_page_ = std::make_unique<DeviceBuffer>(layout->page_bytes);
+      scratch_page_ = std::make_unique<DeviceBuffer>(bytes_at(tier));
       scratch_halves_ = std::make_unique<DeviceBuffer>(fp16_bytes);
     }
   }
@@ -152,7 +189,7 @@ namespace microinfer
     std::vector<PageKey> taken;
     try
     {
-      if (quantised() && !open_pages_ && tokens > 0)
+      if (seals() && !open_pages_ && tokens > 0)
       {
         for (int page : kOpenPages)
         {
@@ -163,20 +200,19 @@ namespace microinfer
           }
         }
       }
-      // At a quantised tier a page is taken only once all its positions are
-      // coming: until then they are an open page's.
-      const int needed = quantised()
-                             ? tokens / page_tokens_
-                             : (tokens + page_tokens_ - 1) / page_tokens_;
+      // In a cache that seals, a page is taken only once all its positions
+      // are coming: until then they are an open page's.
+      const int needed = seals() ? tokens / page_tokens_
+                                 : (tokens + page_tokens_ - 1) / page_tokens_;
       for (int page = pages_; page < needed; ++page)
       {
         for (int layer = 0; layer < layers_; ++layer)
         {
-          allocator_.allocate({layer, page}, storage_tier_);
+          allocator_.allocate({layer, page}, birth_tier(layer, page));
           taken.push_back({layer, page});
         }
       }
-      if (quantised() && tokens > 0)
+      if (seals() && tokens > 0)
       {
         open_pages_ = true;
       }
@@ -191,6 +227,16 @@ namespace microinfer
       }
       throw;
     }
+  }
+
+  Tier KVPages::birth_tier(int layer, int page) const
+  {
+    if (layer >= 0 && layer < static_cast<int>(tier_map_.size()) && page >= 0 &&
+        page < static_cast<int>(tier_map_[layer].size()))
+    {
+      return tier_map_[layer][page];
+    }
+    return storage_tier_;
   }
 
   Tier KVPages::page_tier(PageKey key) const
@@ -278,9 +324,9 @@ namespace microinfer
     {
       return;
     }
-    if (quantised())
+    if (seals())
     {
-      store_quantised(layer, keys, values, start, n);
+      store_sealed(layer, keys, values, start, n);
       return;
     }
     device::store_pages(keys, values, resolve(layer), page_tokens_, kv_width_,
@@ -295,6 +341,13 @@ namespace microinfer
     // table records for it.
     const ResolvedPage resolved = resolve_page({layer, span});
     auto *page = reinterpret_cast<std::uint8_t *>(resolved.address);
+    if (halves_ == Halves::Both && resolved.tier == Tier::FP16)
+    {
+      // A page born at FP16 in a cache that seals: its rows as they came,
+      // as the FP16 layout holds them.
+      copy_rows(reinterpret_cast<__half *>(page), keys, values);
+      return;
+    }
     if (halves_ == Halves::Both)
     {
       device::quantise_page(keys, values, page, resolved.tier, page_tokens_,
@@ -314,16 +367,22 @@ namespace microinfer
                             head_dim_);
     const __half *k = halves_ == Halves::Keys ? round_trip : keys;
     const __half *v = halves_ == Halves::Values ? round_trip + half : values;
-    auto *out = reinterpret_cast<__half *>(page);
+    copy_rows(reinterpret_cast<__half *>(page), k, v);
+  }
+
+  void KVPages::copy_rows(__half *page, const __half *keys,
+                          const __half *values)
+  {
+    const std::size_t half = static_cast<std::size_t>(page_tokens_) * kv_width_;
     const std::size_t bytes = half * sizeof(__half);
-    cuda_check(cudaMemcpy(out, k, bytes, cudaMemcpyDeviceToDevice),
+    cuda_check(cudaMemcpy(page, keys, bytes, cudaMemcpyDeviceToDevice),
                "cudaMemcpy sealed keys");
-    cuda_check(cudaMemcpy(out + half, v, bytes, cudaMemcpyDeviceToDevice),
+    cuda_check(cudaMemcpy(page + half, values, bytes, cudaMemcpyDeviceToDevice),
                "cudaMemcpy sealed values");
   }
 
-  void KVPages::store_quantised(int layer, const __half *keys,
-                                const __half *values, int start, int n)
+  void KVPages::store_sealed(int layer, const __half *keys,
+                             const __half *values, int start, int n)
   {
     const std::size_t half = static_cast<std::size_t>(page_tokens_) * kv_width_;
     const int first = start / page_tokens_;
@@ -387,7 +446,13 @@ namespace microinfer
     {
       return;
     }
-    if (!quantised())
+    if (mixed_)
+    {
+      throw std::logic_error(
+          "attention over pages born at more than one tier reads each at its "
+          "own, which is #91's; this cache's attention reads one tier");
+    }
+    if (!seals())
     {
       device::attention_paged(q, resolve(layer), page_tokens_, k_bias, rope,
                               out, seq_q, seq_k, heads, kv_heads, head_dim);

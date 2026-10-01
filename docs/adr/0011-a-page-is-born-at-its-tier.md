@@ -180,3 +180,22 @@ the peak is 502, 278 and 166 MiB, that is, the footprint above plus the
 16 MiB RoPE table. INT2's prefill took 4% longer than FP16's. Each figure is
 a single run, and FP16's was made at another commit, so that is an upper
 bound on what dequantising inside attention costs, not a measurement of it.
+
+## Amendment (#90): a cache built from a tier map
+
+Milestone 2 (#88) builds a cache from a *tier map*, which names the tier
+each page of positions is born at; a page beyond its layer's row is born at
+the cache's tier. Two things change for such a cache.
+
+- **A cache seals whenever any page is born at a quantised tier,** and then
+  every page is sealed, including one born at FP16: it is allocated once all
+  its positions are reserved and filled in an open page until then, like
+  the others. Sealing an FP16 page copies its rows as they came, keys then
+  values, the FP16 layout. One rule then holds for every page of the cache,
+  where two (FP16's "the open page is the last page" and the quantised
+  tiers' sealing) would have to meet page by page.
+- **A page is allocated at its birth tier,** the map's, not the cache's.
+
+A cache whose map names no tier but its own builds, byte for byte, what
+this ADR's static operation builds. A sealed page still never changes tier
+here; that is #93's, and its own ADR (#109).

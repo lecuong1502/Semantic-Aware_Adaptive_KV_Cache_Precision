@@ -41,6 +41,10 @@ namespace microinfer
     Values = 2,
   };
 
+  // A tier map (#90): row l names the tier each page of positions of layer l
+  // is born at, page i at [l][i].
+  using TierMap = std::vector<std::vector<Tier>>;
+
   // The engine's KV cache, on pages (#14): one layer's keys and values for
   // page_tokens consecutive positions per page, allocated from a
   // PagedKVCache as the sequence grows.
@@ -92,8 +96,15 @@ namespace microinfer
     // the open pages are FP16, so its FP16 pages must be FP16-sized too; with
     // Halves other than Both, the pages themselves are stored at FP16. The
     // allocator must outlive this.
+    //
+    // `tier_map`, if given, names the tier each page of positions is born
+    // at: tier_map[l][i] for page i of layer l, and `tier` beyond the end of
+    // a layer's row. It needs a row per layer, and no diagnostic Halves, and
+    // the allocator's page size at every tier it names must be a page's
+    // there.
     KVPages(PagedKVCache &allocator, int layers, int page_tokens, int kv_heads,
-            int head_dim, Tier tier, Halves halves = Halves::Both);
+            int head_dim, Tier tier, Halves halves = Halves::Both,
+            TierMap tier_map = {});
     // Frees every page this cache holds, newest first, so that each free is
     // of a tail page and moves nothing.
     ~KVPages();
@@ -135,13 +146,24 @@ namespace microinfer
     int pages_per_layer() const { return pages_; }
     int capacity_tokens() const
     {
-      return (pages_ + (quantised() ? 1 : 0)) * page_tokens_;
+      return (pages_ + (seals() ? 1 : 0)) * page_tokens_;
     }
-    // The size of one page of positions as it is born, at storage_tier().
+    // The size of one page of positions at storage_tier(), the cache's own:
+    // a page a tier map places at another tier has that tier's size.
     std::size_t page_bytes() const { return page_bytes_; }
     Tier tier() const { return tier_; }
     Halves halves() const { return halves_; }
-    bool quantised() const { return tier_ != Tier::FP16; }
+    // Whether pages of positions are sealed (ADR-0011): whenever any is
+    // born at a quantised tier. A page is then allocated once all its
+    // positions are reserved, and filled in an open page until then, at
+    // every tier, FP16 included, so that one rule holds for the whole cache.
+    bool seals() const { return seals_; }
+    // The tier page `page` of `layer` is born at: the map's, or the cache's.
+    Tier birth_tier(int layer, int page) const;
+    // Whether every page of positions is born at one tier: the map names no
+    // tier but the cache's. A page beyond a row is born at the cache's, so a
+    // map of INT4 over a cache at FP16 is two tiers.
+    bool born_at_one_tier() const { return !mixed_; }
     // The tier the pages of positions are allocated at: the cache's own,
     // except under a diagnostic Halves, where it is FP16.
     Tier storage_tier() const { return storage_tier_; }
@@ -150,10 +172,12 @@ namespace microinfer
 
   private:
     // store() at a quantised tier, span by span (ADR-0011).
-    void store_quantised(int layer, const __half *keys, const __half *values,
-                         int start, int n);
-    // Quantises the page of positions `span` from rows (page_tokens, kv_width)
-    // of keys and of values, into its place.
+    void store_sealed(int layer, const __half *keys, const __half *values,
+                      int start, int n);
+    // Seals the page of positions `span` from rows (page_tokens, kv_width) of
+    // keys and of values, into its place at its own tier.
+    // Copies rows of keys and of values into an FP16 page, keys then values.
+    void copy_rows(__half *page, const __half *keys, const __half *values);
     void seal(int layer, int span, const __half *keys, const __half *values);
     __half *open_page(int layer, int which);
     // A page as the page table holds it now: its tier, and its address at
@@ -182,6 +206,9 @@ namespace microinfer
     Tier tier_;
     Halves halves_;
     Tier storage_tier_;
+    TierMap tier_map_;
+    bool seals_ = false;
+    bool mixed_ = false;
     std::size_t page_bytes_;
     int pages_ = 0;
     bool open_pages_ = false;
