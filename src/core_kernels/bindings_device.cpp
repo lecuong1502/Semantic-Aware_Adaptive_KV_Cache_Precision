@@ -701,6 +701,29 @@ void bind_device(py::module_ &parent)
            "downgrade; to a quantised tier, quantise_page of the shadow "
            "there. The shadow is kept. If an allocation fails, the cache is "
            "as it was.")
+      .def_property_readonly(
+          "last_move",
+          [](const KVPages &c) -> py::object
+          {
+            const auto &last = c.last_move();
+            if (!last)
+            {
+              return py::none();
+            }
+            py::dict d;
+            d["layer"] = last->key.layer;
+            d["page"] = last->key.page_index;
+            d["from_tier"] = last->from_tier;
+            d["to_tier"] = last->to_tier;
+            d["from_bytes"] = last->from_bytes;
+            d["to_bytes"] = last->to_bytes;
+            d["seconds"] = last->seconds;
+            d["shadow_seconds"] = last->shadow_seconds;
+            return std::move(d);
+          },
+          "What the last downgrade or upgrade took (#97), or None: its page, "
+          "tiers and bytes at each, and its wall time in seconds, of which "
+          "shadow_seconds is the shadow copy.")
       .def_static("seals_for", &KVPages::seals_for, py::arg("tier"),
                   py::arg("tier_map") = microinfer::TierMap{},
                   py::arg("always_seal") = false,
