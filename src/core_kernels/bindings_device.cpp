@@ -620,6 +620,11 @@ void bind_device(py::module_ &parent)
       .def_property_readonly("tier", &KVPages::tier)
       .def_property_readonly("halves", &KVPages::halves)
       .def_property_readonly("storage_tier", &KVPages::storage_tier)
+      .def_static("seals_for", &KVPages::seals_for, py::arg("tier"),
+                  py::arg("tier_map") = microinfer::TierMap{},
+                  "Whether a cache at `tier`, built from `tier_map`, seals "
+                  "(ADR-0011, as amended by #90): at a quantised tier, or when "
+                  "the map names a tier but `tier`. A cache's `seals` is this.")
       .def_property_readonly("seals", &KVPages::seals)
       .def_property_readonly("born_at_one_tier", &KVPages::born_at_one_tier)
       .def("birth_tier", &KVPages::birth_tier, py::arg("layer"),

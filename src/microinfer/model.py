@@ -146,7 +146,8 @@ def tier_page_bytes(cfg: ModelConfig, page_tokens: int | None = None) -> list[in
 class PagedCache(_Cache):
     """Keys and values on pages of P positions (ADR-0004), allocated from the
     VMM allocator (ADR-0007) as the sequence grows (#14), at one precision
-    tier chosen when the cache is made (#18).
+    tier chosen when the cache is made (#18), or at the tiers a tier map
+    names (#92).
 
     Page i of layer l is the page table entry (l, i). Attention reads keys and
     values through the page table, resolved again after any allocator
@@ -160,32 +161,41 @@ class PagedCache(_Cache):
     Milestone 0's static operation, and moving a page between tiers is
     Milestone 2's.
 
+    `tier_map`, if given, names the tier each page of positions is born at:
+    row l for layer l, page i at [l][i], and `tier` beyond a row (kv_pages.h).
+    A cache seals once any page is born at a quantised tier (ADR-0011,
+    amended by #90), and attention reads each page at its own tier (#91).
+
     `halves` other than Both is a diagnostic (kv_pages.h): pages stored at
     FP16 with only keys, or only values, put through the tier's round trip.
 
     The allocator reserves address space for the model's whole context window
-    at the tier the pages are stored at, and for the open pages at FP16, and
+    at every tier a page may be born at, and for the open pages at FP16, and
     takes device memory only as pages are allocated. `nbytes` is therefore
     what the driver actually holds for the cache: whole granules in each
     tier's range, and the RoPE table beside them.
     """
 
-    def __init__(self, cfg: ModelConfig, tier=None, halves=None):
+    def __init__(self, cfg: ModelConfig, tier=None, halves=None, tier_map=None):
         super().__init__(cfg)
         Tier = _microinfer.Tier
         self.tier = Tier.FP16 if tier is None else tier
         halves = device.Halves.Both if halves is None else halves
+        tier_map = tier_map or []
         page_tokens = device.page_tokens
         layers = cfg.num_hidden_layers
         pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
         storage = self.tier if halves == device.Halves.Both else Tier.FP16
+        born = {storage} | {t for row in tier_map for t in row}
         capacity = [0] * 4
-        capacity[int(storage)] = layers * pages_per_layer
-        if self.tier != Tier.FP16:
+        for t in born:
+            capacity[int(t)] = layers * pages_per_layer
+        # Room for the open pages if the cache will seal.
+        if device.KVPages.seals_for(self.tier, tier_map):
             capacity[int(Tier.FP16)] += layers * len(device.open_pages)
         self.allocator = _microinfer.PagedKVCache(tier_page_bytes(cfg), capacity)
         self.pages = device.KVPages(self.allocator, layers, page_tokens, self.kv_heads,
-                                    self.head_dim, self.tier, halves)
+                                    self.head_dim, self.tier, halves, tier_map)
 
     @property
     def nbytes(self) -> int:

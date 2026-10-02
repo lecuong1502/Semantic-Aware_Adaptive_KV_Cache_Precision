@@ -119,35 +119,54 @@ def kv_cache_bytes(cfg: ModelConfig, context_length: int,
     return int(per_token * context_length * bytes_per_element)
 
 
-def paged_cache_ranges(cfg: ModelConfig, context_length: int, tier: str = "FP16") -> list[int]:
-    """The bytes the paged cache's pages need for `context_length` positions
-    at a static tier (#18), one figure per address range they sit in:
-    computed from the layout, before the driver rounds anything.
+def tier_map_of(names: list[list[str]] | None) -> list[list]:
+    """A tier map of tier names as KVPages takes it, of Tiers; None is
+    the empty map."""
+    return [[getattr(_microinfer.Tier, name) for name in row] for row in names or []]
 
-    At FP16 there is one range, with a page for every started span of P
-    positions in every layer. At a quantised tier there are two: a page for
-    every *full* span at the tier's size, scale metadata included, and two
-    FP16 open pages per layer for the rest (ADR-0005, ADR-0011)."""
-    Tier = _microinfer.Tier
-    page_tokens = _microinfer.device.page_tokens
+
+def paged_cache_ranges(cfg: ModelConfig, context_length: int, tier: str = "FP16",
+                       tier_map: list[list[str]] | None = None) -> list[int]:
+    """The bytes the paged cache's pages need for `context_length` positions,
+    at a static tier (#18) or built from a tier map of tier names (#92), one
+    figure per tier's address range, indexed by Tier: computed from the
+    layout, before the driver rounds anything.
+
+    A cache that does not seal, at FP16 with no other tier in its map, has a
+    page for every started span of P positions in every layer, all at FP16.
+    One that seals has a page for every *full* span at its birth tier's size,
+    scale metadata included, and two FP16 open pages per layer for the rest
+    (ADR-0005, ADR-0011), in the FP16 range beside any page born there."""
+    device = _microinfer.device
+    page_tokens = device.page_tokens
     layers = cfg.num_hidden_layers
     page_bytes = model.tier_page_bytes(cfg)
-    fp16 = page_bytes[int(Tier.FP16)]
-    if tier == "FP16":
-        return [layers * -(-context_length // page_tokens) * fp16]
-    page = page_bytes[int(getattr(Tier, tier))]
-    open_pages = layers * len(_microinfer.device.open_pages) * fp16 if context_length > 0 else 0
-    return [layers * (context_length // page_tokens) * page, open_pages]
+    fp16 = int(_microinfer.Tier.FP16)
+    cache_tier = getattr(_microinfer.Tier, tier)
+    rows = tier_map_of(tier_map) or [[] for _ in range(layers)]
+    ranges = [0] * len(page_bytes)
+    if not device.KVPages.seals_for(cache_tier, rows):
+        ranges[fp16] = layers * -(-context_length // page_tokens) * page_bytes[fp16]
+        return ranges
+    for row in rows:
+        for i in range(context_length // page_tokens):
+            born = int(row[i] if i < len(row) else cache_tier)
+            ranges[born] += page_bytes[born]
+    if context_length > 0:
+        ranges[fp16] += layers * len(device.open_pages) * page_bytes[fp16]
+    return ranges
 
 
-def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16") -> int:
+def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16",
+                      tier_map: list[list[str]] | None = None) -> int:
     """What the paged cache's pages take from the driver for `context_length`
-    positions at a static tier: paged_cache_ranges, each rounded up to whole
-    granules, since the driver backs each range in granules (ADR-0007). The
-    RoPE table beside the pages is not included; it is the same at every
-    tier."""
+    positions, at a static tier or built from a tier map: paged_cache_ranges,
+    each rounded up to whole granules, since the driver backs each range in
+    granules (ADR-0007). The RoPE table beside the pages is not included; it
+    is the same at every tier."""
     granule = _microinfer.granule_bytes()
-    return sum(-(-n // granule) * granule for n in paged_cache_ranges(cfg, context_length, tier))
+    return sum(-(-n // granule) * granule
+               for n in paged_cache_ranges(cfg, context_length, tier, tier_map))
 
 
 #: What Engine.hold reports after each prefill chunk and each decoded token.
@@ -178,8 +197,9 @@ class Engine:
     #: 6 GiB card (benchmark log, prefill-throughput at 32768 tokens).
     DEFAULT_PREFILL_CHUNK = 512
 
-    #: The precision tiers the paged cache can be held at, statically: every
-    #: page at one tier for the life of a cache (#18, ADR-0008).
+    #: The precision tiers a page of the paged cache can be held at (ADR-0008).
+    #: A page keeps its tier for the life of a cache: kv_tier (#18), or the
+    #: one kv_tier_map names for it (#92).
     KV_TIERS = ("FP16", "INT8", "INT4", "INT2")
 
     #: Which halves of a page a quantised tier quantises. "both" is the tier;
@@ -188,6 +208,7 @@ class Engine:
 
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
                  kv_tier: str = "FP16", kv_halves: str = "both",
+                 kv_tier_map: list[list[str]] | None = None,
                  prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
@@ -200,6 +221,7 @@ class Engine:
         self.prefill_chunk = prefill_chunk
         self.model_dir = Path(model_dir)
         self.config = ModelConfig.from_model_dir(self.model_dir)
+        self.kv_tier_map = kv_tier_map
 
         if verify:
             expected = VERIFIED.get(self.config.name)
@@ -282,8 +304,9 @@ class Engine:
 
     @property
     def kv_tier(self) -> str:
-        """The tier every page of a cache is held at (#18). Static within a
-        cache: nothing changes a page's tier after it is allocated. Setting it
+        """The tier every page of a cache is held at (#18), or, with a
+        kv_tier_map, every page beyond the map's rows. Static within a cache:
+        nothing changes a page's tier after it is allocated. Setting it
         applies to the next cache, and is checked as the constructor checks
         it."""
         return self._kv_tier
@@ -306,7 +329,46 @@ class Engine:
     def kv_halves(self, halves: str) -> None:
         if halves not in self.KV_HALVES:
             raise ValueError(f"kv_halves is one of {self.KV_HALVES}, got {halves!r}")
+        # Before the constructor sets a map, there is none to check.
+        if halves != "both" and getattr(self, "_kv_tier_map", None) is not None:
+            raise ValueError("a diagnostic kv_halves rounds every page at kv_tier, and "
+                             "takes no tier map")
         self._kv_halves = halves
+
+    @property
+    def kv_tier_map(self) -> list[list[str]] | None:
+        """The tier map a cache is built from (#92), or None: row l names, by
+        tier name, the tier each page of layer l is born at, page i at
+        [l][i], and kv_tier beyond a row (ADR-0011, amended by #90). Setting
+        it applies to the next cache, and is checked as the constructor
+        checks it."""
+        return self._kv_tier_map
+
+    @kv_tier_map.setter
+    def kv_tier_map(self, tier_map: list[list[str]] | None) -> None:
+        if tier_map is not None:
+            layers = self.config.num_hidden_layers
+            if len(tier_map) != layers:
+                raise ValueError(f"a tier map needs a row for every layer: {len(tier_map)} "
+                                 f"rows for {layers} layers")
+            names = {name for row in tier_map for name in row}
+            if not names <= set(self.KV_TIERS):
+                raise ValueError(f"kv_tier_map names tiers of {self.KV_TIERS}, got "
+                                 f"{sorted(names - set(self.KV_TIERS))}")
+            if self.kv_cache == "contiguous":
+                raise ValueError("the contiguous cache holds FP16 only; a tier map is on pages")
+            if self.kv_halves != "both":
+                raise ValueError("a diagnostic kv_halves rounds every page at kv_tier, and "
+                                 "takes no tier map")
+            tier_map = [list(row) for row in tier_map]
+        self._kv_tier_map = tier_map
+
+    def _seals(self) -> bool:
+        """Whether the next cache seals its pages (ADR-0011): KVPages's rule,
+        for kv_tier and kv_tier_map. A diagnostic kv_halves is at a quantised
+        kv_tier, so it seals too."""
+        return _microinfer.device.KVPages.seals_for(
+            getattr(_microinfer.Tier, self.kv_tier), tier_map_of(self.kv_tier_map))
 
     @property
     def tensors(self) -> dict[str, _microinfer.DeviceTensor]:
@@ -414,7 +476,7 @@ class Engine:
         after every chunk and every step, so a hold stops within one, and
         releases its cache as it returns.
         """
-        if self.kv_tier != "FP16" or self.kv_halves != "both":
+        if self._seals():
             raise ValueError("holding rewrites positions in place, which only FP16 pages allow")
         ids = self.encode(prompt) if isinstance(prompt, str) else self._check_ids(prompt)
         context = self.config.max_position_embeddings if context is None else context
@@ -568,10 +630,11 @@ class Engine:
         so a generation that stops early never held room for the rest."""
         if self.kv_cache == "contiguous":
             return model.ContiguousCache(self.config, capacity)
-        tier = getattr(_microinfer.Tier, self.kv_tier)
+        Tier = _microinfer.Tier
+        tier = getattr(Tier, self.kv_tier)
         if self.kv_halves == "both":
-            return model.PagedCache(self.config, tier)
-        if tier == _microinfer.Tier.FP16:
+            return model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map))
+        if tier == Tier.FP16:
             raise ValueError("kv_halves splits a quantised tier; FP16 has nothing to split")
         return model.PagedCache(self.config, tier,
                                 getattr(_microinfer.device.Halves, self.kv_halves.title()))
