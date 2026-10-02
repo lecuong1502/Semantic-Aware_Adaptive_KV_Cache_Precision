@@ -22,6 +22,7 @@
 
 #include "microinfer/check.h"
 #include "microinfer/device_ops.h"
+#include "microinfer/importance_scores.h"
 #include "microinfer/kernels.h"
 #include "microinfer/kv_pages.h"
 #include "microinfer/rope_table.h"
@@ -522,6 +523,58 @@ void bind_device(py::module_ &parent)
       .value("Both", microinfer::Halves::Both)
       .value("Keys", microinfer::Halves::Keys)
       .value("Values", microinfer::Halves::Values);
+
+  using microinfer::ImportanceScores;
+  py::class_<ImportanceScores>(
+      m, "ImportanceScores",
+      "The importance score of every (layer, page) (#99): an EWMA of each "
+      "page's attention mass, averaged over the query heads, folded in on "
+      "the device every decode step. NaN where a page has never been "
+      "observed. Copied to the host only by download().")
+      .def(py::init<int, int, float>(), py::arg("layers"), py::arg("max_pages"),
+           py::arg("alpha") = ImportanceScores::kDefaultAlpha)
+      .def(
+          "fold",
+          [](ImportanceScores &s, int layer, const DeviceFloats &mass,
+             int heads, int pages)
+          {
+            if (heads > 0 && pages > 0 &&
+                mass.count() < static_cast<std::size_t>(heads) * pages)
+            {
+              throw std::invalid_argument(
+                  "the mass of " + std::to_string(heads) + " heads over " +
+                  std::to_string(pages) + " pages needs " +
+                  std::to_string(static_cast<std::size_t>(heads) * pages) +
+                  " floats; got " + std::to_string(mass.count()));
+            }
+            s.fold(layer, mass.data(), heads, pages);
+          },
+          py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
+          py::arg("mass"), py::arg("heads"), py::arg("pages"),
+          "Fold one decode step's masses for `layer`, (heads, pages) fp32 on "
+          "the device. Copies nothing to the host.")
+      .def(
+          "download",
+          [](ImportanceScores &s)
+          {
+            std::vector<float> host;
+            {
+              py::gil_scoped_release release;
+              host = s.download();
+            }
+            py::array_t<float> out({s.layers(), s.max_pages()});
+            std::memcpy(out.mutable_data(), host.data(),
+                        host.size() * sizeof(float));
+            return out;
+          },
+          "Every layer's scores, (layers, max_pages): the one copy to the "
+          "host.")
+      .def_property_readonly("alpha", &ImportanceScores::alpha)
+      .def_property_readonly("layers", &ImportanceScores::layers)
+      .def_property_readonly("max_pages", &ImportanceScores::max_pages)
+      .def_property_readonly("downloads", &ImportanceScores::downloads)
+      .def_property_readonly("nbytes", &ImportanceScores::nbytes)
+      .attr("default_alpha") = ImportanceScores::kDefaultAlpha;
 
   using microinfer::ShadowStore;
   py::class_<ShadowStore>(
