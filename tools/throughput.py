@@ -5,6 +5,7 @@
     .venv/bin/python tools/throughput.py --model qwen2.5-1.5b-instruct --lengths 32768 --repeat 1
     .venv/bin/python tools/throughput.py --kv-tier INT4 ...
     .venv/bin/python tools/throughput.py --monitor --lengths 512 --repeat 10
+    .venv/bin/python tools/throughput.py --monitor --scorer --lengths 512 --repeat 10
 
 They are two different regimes, so they are two entries per length:
 - **Prefill** runs many positions through each projection at once and is
@@ -29,6 +30,12 @@ both distributions and whether the difference of their means is within
 noise: no more than twice its standard error, sqrt(s_on^2/n + s_off^2/n).
 A transition also reads the own/others split, which the timed runs may never
 see, so the entry carries that read's own cost, timed apart.
+
+--monitor --scorer measures the monitor and the importance scorer (#99,
+#100) together the same way: decode with both on against both off. With
+the scorer on, every decode step writes each page's attention mass and
+folds it into the scores on the device. It logs "monitor-scorer-overhead"
+entries.
 """
 
 from __future__ import annotations
@@ -44,7 +51,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import Engine, benchlog, monitor  # noqa: E402
+from microinfer import Engine, _microinfer, benchlog, monitor  # noqa: E402
 from microinfer.contention import spread  # noqa: E402
 
 SEED = 15
@@ -92,9 +99,11 @@ def decode_rate(engine: Engine, prompt: np.ndarray) -> float:
     return DECODE_STEPS / max(steps, 1e-9)
 
 
-def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: int) -> dict:
+def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: int,
+                     scorer: bool = False) -> dict:
     """Decode throughput with the pressure monitor on and off, `repeat`
-    times each, interleaved, the order alternating."""
+    times each, interleaved, the order alternating; with `scorer`, the
+    importance scorer on and off with it."""
     for _ in range(warmup):
         decode_rate(engine, prompt)
     rates: dict[bool, list[float]] = {False: [], True: []}
@@ -103,10 +112,12 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
         for on in ((False, True) if r % 2 == 0 else (True, False)):
             if on:
                 engine.start_monitor()
+                engine.kv_scoring = scorer
             try:
                 rates[on].append(decode_rate(engine, prompt))
             finally:
                 engine.stop_monitor()
+                engine.kv_scoring = False
             if on:
                 events += len(engine.pressure_events)
                 if engine.monitor_error is not None:
@@ -131,9 +142,10 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
 
 def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
                          tiers: dict) -> None:
-    """Measure and log what the pressure monitor costs decoding after `ids`."""
+    """Measure and log what the pressure monitor, and with --scorer the
+    importance scorer, cost decoding after `ids`."""
     prompt = decode_prompt(engine, ids)
-    results = monitor_overhead(engine, prompt, args.repeat, args.warmup)
+    results = monitor_overhead(engine, prompt, args.repeat, args.warmup, args.scorer)
     thresholds = monitor.DEFAULT
     config = {**method, "statistic": "mean", "steps": DECODE_STEPS,
               "order": "interleaved, alternating", "poll_s": monitor.POLL_S,
@@ -141,12 +153,17 @@ def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
                              "yellow_below_bytes": thresholds.yellow_below_bytes,
                              "persist_polls": thresholds.persist_polls,
                              "thresholds_adr": 13}}
+    if args.scorer:
+        config["scorer"] = {"alpha": _microinfer.device.ImportanceScores.default_alpha,
+                            "issue": 99}
+    what = "the monitor and scorer" if args.scorer else "the monitor"
     print(f"decode after {len(prompt):6}: {results['off']['mean']:8.1f} tok/s without "
-          f"the monitor, {results['on']['mean']:8.1f} with "
+          f"{what}, {results['on']['mean']:8.1f} with "
           f"({results['difference_percent']:+.2f}%, noise +-{results['noise']:.1f}): "
           f"{'within' if results['within_noise'] else 'OUTSIDE'} noise; a split read "
           f"{results['split_read_ms']['median']:.2f} ms")
-    benchlog.append("monitor-overhead", model=args.model,
+    benchlog.append("monitor-scorer-overhead" if args.scorer else "monitor-overhead",
+                    model=args.model,
                     context_length=len(prompt) + DECODE_STEPS, precision_tiers=tiers,
                     config=config, results=results, log=args.log)
 
@@ -164,10 +181,14 @@ def main(argv: list[str]) -> int:
                              "more prefills")
     parser.add_argument("--monitor", action="store_true",
                         help="measure the pressure monitor's cost to decoding, instead")
+    parser.add_argument("--scorer", action="store_true",
+                        help="with --monitor, the importance scorer on with the monitor")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     if args.monitor and args.repeat < 2:
         parser.error("--monitor compares spreads, and needs --repeat 2 or more")
+    if args.scorer and not args.monitor:
+        parser.error("--scorer is measured with --monitor, both on against both off")
 
     if benchlog.environment(args.log)["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first")
