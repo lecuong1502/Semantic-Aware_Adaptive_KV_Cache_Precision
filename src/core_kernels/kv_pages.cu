@@ -101,14 +101,12 @@ namespace microinfer
           "a diagnostic Halves rounds every page at the cache's one tier, and "
           "takes no tier map");
     }
-    // Every tier a page of positions is born at: the cache's, and the map's.
-    std::array<bool, kTierCount> born{};
-    born[static_cast<int>(storage_tier_)] = true;
+    born_[static_cast<int>(storage_tier_)] = true;
     for (const auto &row : tier_map_)
     {
       for (Tier t : row)
       {
-        born[static_cast<int>(t)] = true;
+        born_[static_cast<int>(t)] = true;
         mixed_ = mixed_ || t != tier;
       }
     }
@@ -136,7 +134,7 @@ namespace microinfer
     };
     for (int t = 0; t < kTierCount; ++t)
     {
-      if (born[t])
+      if (born_[t])
       {
         check(static_cast<Tier>(t), bytes_at(static_cast<Tier>(t)),
               "a page of positions");
@@ -250,7 +248,7 @@ namespace microinfer
     return {tier, allocator_.address(key, allocator_.page_bytes(tier))};
   }
 
-  const unsigned long long *KVPages::resolve(int layer)
+  KVPages::LayerTable KVPages::resolve(int layer)
   {
     if (layer < 0 || layer >= layers_)
     {
@@ -261,7 +259,7 @@ namespace microinfer
     // its first page fills in an open page; then there is no table.
     if (pages_ == 0)
     {
-      return nullptr;
+      return {nullptr, nullptr};
     }
     if (resolved_pages_ != pages_ ||
         resolved_generation_ != allocator_.generation_)
@@ -271,32 +269,45 @@ namespace microinfer
         // Room to grow before the next reallocation. Freeing the old buffer
         // waits for launches that may still read it, as cudaFree does.
         table_stride_ = pages_ > 2 * table_stride_ ? pages_ : 2 * table_stride_;
-        tables_ = std::make_unique<DeviceBuffer>(static_cast<size_t>(layers_) *
-                                                 table_stride_ *
-                                                 sizeof(unsigned long long));
+        tables_ = std::make_unique<DeviceBuffer>(
+            static_cast<size_t>(layers_) * table_stride_ *
+            (sizeof(unsigned long long) + sizeof(std::uint8_t)));
       }
+      // The addresses of every layer's pages, then each page's tier, in the
+      // same order: one buffer, one upload.
+      const size_t entries = static_cast<size_t>(layers_) * table_stride_;
       std::vector<unsigned long long> host(
-          static_cast<size_t>(layers_) * table_stride_, 0);
+          entries + (entries + sizeof(unsigned long long) - 1) /
+                        sizeof(unsigned long long),
+          0);
+      auto *tiers = reinterpret_cast<std::uint8_t *>(host.data() + entries);
       for (int l = 0; l < layers_; ++l)
       {
         for (int page = 0; page < pages_; ++page)
         {
-          host[static_cast<size_t>(l) * table_stride_ + page] =
-              resolve_page({l, page}).address;
+          const ResolvedPage resolved = resolve_page({l, page});
+          const size_t at = static_cast<size_t>(l) * table_stride_ + page;
+          host[at] = resolved.address;
+          tiers[at] = static_cast<std::uint8_t>(resolved.tier);
         }
       }
       // On the legacy default stream, so ordered after every launch already
       // enqueued, which may still be reading the tables this overwrites.
       // Moving to other streams would have to order this explicitly.
       cuda_check(cudaMemcpy(tables_->raw(), host.data(),
-                            host.size() * sizeof(unsigned long long),
+                            entries * (sizeof(unsigned long long) +
+                                       sizeof(std::uint8_t)),
                             cudaMemcpyHostToDevice),
                  "cudaMemcpy page tables host-to-device");
       resolved_pages_ = pages_;
       resolved_generation_ = allocator_.generation_;
     }
-    return tables_->as<const unsigned long long>() +
-           static_cast<size_t>(layer) * table_stride_;
+    // table_stride_ as it is now, after any growth above.
+    const size_t entries = static_cast<size_t>(layers_) * table_stride_;
+    const size_t at = static_cast<size_t>(layer) * table_stride_;
+    return {tables_->as<const unsigned long long>() + at,
+            tables_->as<const std::uint8_t>() +
+                entries * sizeof(unsigned long long) + at};
   }
 
   __half *KVPages::open_page(int layer, int which)
@@ -329,8 +340,8 @@ namespace microinfer
       store_sealed(layer, keys, values, start, n);
       return;
     }
-    device::store_pages(keys, values, resolve(layer), page_tokens_, kv_width_,
-                        start, n);
+    device::store_pages(keys, values, resolve(layer).pages, page_tokens_,
+                        kv_width_, start, n);
   }
 
   void KVPages::seal(int layer, int span, const __half *keys,
@@ -446,16 +457,11 @@ namespace microinfer
     {
       return;
     }
-    if (mixed_)
-    {
-      throw std::logic_error(
-          "attention over pages born at more than one tier reads each at its "
-          "own, which is #91's; this cache's attention reads one tier");
-    }
     if (!seals())
     {
-      device::attention_paged(q, resolve(layer), page_tokens_, k_bias, rope,
-                              out, seq_q, seq_k, heads, kv_heads, head_dim);
+      device::attention_paged(q, resolve(layer).pages, page_tokens_, k_bias,
+                              rope, out, seq_q, seq_k, heads, kv_heads,
+                              head_dim);
       return;
     }
     if (keys == nullptr || values == nullptr)
@@ -468,10 +474,12 @@ namespace microinfer
     {
       throw std::logic_error("attention before any position was reserved");
     }
-    device::attention_paged_causal(
-        q, resolve(layer), open_page(layer, attend_open_[layer]), keys, values,
-        page_tokens_, tier_, storage_tier_ == Tier::FP16, k_bias, rope, out,
-        seq_q, seq_k, heads, kv_heads, head_dim);
+    // Each page is read at the tier the page table records for it (#91).
+    const LayerTable table = resolve(layer);
+    device::attention_paged_causal(q, table.pages, table.tiers, born_,
+                                   open_page(layer, attend_open_[layer]), keys,
+                                   values, page_tokens_, k_bias, rope, out,
+                                   seq_q, seq_k, heads, kv_heads, head_dim);
   }
 
 } // namespace microinfer

@@ -2,6 +2,7 @@
 
 #include <cuda_fp16.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -77,20 +78,23 @@ namespace microinfer
                          const RopeTable *rope, __half *out, int seq_q,
                          int seq_k, int heads, int kv_heads, int head_dim);
 
-    // The same attention over a cache at a quantised tier, read causally
-    // (#18, ADR-0011): a query reads every page before its own as sealed, and
-    // its own page at FP16, as decode does. `sealed` is the layer's table of
-    // sealed pages, at `tier` in quant.h's layout, or, with fp16_pages, FP16
-    // pages laid out as attention_paged's. Of the query's own page, positions
-    // before the first query's, seq_k - seq_q, are read from `open`, an FP16
-    // page; the rest from chunk_k and chunk_v, the seq_q rows the queries
-    // brought. A sealed page's codes are dequantised as dequantise_page does
-    // it. page_tokens must be a multiple of kAttentionTileQ.
+    // The same attention over a cache that seals, read causally (#18,
+    // ADR-0011): a query reads every page before its own as sealed, and its
+    // own page at FP16, as decode does. `sealed` is the layer's table of
+    // sealed pages, and `tiers` beside it the tier the page table records
+    // for each (#91): a page at a quantised tier is in quant.h's layout, and
+    // its codes are dequantised as dequantise_page does it; one at FP16 is
+    // laid out as attention_paged's. `born` names every tier a page may be
+    // at. Of the query's own page, positions before the first query's,
+    // seq_k - seq_q, are read from `open`, an FP16 page; the rest from
+    // chunk_k and chunk_v, the seq_q rows the queries brought. page_tokens
+    // must be a multiple of kAttentionTileQ.
     void attention_paged_causal(const __half *q,
                                 const unsigned long long *sealed,
+                                const std::uint8_t *tiers,
+                                const std::array<bool, kTierCount> &born,
                                 const __half *open, const __half *chunk_k,
                                 const __half *chunk_v, int page_tokens,
-                                Tier tier, bool fp16_pages,
                                 const __half *k_bias, const RopeTable *rope,
                                 __half *out, int seq_q, int seq_k, int heads,
                                 int kv_heads, int head_dim);

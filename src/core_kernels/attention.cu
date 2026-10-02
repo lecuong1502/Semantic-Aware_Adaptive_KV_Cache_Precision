@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -177,8 +178,9 @@ namespace microinfer
       }
     };
 
-    // ... or an FP16 page, keys then values, as PagedKV reads it: the
-    // diagnostic pages of KVPages' Halves::Keys and Halves::Values, whose
+    // ... or an FP16 page, keys then values, as PagedKV reads it: a page
+    // born at FP16 in a cache that seals (ADR-0011, amended by #90), or a
+    // diagnostic page of KVPages' Halves::Keys and Halves::Values, whose
     // other half was quantised and dequantised when the page was sealed.
     struct Fp16Format
     {
@@ -197,14 +199,64 @@ namespace microinfer
       }
     };
 
-    // A cache at a quantised tier, read causally (ADR-0011): a query reads
-    // every page before its own as sealed, and its own page at FP16, as
-    // decode does, whatever else arrived in the same launch. Of its own
-    // page, the positions before `start`, the first query's, are in the open
-    // page they were written to; the rest are the rows this launch's queries
-    // brought, `chunk_k` and `chunk_v`. The kernel's query tiles are aligned
-    // so that no tile spans two pages, and view_for binds a tile's page.
-    template <typename Format> struct CausalPagedKV
+    // Each sealed page read at its own tier (#91): `tiers` is the layer's
+    // table of the tier the page table records for each page, beside its
+    // addresses, and a page is read in that tier's format. A tier no page
+    // of the cache can be at has no layout, and is never named.
+    //
+    // The branch costs no divergence within a warp. A key tile is loaded
+    // one key row at a time, head_dim consecutive elements per row, and
+    // head_dim is a multiple of the warp's 32 lanes in every model here, so
+    // a warp's lanes all load one row, of one page, at one tier. Different
+    // warps may take different branches, which costs nothing.
+    struct TierFormats
+    {
+      const std::uint8_t *tiers;
+      Fp16Format fp16;
+      QuantisedFormat<8> int8;
+      QuantisedFormat<4> int4;
+      QuantisedFormat<2> int2;
+
+      // Calls read(format) with page p's format: the one switch on a tier.
+      template <typename Read>
+      __device__ auto with_format(int p, Read read) const
+      {
+        switch (static_cast<Tier>(tiers[p]))
+        {
+        case Tier::INT8:
+          return read(int8);
+        case Tier::INT4:
+          return read(int4);
+        case Tier::INT2:
+          return read(int2);
+        case Tier::FP16:
+          break;
+        }
+        return read(fp16);
+      }
+      __device__ float key(int p, const std::uint8_t *page, int t,
+                           size_t at) const
+      {
+        return with_format(p, [&](const auto &format)
+                           { return format.key(page, t, at); });
+      }
+      __device__ __half value(int p, const std::uint8_t *page, int t,
+                              size_t at) const
+      {
+        return with_format(p, [&](const auto &format)
+                           { return format.value(page, t, at); });
+      }
+    };
+
+    // A cache that seals, read causally (ADR-0011): a query reads every page
+    // before its own as sealed, each at its own tier, and its own page at
+    // FP16, as decode does, whatever else arrived in the same launch. Of its
+    // own page, the positions before `start`, the first query's, are in the
+    // open page they were written to; the rest are the rows this launch's
+    // queries brought, `chunk_k` and `chunk_v`. The kernel's query tiles are
+    // aligned so that no tile spans two pages, and view_for binds a tile's
+    // page.
+    struct CausalPagedKV
     {
       const unsigned long long *sealed;
       const __half *open;
@@ -213,7 +265,7 @@ namespace microinfer
       int page_tokens;
       int start;
       size_t row;
-      Format format;
+      TierFormats formats;
       int own = 0;
 
       __device__ CausalPagedKV view_for(int position) const
@@ -232,7 +284,7 @@ namespace microinfer
         const int t = j % page_tokens;
         if (p < own)
         {
-          return format.key(page(p), t, at);
+          return formats.key(p, page(p), t, at);
         }
         if (j >= start)
         {
@@ -247,7 +299,7 @@ namespace microinfer
         const int t = j % page_tokens;
         if (p < own)
         {
-          return format.value(page(p), t, at);
+          return formats.value(p, page(p), t, at);
         }
         if (j >= start)
         {
@@ -531,9 +583,10 @@ namespace microinfer
   }
 
   void device::attention_paged_causal(
-      const __half *q, const unsigned long long *sealed, const __half *open,
-      const __half *chunk_k, const __half *chunk_v, int page_tokens, Tier tier,
-      bool fp16_pages, const __half *k_bias, const RopeTable *rope, __half *out,
+      const __half *q, const unsigned long long *sealed,
+      const std::uint8_t *tiers, const std::array<bool, kTierCount> &born,
+      const __half *open, const __half *chunk_k, const __half *chunk_v,
+      int page_tokens, const __half *k_bias, const RopeTable *rope, __half *out,
       int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
   {
     if (page_tokens <= 0 || page_tokens % kAttentionTileQ != 0)
@@ -549,30 +602,23 @@ namespace microinfer
     // The first tile begins at the last multiple of the tile size at or
     // before `start`, so every tile lies within one page.
     const int lead = start % kAttentionTileQ;
-    if (fp16_pages)
+    // A layout for each quantised tier a page can be at, and none for the
+    // others, whose shape the layout may not hold.
+    const auto layout = [&](Tier tier)
     {
-      launch(q,
-             CausalPagedKV<Fp16Format>{sealed, open, chunk_k, chunk_v,
-                                       page_tokens, start, row,
-                                       Fp16Format{row, page_tokens}},
-             k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim, lead);
-      return;
-    }
-    const QuantisedPageLayout layout =
-        quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
-    with_code_width(
-        tier,
-        [&](auto width)
-        {
-          constexpr int kBits = decltype(width)::value;
-          using Format = QuantisedFormat<kBits>;
-          launch(q,
-                 CausalPagedKV<Format>{sealed, open, chunk_k, chunk_v,
-                                       page_tokens, start, row,
-                                       Format{layout, row, kv_heads, head_dim}},
-                 k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim,
-                 lead);
-        });
+      return born[static_cast<int>(tier)]
+                 ? quantised_page_layout(tier, page_tokens, kv_heads, head_dim)
+                 : QuantisedPageLayout{};
+    };
+    const TierFormats formats{
+        tiers, Fp16Format{row, page_tokens},
+        QuantisedFormat<8>{layout(Tier::INT8), row, kv_heads, head_dim},
+        QuantisedFormat<4>{layout(Tier::INT4), row, kv_heads, head_dim},
+        QuantisedFormat<2>{layout(Tier::INT2), row, kv_heads, head_dim}};
+    launch(q,
+           CausalPagedKV{sealed, open, chunk_k, chunk_v, page_tokens, start,
+                         row, formats},
+           k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim, lead);
   }
 
   void attention(const float *q, const float *k, const float *v,

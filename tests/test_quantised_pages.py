@@ -51,18 +51,20 @@ def pages_for(cfg, page_tokens, tier, halves=Halves.Both, capacity_pages=4096, t
                                      cfg.head_dim, tier, halves, tier_map or [])
 
 
-def sealed(allocator, cfg, layer, pages, page_tokens, tier, halves=Halves.Both):
-    """The first `pages` pages of `layer`, as rows: dequantised as
-    dequantise_page returns them, or, for a diagnostic, as the FP16 page
-    holds them."""
+def sealed(allocator, cfg, layer, pages, page_tokens):
+    """The first `pages` pages of `layer`, as rows, each read at the tier the
+    page table records for it: dequantised as dequantise_page returns it, or,
+    at FP16 (a diagnostic's pages, or a page a map placed there), as the page
+    holds it."""
     kv_heads, hd = cfg.num_key_value_heads, cfg.head_dim
     keys, values = [], []
     for i in range(pages):
         raw = allocator.read(layer, i)
-        if halves == Halves.Both:
-            k, v = _microinfer.dequantise_page(raw, tier, kv_heads, hd, page_tokens)
-        else:
+        tier = allocator.locate(layer, i)[0]
+        if tier == Tier.FP16:
             k, v = raw.view(np.float16).astype(np.float32).reshape(2, page_tokens, kv_heads, hd)
+        else:
+            k, v = _microinfer.dequantise_page(raw, tier, kv_heads, hd, page_tokens)
         keys.append(k)
         values.append(v)
     empty = np.zeros((0, kv_heads, hd), np.float32)
@@ -81,17 +83,16 @@ def store_in_runs(cache, layer, k, v, runs):
     return start - runs[-1]
 
 
-def causal_reference(cfg, allocator, layer, q, k, v, bias, start, page_tokens, tier,
-                     halves=Halves.Both):
+def causal_reference(cfg, allocator, layer, q, k, v, bias, start, page_tokens):
     """Each query alone, over what it may read: the pages before its own as
-    sealed, and its own page's positions as they came."""
+    sealed, each at its own tier, and its own page's positions as they
+    came."""
     heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
     seq_k = len(k)
     rope = device.RopeTable(hd, cfg.rope_theta)
     rope.cover(seq_k)
     b = put(bias) if bias is not None else None
-    sealed_k, sealed_v = sealed(allocator, cfg, layer, seq_k // page_tokens, page_tokens,
-                                tier, halves)
+    sealed_k, sealed_v = sealed(allocator, cfg, layer, seq_k // page_tokens, page_tokens)
     rows = []
     for i, pos in enumerate(range(start, seq_k)):
         own = pos // page_tokens * page_tokens
@@ -194,8 +195,7 @@ def test_each_query_reads_earlier_pages_sealed_and_its_own_as_it_came():
             start = store_in_runs(cache, 1, k, v, runs)
             for bias in (None, normal(rng, kv_heads, hd) * 30):
                 q = normal(rng, seq - start, heads, hd)
-                want = causal_reference(cfg, allocator, 1, q, k, v, bias, start, page_tokens,
-                                        tier)
+                want = causal_reference(cfg, allocator, 1, q, k, v, bias, start, page_tokens)
                 np.testing.assert_array_equal(attend(cfg, cache, 1, q, k, v, bias, start), want,
                                               err_msg=f"runs={runs}")
 
@@ -221,7 +221,7 @@ def test_each_query_reads_earlier_pages_sealed_and_its_own_as_it_came():
         after = attend(CFG, cache, 0, q, k, v, None, start)
         np.testing.assert_array_equal(after, before)
         np.testing.assert_array_equal(
-            after, causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens, tier))
+            after, causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens))
 
     each([(n, t, p) for n in MODELS for t in QUANTISED for p in PAGE_TOKENS], causal,
          name=lambda c: f"{c[0]} {c[1].name} P={c[2]}")
@@ -243,7 +243,7 @@ def test_a_diagnostic_page_rounds_one_half_and_keeps_the_other():
         allocator, cache = pages_for(CFG, page_tokens, tier, halves)
         assert cache.storage_tier == Tier.FP16 and cache.halves == halves
         start = store_in_runs(cache, 0, k, v, [page_tokens + 2, seq - page_tokens - 2])
-        got_k, got_v = sealed(allocator, CFG, 0, 2, page_tokens, tier, halves)
+        got_k, got_v = sealed(allocator, CFG, 0, 2, page_tokens)
         for i in range(2):
             span = slice(i * page_tokens, (i + 1) * page_tokens)
             rk, rv = _microinfer.dequantise_page(
@@ -254,7 +254,7 @@ def test_a_diagnostic_page_rounds_one_half_and_keeps_the_other():
         q = normal(rng, seq - start, heads, hd)
         np.testing.assert_array_equal(
             attend(CFG, cache, 0, q, k, v, None, start),
-            causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens, tier, halves))
+            causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens))
 
     each([(t, h) for t in QUANTISED for h in (Halves.Keys, Halves.Values)], diagnostic,
          name=lambda c: f"{c[0].name} {c[1].name}")
@@ -333,8 +333,7 @@ def test_a_cache_built_from_a_tier_map_seals_each_page_at_its_tier():
     or, born at FP16, its rows as they came (quantise_page has no FP16
     layout; the FP16 page is the rows). A map with one tier everywhere builds
     what the static path builds, byte for byte, open pages included. A map that does not name every
-    layer, one with a diagnostic, and attention over pages at more than one
-    tier (until #91) are refused."""
+    layer, and one with a diagnostic, are refused."""
     kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
     mixed = [[Tier.INT8, Tier.FP16, Tier.INT4, Tier.INT2], [Tier.FP16, Tier.INT2]]
 
@@ -388,7 +387,59 @@ def test_a_cache_built_from_a_tier_map_seals_each_page_at_its_tier():
         pages_for(CFG, 16, Tier.FP16, tier_map=[[Tier.INT8]])
     with pytest.raises(ValueError, match="diagnostic"):
         pages_for(CFG, 16, Tier.INT4, Halves.Keys, tier_map=mixed)
-    _, cache, k, v = stored(16, Tier.FP16, mixed)
-    with pytest.raises(RuntimeError, match="#91"):
-        attend(CFG, cache, 0, normal(np.random.default_rng(0), 1, CFG.num_attention_heads, hd),
-               k[0], v[0], None, len(k[0]) - 1)
+
+
+def test_attention_reads_each_page_at_its_own_tier():
+    """Over a cache built from a map of every tier, at both models and both
+    page sizes, over caches at FP16 and at INT4: each query reads every page
+    before its own at the tier the page table records for it, and its own
+    page at FP16, as ADR-0011 has it. A prompt in one step, a step that
+    begins mid-page and crosses pages, and single positions; after each,
+    every query's output is, to the bit, the causal reference's, which
+    dequantises each page at its own tier, with and without the key bias.
+    And a map with one tier everywhere reads, to the bit, as the static
+    cache at that tier does, at every tier."""
+    def mixed_map(page_tokens, seq):
+        pages = seq // page_tokens + 1
+        order = [Tier.INT8, Tier.FP16, Tier.INT2, Tier.INT4]
+        return [[order[(layer + i) % 4] for i in range(pages)] for layer in range(LAYERS)]
+
+    def per_page(name, tier, page_tokens):
+        cfg = ModelConfig.from_card(name)
+        rng = np.random.default_rng(page_tokens)
+        heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        seq = 4 * page_tokens + 7
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        for runs in ([seq], [page_tokens + 5, seq - page_tokens - 5],
+                     [page_tokens - 1, 1, 3 * page_tokens + 4, 1, 1, 1]):
+            allocator, cache = pages_for(cfg, page_tokens, tier,
+                                         tier_map=mixed_map(page_tokens, seq))
+            start = store_in_runs(cache, 1, k, v, runs)
+            assert {cache.page_tier(1, i) for i in range(cache.pages_per_layer)} == set(
+                Tier.__members__.values())
+            for bias in (None, normal(rng, kv_heads, hd) * 30):
+                q = normal(rng, seq - start, heads, hd)
+                np.testing.assert_array_equal(
+                    attend(cfg, cache, 1, q, k, v, bias, start),
+                    causal_reference(cfg, allocator, 1, q, k, v, bias, start, page_tokens),
+                    err_msg=f"runs={runs}")
+
+    def as_static(tier, page_tokens):
+        rng = np.random.default_rng(91)
+        heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
+        seq = 3 * page_tokens + 5
+        k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+        bias = normal(rng, kv_heads, hd) * 30
+        runs = [page_tokens + 3, seq - page_tokens - 3]
+        outs = []
+        for tier_map in ([[tier] * (seq // page_tokens + 1) for _ in range(LAYERS)], None):
+            _, cache = pages_for(CFG, page_tokens, tier, tier_map=tier_map)
+            start = store_in_runs(cache, 0, k, v, runs)
+            q = normal(np.random.default_rng(0), seq - start, heads, hd)
+            outs.append(attend(CFG, cache, 0, q, k, v, bias, start))
+        np.testing.assert_array_equal(outs[0], outs[1])
+
+    each([(n, t, p) for n in MODELS for t in (Tier.FP16, Tier.INT4) for p in PAGE_TOKENS],
+         per_page, name=lambda c: f"{c[0]} {c[1].name} P={c[2]}")
+    each([(t, p) for t in Tier.__members__.values() for p in PAGE_TOKENS], as_static,
+         name=lambda c: f"as static {c[0].name} P={c[1]}")
