@@ -65,12 +65,21 @@ The tier a page of positions is allocated and sealed at: its tier map's, or
 its cache's. It is where a page starts; a requantisation plan may move it
 later (#88).
 
+**Staging page**:
+Where a downgrade writes a page's new bytes, at the target tier, while the
+FP16 page they are quantised from is still read: the page table entry
+`(layer, -3)`, which takes the page's own entry when the FP16 page is freed
+(#93).
+_Avoid_: temporary page, scratch page
+
 **Seal**:
 To write a page of positions at its birth tier, once and for good, when its
 last position arrives: quantised from the rows that brought it, or from the
 open page it filled, or, for a page born at FP16 in a cache that seals,
 copied as it came. A cache seals when any of its pages is born at a quantised
-tier (ADR-0011 and its amendment). A sealed page is never written again.
+tier, or when asked to, so that it can downgrade pages born at FP16
+(ADR-0011 and its amendments). A sealed page is never written again: a
+downgrade puts a new page in its place.
 _Avoid_: flush, commit, finalise, close
 _Avoid_: partial page, current block, tail page (the tail is the allocator's
 last slot, ADR-0007)

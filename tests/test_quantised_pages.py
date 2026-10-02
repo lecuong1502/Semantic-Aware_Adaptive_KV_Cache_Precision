@@ -443,3 +443,194 @@ def test_attention_reads_each_page_at_its_own_tier():
          per_page, name=lambda c: f"{c[0]} {c[1].name} P={c[2]}")
     each([(t, p) for t in Tier.__members__.values() for p in PAGE_TOKENS], as_static,
          name=lambda c: f"as static {c[0].name} P={c[1]}")
+
+
+# -- runtime tier changes (#93) -------------------------------------------------------
+
+
+def snapshot(allocator):
+    """Every page the allocator holds, by key: its bytes."""
+    return {key: allocator.read(*key) for t in Tier.__members__.values()
+            for key in allocator.pages(t)}
+
+
+def test_a_sealed_fp16_page_downgrades_at_runtime():
+    """A page of positions sealed at FP16 is moved to a lower tier mid-session:
+    allocated at the target tier, quantised from the FP16 page, put in its
+    place in the page table, and the FP16 page freed, its tier's tail moving
+    into the slot (ADR-0007). Afterwards each moved page holds quantise_page's
+    bytes for its positions at its target tier, every other page holds what
+    it held, and attention reads, to the bit, what a cache built at those
+    tiers reads. At both page sizes, over caches at FP16 and INT4."""
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    heads = CFG.num_attention_heads
+
+    def downgrades(page_tokens, tier):
+        rng = np.random.default_rng(93)
+        seq = 5 * page_tokens + 3
+        pages = seq // page_tokens
+        k = [normal(rng, seq, kv_heads, hd) for _ in range(LAYERS)]
+        v = [normal(rng, seq, kv_heads, hd) for _ in range(LAYERS)]
+        born = [[Tier.FP16] * pages for _ in range(LAYERS)]
+        born[0][0] = Tier.INT8  # so that a cache at FP16 seals
+        moves = {(0, 1): Tier.INT4, (0, 3): Tier.INT2, (1, 0): Tier.INT8, (1, 4): Tier.INT4}
+        final = [row[:] for row in born]
+        for (layer, i), target in moves.items():
+            final[layer][i] = target
+        runs = [page_tokens + 5, seq - page_tokens - 5]
+
+        def built(tier_map):
+            allocator, cache = pages_for(CFG, page_tokens, tier, tier_map=tier_map)
+            for layer in range(LAYERS):
+                start = store_in_runs(cache, layer, k[layer], v[layer], runs)
+            return allocator, cache, start
+
+        allocator, cache, start = built(born)
+        before = snapshot(allocator)
+        for (layer, i), target in moves.items():
+            cache.downgrade(layer, i, target)
+        for layer in range(LAYERS):
+            for i in range(pages):
+                assert cache.page_tier(layer, i) == final[layer][i], (layer, i)
+                if (layer, i) in moves:
+                    span = slice(i * page_tokens, (i + 1) * page_tokens)
+                    want = _microinfer.quantise_page(k[layer][span], v[layer][span],
+                                                     final[layer][i], page_tokens)
+                else:
+                    want = before[(layer, i)]
+                np.testing.assert_array_equal(allocator.read(layer, i), want,
+                                              err_msg=f"layer {layer} page {i}")
+        for p in device.open_pages:
+            np.testing.assert_array_equal(allocator.read(0, p), before[(0, p)])
+
+        reference, cache_at_final, _ = built(final)
+        for layer in range(LAYERS):
+            for bias in (None, normal(rng, kv_heads, hd) * 30):
+                q = normal(rng, seq - start, heads, hd)
+                got = attend(CFG, cache, layer, q, k[layer], v[layer], bias, start)
+                np.testing.assert_array_equal(
+                    got, attend(CFG, cache_at_final, layer, q, k[layer], v[layer], bias, start))
+                np.testing.assert_array_equal(
+                    got, causal_reference(CFG, allocator, layer, q, k[layer], v[layer], bias,
+                                          start, page_tokens))
+
+    each([(p, t) for p in PAGE_TOKENS for t in (Tier.FP16, Tier.INT4)], downgrades,
+         name=lambda c: f"P={c[0]} {c[1].name}")
+
+
+def test_a_downgrade_whose_slot_takes_the_tail_keeps_every_other_page():
+    """The FP16 page a downgrade frees is not its tier's tail, so the tail, a
+    page of another layer, moves into its slot, and keeps its bytes; and a
+    page of another cache sharing the allocator keeps its bytes and its slot
+    in the target tier, where the new page goes after it."""
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(7)
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    seq = 3 * page_tokens
+    born = [[Tier.INT8, Tier.FP16, Tier.FP16]] * LAYERS
+    allocator, cache = pages_for(CFG, page_tokens, Tier.FP16, tier_map=born)
+    allocator.allocate(99, 0, Tier.INT4)
+    other = rng.integers(0, 256, allocator.page_bytes(Tier.INT4), dtype=np.uint8)
+    allocator.write(99, 0, other)
+    for layer in range(LAYERS):
+        store_in_runs(cache, layer, normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd),
+                      [seq])
+    tail = allocator.pages(Tier.FP16)[-1]
+    assert tail != (0, 1)
+    slot = allocator.locate(0, 1)[1]
+    before = snapshot(allocator)
+    cache.downgrade(0, 1, Tier.INT4)
+    assert allocator.locate(*tail) == (Tier.FP16, slot), "the tail did not move into the slot"
+    assert allocator.locate(99, 0) == (Tier.INT4, 0) and allocator.locate(0, 1) == (Tier.INT4, 1)
+    np.testing.assert_array_equal(allocator.read(99, 0), other)
+    for key, was in before.items():
+        if key != (0, 1):
+            np.testing.assert_array_equal(allocator.read(*key), was, err_msg=str(key))
+
+
+def test_what_a_downgrade_refuses():
+    """Only a sealed page of positions at FP16 downgrades, and only to a
+    quantised tier, in a cache that seals: not an open page, not a page
+    whose positions are reserved but not yet stored, not a page already
+    quantised, not to FP16, not in a cache that does not seal, nor under a
+    diagnostic Halves, whose pages are FP16 by definition. A downgrade that
+    cannot allocate its target page leaves the cache as it was."""
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(8)
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    born = [[Tier.INT8, Tier.FP16, Tier.FP16]] * LAYERS
+    allocator, cache = pages_for(CFG, page_tokens, Tier.FP16, tier_map=born)
+    seq = 2 * page_tokens
+    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+    store_in_runs(cache, 0, k, v, [seq])
+    cache.reserve(3 * page_tokens)  # page 2 is held, and not sealed
+    for layer, page, target, match in ((0, device.open_pages[0], Tier.INT4, "page of positions"),
+                                       (0, 2, Tier.INT4, "sealed"),
+                                       (1, 1, Tier.INT4, "sealed"),
+                                       (0, 0, Tier.INT4, "FP16"),
+                                       (0, 1, Tier.FP16, "quantised tier"),
+                                       (0, 9, Tier.INT4, "page of positions")):
+        with pytest.raises(ValueError, match=match):
+            cache.downgrade(layer, page, target)
+
+    _, plain = pages_for(CFG, page_tokens, Tier.FP16)
+    store_in_runs(plain, 0, k, v, [seq])
+    with pytest.raises(ValueError, match="seal"):
+        plain.downgrade(0, 0, Tier.INT4)
+    _, diagnostic = pages_for(CFG, page_tokens, Tier.INT4, Halves.Keys)
+    store_in_runs(diagnostic, 0, k, v, [seq])
+    with pytest.raises(ValueError, match="diagnostic"):
+        diagnostic.downgrade(0, 0, Tier.INT2)
+
+    capacity = [0] * 4
+    capacity[int(Tier.FP16)] = 4096
+    capacity[int(Tier.INT8)] = LAYERS * 3
+    full = PagedKVCache(tier_page_bytes(CFG, page_tokens), capacity)
+    small = device.KVPages(full, LAYERS, page_tokens, kv_heads, hd, Tier.FP16, Halves.Both,
+                           born)
+    store_in_runs(small, 0, k, v, [seq])
+    for j in range(capacity[int(Tier.INT8)] - len(full.pages(Tier.INT8))):
+        full.allocate(98, j, Tier.INT8)  # until the INT8 range is full
+    before = full.read(0, 1)
+    with pytest.raises(ValueError, match="full"):
+        small.downgrade(0, 1, Tier.INT8)
+    assert small.page_tier(0, 1) == Tier.FP16
+    np.testing.assert_array_equal(full.read(0, 1), before)
+
+
+def test_a_cache_at_fp16_can_be_asked_to_seal():
+    """always_seal makes a cache seal with every page born at FP16, as one
+    whose map names a quantised tier does, so that its pages can be
+    downgraded (#93): each page is sealed as its rows came, its positions in
+    the open pages until then, and attention reads it as the causal
+    reference does, before and after a downgrade. seals_for says so too."""
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(17)
+    heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
+    assert device.KVPages.seals_for(Tier.FP16, [], True)
+    assert not device.KVPages.seals_for(Tier.FP16, [], False)
+    storage = [0] * 4
+    storage[int(Tier.FP16)] = 4096
+    storage[int(Tier.INT4)] = 4096
+    allocator = PagedKVCache(tier_page_bytes(CFG, page_tokens), storage)
+    cache = device.KVPages(allocator, LAYERS, page_tokens, kv_heads, hd, Tier.FP16,
+                           Halves.Both, [], True)
+    assert cache.seals and cache.born_at_one_tier
+    seq = 3 * page_tokens + 5
+    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+    start = store_in_runs(cache, 0, k, v, [page_tokens + 3, seq - page_tokens - 3])
+    assert sorted(allocator.pages(Tier.FP16)) == sorted(
+        [(layer, i) for layer in range(LAYERS) for i in range(3)]
+        + [(layer, p) for layer in range(LAYERS) for p in device.open_pages])
+    for i in range(3):
+        span = slice(i * page_tokens, (i + 1) * page_tokens)
+        np.testing.assert_array_equal(
+            allocator.read(0, i),
+            np.concatenate([k[span], v[span]]).astype(np.float16).view(np.uint8).ravel())
+    for downgrade in (False, True):
+        if downgrade:
+            cache.downgrade(0, 1, Tier.INT4)
+        q = normal(rng, seq - start, heads, hd)
+        np.testing.assert_array_equal(
+            attend(CFG, cache, 0, q, k, v, None, start),
+            causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens))

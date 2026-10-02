@@ -531,24 +531,27 @@ void bind_device(py::module_ &parent)
       "the allocator may move pages between launches (ADR-0007).\n"
       "At a quantised tier (#18, ADR-0011) a page is allocated at that tier "
       "and sealed once, when full; until then its positions are in one of "
-      "the layer's two FP16 open pages, (layer, p) for p in open_pages. No "
-      "page changes tier, and attention reads a query's own page at FP16.")
-      .def(
-          py::init<microinfer::PagedKVCache &, int, int, int, int,
-                   microinfer::Tier, microinfer::Halves, microinfer::TierMap>(),
-          py::arg("allocator"), py::arg("layers"), py::arg("page_tokens"),
-          py::arg("kv_heads"), py::arg("head_dim"), py::arg("tier"),
-          py::arg("halves") = microinfer::Halves::Both,
-          py::arg("tier_map") = microinfer::TierMap{}, py::keep_alive<1, 2>(),
-          "The allocator's page size at the tier the pages are stored at must "
-          "be a page's there: page_bytes(page_tokens, kv_heads * head_dim) at "
-          "FP16, else quantised_page_layout(...)['page_bytes']. The pages are "
-          "stored at `tier`, or at FP16 under a diagnostic `halves`; at a "
-          "quantised tier the FP16 pages also hold the open pages. "
-          "`tier_map[l][i]`, if given, is the tier page i of layer l is born "
-          "at, `tier` beyond a layer's row. A cache with any page born at a "
-          "quantised tier seals every page, an FP16 one by copying its rows "
-          "(ADR-0011, as amended by #90).")
+      "the layer's two FP16 open pages, (layer, p) for p in open_pages. A "
+      "page changes tier only by downgrade(), and attention reads a query's "
+      "own page at FP16.")
+      .def(py::init<microinfer::PagedKVCache &, int, int, int, int,
+                    microinfer::Tier, microinfer::Halves, microinfer::TierMap,
+                    bool>(),
+           py::arg("allocator"), py::arg("layers"), py::arg("page_tokens"),
+           py::arg("kv_heads"), py::arg("head_dim"), py::arg("tier"),
+           py::arg("halves") = microinfer::Halves::Both,
+           py::arg("tier_map") = microinfer::TierMap{},
+           py::arg("always_seal") = false, py::keep_alive<1, 2>(),
+           "The allocator's page size at the tier the pages are stored at must "
+           "be a page's there: page_bytes(page_tokens, kv_heads * head_dim) at "
+           "FP16, else quantised_page_layout(...)['page_bytes']. The pages are "
+           "stored at `tier`, or at FP16 under a diagnostic `halves`; at a "
+           "quantised tier the FP16 pages also hold the open pages. "
+           "`tier_map[l][i]`, if given, is the tier page i of layer l is born "
+           "at, `tier` beyond a layer's row. A cache with any page born at a "
+           "quantised tier seals every page, an FP16 one by copying its rows "
+           "(ADR-0011, as amended by #90). `always_seal` makes the cache seal "
+           "however its pages are born, so that they can be downgraded (#93).")
       .def("reserve", &KVPages::reserve,
            py::call_guard<py::gil_scoped_release>(), py::arg("tokens"),
            "Pages for positions [0, tokens) in every layer, allocating only "
@@ -620,11 +623,21 @@ void bind_device(py::module_ &parent)
       .def_property_readonly("tier", &KVPages::tier)
       .def_property_readonly("halves", &KVPages::halves)
       .def_property_readonly("storage_tier", &KVPages::storage_tier)
+      .def("downgrade", &KVPages::downgrade,
+           py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
+           py::arg("page"), py::arg("target"),
+           "Move a page of positions sealed at FP16 to the quantised tier "
+           "`target` at runtime (#93): allocated there, quantised from the "
+           "FP16 page, put in its place in the page table, and the FP16 page "
+           "freed, its tier's tail moving into the slot (ADR-0007). If the "
+           "allocation fails, the cache is as it was.")
       .def_static("seals_for", &KVPages::seals_for, py::arg("tier"),
                   py::arg("tier_map") = microinfer::TierMap{},
+                  py::arg("always_seal") = false,
                   "Whether a cache at `tier`, built from `tier_map`, seals "
-                  "(ADR-0011, as amended by #90): at a quantised tier, or when "
-                  "the map names a tier but `tier`. A cache's `seals` is this.")
+                  "(ADR-0011, as amended by #90 and #93): at a quantised tier, "
+                  "when the map names a tier but `tier`, or with "
+                  "`always_seal`. A cache's `seals` is this.")
       .def_property_readonly("seals", &KVPages::seals)
       .def_property_readonly("born_at_one_tier", &KVPages::born_at_one_tier)
       .def("birth_tier", &KVPages::birth_tier, py::arg("layer"),

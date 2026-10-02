@@ -584,7 +584,7 @@ namespace microinfer
 
   void device::attention_paged_causal(
       const __half *q, const unsigned long long *sealed,
-      const std::uint8_t *tiers, const std::array<bool, kTierCount> &born,
+      const std::uint8_t *tiers, const std::array<bool, kTierCount> &may_be_at,
       const __half *open, const __half *chunk_k, const __half *chunk_v,
       int page_tokens, const __half *k_bias, const RopeTable *rope, __half *out,
       int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
@@ -606,7 +606,7 @@ namespace microinfer
     // others, whose shape the layout may not hold.
     const auto layout = [&](Tier tier)
     {
-      return born[static_cast<int>(tier)]
+      return may_be_at[static_cast<int>(tier)]
                  ? quantised_page_layout(tier, page_tokens, kv_heads, head_dim)
                  : QuantisedPageLayout{};
     };

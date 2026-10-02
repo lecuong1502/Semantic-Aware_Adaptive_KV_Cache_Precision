@@ -218,6 +218,23 @@ namespace microinfer
     fit_granules(r);
   }
 
+  void PagedKVCache::replace(PageKey key, PageKey staged)
+  {
+    if (key.layer == staged.layer && key.page_index == staged.page_index)
+    {
+      throw std::invalid_argument("a page cannot replace itself");
+    }
+    locate(staged); // PageNotFound before anything changes
+    free(key);
+    // Looked up after the free, which moves staged if it was key's tier's
+    // tail.
+    const PageLocation loc = table_.at(staged);
+    table_.erase(staged);
+    table_[key] = loc;
+    range(loc.tier).slots[loc.slot] = key;
+    ++generation_;
+  }
+
   void PagedKVCache::fit_granules(Range &r)
   {
     const std::size_t needed =

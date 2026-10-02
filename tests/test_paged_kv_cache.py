@@ -241,6 +241,49 @@ def test_freeing_a_page_moves_the_tail_into_its_slot_with_its_contents():
     assert cache.pages(Tier.FP16) == [(0, 0), (0, 1), (0, 2)]
 
 
+def test_replacing_a_page_puts_the_staged_page_in_its_place():
+    """replace(key, staged), a tier change's update of the page table (#93):
+    the page `key` names is freed, as free() frees it, so its tier's tail
+    moves into its slot; and `staged`, allocated and written while `key` was
+    still readable, is then `key`, with staged's tier, slot and bytes. Every
+    other page keeps its bytes. Within one tier too, where staged may be the
+    tail that moves. A key the table does not hold is PageNotFound, and a
+    page cannot replace itself; neither changes anything."""
+    pages = halving_pages()
+    cache = make_cache(pages)
+    for i in range(4):
+        cache.allocate(0, i, Tier.FP16)
+        cache.write(0, i, pattern(0, i, pages[0]))
+    cache.allocate(1, 0, Tier.INT4)
+    cache.write(1, 0, pattern(1, 0, pages[2]))
+    cache.allocate(0, 7, Tier.INT4)
+    cache.write(0, 7, pattern(0, 7, pages[2]))
+    cache.replace((0, 1), (0, 7))
+    assert cache.locate(0, 1) == (Tier.INT4, 1) and (0, 7) not in cache
+    np.testing.assert_array_equal(cache.read(0, 1), pattern(0, 7, pages[2]))
+    assert cache.pages(Tier.FP16) == [(0, 0), (0, 3), (0, 2)], "the tail did not move"
+    assert cache.pages(Tier.INT4) == [(1, 0), (0, 1)]
+    for layer, i in [(0, 0), (0, 2), (0, 3)]:
+        np.testing.assert_array_equal(cache.read(layer, i), pattern(layer, i, pages[0]))
+    np.testing.assert_array_equal(cache.read(1, 0), pattern(1, 0, pages[2]))
+
+    cache = make_cache(pages)
+    for i in (0, 1, 7):
+        cache.allocate(0, i, Tier.INT8)
+        cache.write(0, i, pattern(0, i, pages[1]))
+    cache.replace((0, 0), (0, 7))  # staged is the tail, and moves into key's slot
+    assert cache.pages(Tier.INT8) == [(0, 0), (0, 1)]
+    np.testing.assert_array_equal(cache.read(0, 0), pattern(0, 7, pages[1]))
+    np.testing.assert_array_equal(cache.read(0, 1), pattern(0, 1, pages[1]))
+
+    for key, staged in (((0, 0), (9, 9)), ((9, 9), (0, 1))):
+        with pytest.raises(PageNotFound):
+            cache.replace(key, staged)
+    with pytest.raises(ValueError, match="itself"):
+        cache.replace((0, 1), (0, 1))
+    assert cache.pages(Tier.INT8) == [(0, 0), (0, 1)]
+
+
 # -- the page table ---------------------------------------------------------
 
 

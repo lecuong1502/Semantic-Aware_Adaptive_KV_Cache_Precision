@@ -120,6 +120,14 @@ namespace microinfer
     // granule the retracted tail leaves empty is unmapped and released.
     void free(PageKey key);
 
+    // Puts the page `staged` names in the place of the page `key` names: a
+    // tier change's update of the page table (#93). `key`'s page is freed,
+    // as free() frees it, and `staged` is renamed `key`, keeping its tier,
+    // its slot and its bytes. The new page is allocated and written under
+    // `staged` while `key`'s is still readable, which is why it needs a key
+    // of its own until now. Both must be held, and differ.
+    void replace(PageKey key, PageKey staged);
+
     // Copies a page's bytes in from, or out to, host memory. `bytes` must be
     // exactly page_bytes(tier) of the page's tier.
     void write(PageKey key, const void *host, std::size_t bytes);

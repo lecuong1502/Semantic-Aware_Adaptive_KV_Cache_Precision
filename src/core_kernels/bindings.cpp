@@ -603,6 +603,18 @@ PYBIND11_MODULE(_microinfer, m)
             c.free({layer, page_index});
           },
           py::arg("layer"), py::arg("page_index"))
+      .def(
+          "replace",
+          [](PagedKVCache &c, std::pair<int, int> key,
+             std::pair<int, int> staged)
+          {
+            py::gil_scoped_release release;
+            c.replace({key.first, key.second}, {staged.first, staged.second});
+          },
+          py::arg("key"), py::arg("staged"),
+          "Free the page `key`, (layer, page_index), and rename `staged` to "
+          "it, with staged's tier, slot and bytes: a tier change's update of "
+          "the page table.")
       .def("write", &write_page, py::arg("layer"), py::arg("page_index"),
            py::arg("data"),
            "Copy a C-contiguous array of exactly the page's size into it.")
