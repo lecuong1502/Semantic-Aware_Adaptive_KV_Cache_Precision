@@ -11,6 +11,7 @@
 #include "microinfer/device_buffer.h"
 #include "microinfer/paged_kv_cache.h"
 #include "microinfer/rope_table.h"
+#include "microinfer/shadow_store.h"
 
 // P, the tokens per page, is a build-time parameter (ADR-0004): 32 by
 // default, and set with -DMICROINFER_PAGE_TOKENS for Milestone 3's ablation
@@ -158,8 +159,9 @@ namespace microinfer
 
     // Moves page `page` of `layer`, a page of positions sealed at FP16, to
     // the quantised tier `target` at runtime (#93): allocated at `target`,
-    // quantised from the FP16 page, put in its place in the page table, and
-    // the FP16 page freed, its tier's tail moving into the slot (ADR-0007).
+    // its FP16 bytes copied to its shadow if it has none (#94), quantised
+    // from the FP16 page, put in its place in the page table, and the FP16
+    // page freed, its tier's tail moving into the slot (ADR-0007).
     // The page then holds quantise_page's bytes for its positions at
     // `target`, as a page born there does, and attention reads it there. If
     // the allocation fails, as it will when contention leaves no memory, the
@@ -167,6 +169,11 @@ namespace microinfer
     // is a sticky CUDA error, after which the context, and this cache with
     // it, is unusable. Needs a cache that seals, and no diagnostic Halves.
     void downgrade(int layer, int page, Tier target);
+
+    // The FP16 shadows, one for each page whose downgrade has begun, in
+    // pinned host memory, freed with this cache (#94). A downgrade that
+    // fails after taking it leaves it, still the page's bytes, for the next.
+    const ShadowStore &shadows() const { return shadows_; }
 
     // The tier the page table records for a page; the open pages are
     // (layer, kOpenPages[k]). PageNotFound if the table holds no such page.
@@ -267,6 +274,7 @@ namespace microinfer
     std::vector<int> attend_open_;
     // Per layer: how many pages of positions are sealed, from page 0 up.
     std::vector<int> sealed_;
+    ShadowStore shadows_;
     // For a diagnostic Halves only: a quantised page and its dequantised
     // halves, the scratch a seal goes through.
     std::unique_ptr<DeviceBuffer> scratch_page_;

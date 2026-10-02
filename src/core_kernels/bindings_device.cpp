@@ -15,6 +15,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -522,6 +523,43 @@ void bind_device(py::module_ &parent)
       .value("Keys", microinfer::Halves::Keys)
       .value("Values", microinfer::Halves::Values);
 
+  using microinfer::ShadowStore;
+  py::class_<ShadowStore>(
+      m, "ShadowStore",
+      "FP16 shadows in pinned host memory (#94): a page's bytes, copied "
+      "once, kept until the store goes. KVPages holds one; this binding is "
+      "for tests.")
+      .def(py::init<std::size_t>(), py::arg("page_bytes"))
+      .def(
+          "take",
+          [](ShadowStore &s, int layer, int page, py::object tensor)
+          {
+            const Span from = whole(tensor);
+            need(from, s.page_bytes() / sizeof(__half), "a page's bytes");
+            s.take({layer, page}, from.ptr);
+          },
+          py::arg("layer"), py::arg("page"), py::arg("tensor"),
+          "Copy the first page_bytes of a device tensor to a new shadow for "
+          "(layer, page); an error if it has one.")
+      .def(
+          "contains", [](const ShadowStore &s, int layer, int page)
+          { return s.contains({layer, page}); }, py::arg("layer"),
+          py::arg("page"))
+      .def(
+          "shadow",
+          [](const ShadowStore &s, int layer, int page)
+          {
+            const std::uint8_t *bytes = s.shadow({layer, page});
+            py::array_t<std::uint8_t> out(
+                static_cast<py::ssize_t>(s.page_bytes()));
+            std::memcpy(out.mutable_data(), bytes, s.page_bytes());
+            return out;
+          },
+          py::arg("layer"), py::arg("page"))
+      .def_property_readonly("count", &ShadowStore::count)
+      .def_property_readonly("bytes", &ShadowStore::bytes)
+      .attr("allocation_bytes") = ShadowStore::kAllocationBytes;
+
   using microinfer::KVPages;
   py::class_<KVPages>(
       m, "KVPages",
@@ -615,6 +653,29 @@ void bind_device(py::module_ &parent)
           py::arg("page"),
           "The tier the page table records for the page; the open pages are "
           "(layer, p) for p in open_pages.")
+      .def(
+          "has_shadow", [](const KVPages &c, int layer, int page)
+          { return c.shadows().contains({layer, page}); }, py::arg("layer"),
+          py::arg("page"), "Whether the page has an FP16 shadow (#94).")
+      .def(
+          "shadow",
+          [](const KVPages &c, int layer, int page)
+          {
+            const std::uint8_t *bytes = c.shadows().shadow({layer, page});
+            const auto n = static_cast<py::ssize_t>(c.shadows().page_bytes());
+            py::array_t<std::uint8_t> out(n);
+            std::memcpy(out.mutable_data(), bytes, static_cast<std::size_t>(n));
+            return out;
+          },
+          py::arg("layer"), py::arg("page"),
+          "A copy of the page's FP16 shadow, as uint8; PageNotFound if it has "
+          "none.")
+      .def_property_readonly(
+          "shadow_count", [](const KVPages &c) { return c.shadows().count(); },
+          "How many pages have an FP16 shadow.")
+      .def_property_readonly(
+          "shadow_bytes", [](const KVPages &c) { return c.shadows().bytes(); },
+          "The pinned host memory the shadows hold, in whole allocations.")
       .def_property_readonly("page_tokens", &KVPages::page_tokens)
       .def_property_readonly("pages_per_layer", &KVPages::pages_per_layer)
       .def_property_readonly("capacity_tokens", &KVPages::capacity_tokens)

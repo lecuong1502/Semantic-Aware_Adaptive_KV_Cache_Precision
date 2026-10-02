@@ -94,7 +94,8 @@ namespace microinfer
         tier_map_(std::move(tier_map)),
         current_open_(layers > 0 ? layers : 0, 0),
         attend_open_(layers > 0 ? layers : 0, 0),
-        sealed_(layers > 0 ? layers : 0, 0)
+        sealed_(layers > 0 ? layers : 0, 0),
+        shadows_(page_bytes_for(page_tokens, kv_width_))
   {
     if (layers <= 0 || page_tokens <= 0 || kv_heads <= 0 || head_dim <= 0)
     {
@@ -505,6 +506,13 @@ namespace microinfer
     allocator_.allocate(staged, target);
     try
     {
+      // Before its first downgrade, the page's FP16 bytes go to its shadow
+      // (#94), and the copy is complete before the page is freed below.
+      if (!shadows_.contains(key))
+      {
+        shadows_.take(
+            key, reinterpret_cast<const void *>(resolve_page(key).address));
+      }
       // 2. Quantised from the FP16 page, exactly as a page born at the
       // target is from its rows, which the FP16 page holds as they came.
       // Both are resolved here, between allocator operations, and used at

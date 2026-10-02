@@ -65,6 +65,14 @@ The tier a page of positions is allocated and sealed at: its tier map's, or
 its cache's. It is where a page starts; a requantisation plan may move it
 later (#88).
 
+**Shadow**:
+A downgraded page's FP16 bytes, copied to pinned host memory before its
+first downgrade and kept for the session, so that a later downgrade can
+quantise from FP16 and an upgrade can restore the page bit for bit (#88,
+#94). A page has one.
+_Avoid_: backup, host copy, offload (offloading moves a page off the device;
+a shadow sits beside it)
+
 **Staging page**:
 Where a downgrade writes a page's new bytes, at the target tier, while the
 FP16 page they are quantised from is still read: the page table entry
