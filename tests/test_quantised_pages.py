@@ -937,3 +937,36 @@ def test_what_an_upgrade_refuses():
     np.testing.assert_array_equal(tight.read(0, 1), held)
     assert not [key for t in Tier.__members__.values() for key in tight.pages(t)
                 if key[1] in (device.staging_page, device.shadow_upload_page)]
+
+
+# -- what a move costs (#97) ------------------------------------------------------------
+
+
+def test_each_move_reports_what_it_took():
+    """After each downgrade or upgrade, last_move says what it was: the page,
+    the tiers from and to, the bytes of the page at each, and the seconds it
+    took, wall time, and of those the seconds the shadow's copy took, to the
+    host on a first downgrade, back to the device on a move from it; a
+    downgrade from FP16 whose shadow is held copies nothing. Before any move
+    there is none."""
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(97)
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    seq = 2 * page_tokens
+    allocator, cache = sealing_at_fp16(page_tokens)
+    store_in_runs(cache, 0, normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd), [seq])
+    assert cache.last_move is None
+    sizes = tier_page_bytes(CFG, page_tokens)
+    for move, target, source, shadowed in ((cache.downgrade, Tier.INT4, Tier.FP16, True),
+                                           (cache.downgrade, Tier.INT2, Tier.INT4, True),
+                                           (cache.upgrade, Tier.INT8, Tier.INT2, True),
+                                           (cache.upgrade, Tier.FP16, Tier.INT8, True),
+                                           (cache.downgrade, Tier.INT4, Tier.FP16, False)):
+        move(0, 1, target)
+        last = cache.last_move
+        assert (last["layer"], last["page"]) == (0, 1)
+        assert (last["from_tier"], last["to_tier"]) == (source, target)
+        assert (last["from_bytes"], last["to_bytes"]) == (sizes[int(source)], sizes[int(target)])
+        assert last["seconds"] > 0
+        assert (last["shadow_seconds"] > 0) == shadowed
+        assert last["shadow_seconds"] < last["seconds"]

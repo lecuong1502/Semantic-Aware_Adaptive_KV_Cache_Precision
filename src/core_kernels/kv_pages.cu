@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -547,6 +548,12 @@ namespace microinfer
   void KVPages::move(PageKey key, Tier current, Tier target)
   {
     require_page_size(target, "a page of positions");
+    // What the device was given before this move is finished first, so that
+    // the move's time is its own (#97). Its last free synchronises anyway.
+    cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize before a move");
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point began = Clock::now();
+    double shadow_seconds = 0.0;
     // The FP16 bytes the page at `target` is made from: the page itself
     // while it is FP16, its shadow once it is not (#95, #96). A page at a
     // quantised tier T is then always quantise_page(FP16, T), and a page
@@ -587,8 +594,11 @@ namespace microinfer
           reinterpret_cast<std::uint8_t *>(resolve_page(staged).address);
       if (!from_shadow && !shadows_.contains(key))
       {
+        const Clock::time_point copying = Clock::now();
         shadows_.take(
             key, reinterpret_cast<const void *>(resolve_page(key).address));
+        shadow_seconds =
+            std::chrono::duration<double>(Clock::now() - copying).count();
       }
       // The FP16 bytes to quantise, or, for an FP16 target, the new page's
       // own: the page itself while it is FP16; else its shadow, copied into
@@ -599,9 +609,12 @@ namespace microinfer
         void *to = target == Tier::FP16
                        ? static_cast<void *>(staged_bytes)
                        : reinterpret_cast<void *>(resolve_page(upload).address);
+        const Clock::time_point copying = Clock::now();
         cuda_check(cudaMemcpy(to, shadows_.shadow(key), fp16_bytes,
                               cudaMemcpyHostToDevice),
                    "cudaMemcpy a page's FP16 shadow host-to-device");
+        shadow_seconds =
+            std::chrono::duration<double>(Clock::now() - copying).count();
         rows = to;
       }
       else
@@ -638,6 +651,14 @@ namespace microinfer
     // and it synchronises before any granule is unmapped.
     allocator_.replace(key, staged);
     may_be_at_[static_cast<int>(target)] = true;
+    last_move_ =
+        MoveRecord{key,
+                   current,
+                   target,
+                   bytes_at(current),
+                   bytes_at(target),
+                   std::chrono::duration<double>(Clock::now() - began).count(),
+                   shadow_seconds};
   }
 
   void KVPages::attention(int layer, const __half *q, const __half *k_bias,

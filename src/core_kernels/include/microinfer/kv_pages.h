@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -188,6 +189,26 @@ namespace microinfer
     // allocation fails, the cache is as it was.
     void upgrade(int layer, int page, Tier target);
 
+    // What a downgrade or an upgrade took (#97): the page, its tiers and
+    // its bytes at each, and the wall time of the whole move, from once the
+    // device has finished what it was given before, to the end of its last
+    // free. Every step of a move is synchronous, so that is its whole cost.
+    // Of it, `shadow_seconds` is the shadow's copy, either way: to the host
+    // on a first downgrade, back to the device on a move from the shadow.
+    // A downgrade from FP16 whose shadow is held copies nothing.
+    struct MoveRecord
+    {
+      PageKey key;
+      Tier from_tier;
+      Tier to_tier;
+      std::size_t from_bytes;
+      std::size_t to_bytes;
+      double seconds;
+      double shadow_seconds;
+    };
+    // The last move this cache made, if any.
+    const std::optional<MoveRecord> &last_move() const { return last_move_; }
+
     // The FP16 shadows, one for each page whose downgrade has begun, in
     // pinned host memory, freed with this cache (#94). A downgrade that
     // fails after taking it leaves it, still the page's bytes, for the next.
@@ -302,6 +323,7 @@ namespace microinfer
     // Per layer: how many pages of positions are sealed, from page 0 up.
     std::vector<int> sealed_;
     ShadowStore shadows_;
+    std::optional<MoveRecord> last_move_;
     // For a diagnostic Halves only: a quantised page and its dequantised
     // halves, the scratch a seal goes through.
     std::unique_ptr<DeviceBuffer> scratch_page_;
