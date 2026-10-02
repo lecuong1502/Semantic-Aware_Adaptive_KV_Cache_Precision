@@ -41,8 +41,7 @@ def golden() -> GoldenSet:
 
 def test_after_runtime_downgrades_the_logits_are_a_cache_built_at_those_tiers(engine, golden):
     """Two caches holding one prompt's keys and values. One holds every page
-    at FP16, and seals, its map naming INT8 only for a page it never reaches;
-    after the prefill, and after every decode step that seals a page, it
+    at FP16, and seals (always_seal); after the prefill, and after every decode step that seals a page, it
     downgrades each page it holds to the page's final tier, page 0 staying
     FP16 and the others going down the tiers in turn. The other is born at
     those final tiers, from the same rows: the prefill's keys and values,
@@ -63,9 +62,7 @@ def test_after_runtime_downgrades_the_logits_are_a_cache_built_at_those_tiers(en
         new = 2 * P + 5
         pages = (len(ids) + new) // P
         final = [[final_tier(layer, i) for i in range(pages)] for layer in range(layers)]
-        beyond = cfg.max_position_embeddings // P + 1  # a page no position reaches
-        never = [[Tier.FP16] * beyond + [Tier.INT8] for _ in range(layers)]
-        moving = model.PagedCache(cfg, Tier.FP16, tier_map=never)
+        moving = model.PagedCache(cfg, Tier.FP16, always_seal=True)
         built = model.PagedCache(cfg, Tier.FP16, tier_map=final)
 
         prefill = model.Workspace(cfg, rows=len(ids))

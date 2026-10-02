@@ -97,11 +97,14 @@ namespace microinfer
     static std::size_t page_bytes_for(int page_tokens, std::size_t kv_width);
 
     // Whether a cache at `tier`, built from `tier_map`, seals (ADR-0011,
-    // amended by #90): whenever any page of positions is born at a quantised
-    // tier, that is, at a quantised `tier` or when the map names a tier but
-    // `tier`. The one place the rule is written down; seals() is it, and a
-    // caller that must size an allocator before the cache exists asks here.
-    static bool seals_for(Tier tier, const TierMap &tier_map);
+    // amended by #90 and #93): whenever any page of positions is born at a
+    // quantised tier, that is, at a quantised `tier` or when the map names a
+    // tier but `tier`; or when asked to, with `always_seal`, so that a
+    // cache whose every page is born at FP16 can downgrade them. The one
+    // place the rule is written down; seals() is it, and a caller that must
+    // size an allocator before the cache exists asks here.
+    static bool seals_for(Tier tier, const TierMap &tier_map,
+                          bool always_seal = false);
 
     // The allocator's page size at the tier the pages are stored at must be
     // a page's there: page_bytes_for(page_tokens, kv_heads * head_dim) at
@@ -115,9 +118,12 @@ namespace microinfer
     // a layer's row. It needs a row per layer, and no diagnostic Halves, and
     // the allocator's page size at every tier it names must be a page's
     // there.
+    //
+    // `always_seal` makes the cache seal however its pages are born (see
+    // seals_for): its pages can then be downgraded (#93).
     KVPages(PagedKVCache &allocator, int layers, int page_tokens, int kv_heads,
             int head_dim, Tier tier, Halves halves = Halves::Both,
-            TierMap tier_map = {});
+            TierMap tier_map = {}, bool always_seal = false);
     // Frees every page this cache holds, newest first, so that each free is
     // of a tail page and moves nothing.
     ~KVPages();

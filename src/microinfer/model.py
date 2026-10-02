@@ -169,7 +169,8 @@ class PagedCache(_Cache):
     FP16 with only keys, or only values, put through the tier's round trip.
 
     In a cache that seals, a page sealed at FP16 may be downgraded at runtime
-    (KVPages.downgrade, #93).
+    (KVPages.downgrade, #93). `always_seal` makes a cache seal however its
+    pages are born, so that one born all at FP16 can downgrade them.
 
     The allocator reserves address space for the model's whole context window
     at every tier a page may be at (every tier, in a cache that can
@@ -180,7 +181,8 @@ class PagedCache(_Cache):
     tier's range, and the RoPE table beside them.
     """
 
-    def __init__(self, cfg: ModelConfig, tier=None, halves=None, tier_map=None):
+    def __init__(self, cfg: ModelConfig, tier=None, halves=None, tier_map=None,
+                 always_seal=False):
         super().__init__(cfg)
         Tier = _microinfer.Tier
         self.tier = Tier.FP16 if tier is None else tier
@@ -190,7 +192,7 @@ class PagedCache(_Cache):
         layers = cfg.num_hidden_layers
         pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
         storage = self.tier if halves == device.Halves.Both else Tier.FP16
-        seals = device.KVPages.seals_for(self.tier, tier_map)
+        seals = device.KVPages.seals_for(self.tier, tier_map, always_seal)
         held = {storage} | {t for row in tier_map for t in row}
         if seals and halves == device.Halves.Both:
             # Any page may be downgraded to any tier (#93). A downgrade's
@@ -205,7 +207,7 @@ class PagedCache(_Cache):
             capacity[int(Tier.FP16)] += layers * len(device.open_pages)
         self.allocator = _microinfer.PagedKVCache(tier_page_bytes(cfg), capacity)
         self.pages = device.KVPages(self.allocator, layers, page_tokens, self.kv_heads,
-                                    self.head_dim, self.tier, halves, tier_map)
+                                    self.head_dim, self.tier, halves, tier_map, always_seal)
 
     @property
     def nbytes(self) -> int:

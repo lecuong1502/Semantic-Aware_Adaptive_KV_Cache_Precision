@@ -215,3 +215,32 @@ row at a time, and head_dim, 64 or 128 here, is a multiple of the warp's 32
 lanes, so all the lanes of a warp load one page. A cache born at one tier
 reads, bit for bit, as the static path did, since each element is decoded
 by the same arithmetic.
+
+## Amendment (#93): a sealed FP16 page may be downgraded
+
+The rule that no page changes tier after allocation was Milestone 0's, and
+the layout above left it room to go. #93 lets a page of positions sealed at
+FP16 move to a quantised tier mid-session, between steps:
+
+1. the page is allocated at the target tier under the cache's *staging
+   page*, `(layer, -3)`, while the FP16 page is still read;
+2. it is quantised from the FP16 page, which holds its rows as they came,
+   so its bytes are exactly those of a page born at the target;
+3. the page table names the new page (`PagedKVCache::replace`);
+4. the FP16 page is freed, and its tier's tail moves into the slot
+   (ADR-0007).
+
+If step 1 cannot allocate, the cache is as it was. A sealed page is still
+never written again: a downgrade puts a new page in its place. Attention
+reads the page at its new tier from the next launch on, since the free moves
+the allocator's generation and the page table is resolved again.
+
+Only a cache that seals can downgrade, since in one that does not every page
+is FP16 and its last is still being written. A cache whose pages are all
+born at FP16 is asked to seal with `always_seal`, and then seals as one
+born partly at a quantised tier does. A diagnostic `Halves` never
+downgrades: its pages are FP16 by its definition.
+
+Downgrading from a page already quantised, upgrades, and the FP16 shadow
+they need are later tickets of #88. The decision as a whole, with the
+options it rejected, is #109's ADR.

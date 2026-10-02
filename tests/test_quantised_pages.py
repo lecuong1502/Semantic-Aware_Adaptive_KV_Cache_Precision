@@ -596,3 +596,41 @@ def test_what_a_downgrade_refuses():
         small.downgrade(0, 1, Tier.INT8)
     assert small.page_tier(0, 1) == Tier.FP16
     np.testing.assert_array_equal(full.read(0, 1), before)
+
+
+def test_a_cache_at_fp16_can_be_asked_to_seal():
+    """always_seal makes a cache seal with every page born at FP16, as one
+    whose map names a quantised tier does, so that its pages can be
+    downgraded (#93): each page is sealed as its rows came, its positions in
+    the open pages until then, and attention reads it as the causal
+    reference does, before and after a downgrade. seals_for says so too."""
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(17)
+    heads, kv_heads, hd = CFG.num_attention_heads, CFG.num_key_value_heads, CFG.head_dim
+    assert device.KVPages.seals_for(Tier.FP16, [], True)
+    assert not device.KVPages.seals_for(Tier.FP16, [], False)
+    storage = [0] * 4
+    storage[int(Tier.FP16)] = 4096
+    storage[int(Tier.INT4)] = 4096
+    allocator = PagedKVCache(tier_page_bytes(CFG, page_tokens), storage)
+    cache = device.KVPages(allocator, LAYERS, page_tokens, kv_heads, hd, Tier.FP16,
+                           Halves.Both, [], True)
+    assert cache.seals and cache.born_at_one_tier
+    seq = 3 * page_tokens + 5
+    k, v = normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd)
+    start = store_in_runs(cache, 0, k, v, [page_tokens + 3, seq - page_tokens - 3])
+    assert sorted(allocator.pages(Tier.FP16)) == sorted(
+        [(layer, i) for layer in range(LAYERS) for i in range(3)]
+        + [(layer, p) for layer in range(LAYERS) for p in device.open_pages])
+    for i in range(3):
+        span = slice(i * page_tokens, (i + 1) * page_tokens)
+        np.testing.assert_array_equal(
+            allocator.read(0, i),
+            np.concatenate([k[span], v[span]]).astype(np.float16).view(np.uint8).ravel())
+    for downgrade in (False, True):
+        if downgrade:
+            cache.downgrade(0, 1, Tier.INT4)
+        q = normal(rng, seq - start, heads, hd)
+        np.testing.assert_array_equal(
+            attend(CFG, cache, 0, q, k, v, None, start),
+            causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens))
