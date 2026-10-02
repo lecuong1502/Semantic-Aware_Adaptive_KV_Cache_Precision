@@ -190,9 +190,8 @@ class PagedCache(_Cache):
         capacity = [0] * 4
         for t in born:
             capacity[int(t)] = layers * pages_per_layer
-        # Room for the open pages if the cache will seal: KVPages.seals's
-        # rule, restated, since the KVPages that knows it needs this allocator.
-        if self.tier != Tier.FP16 or born != {self.tier}:
+        # Room for the open pages if the cache will seal.
+        if device.KVPages.seals_for(self.tier, tier_map):
             capacity[int(Tier.FP16)] += layers * len(device.open_pages)
         self.allocator = _microinfer.PagedKVCache(tier_page_bytes(cfg), capacity)
         self.pages = device.KVPages(self.allocator, layers, page_tokens, self.kv_heads,

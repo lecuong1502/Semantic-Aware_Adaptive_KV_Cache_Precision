@@ -63,6 +63,25 @@ namespace microinfer
            sizeof(__half);
   }
 
+  bool KVPages::seals_for(Tier tier, const TierMap &tier_map)
+  {
+    if (tier != Tier::FP16)
+    {
+      return true;
+    }
+    for (const auto &row : tier_map)
+    {
+      for (Tier t : row)
+      {
+        if (t != tier)
+        {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   KVPages::KVPages(PagedKVCache &allocator, int layers, int page_tokens,
                    int kv_heads, int head_dim, Tier tier, Halves halves,
                    TierMap tier_map)
@@ -110,7 +129,7 @@ namespace microinfer
         mixed_ = mixed_ || t != tier;
       }
     }
-    seals_ = tier != Tier::FP16 || mixed_;
+    seals_ = seals_for(tier, tier_map_);
     const std::size_t fp16_bytes = page_bytes_for(page_tokens, kv_width_);
     const auto bytes_at = [&](Tier t)
     {

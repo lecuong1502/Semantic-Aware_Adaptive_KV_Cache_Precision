@@ -21,7 +21,7 @@ from test_paged_engine import decode
 from test_static_tiers import MODEL, P, REPO, TIERS, at_tier
 
 from conftest import each, require_model
-from microinfer import Engine, _microinfer
+from microinfer import Engine, ModelConfig, _microinfer, model, nvml, paged_cache_bytes
 from microinfer.golden import GoldenError, GoldenSet
 
 PROMPTS = ("short-00", "medium-01", "adversarial-04", "long-03")
@@ -170,3 +170,50 @@ def test_the_map_is_chosen_by_configuration():
     held = Engine(path, kv_tier_map=[row] * layers)
     with pytest.raises(ValueError, match="in place"):
         held.hold([1, 2, 3], context=8, stop=None)
+
+
+def test_one_rule_says_when_a_cache_seals():
+    """KVPages.seals_for is the rule a cache's seals follows (ADR-0011,
+    amended by #90): at a quantised tier, or when the map names a tier but
+    the cache's. A cache built from the same tier and map seals as it
+    says."""
+    Tier = _microinfer.Tier
+    cfg = ModelConfig.from_card(MODEL)
+    layers = cfg.num_hidden_layers
+    for tier, tier_map, seals in ((Tier.FP16, [], False),
+                                  (Tier.FP16, [[Tier.FP16]] * layers, False),
+                                  (Tier.FP16, [[Tier.FP16, Tier.INT8]] * layers, True),
+                                  (Tier.INT4, [], True),
+                                  (Tier.INT4, [[Tier.INT4]] * layers, True)):
+        assert _microinfer.device.KVPages.seals_for(tier, tier_map) == seals, (tier, tier_map)
+        assert model.PagedCache(cfg, tier, tier_map=tier_map).pages.seals == seals
+
+
+def test_the_footprint_of_a_mapped_cache_is_what_the_layout_computes():
+    """paged_cache_bytes with a tier map: each page of positions at its birth
+    tier, the open pages at FP16 when the cache seals, each tier's range in
+    whole granules. To the byte against what the allocator maps, at lengths
+    that end on a page, mid-page and beyond the map's rows; and Qwen2.5-1.5B's
+    whole 32K window against what the driver reports for this process alone,
+    within 1%, as test_static_tiers.py has it at a static tier."""
+    def mapped(name, tier, positions):
+        cfg = ModelConfig.from_card(name)
+        tier_map = mixed_map(cfg.num_hidden_layers, positions // 2)
+        cache = model.PagedCache(cfg, getattr(_microinfer.Tier, tier), tier_map=[
+            [getattr(_microinfer.Tier, t) for t in row] for row in tier_map])
+        cache.rope.cover(positions)
+        before = nvml.own_used_bytes()
+        cache.pages.reserve(positions)
+        measured = nvml.own_used_bytes() - before
+        computed = paged_cache_bytes(cfg, positions, tier, tier_map)
+        assert computed == sum(cache.allocator.mapped_bytes(t)
+                               for t in _microinfer.Tier.__members__.values())
+        return measured, computed
+
+    for tier in ("FP16", "INT4"):
+        for positions in (P, 5 * P + 7, 40 * P + 1):
+            mapped(MODEL, tier, positions)
+    window = ModelConfig.from_card("qwen2.5-1.5b-instruct").max_position_embeddings
+    measured, computed = mapped("qwen2.5-1.5b-instruct", "FP16", window)
+    print(f"\nmapped 32K: measured {measured / 2**20:.1f} MiB, computed {computed / 2**20:.1f} MiB")
+    assert abs(measured - computed) <= 0.01 * computed

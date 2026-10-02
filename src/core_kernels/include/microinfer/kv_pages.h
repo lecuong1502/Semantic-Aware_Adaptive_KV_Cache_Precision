@@ -89,6 +89,13 @@ namespace microinfer
     // is written down.
     static std::size_t page_bytes_for(int page_tokens, std::size_t kv_width);
 
+    // Whether a cache at `tier`, built from `tier_map`, seals (ADR-0011,
+    // amended by #90): whenever any page of positions is born at a quantised
+    // tier, that is, at a quantised `tier` or when the map names a tier but
+    // `tier`. The one place the rule is written down; seals() is it, and a
+    // caller that must size an allocator before the cache exists asks here.
+    static bool seals_for(Tier tier, const TierMap &tier_map);
+
     // The allocator's page size at the tier the pages are stored at must be
     // a page's there: page_bytes_for(page_tokens, kv_heads * head_dim) at
     // FP16, else quantised_page_layout(...).page_bytes. At a quantised tier
