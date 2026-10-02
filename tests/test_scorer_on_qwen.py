@@ -51,7 +51,8 @@ def test_the_first_page_scores_among_the_highest_without_protection():
         cache = model.PagedCache(engine.config, scoring=True)
         new = 64
         decode(engine, ids, new, cache)
-        scores = cache.scores.download()[:, :-(-(len(ids) + new - 1) // P)]
+        attended = -(-(len(ids) + new - 1) // P)  # the pages the last step read
+        scores = cache.scores.download()[:, :attended]
         mean = scores.mean(axis=0)
         assert mean.argmax() == 0, f"page {mean.argmax()} outscores the first: {mean}"
         among = [(row > row[0]).sum() < TOP for row in scores]

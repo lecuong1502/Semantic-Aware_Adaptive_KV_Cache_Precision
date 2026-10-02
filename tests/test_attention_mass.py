@@ -25,6 +25,10 @@ from microinfer._microinfer import Tier
 from microinfer.config import ModelConfig
 
 device = _microinfer.device
+#: test_kv_pages.py's page sizes, neither a multiple of the kernel's key tile,
+#: so a tile may span pages and adds key by key; and two that are, so every
+#: tile lies within a page and adds its sum at once, as the default P does.
+MASS_PAGE_TOKENS = [*PAGE_TOKENS, 32, 64]
 #: Masses are fp32 in [0, 1], so a bound on them is in ulps of fp32 at 1.0
 #: (ADR-0006): the kernel's fp32 dot products, exp and log against numpy's
 #: float64. 2e-6 was the largest difference measured here; 32 ulps is 3.8e-6.
@@ -93,7 +97,7 @@ def test_the_masses_are_a_hand_made_attention_matrix_s_per_page():
         np.testing.assert_allclose(got, hand_made(CFG, allocator, cache, k, q),
                                    rtol=0, atol=MASS_TOLERANCE)
 
-    each([(p, t, m) for p in PAGE_TOKENS for t, m in ((Tier.FP16, False), (Tier.INT4, False),
+    each([(p, t, m) for p in MASS_PAGE_TOKENS for t, m in ((Tier.FP16, False), (Tier.INT4, False),
                                                       (Tier.FP16, True))],
          lambda p, t, m: matches(p, t, m),
          name=lambda c: f"P={c[0]} {c[1].name}{' mapped' if c[2] else ''}")
@@ -111,7 +115,7 @@ def test_each_head_s_masses_sum_to_one():
             assert (got >= 0).all()
             np.testing.assert_allclose(got.sum(axis=1), 1.0, rtol=0, atol=SUM_TOLERANCE)
 
-    each([(n, p) for n in MODELS for p in PAGE_TOKENS], sums)
+    each([(n, p) for n in MODELS for p in MASS_PAGE_TOKENS], sums)
 
 
 def test_with_the_masses_off_the_output_is_what_it_was():
@@ -126,7 +130,7 @@ def test_with_the_masses_off_the_output_is_what_it_was():
         off, _ = decode_attention(CFG, cache, k, v, q, bias, with_mass=False)
         np.testing.assert_array_equal(on, off)
 
-    each([(p, t) for p in PAGE_TOKENS for t in Tier.__members__.values()],
+    each([(p, t) for p in MASS_PAGE_TOKENS for t in Tier.__members__.values()],
          lambda p, t: same(p, t), name=lambda c: f"P={c[0]} {c[1].name}")
 
 

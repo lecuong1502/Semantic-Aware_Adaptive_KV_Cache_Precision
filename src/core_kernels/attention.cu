@@ -57,7 +57,8 @@ namespace microinfer
     // page's share of each query head's softmax, for the scorer. It is the
     // same kernel with PageMass compiled in: the one query's thread sums
     // each page's exp(s - m) from the scores the bookkeeping below already
-    // computes, and normalises them once m and l are final. Without it the
+    // computes, into shared memory, and once m and l are final every thread
+    // of the block makes pages' shares from those sums. Without it the
     // kernel is compiled as it always was, and no bit of `out` differs with
     // it or without.
     //
@@ -324,7 +325,7 @@ namespace microinfer
     // and l are final, every thread of the block makes pages' shares from
     // them, sum * exp(m_page - m) / l. The query's thread is the one every
     // other waits for, so it does as little as it can: a division only on
-    // a new page, no log, nothing global (#100: more cost decode 2%).
+    // a new page, no log, nothing global (#100).
     struct PageMass
     {
       float *partial_sum;
@@ -552,7 +553,11 @@ namespace microinfer
       if constexpr (kMass)
       {
         // The query's row, the one with seq_q 1, and the thread that kept
-        // it: the bookkeeping gives thread r row r.
+        // it. With one query there is one block of rows (lead is less than a
+        // tile), the query's row is -q_first, and the bookkeeping gives
+        // thread r row r, there being a thread for every row.
+        static_assert(kBlockThreads >= kAttentionTileQ,
+                      "a thread keeps each row of a tile");
         const int row = -q_first;
         if (threadIdx.x == row)
         {
