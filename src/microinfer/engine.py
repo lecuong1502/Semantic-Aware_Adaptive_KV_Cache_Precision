@@ -178,8 +178,9 @@ class Engine:
     #: 6 GiB card (benchmark log, prefill-throughput at 32768 tokens).
     DEFAULT_PREFILL_CHUNK = 512
 
-    #: The precision tiers the paged cache can be held at, statically: every
-    #: page at one tier for the life of a cache (#18, ADR-0008).
+    #: The precision tiers a page of the paged cache can be held at (ADR-0008).
+    #: A page keeps its tier for the life of a cache: kv_tier (#18), or the
+    #: one kv_tier_map names for it (#92).
     KV_TIERS = ("FP16", "INT8", "INT4", "INT2")
 
     #: Which halves of a page a quantised tier quantises. "both" is the tier;
@@ -188,6 +189,7 @@ class Engine:
 
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
                  kv_tier: str = "FP16", kv_halves: str = "both",
+                 kv_tier_map: list[list[str]] | None = None,
                  prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
@@ -200,6 +202,7 @@ class Engine:
         self.prefill_chunk = prefill_chunk
         self.model_dir = Path(model_dir)
         self.config = ModelConfig.from_model_dir(self.model_dir)
+        self.kv_tier_map = kv_tier_map
 
         if verify:
             expected = VERIFIED.get(self.config.name)
@@ -282,8 +285,9 @@ class Engine:
 
     @property
     def kv_tier(self) -> str:
-        """The tier every page of a cache is held at (#18). Static within a
-        cache: nothing changes a page's tier after it is allocated. Setting it
+        """The tier every page of a cache is held at (#18), or, with a
+        kv_tier_map, every page beyond the map's rows. Static within a cache:
+        nothing changes a page's tier after it is allocated. Setting it
         applies to the next cache, and is checked as the constructor checks
         it."""
         return self._kv_tier
@@ -306,7 +310,46 @@ class Engine:
     def kv_halves(self, halves: str) -> None:
         if halves not in self.KV_HALVES:
             raise ValueError(f"kv_halves is one of {self.KV_HALVES}, got {halves!r}")
+        # Before the constructor sets a map, there is none to check.
+        if halves != "both" and getattr(self, "_kv_tier_map", None) is not None:
+            raise ValueError("a diagnostic kv_halves rounds every page at kv_tier, and "
+                             "takes no tier map")
         self._kv_halves = halves
+
+    @property
+    def kv_tier_map(self) -> list[list[str]] | None:
+        """The tier map a cache is built from (#92), or None: row l names, by
+        tier name, the tier each page of layer l is born at, page i at
+        [l][i], and kv_tier beyond a row (ADR-0011, amended by #90). Setting
+        it applies to the next cache, and is checked as the constructor
+        checks it."""
+        return self._kv_tier_map
+
+    @kv_tier_map.setter
+    def kv_tier_map(self, tier_map: list[list[str]] | None) -> None:
+        if tier_map is not None:
+            layers = self.config.num_hidden_layers
+            if len(tier_map) != layers:
+                raise ValueError(f"a tier map needs a row for every layer: {len(tier_map)} "
+                                 f"rows for {layers} layers")
+            names = {name for row in tier_map for name in row}
+            if not names <= set(self.KV_TIERS):
+                raise ValueError(f"kv_tier_map names tiers of {self.KV_TIERS}, got "
+                                 f"{sorted(names - set(self.KV_TIERS))}")
+            if self.kv_cache == "contiguous":
+                raise ValueError("the contiguous cache holds FP16 only; a tier map is on pages")
+            if self.kv_halves != "both":
+                raise ValueError("a diagnostic kv_halves rounds every page at kv_tier, and "
+                                 "takes no tier map")
+            tier_map = [list(row) for row in tier_map]
+        self._kv_tier_map = tier_map
+
+    def _seals(self) -> bool:
+        """Whether the next cache seals its pages (ADR-0011): at a quantised
+        kv_tier, which a diagnostic kv_halves needs, or when the map names
+        one. KVPages.seals is the same rule, on a cache that exists."""
+        named = {name for row in self.kv_tier_map or [] for name in row}
+        return self.kv_tier != "FP16" or self.kv_halves != "both" or bool(named - {"FP16"})
 
     @property
     def tensors(self) -> dict[str, _microinfer.DeviceTensor]:
@@ -414,7 +457,7 @@ class Engine:
         after every chunk and every step, so a hold stops within one, and
         releases its cache as it returns.
         """
-        if self.kv_tier != "FP16" or self.kv_halves != "both":
+        if self._seals():
             raise ValueError("holding rewrites positions in place, which only FP16 pages allow")
         ids = self.encode(prompt) if isinstance(prompt, str) else self._check_ids(prompt)
         context = self.config.max_position_embeddings if context is None else context
@@ -568,10 +611,13 @@ class Engine:
         so a generation that stops early never held room for the rest."""
         if self.kv_cache == "contiguous":
             return model.ContiguousCache(self.config, capacity)
-        tier = getattr(_microinfer.Tier, self.kv_tier)
+        Tier = _microinfer.Tier
+        tier = getattr(Tier, self.kv_tier)
         if self.kv_halves == "both":
-            return model.PagedCache(self.config, tier)
-        if tier == _microinfer.Tier.FP16:
+            tier_map = [[getattr(Tier, name) for name in row]
+                        for row in self.kv_tier_map or []]
+            return model.PagedCache(self.config, tier, tier_map=tier_map)
+        if tier == Tier.FP16:
             raise ValueError("kv_halves splits a quantised tier; FP16 has nothing to split")
         return model.PagedCache(self.config, tier,
                                 getattr(_microinfer.device.Halves, self.kv_halves.title()))
