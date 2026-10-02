@@ -208,7 +208,7 @@ class Engine:
 
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
                  kv_tier: str = "FP16", kv_halves: str = "both",
-                 kv_tier_map: list[list[str]] | None = None,
+                 kv_tier_map: list[list[str]] | None = None, kv_scoring: bool = False,
                  prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
@@ -222,6 +222,7 @@ class Engine:
         self.model_dir = Path(model_dir)
         self.config = ModelConfig.from_model_dir(self.model_dir)
         self.kv_tier_map = kv_tier_map
+        self.kv_scoring = kv_scoring
 
         if verify:
             expected = VERIFIED.get(self.config.name)
@@ -334,6 +335,19 @@ class Engine:
             raise ValueError("a diagnostic kv_halves rounds every page at kv_tier, and "
                              "takes no tier map")
         self._kv_halves = halves
+
+    @property
+    def kv_scoring(self) -> bool:
+        """Whether a cache keeps the importance score of its pages (#99),
+        folding each decode step's attention mass into it on the device.
+        Setting it applies to the next cache."""
+        return self._kv_scoring
+
+    @kv_scoring.setter
+    def kv_scoring(self, scoring: bool) -> None:
+        if scoring and self.kv_cache == "contiguous":
+            raise ValueError("the contiguous cache has no pages to score")
+        self._kv_scoring = bool(scoring)
 
     @property
     def kv_tier_map(self) -> list[list[str]] | None:
@@ -633,11 +647,13 @@ class Engine:
         Tier = _microinfer.Tier
         tier = getattr(Tier, self.kv_tier)
         if self.kv_halves == "both":
-            return model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map))
+            return model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map),
+                                    scoring=self.kv_scoring)
         if tier == Tier.FP16:
             raise ValueError("kv_halves splits a quantised tier; FP16 has nothing to split")
         return model.PagedCache(self.config, tier,
-                                getattr(_microinfer.device.Halves, self.kv_halves.title()))
+                                getattr(_microinfer.device.Halves, self.kv_halves.title()),
+                                scoring=self.kv_scoring)
 
     @contextmanager
     def _holding(self, cache, ws: model.Workspace):
