@@ -93,7 +93,8 @@ namespace microinfer
                                                                    : tier),
         tier_map_(std::move(tier_map)),
         current_open_(layers > 0 ? layers : 0, 0),
-        attend_open_(layers > 0 ? layers : 0, 0)
+        attend_open_(layers > 0 ? layers : 0, 0),
+        sealed_(layers > 0 ? layers : 0, 0)
   {
     if (layers <= 0 || page_tokens <= 0 || kv_heads <= 0 || head_dim <= 0)
     {
@@ -120,53 +121,63 @@ namespace microinfer
           "a diagnostic Halves rounds every page at the cache's one tier, and "
           "takes no tier map");
     }
-    born_[static_cast<int>(storage_tier_)] = true;
+    may_be_at_[static_cast<int>(storage_tier_)] = true;
     for (const auto &row : tier_map_)
     {
       for (Tier t : row)
       {
-        born_[static_cast<int>(t)] = true;
+        may_be_at_[static_cast<int>(t)] = true;
         mixed_ = mixed_ || t != tier;
       }
     }
     seals_ = seals_for(tier, tier_map_);
-    const std::size_t fp16_bytes = page_bytes_for(page_tokens, kv_width_);
-    const auto bytes_at = [&](Tier t)
-    {
-      return t == Tier::FP16
-                 ? fp16_bytes
-                 : quantised_page_layout(t, page_tokens, kv_heads, head_dim)
-                       .page_bytes;
-    };
     page_bytes_ = bytes_at(storage_tier_);
-    const auto check = [&](Tier t, std::size_t needed, const char *what)
-    {
-      if (allocator.page_bytes(t) != needed)
-      {
-        throw std::invalid_argument(
-            std::string("the allocator's ") + tier_name(t) + " pages hold " +
-            std::to_string(allocator.page_bytes(t)) + " bytes; " + what +
-            " of " + std::to_string(page_tokens) + " positions at " +
-            std::to_string(kv_width_) + " elements needs " +
-            std::to_string(needed));
-      }
-    };
     for (int t = 0; t < kTierCount; ++t)
     {
-      if (born_[t])
+      if (may_be_at_[t])
       {
-        check(static_cast<Tier>(t), bytes_at(static_cast<Tier>(t)),
-              "a page of positions");
+        require_page_size(static_cast<Tier>(t), "a page of positions");
       }
     }
     if (seals_)
     {
-      check(Tier::FP16, fp16_bytes, "an open page");
+      require_page_size(Tier::FP16, "an open page");
     }
     if (halves != Halves::Both)
     {
       scratch_page_ = std::make_unique<DeviceBuffer>(bytes_at(tier));
-      scratch_halves_ = std::make_unique<DeviceBuffer>(fp16_bytes);
+      scratch_halves_ = std::make_unique<DeviceBuffer>(bytes_at(Tier::FP16));
+    }
+  }
+
+  void KVPages::require_layer(int layer) const
+  {
+    if (layer < 0 || layer >= layers_)
+    {
+      throw std::out_of_range("layer " + std::to_string(layer) + " of " +
+                              std::to_string(layers_));
+    }
+  }
+
+  std::size_t KVPages::bytes_at(Tier tier) const
+  {
+    return tier == Tier::FP16
+               ? page_bytes_for(page_tokens_, kv_width_)
+               : quantised_page_layout(tier, page_tokens_, kv_heads_, head_dim_)
+                     .page_bytes;
+  }
+
+  void KVPages::require_page_size(Tier tier, const char *what) const
+  {
+    const std::size_t needed = bytes_at(tier);
+    if (allocator_.page_bytes(tier) != needed)
+    {
+      throw std::invalid_argument(
+          std::string("the allocator's ") + tier_name(tier) + " pages hold " +
+          std::to_string(allocator_.page_bytes(tier)) + " bytes; " + what +
+          " of " + std::to_string(page_tokens_) + " positions at " +
+          std::to_string(kv_width_) + " elements needs " +
+          std::to_string(needed));
     }
   }
 
@@ -269,11 +280,7 @@ namespace microinfer
 
   KVPages::LayerTable KVPages::resolve(int layer)
   {
-    if (layer < 0 || layer >= layers_)
-    {
-      throw std::out_of_range("layer " + std::to_string(layer) + " of " +
-                              std::to_string(layers_));
-    }
+    require_layer(layer);
     // At a quantised tier a cache can hold no page of positions yet, while
     // its first page fills in an open page; then there is no table.
     if (pages_ == 0)
@@ -345,11 +352,7 @@ namespace microinfer
           std::to_string(start + n) + ") are not all on pages; " +
           std::to_string(capacity_tokens()) + " positions are reserved");
     }
-    if (layer < 0 || layer >= layers_)
-    {
-      throw std::out_of_range("layer " + std::to_string(layer) + " of " +
-                              std::to_string(layers_));
-    }
+    require_layer(layer);
     if (n == 0)
     {
       return;
@@ -371,6 +374,7 @@ namespace microinfer
     // table records for it.
     const ResolvedPage resolved = resolve_page({layer, span});
     auto *page = reinterpret_cast<std::uint8_t *>(resolved.address);
+    sealed_[layer] = std::max(sealed_[layer], span + 1);
     if (halves_ == Halves::Both && resolved.tier == Tier::FP16)
     {
       // A page born at FP16 in a cache that seals: its rows as they came,
@@ -455,6 +459,76 @@ namespace microinfer
     }
   }
 
+  void KVPages::downgrade(int layer, int page, Tier target)
+  {
+    if (!seals())
+    {
+      throw std::invalid_argument(
+          "only a cache that seals can downgrade a page: in one that does not, "
+          "every page is FP16 and its last is still being written (ADR-0011)");
+    }
+    if (halves_ != Halves::Both)
+    {
+      throw std::invalid_argument("a diagnostic Halves stores every page at "
+                                  "FP16 by its definition; none downgrades");
+    }
+    require_layer(layer);
+    const std::string name =
+        "page " + std::to_string(page) + " of layer " + std::to_string(layer);
+    if (page < 0 || page >= pages_)
+    {
+      throw std::invalid_argument(name +
+                                  " is not a page of positions this cache "
+                                  "holds; only one of those downgrades");
+    }
+    if (page >= sealed_[layer])
+    {
+      throw std::invalid_argument(
+          name + " is not sealed: its positions are reserved, not all stored");
+    }
+    if (target == Tier::FP16)
+    {
+      throw std::invalid_argument("a downgrade is to a quantised tier");
+    }
+    const Tier current = page_tier({layer, page});
+    if (current != Tier::FP16)
+    {
+      throw std::invalid_argument(name + " is at " + tier_name(current) +
+                                  "; only an FP16 page downgrades (#93)");
+    }
+    require_page_size(target, "a page of positions");
+
+    // 1. The page at its target tier, under a key of its own while the FP16
+    // page is still read. If this fails, nothing has changed.
+    const PageKey key{layer, page};
+    const PageKey staged{layer, kStagingPage};
+    allocator_.allocate(staged, target);
+    try
+    {
+      // 2. Quantised from the FP16 page, exactly as a page born at the
+      // target is from its rows, which the FP16 page holds as they came.
+      // Both are resolved here, between allocator operations, and used at
+      // once.
+      const auto *rows =
+          reinterpret_cast<const __half *>(resolve_page(key).address);
+      device::quantise_page(
+          rows, rows + static_cast<std::size_t>(page_tokens_) * kv_width_,
+          reinterpret_cast<std::uint8_t *>(resolve_page(staged).address),
+          target, page_tokens_, page_tokens_, kv_heads_, head_dim_);
+    }
+    catch (...)
+    {
+      allocator_.free(staged);
+      throw;
+    }
+    // 3 and 4. The page table names the new page, and the FP16 page is
+    // freed, its tier's tail moving into the slot (ADR-0007). The free's
+    // copy is ordered after the quantisation on the legacy default stream,
+    // and it synchronises before any granule is unmapped.
+    allocator_.replace(key, staged);
+    may_be_at_[static_cast<int>(target)] = true;
+  }
+
   void KVPages::attention(int layer, const __half *q, const __half *k_bias,
                           const RopeTable *rope, __half *out, int seq_q,
                           int seq_k, int heads, int kv_heads, int head_dim,
@@ -495,7 +569,7 @@ namespace microinfer
     }
     // Each page is read at the tier the page table records for it (#91).
     const LayerTable table = resolve(layer);
-    device::attention_paged_causal(q, table.pages, table.tiers, born_,
+    device::attention_paged_causal(q, table.pages, table.tiers, may_be_at_,
                                    open_page(layer, attend_open_[layer]), keys,
                                    values, page_tokens_, k_bias, rope, out,
                                    seq_q, seq_k, heads, kv_heads, head_dim);

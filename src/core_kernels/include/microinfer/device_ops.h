@@ -84,15 +84,15 @@ namespace microinfer
     // sealed pages, and `tiers` beside it the tier the page table records
     // for each (#91): a page at a quantised tier is in quant.h's layout, and
     // its codes are dequantised as dequantise_page does it; one at FP16 is
-    // laid out as attention_paged's. `born` names every tier a page may be
-    // at. Of the query's own page, positions before the first query's,
+    // laid out as attention_paged's. `may_be_at` names every tier a page
+    // may be at. Of the query's own page, positions before the first query's,
     // seq_k - seq_q, are read from `open`, an FP16 page; the rest from
     // chunk_k and chunk_v, the seq_q rows the queries brought. page_tokens
     // must be a multiple of kAttentionTileQ.
     void attention_paged_causal(const __half *q,
                                 const unsigned long long *sealed,
                                 const std::uint8_t *tiers,
-                                const std::array<bool, kTierCount> &born,
+                                const std::array<bool, kTierCount> &may_be_at,
                                 const __half *open, const __half *chunk_k,
                                 const __half *chunk_v, int page_tokens,
                                 const __half *k_bias, const RopeTable *rope,

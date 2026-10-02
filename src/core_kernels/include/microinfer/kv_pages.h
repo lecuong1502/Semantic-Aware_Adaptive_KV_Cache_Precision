@@ -29,6 +29,11 @@ namespace microinfer
   // position's page, so they cannot collide with one.
   constexpr std::array<int, 2> kOpenPages{-1, -2};
 
+  // The page_index a downgrade's new page is allocated under while the FP16
+  // page it replaces is still read (#93): never a position's page, nor an
+  // open page.
+  constexpr int kStagingPage = -3;
+
   // Which halves of a page a quantised tier quantises. Both is the tier; the
   // other two are a diagnostic (#18): the page is stored at FP16, and when it
   // is sealed only the named half is replaced by what the tier's quantiser
@@ -60,7 +65,9 @@ namespace microinfer
   // quant.h's layout, and never written again. Until then its positions
   // are in one of the layer's two open pages, (l, kOpenPages[k]), FP16 and
   // allocated once. A key channel's scale spans a whole page, so a page
-  // being filled cannot be quantised (ADR-0005). No page ever changes tier.
+  // being filled cannot be quantised (ADR-0005). A page changes tier only
+  // by downgrade() (#93), which puts a new page, at the target tier, in its
+  // place: a sealed page is still never written again.
   //
   // Attention at a quantised tier is causal in the sense decode is: a query
   // reads the pages before its own as sealed, and its own page at FP16,
@@ -143,6 +150,18 @@ namespace microinfer
                    int heads, int kv_heads, int head_dim, const __half *keys,
                    const __half *values);
 
+    // Moves page `page` of `layer`, a page of positions sealed at FP16, to
+    // the quantised tier `target` at runtime (#93): allocated at `target`,
+    // quantised from the FP16 page, put in its place in the page table, and
+    // the FP16 page freed, its tier's tail moving into the slot (ADR-0007).
+    // The page then holds quantise_page's bytes for its positions at
+    // `target`, as a page born there does, and attention reads it there. If
+    // the allocation fails, as it will when contention leaves no memory, the
+    // cache is as it was. A device fault reported by the free's synchronise
+    // is a sticky CUDA error, after which the context, and this cache with
+    // it, is unusable. Needs a cache that seals, and no diagnostic Halves.
+    void downgrade(int layer, int page, Tier target);
+
     // The tier the page table records for a page; the open pages are
     // (layer, kOpenPages[k]). PageNotFound if the table holds no such page.
     Tier page_tier(PageKey key) const;
@@ -184,6 +203,12 @@ namespace microinfer
     // keys and of values, into its place at its own tier.
     // Copies rows of keys and of values into an FP16 page, keys then values.
     void copy_rows(__half *page, const __half *keys, const __half *values);
+    // Throws std::out_of_range unless `layer` is one of this cache's.
+    void require_layer(int layer) const;
+    // One page's bytes at `tier`: FP16's layout, or quant.h's.
+    std::size_t bytes_at(Tier tier) const;
+    // Throws unless the allocator's pages at `tier` are bytes_at(tier).
+    void require_page_size(Tier tier, const char *what) const;
     void seal(int layer, int span, const __half *keys, const __half *values);
     __half *open_page(int layer, int which);
     // A page as the page table holds it now: its tier, and its address at
@@ -221,8 +246,9 @@ namespace microinfer
     Halves halves_;
     Tier storage_tier_;
     TierMap tier_map_;
-    // Every tier a page of positions is born at: the cache's, and the map's.
-    std::array<bool, kTierCount> born_{};
+    // Every tier a page of positions may be at: the cache's, the map's, and
+    // any a downgrade moved one to. Attention has a layout for each.
+    std::array<bool, kTierCount> may_be_at_{};
     bool seals_ = false;
     bool mixed_ = false;
     std::size_t page_bytes_;
@@ -233,6 +259,8 @@ namespace microinfer
     // last store, which attention reads.
     std::vector<int> current_open_;
     std::vector<int> attend_open_;
+    // Per layer: how many pages of positions are sealed, from page 0 up.
+    std::vector<int> sealed_;
     // For a diagnostic Halves only: a quantised page and its dequantised
     // halves, the scratch a seal goes through.
     std::unique_ptr<DeviceBuffer> scratch_page_;

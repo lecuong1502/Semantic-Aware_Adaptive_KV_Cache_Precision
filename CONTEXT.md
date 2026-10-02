@@ -65,6 +65,13 @@ The tier a page of positions is allocated and sealed at: its tier map's, or
 its cache's. It is where a page starts; a requantisation plan may move it
 later (#88).
 
+**Staging page**:
+Where a downgrade writes a page's new bytes, at the target tier, while the
+FP16 page they are quantised from is still read: the page table entry
+`(layer, -3)`, which takes the page's own entry when the FP16 page is freed
+(#93).
+_Avoid_: temporary page, scratch page
+
 **Seal**:
 To write a page of positions at its birth tier, once and for good, when its
 last position arrives: quantised from the rows that brought it, or from the

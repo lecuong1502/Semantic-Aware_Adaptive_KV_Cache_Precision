@@ -157,9 +157,8 @@ class PagedCache(_Cache):
     when its last position arrives; until then its positions are in one of
     the layer's two FP16 open pages (ADR-0005, ADR-0011). Attention reads a
     query's own page at FP16 and every page before it sealed, as decode does,
-    however many positions a step brings. The tier never changes: this is
-    Milestone 0's static operation, and moving a page between tiers is
-    Milestone 2's.
+    however many positions a step brings. A page keeps the tier it is born
+    at, unless it is downgraded (below).
 
     `tier_map`, if given, names the tier each page of positions is born at:
     row l for layer l, page i at [l][i], and `tier` beyond a row (kv_pages.h).
@@ -169,8 +168,13 @@ class PagedCache(_Cache):
     `halves` other than Both is a diagnostic (kv_pages.h): pages stored at
     FP16 with only keys, or only values, put through the tier's round trip.
 
+    In a cache that seals, a page sealed at FP16 may be downgraded at runtime
+    (KVPages.downgrade, #93).
+
     The allocator reserves address space for the model's whole context window
-    at every tier a page may be born at, and for the open pages at FP16, and
+    at every tier a page may be at (every tier, in a cache that can
+    downgrade: one that seals, without a diagnostic halves), and for the
+    open pages at FP16, and
     takes device memory only as pages are allocated. `nbytes` is therefore
     what the driver actually holds for the cache: whole granules in each
     tier's range, and the RoPE table beside them.
@@ -186,12 +190,18 @@ class PagedCache(_Cache):
         layers = cfg.num_hidden_layers
         pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
         storage = self.tier if halves == device.Halves.Both else Tier.FP16
-        born = {storage} | {t for row in tier_map for t in row}
+        seals = device.KVPages.seals_for(self.tier, tier_map)
+        held = {storage} | {t for row in tier_map for t in row}
+        if seals and halves == device.Halves.Both:
+            # Any page may be downgraded to any tier (#93). A downgrade's
+            # staging page needs no room of its own: the page it replaces is
+            # FP16 until then, so the target tier is never full of this
+            # cache's pages.
+            held = set(Tier.__members__.values())
         capacity = [0] * 4
-        for t in born:
+        for t in held:
             capacity[int(t)] = layers * pages_per_layer
-        # Room for the open pages if the cache will seal.
-        if device.KVPages.seals_for(self.tier, tier_map):
+        if seals:
             capacity[int(Tier.FP16)] += layers * len(device.open_pages)
         self.allocator = _microinfer.PagedKVCache(tier_page_bytes(cfg), capacity)
         self.pages = device.KVPages(self.allocator, layers, page_tokens, self.kv_heads,
