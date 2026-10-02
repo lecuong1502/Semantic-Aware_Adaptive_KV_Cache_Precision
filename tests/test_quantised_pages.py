@@ -634,3 +634,115 @@ def test_a_cache_at_fp16_can_be_asked_to_seal():
         np.testing.assert_array_equal(
             attend(CFG, cache, 0, q, k, v, None, start),
             causal_reference(CFG, allocator, 0, q, k, v, None, start, page_tokens))
+
+
+# -- the FP16 shadow (#94) ------------------------------------------------------------
+
+
+def sealing_at_fp16(page_tokens):
+    """A cache at FP16 asked to seal, so that its pages can be downgraded,
+    and an allocator with a range at every tier."""
+    allocator, _ = pages_for(CFG, page_tokens, Tier.FP16, tier_map=[[Tier.FP16]] * LAYERS)
+    return allocator, device.KVPages(allocator, LAYERS, page_tokens, CFG.num_key_value_heads,
+                                     CFG.head_dim, Tier.FP16, Halves.Both, [], True)
+
+
+def test_a_downgraded_page_keeps_its_fp16_bytes_in_a_shadow():
+    """Before a page's first downgrade its FP16 bytes are copied to pinned
+    host memory, its shadow, bit for bit, and kept: through later
+    downgrades of other pages, and the tail moves they cause. Only a
+    downgraded page has one, each exactly one, and a downgrade that cannot
+    allocate its target page takes none."""
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(94)
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    seq = 4 * page_tokens
+    allocator, cache = sealing_at_fp16(page_tokens)
+    for layer in range(LAYERS):
+        store_in_runs(cache, layer, normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd),
+                      [seq])
+    assert cache.shadow_count == 0 and cache.shadow_bytes == 0
+    fp16 = snapshot(allocator)
+    moves = [(0, 1, Tier.INT4), (1, 0, Tier.INT2), (0, 3, Tier.INT8), (1, 2, Tier.INT4)]
+    for n, (layer, page, target) in enumerate(moves, 1):
+        assert not cache.has_shadow(layer, page)
+        cache.downgrade(layer, page, target)
+        assert cache.has_shadow(layer, page) and cache.shadow_count == n
+        for moved, page_moved, _ in moves[:n]:
+            np.testing.assert_array_equal(cache.shadow(moved, page_moved),
+                                          fp16[(moved, page_moved)],
+                                          err_msg=f"{moved, page_moved}")
+    assert cache.shadow_bytes >= len(moves) * allocator.page_bytes(Tier.FP16)
+    for layer in range(LAYERS):
+        for page in range(cache.pages_per_layer):
+            if not any((layer, page) == (moved, page_moved) for moved, page_moved, _ in moves):
+                assert not cache.has_shadow(layer, page), (layer, page)
+    with pytest.raises(_microinfer.PageNotFound):
+        cache.shadow(0, 0)
+
+    capacity = [0] * 4
+    capacity[int(Tier.FP16)] = 4096
+    full = PagedKVCache(tier_page_bytes(CFG, page_tokens), capacity)  # no INT4 range
+    small = device.KVPages(full, LAYERS, page_tokens, kv_heads, hd, Tier.FP16, Halves.Both,
+                           [], True)
+    store_in_runs(small, 0, normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd), [seq])
+    with pytest.raises(ValueError):
+        small.downgrade(0, 1, Tier.INT4)
+    assert small.shadow_count == 0 and not small.has_shadow(0, 1)
+
+
+def test_the_shadows_host_memory_is_freed_with_the_cache():
+    """The shadows are pinned host memory, which the driver maps into this
+    process as shared memory: its resident shared memory (RssShmem; the
+    driver's pinning shows in neither VmPin nor VmLck, measured here) grows
+    by the shadows' bytes as pages are downgraded, within the OS's 4 KiB
+    page of each pinned allocation, and falls back to where it was when the
+    cache goes. How the driver maps pinned memory is not a documented
+    interface; this is what it does here."""
+    def pinned():
+        with open("/proc/self/status") as status:
+            fields = dict(line.split(":", 1) for line in status if ":" in line)
+        return int(fields["RssShmem"].split()[0]) * 1024
+
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(95)
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    seq = 256 * page_tokens
+    allocator, cache = sealing_at_fp16(page_tokens)
+    for layer in range(LAYERS):
+        store_in_runs(cache, layer, normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd),
+                      [seq])
+    before = pinned()  # after the CUDA work that maps memory of its own
+    for layer in range(LAYERS):
+        for page in range(seq // page_tokens):
+            cache.downgrade(layer, page, Tier.INT4)
+    held = cache.shadow_bytes
+    assert held >= LAYERS * (seq // page_tokens) * allocator.page_bytes(Tier.FP16)
+    allocations = -(-held // device.ShadowStore.allocation_bytes)
+    assert held <= pinned() - before < held + allocations * 4096, (pinned() - before, held)
+    del cache
+    assert pinned() == before
+
+
+def test_a_page_has_one_shadow_taken_once():
+    """The store under KVPages: a shadow is a device page's bytes, copied
+    once; a second for the same page is refused, and the first is kept.
+    Shadows pack into pinned allocations of whole pages, a new one made only
+    when the last is full."""
+    page_bytes = tier_page_bytes(CFG, PAGE_TOKENS[0])[int(Tier.FP16)]
+    store = device.ShadowStore(page_bytes)
+    rng = np.random.default_rng(96)
+    first = normal(rng, page_bytes // 2)
+    store.take(0, 1, put(first))
+    with pytest.raises(RuntimeError, match="has a shadow already"):
+        store.take(0, 1, put(normal(rng, page_bytes // 2)))
+    np.testing.assert_array_equal(store.shadow(0, 1),
+                                  first.astype(np.float16).view(np.uint8))
+    assert store.count == 1 and store.contains(0, 1) and not store.contains(1, 0)
+    per_allocation = max(1, device.ShadowStore.allocation_bytes // page_bytes)
+    for page in range(2, per_allocation + 2):
+        store.take(0, page, put(first))
+    assert store.count == per_allocation + 1
+    assert store.bytes == 2 * per_allocation * page_bytes
+    with pytest.raises(_microinfer.PageNotFound):
+        store.shadow(5, 5)
