@@ -57,7 +57,8 @@ namespace microinfer
     // page's share of each query head's softmax, for the scorer. It is the
     // same kernel with PageMass compiled in: the one query's thread sums
     // each page's exp(s - m) from the scores the bookkeeping below already
-    // computes, and normalises them once m and l are final. Without it the
+    // computes, into shared memory, and once m and l are final every thread
+    // of the block makes pages' shares from those sums. Without it the
     // kernel is compiled as it always was, and no bit of `out` differs with
     // it or without.
     //
@@ -320,25 +321,29 @@ namespace microinfer
     // A decode step's per-page attention mass (#98), kept by the thread of
     // its one query as the key tiles go by. Pages come in order, so one is
     // open at a time: its sum of exp(s - m) and that m, rescaled as m rises.
-    // A finished page is left in `mass` as log(sum) + m, one float, and
-    // normalise() makes each page's share once m and l are final: exp(log(sum)
-    // + m_page - m) / l.
+    // A finished page is left in shared memory, its sum and its m; once m
+    // and l are final, every thread of the block makes pages' shares from
+    // them, sum * exp(m_page - m) / l. The query's thread is the one every
+    // other waits for, so it does as little as it can: a division only on
+    // a new page, no log, nothing global (#100).
     struct PageMass
     {
-      float *mass;
+      float *partial_sum;
+      float *partial_max;
       int page_tokens;
       int pages;
       int open = -1;
+      int end = 0; // the position after the open page
       float sum = 0.0f;
       float max = -INFINITY;
 
       __device__ void add(int position, float p, float m)
       {
-        const int page = position / page_tokens;
-        if (page != open)
+        if (position >= end)
         {
           close();
-          open = page;
+          open = position / page_tokens;
+          end = (open + 1) * page_tokens;
           sum = 0.0f;
           max = m;
         }
@@ -353,15 +358,8 @@ namespace microinfer
       {
         if (open >= 0)
         {
-          mass[open] = logf(sum) + max;
-        }
-      }
-      __device__ void normalise(float m, float l)
-      {
-        close();
-        for (int page = 0; page < pages; ++page)
-        {
-          mass[page] = expf(mass[page] - m) / l;
+          partial_sum[open] = sum;
+          partial_max[open] = max;
         }
       }
     };
@@ -385,6 +383,9 @@ namespace microinfer
       float *k_s = rescale_s + kAttentionTileQ; // kAttentionTileK x head_dim
       __half *v_s = reinterpret_cast<__half *>(
           k_s + kAttentionTileK * head_dim); // kAttentionTileK x head_dim
+      // With the masses only: two floats per page, after the rest.
+      [[maybe_unused]] float *mass_s =
+          reinterpret_cast<float *>(v_s + kAttentionTileK * head_dim);
 
       const int head = blockIdx.y;
       // Tiles start `lead` rows before the first query, so that a layout
@@ -427,8 +428,7 @@ namespace microinfer
       if constexpr (kMass)
       {
         const int pages = (seq_k + mass_page_tokens - 1) / mass_page_tokens;
-        page_mass = PageMass{mass + static_cast<size_t>(head) * pages,
-                             mass_page_tokens, pages};
+        page_mass = PageMass{mass_s, mass_s + pages, mass_page_tokens, pages};
       }
 
       // The last key the block's last query can see. Uniform across the block,
@@ -502,9 +502,21 @@ namespace microinfer
           {
             if (q_first + r == 0)
             {
-              for (int c = 0; c < kAttentionTileK && k_first + c < seq_k; ++c)
+              // When P is a multiple of the tile's size, as the default 32
+              // is, every tile lies within one page and adds its sum at
+              // once: the keys past seq_k in it are masked, and add
+              // nothing. Otherwise a tile may span pages, and adds key by
+              // key.
+              if (page_mass.page_tokens % kAttentionTileK == 0)
               {
-                page_mass.add(k_first + c, row[c], m_new);
+                page_mass.add(k_first, sum, m_new);
+              }
+              else
+              {
+                for (int c = 0; c < kAttentionTileK && k_first + c < seq_k; ++c)
+                {
+                  page_mass.add(k_first + c, row[c], m_new);
+                }
               }
             }
           }
@@ -538,16 +550,27 @@ namespace microinfer
               __float2half(o_s[i] / l_s[r]);
         }
       }
-      // The same thread kept the query's row above, so it reads its own
-      // writes.
       if constexpr (kMass)
       {
-        for (int r = threadIdx.x; r < kAttentionTileQ; r += blockDim.x)
+        // The query's row, the one with seq_q 1, and the thread that kept
+        // it. With one query there is one block of rows (lead is less than a
+        // tile), the query's row is -q_first, and the bookkeeping gives
+        // thread r row r, there being a thread for every row.
+        static_assert(kBlockThreads >= kAttentionTileQ,
+                      "a thread keeps each row of a tile");
+        const int row = -q_first;
+        if (threadIdx.x == row)
         {
-          if (q_first + r == 0)
-          {
-            page_mass.normalise(m_s[r], l_s[r]);
-          }
+          page_mass.close();
+        }
+        __syncthreads();
+        const float m = m_s[row];
+        const float l = l_s[row];
+        float *head_mass = mass + static_cast<size_t>(head) * page_mass.pages;
+        for (int page = threadIdx.x; page < page_mass.pages; page += blockDim.x)
+        {
+          head_mass[page] = page_mass.partial_sum[page] *
+                            expf(page_mass.partial_max[page] - m) / l;
         }
       }
     }
@@ -638,7 +661,15 @@ namespace microinfer
       // layout, since each is its own kernel. Atomic because the NumPy binding
       // releases the GIL: two threads may both make the call, which is
       // harmless, but not race on the variable.
-      const size_t smem = shared_bytes(head_dim);
+      // The masses take two floats per page of shared memory besides.
+      const size_t smem =
+          shared_bytes(head_dim) +
+          (mass.mass != nullptr
+               ? 2 *
+                     static_cast<size_t>((seq_k + mass.page_tokens - 1) /
+                                         mass.page_tokens) *
+                     sizeof(float)
+               : 0);
       const dim3 grid((lead + seq_q + kAttentionTileQ - 1) / kAttentionTileQ,
                       heads);
       const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));

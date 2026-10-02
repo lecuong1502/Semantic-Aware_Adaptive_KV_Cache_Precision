@@ -204,3 +204,39 @@ def test_scoring_is_chosen_by_configuration():
     assert Engine(path, kv_scoring=True).kv_scoring is True
     with pytest.raises(ValueError, match="contiguous"):
         Engine(path, kv_cache="contiguous", kv_scoring=True)
+
+
+def test_a_cache_can_score_every_r_th_decode_step(engine, golden):
+    """With score_every R, the fallback #88 allows if scoring every step
+    costs decode more than noise (#100), a decode step folds its masses
+    only when the positions it attends number a multiple of R: every layer
+    of such a step, and no layer of another. R 1 is every step."""
+    cfg = engine.config
+    ids = golden["medium-01"].token_ids
+    new = 2 * P + 3
+
+    class Counting:
+        def __init__(self, scores):
+            self.scores, self.folds = scores, []
+
+        def fold(self, layer, mass, heads, pages):
+            self.folds.append(layer)
+            self.scores.fold(layer, mass, heads, pages)
+
+    def folds(every):
+        cache = model.PagedCache(cfg, scoring=True, score_every=every)
+        cache.scores = Counting(cache.scores)
+        decode(engine, ids, new, cache)
+        return len(cache.scores.folds)
+
+    steps = range(len(ids) + 1, len(ids) + new)  # seq_k of each decode step
+    for every in (1, 3, 8):
+        want = sum(seq_k % every == 0 for seq_k in steps) * cfg.num_hidden_layers
+        assert folds(every) == want, every
+    with pytest.raises(ValueError, match="score_every"):
+        model.PagedCache(cfg, scoring=True, score_every=0)
+    path = require_model(MODEL)
+    assert Engine(path).kv_score_every == Engine.DEFAULT_SCORE_EVERY
+    assert Engine(path, kv_score_every=2).kv_score_every == 2
+    with pytest.raises(ValueError, match="kv_score_every"):
+        Engine(path, kv_score_every=0)
