@@ -12,8 +12,8 @@ namespace microinfer
 
   // The FP16 shadows of a cache's downgraded pages (#94): each page's FP16
   // bytes, copied to pinned host memory before its first downgrade, and kept
-  // for the life of the cache. #88's later tickets will quantise further
-  // downgrades from it, and copy it back for an upgrade. About 0.9 GiB for
+  // for the life of the cache: a later downgrade quantises from it (#95),
+  // and an upgrade restores the page from it (#96). About 0.9 GiB for
   // Qwen2.5-1.5B at 32K, against 23 GiB of RAM, so nothing is ever evicted.
   //
   // Shadows are only ever added, so they are packed into pinned allocations

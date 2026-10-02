@@ -568,7 +568,7 @@ def test_what_a_downgrade_refuses():
                                        (0, 2, Tier.INT4, "sealed"),
                                        (1, 1, Tier.INT4, "sealed"),
                                        (0, 0, Tier.INT4, "FP16"),
-                                       (0, 1, Tier.FP16, "quantised tier"),
+                                       (0, 1, Tier.FP16, "lower tier"),
                                        (0, 9, Tier.INT4, "page of positions")):
         with pytest.raises(ValueError, match=match):
             cache.downgrade(layer, page, target)
@@ -825,3 +825,115 @@ def test_what_a_further_downgrade_refuses():
         for key in before:
             np.testing.assert_array_equal(after[key], before[key], err_msg=str(key))
     assert cache.shadow_count == 1
+
+
+# -- upgrading from the shadow (#96) ------------------------------------------------
+
+
+def test_an_upgrade_restores_a_page_from_its_shadow():
+    """A page moves back up by copying its shadow to a page at the higher
+    tier: back to FP16, its bytes are exactly those it had before its first
+    downgrade; to an intermediate tier, they are quantise_page's of the FP16
+    shadow there, as a page born at that tier would be. The shadow is kept,
+    and a page upgraded to FP16 downgrades again as it did the first time.
+    Attention reads as a cache built at the tiers the pages end at."""
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    heads = CFG.num_attention_heads
+
+    def upgrades(page_tokens):
+        rng = np.random.default_rng(96)
+        seq = 4 * page_tokens + 3
+        k = [normal(rng, seq, kv_heads, hd) for _ in range(LAYERS)]
+        v = [normal(rng, seq, kv_heads, hd) for _ in range(LAYERS)]
+        runs = [page_tokens + 5, seq - page_tokens - 5]
+        allocator, cache = sealing_at_fp16(page_tokens)
+        for layer in range(LAYERS):
+            start = store_in_runs(cache, layer, k[layer], v[layer], runs)
+        fp16 = snapshot(allocator)
+        moves = {(0, 1): [("down", Tier.INT2), ("up", Tier.FP16)],
+                 (1, 2): [("down", Tier.INT2), ("up", Tier.INT8)],
+                 (1, 0): [("down", Tier.INT4), ("up", Tier.INT8), ("up", Tier.FP16),
+                          ("down", Tier.INT4)],
+                 (0, 3): [("down", Tier.INT8), ("down", Tier.INT2), ("up", Tier.INT4)]}
+        for (layer, page), path in moves.items():
+            span = slice(page * page_tokens, (page + 1) * page_tokens)
+            for way, tier in path:
+                (cache.downgrade if way == "down" else cache.upgrade)(layer, page, tier)
+                assert cache.page_tier(layer, page) == tier
+                want = (fp16[(layer, page)] if tier == Tier.FP16 else
+                        _microinfer.quantise_page(k[layer][span], v[layer][span], tier,
+                                                  page_tokens))
+                np.testing.assert_array_equal(allocator.read(layer, page), want,
+                                              err_msg=f"layer {layer} page {page} {way} to "
+                                                      f"{tier.name}")
+                np.testing.assert_array_equal(cache.shadow(layer, page), fp16[(layer, page)])
+        assert cache.shadow_count == len(moves)
+        staging = (device.staging_page, device.shadow_upload_page)
+        assert not [key for key in snapshot(allocator) if key[1] in staging]
+
+        final = [[Tier.FP16] * (seq // page_tokens) for _ in range(LAYERS)]
+        final[0][0] = Tier.INT8  # so that the built cache seals, born there in both
+        for (layer, page), path in moves.items():
+            final[layer][page] = path[-1][1]
+        cache.downgrade(0, 0, Tier.INT8)
+        _, built = pages_for(CFG, page_tokens, Tier.FP16, tier_map=final)
+        for layer in range(LAYERS):
+            store_in_runs(built, layer, k[layer], v[layer], runs)
+            q = normal(rng, seq - start, heads, hd)
+            np.testing.assert_array_equal(
+                attend(CFG, cache, layer, q, k[layer], v[layer], None, start),
+                attend(CFG, built, layer, q, k[layer], v[layer], None, start))
+
+    each(PAGE_TOKENS, upgrades, name=lambda p: f"P={p}")
+
+
+def test_what_an_upgrade_refuses():
+    """Only to a higher tier: not to the page's own, nor to a lower one,
+    which is a downgrade's. And only from a shadow: a page at FP16 has
+    nothing above it, and a page born at a quantised tier never had FP16
+    bytes. Each refusal changes nothing; an upgrade that cannot allocate
+    its page leaves the cache as it was."""
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(961)
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    seq = 3 * page_tokens
+    born = [[Tier.INT8, Tier.FP16, Tier.FP16]] * LAYERS
+    allocator, cache = pages_for(CFG, page_tokens, Tier.FP16, tier_map=born)
+    store_in_runs(cache, 0, normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd), [seq])
+    cache.downgrade(0, 1, Tier.INT4)
+    before = snapshot(allocator)
+    for layer, page, target, match in ((0, 1, Tier.INT4, "higher"), (0, 1, Tier.INT2, "higher"),
+                                       (0, 2, Tier.FP16, "higher"), (0, 0, Tier.FP16, "shadow")):
+        with pytest.raises(ValueError, match=match):
+            cache.upgrade(layer, page, target)
+        after = snapshot(allocator)
+        assert after.keys() == before.keys()
+        for key in before:
+            np.testing.assert_array_equal(after[key], before[key], err_msg=str(key))
+
+    capacity = [0] * 4
+    capacity[int(Tier.FP16)] = len(device.open_pages) + 2  # one layer: its open pages, two more
+    capacity[int(Tier.INT4)] = capacity[int(Tier.INT2)] = capacity[int(Tier.INT8)] = 4096
+    tight = PagedKVCache(tier_page_bytes(CFG, page_tokens), capacity)
+    small = device.KVPages(tight, 1, page_tokens, kv_heads, hd, Tier.FP16, Halves.Both, [], True)
+    store_in_runs(small, 0, normal(rng, 2 * page_tokens, kv_heads, hd),
+                  normal(rng, 2 * page_tokens, kv_heads, hd), [2 * page_tokens])
+    small.downgrade(0, 1, Tier.INT4)
+    tight.allocate(98, 0, Tier.FP16)  # the FP16 range is now full
+    held = tight.read(0, 1)
+    with pytest.raises(ValueError, match="full"):
+        small.upgrade(0, 1, Tier.FP16)
+    assert small.page_tier(0, 1) == Tier.INT4
+    np.testing.assert_array_equal(tight.read(0, 1), held)
+    # To an intermediate tier the new page fits, and the FP16 page the shadow
+    # is uploaded to does not: the new page is given back too.
+    tight.free(98, 0)  # room for the FP16 page this downgrade uploads to
+    small.downgrade(0, 1, Tier.INT2)
+    tight.allocate(98, 0, Tier.FP16)  # full again
+    held = tight.read(0, 1)
+    with pytest.raises(ValueError, match="full"):
+        small.upgrade(0, 1, Tier.INT8)
+    assert small.page_tier(0, 1) == Tier.INT2
+    np.testing.assert_array_equal(tight.read(0, 1), held)
+    assert not [key for t in Tier.__members__.values() for key in tight.pages(t)
+                if key[1] in (device.staging_page, device.shadow_upload_page)]

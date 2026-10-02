@@ -1,4 +1,5 @@
-"""Downgrading a sealed FP16 page at runtime, end to end (#93, #95, Seam A).
+"""Moving a sealed page between tiers at runtime, end to end (#93, #95, #96,
+Seam A).
 
 KVPages.downgrade moves a page of positions sealed at FP16 to a lower tier
 mid-session: allocated at the target tier, quantised from FP16 (the page
@@ -116,14 +117,16 @@ def test_after_runtime_downgrades_the_logits_are_a_cache_built_at_those_tiers(en
          name=lambda c: f"{c[0]}{' chained' if c[1] else ''}")
 
 
-def test_the_driver_sees_the_memory_tier_page_bytes_predicts_returned():
+def test_the_driver_sees_the_memory_tier_page_bytes_predicts_returned_and_taken_back():
     """Qwen2.5-1.5B with 4096 positions held, every page at FP16 but each
     layer's first, at INT8. In three rounds, a third of the FP16 pages each
-    go to INT4, to INT2 and to INT8, layer by layer. After each round, what this process
-    holds by the driver's own account has fallen by what paged_cache_bytes
-    computes from tier_page_bytes for the tiers the pages are now at, to a
-    granule. The prediction is checked against the allocator too, to the
-    byte."""
+    go to INT4, to INT2 and to INT8, layer by layer; then, in two more, the
+    INT2 pages come back to FP16 and the INT4 pages up to INT8 (#96). After
+    each round, what this process holds by the driver's own account has
+    moved by what paged_cache_bytes computes from tier_page_bytes for the
+    tiers the pages are now at, to a granule: fallen after a downgrade,
+    risen after an upgrade. The prediction is checked against the allocator
+    too, to the byte."""
     cfg = ModelConfig.from_card("qwen2.5-1.5b-instruct")
     layers, kv_width = cfg.num_hidden_layers, cfg.num_key_value_heads * cfg.head_dim
     positions = 4096
@@ -141,20 +144,65 @@ def test_the_driver_sees_the_memory_tier_page_bytes_predicts_returned():
     def held():
         return sum(cache.allocator.mapped_bytes(t) for t in Tier.__members__.values())
 
-    rounds = [{i: "INT4" for i in range(1, pages, 3)},
-              {i: "INT2" for i in range(2, pages, 3)},
-              {i: "INT8" for i in range(3, pages, 3)}]
-    for moves in rounds:
+    rounds = [(cache.pages.downgrade, "FP16", {i: "INT4" for i in range(1, pages, 3)}),
+              (cache.pages.downgrade, "FP16", {i: "INT2" for i in range(2, pages, 3)}),
+              (cache.pages.downgrade, "FP16", {i: "INT8" for i in range(3, pages, 3)}),
+              (cache.pages.upgrade, "INT2", {i: "FP16" for i in range(2, pages, 3)}),
+              (cache.pages.upgrade, "INT4", {i: "INT8" for i in range(1, pages, 3)})]
+    for move, source, moves in rounds:
         before = nvml.settled_own_used_bytes()
         predicted = paged_cache_bytes(cfg, positions, "FP16", names)
         for layer in range(layers):
             for i, target in moves.items():
-                if names[layer][i] == "FP16":
-                    cache.pages.downgrade(layer, i, getattr(Tier, target))
+                if names[layer][i] == source:
+                    move(layer, i, getattr(Tier, target))
                     names[layer][i] = target
         returned = predicted - paged_cache_bytes(cfg, positions, "FP16", names)
         measured = before - nvml.settled_own_used_bytes()
-        print(f"\npredicted {returned / 2**20:.1f} MiB returned, measured {measured / 2**20:.1f}")
+        print(f"\n{move.__name__}: predicted {returned / 2**20:.1f} MiB returned, "
+              f"measured {measured / 2**20:.1f}")
         assert held() == paged_cache_bytes(cfg, positions, "FP16", names)
-        assert returned > 0
+        assert returned > 0 if move == cache.pages.downgrade else returned < 0
         assert abs(measured - returned) <= granule
+
+
+def test_an_upgrade_back_to_fp16_restores_the_logits(engine, golden):
+    """Two caches of one prompt, at FP16, both sealing. After the prefill,
+    one takes every page it holds down to a tier, on to INT2, up to INT8
+    and back to FP16 (#96), before any step reads them.
+    Its pages are then, byte for byte, what they were before, and every
+    decode step after gives the other's logits, to the bit."""
+    cfg = engine.config
+    m = engine._model
+    layers = cfg.num_hidden_layers
+    ids = golden["long-03"].token_ids
+    kept = model.PagedCache(cfg, Tier.FP16, always_seal=True)
+    moved = model.PagedCache(cfg, Tier.FP16, always_seal=True)
+    prefill = model.Workspace(cfg, rows=len(ids))
+    for cache in (kept, moved):
+        m.run(prefill, cache, ids)
+    token = m.greedy_last(prefill, len(ids))
+    pages = moved.pages.pages_per_layer
+    before = {(layer, i): moved.allocator.read(layer, i)
+              for layer in range(layers) for i in range(pages)}
+    for layer in range(layers):
+        for i in range(pages):
+            # Down to a tier, on to INT2 from the shadow, up to INT8 from it,
+            # and back to FP16.
+            first = LADDER[(layer + i) % 3]
+            moved.pages.downgrade(layer, i, first)
+            if first != Tier.INT2:
+                moved.pages.downgrade(layer, i, Tier.INT2)
+            moved.pages.upgrade(layer, i, Tier.INT8)
+            moved.pages.upgrade(layer, i, Tier.FP16)
+    for key, was in before.items():
+        assert moved.pages.page_tier(*key) == Tier.FP16
+        np.testing.assert_array_equal(moved.allocator.read(*key), was, err_msg=str(key))
+    step = model.Workspace(cfg, rows=1)
+    for t in range(P + 3):
+        logits = []
+        for cache in (kept, moved):
+            m.run(step, cache, np.array([token], np.int32))
+            logits.append(m.logits(step, 1))
+        np.testing.assert_array_equal(logits[1], logits[0], err_msg=f"step {t}")
+        token = int(logits[0][-1].argmax())

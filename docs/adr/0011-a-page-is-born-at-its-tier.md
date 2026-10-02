@@ -256,4 +256,15 @@ only for the downgrade, never its current codes
 page at tier T is therefore always exactly `quantise_page(FP16,
 T)`, however many steps it took to get there, and each tier has one error,
 the one Milestone 0 measured. A page born at a quantised tier has no shadow,
-and never moves. Upgrades are still a later ticket of #88.
+and never moves. Upgrades were still to come; #96's amendment below adds
+them.
+
+## Amendment (#96): an upgrade restores a page from its shadow
+
+A page moves back up by its shadow too: to FP16 the shadow is copied into
+a new FP16 page, exactly the page's bytes before its first downgrade; to an
+intermediate tier the shadow is uploaded and quantised there, as a
+downgrade from it would be. The steps are a downgrade's (a page at the
+target under the staging page, then the page table, then the old page
+freed), and the shadow is kept. Dequantising the codes up is rejected, as
+#88 decided: it recovers nothing.

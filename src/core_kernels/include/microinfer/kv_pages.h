@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "microinfer/device_buffer.h"
@@ -30,13 +31,14 @@ namespace microinfer
   // position's page, so they cannot collide with one.
   constexpr std::array<int, 2> kOpenPages{-1, -2};
 
-  // The page_index a downgrade's new page is allocated under while the page
-  // it replaces is still read (#93): never a position's page, nor an open
-  // page.
+  // The page_index a downgrade's or an upgrade's new page is allocated
+  // under while the page it replaces is still read (#93): never a
+  // position's page, nor an open page.
   constexpr int kStagingPage = -3;
 
-  // The page_index of the FP16 page a downgrade from a shadow uploads the
-  // shadow to, to quantise from (#95), freed before the downgrade returns.
+  // The page_index of the FP16 page a move from a shadow to a quantised
+  // tier uploads the shadow to, to quantise from (#95, #96), freed before
+  // the move returns.
   constexpr int kShadowUploadPage = -4;
 
   // Which halves of a page a quantised tier quantises. Both is the tier; the
@@ -71,8 +73,9 @@ namespace microinfer
   // are in one of the layer's two open pages, (l, kOpenPages[k]), FP16 and
   // allocated once. A key channel's scale spans a whole page, so a page
   // being filled cannot be quantised (ADR-0005). A page changes tier only
-  // by downgrade() (#93), which puts a new page, at the target tier, in its
-  // place: a sealed page is still never written again.
+  // by downgrade() or upgrade() (#93, #96), each of which puts a new page,
+  // at the target tier, in its place: a sealed page is still never written
+  // again.
   //
   // Attention at a quantised tier is causal in the sense decode is: a query
   // reads the pages before its own as sealed, and its own page at FP16,
@@ -177,6 +180,14 @@ namespace microinfer
     // it, is unusable. Needs a cache that seals, and no diagnostic Halves.
     void downgrade(int layer, int page, Tier target);
 
+    // Moves page `page` of `layer`, a page downgraded before, back up to the
+    // higher tier `target` (#96), from its shadow: to FP16, the shadow's
+    // bytes, exactly the page's before its first downgrade; to a quantised
+    // tier, quantise_page of the shadow there. Then as a downgrade: put in
+    // the page's place, the old page freed. The shadow is kept. If an
+    // allocation fails, the cache is as it was.
+    void upgrade(int layer, int page, Tier target);
+
     // The FP16 shadows, one for each page whose downgrade has begun, in
     // pinned host memory, freed with this cache (#94). A downgrade that
     // fails after taking it leaves it, still the page's bytes, for the next.
@@ -223,6 +234,15 @@ namespace microinfer
     // keys and of values, into its place at its own tier.
     // Copies rows of keys and of values into an FP16 page, keys then values.
     void copy_rows(__half *page, const __half *keys, const __half *values);
+    // The key of a page that can change tier, a sealed page of positions of
+    // a cache that seals, without a diagnostic Halves, or why not, for
+    // `move`, "downgrade" or "upgrade".
+    PageKey require_movable(int layer, int page, const char *verb) const;
+    // "page i of layer l", for messages.
+    static std::string page_name(PageKey key);
+    // A page from `current` to `target`, either way: downgrade's and
+    // upgrade's shared steps, once each has checked the direction.
+    void move(PageKey key, Tier current, Tier target);
     // Throws std::out_of_range unless `layer` is one of this cache's.
     void require_layer(int layer) const;
     // One page's bytes at `tier`: FP16's layout, or quant.h's.
