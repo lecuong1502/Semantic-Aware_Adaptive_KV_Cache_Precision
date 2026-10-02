@@ -460,68 +460,111 @@ namespace microinfer
     }
   }
 
-  void KVPages::downgrade(int layer, int page, Tier target)
+  PageKey KVPages::require_movable(int layer, int page, const char *verb) const
   {
     if (!seals())
     {
       throw std::invalid_argument(
-          "only a cache that seals can downgrade a page: in one that does not, "
-          "every page is FP16 and its last is still being written (ADR-0011)");
+          std::string("only a cache that seals can ") + verb +
+          " a page: in one that does not, every page is FP16 and its last is "
+          "still being written (ADR-0011)");
     }
     if (halves_ != Halves::Both)
     {
-      throw std::invalid_argument("a diagnostic Halves stores every page at "
-                                  "FP16 by its definition; none downgrades");
+      throw std::invalid_argument(
+          std::string("a diagnostic Halves stores every page at FP16 by its "
+                      "definition; none can ") +
+          verb);
     }
     require_layer(layer);
-    const std::string name =
-        "page " + std::to_string(page) + " of layer " + std::to_string(layer);
     if (page < 0 || page >= pages_)
     {
-      throw std::invalid_argument(name +
+      throw std::invalid_argument(page_name({layer, page}) +
                                   " is not a page of positions this cache "
-                                  "holds; only one of those downgrades");
+                                  "holds; only one of those moves");
     }
     if (page >= sealed_[layer])
     {
       throw std::invalid_argument(
-          name + " is not sealed: its positions are reserved, not all stored");
+          page_name({layer, page}) +
+          " is not sealed: its positions are reserved, not all stored");
     }
-    if (target == Tier::FP16)
-    {
-      throw std::invalid_argument("a downgrade is to a quantised tier");
-    }
-    const PageKey key{layer, page};
+    return {layer, page};
+  }
+
+  std::string KVPages::page_name(PageKey key)
+  {
+    return "page " + std::to_string(key.page_index) + " of layer " +
+           std::to_string(key.layer);
+  }
+
+  void KVPages::downgrade(int layer, int page, Tier target)
+  {
+    const PageKey key = require_movable(layer, page, "downgrade");
     const Tier current = page_tier(key);
     if (!is_lower(target, current))
     {
-      throw std::invalid_argument(name + " is at " + tier_name(current) +
-                                  "; a downgrade is to a lower "
-                                  "tier, and " +
+      throw std::invalid_argument(page_name(key) + " is at " +
+                                  tier_name(current) +
+                                  "; a downgrade is to a lower tier, and " +
                                   tier_name(target) + " is not");
     }
     // Below FP16 the page's own bytes are codes, and a downgrade quantises
     // from FP16 only (#95): from the page's shadow, which a page born at a
     // quantised tier never had.
-    const bool from_shadow = current != Tier::FP16;
-    if (from_shadow && !shadows_.contains(key))
+    if (current != Tier::FP16 && !shadows_.contains(key))
     {
       throw std::invalid_argument(
-          name + " was born at " + tier_name(current) +
+          page_name(key) + " was born at " + tier_name(current) +
           " and has no FP16 shadow to quantise from; only a page sealed at "
           "FP16 downgrades");
     }
+    move(key, current, target);
+  }
+
+  void KVPages::upgrade(int layer, int page, Tier target)
+  {
+    const PageKey key = require_movable(layer, page, "upgrade");
+    const Tier current = page_tier(key);
+    if (!is_lower(current, target))
+    {
+      throw std::invalid_argument(page_name(key) + " is at " +
+                                  tier_name(current) +
+                                  "; an upgrade is to a higher tier, and " +
+                                  tier_name(target) + " is not");
+    }
+    // An upgrade restores what the codes lost from the page's shadow
+    // (#96): dequantising them would recover nothing.
+    if (!shadows_.contains(key))
+    {
+      throw std::invalid_argument(page_name(key) + " was born at " +
+                                  tier_name(current) +
+                                  " and has no FP16 shadow to restore it from");
+    }
+    move(key, current, target);
+  }
+
+  void KVPages::move(PageKey key, Tier current, Tier target)
+  {
     require_page_size(target, "a page of positions");
+    // The FP16 bytes the page at `target` is made from: the page itself
+    // while it is FP16, its shadow once it is not (#95, #96). A page at a
+    // quantised tier T is then always quantise_page(FP16, T), and a page
+    // back at FP16 is its shadow.
+    const bool from_shadow = current != Tier::FP16;
+    // An FP16 page to upload the shadow to, to quantise from, only when
+    // the target is quantised: an FP16 target is the shadow itself.
+    const bool upload_shadow = from_shadow && target != Tier::FP16;
 
     // 1. The page at its target tier, under a key of its own while the
-    // page it replaces is still read; and, from a shadow, an FP16 page to
-    // upload it to, from the allocator, so that the cache's memory is all
-    // the allocator's (ADR-0007), freed again before this returns. If
-    // either fails, nothing has changed.
-    const PageKey staged{layer, kStagingPage};
-    const PageKey upload{layer, kShadowUploadPage};
+    // page it replaces is still read; and, when the shadow is to be
+    // quantised, the upload page, from the allocator too, so that the
+    // cache's memory is all the allocator's (ADR-0007), freed again before
+    // this returns. If an allocation fails, nothing has changed.
+    const PageKey staged{key.layer, kStagingPage};
+    const PageKey upload{key.layer, kShadowUploadPage};
     allocator_.allocate(staged, target);
-    if (from_shadow)
+    if (upload_shadow)
     {
       try
       {
@@ -535,43 +578,54 @@ namespace microinfer
     }
     try
     {
-      // 2. Quantised from FP16, exactly as a page born at the target is
-      // from its rows: the page itself while it is FP16, its shadow after
-      // (#95), so that a page at tier T is always quantise_page(FP16, T).
-      // Before its first downgrade the page's FP16 bytes go to its shadow
-      // (#94), and the copy is complete before the page is freed below.
-      // Pages are resolved here, between allocator operations, and used at
-      // once.
-      const __half *rows = nullptr;
-      if (!from_shadow)
+      // 2. The page's bytes at `target`. Before its first downgrade the
+      // page's FP16 bytes go to its shadow (#94), and the copy is complete
+      // before the page is freed below. Pages are resolved here, between
+      // allocator operations, and used at once.
+      const std::size_t fp16_bytes = bytes_at(Tier::FP16);
+      auto *staged_bytes =
+          reinterpret_cast<std::uint8_t *>(resolve_page(staged).address);
+      if (!from_shadow && !shadows_.contains(key))
       {
-        rows = reinterpret_cast<const __half *>(resolve_page(key).address);
-        if (!shadows_.contains(key))
-        {
-          shadows_.take(key, rows);
-        }
+        shadows_.take(
+            key, reinterpret_cast<const void *>(resolve_page(key).address));
+      }
+      // The FP16 bytes to quantise, or, for an FP16 target, the new page's
+      // own: the page itself while it is FP16; else its shadow, copied into
+      // the new page at FP16, or into the upload page to quantise from.
+      const void *rows = nullptr;
+      if (from_shadow)
+      {
+        void *to = target == Tier::FP16
+                       ? static_cast<void *>(staged_bytes)
+                       : reinterpret_cast<void *>(resolve_page(upload).address);
+        cuda_check(cudaMemcpy(to, shadows_.shadow(key), fp16_bytes,
+                              cudaMemcpyHostToDevice),
+                   "cudaMemcpy a page's FP16 shadow host-to-device");
+        rows = to;
       }
       else
       {
-        rows = reinterpret_cast<const __half *>(resolve_page(upload).address);
-        cuda_check(cudaMemcpy(const_cast<__half *>(rows), shadows_.shadow(key),
-                              bytes_at(Tier::FP16), cudaMemcpyHostToDevice),
-                   "cudaMemcpy a page's FP16 shadow host-to-device");
+        rows = reinterpret_cast<const void *>(resolve_page(key).address);
       }
-      device::quantise_page(
-          rows, rows + static_cast<std::size_t>(page_tokens_) * kv_width_,
-          reinterpret_cast<std::uint8_t *>(resolve_page(staged).address),
-          target, page_tokens_, page_tokens_, kv_heads_, head_dim_);
+      if (target != Tier::FP16)
+      {
+        const auto *keys = static_cast<const __half *>(rows);
+        device::quantise_page(
+            keys, keys + static_cast<std::size_t>(page_tokens_) * kv_width_,
+            staged_bytes, target, page_tokens_, page_tokens_, kv_heads_,
+            head_dim_);
+      }
       // The upload page is FP16's tail, so its free moves nothing, and it
       // synchronises, so the quantisation has read it before it goes.
-      if (from_shadow)
+      if (upload_shadow)
       {
         allocator_.free(upload);
       }
     }
     catch (...)
     {
-      if (from_shadow && allocator_.contains(upload))
+      if (upload_shadow && allocator_.contains(upload))
       {
         allocator_.free(upload);
       }

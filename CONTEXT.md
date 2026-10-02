@@ -69,13 +69,14 @@ later (#88).
 A downgraded page's FP16 bytes, copied to pinned host memory before its
 first downgrade and kept for the session, so that a later downgrade can
 quantise from FP16 and an upgrade can restore the page bit for bit (#88,
-#94). A page has one. A downgrade from it uploads it to an FP16 page of the
-allocator's, `(layer, -4)`, for as long as the downgrade takes (#95).
+#94). A page has one. A move from it to a quantised tier, down or up,
+uploads it to an FP16 page of the allocator's, `(layer, -4)`, for as long as
+the move takes (#95, #96); an upgrade to FP16 copies it into the new page.
 _Avoid_: backup, host copy, offload (offloading moves a page off the device;
 a shadow sits beside it)
 
 **Staging page**:
-Where a downgrade writes a page's new bytes, at the target tier, while the
+Where a downgrade or an upgrade writes a page's new bytes, at the target tier, while the
 page they replace is still read: the page table entry `(layer, -3)`, which
 takes the page's own entry when the old page is freed (#93).
 _Avoid_: temporary page, scratch page

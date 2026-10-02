@@ -693,6 +693,14 @@ void bind_device(py::module_ &parent)
            "put in its place in the page table, and the old page freed, its "
            "tier's tail moving into the slot (ADR-0007). If the allocation "
            "fails, the cache is as it was.")
+      .def("upgrade", &KVPages::upgrade,
+           py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
+           py::arg("page"), py::arg("target"),
+           "Move a downgraded page back up to the higher tier `target` from "
+           "its shadow (#96): to FP16, exactly its bytes before its first "
+           "downgrade; to a quantised tier, quantise_page of the shadow "
+           "there. The shadow is kept. If an allocation fails, the cache is "
+           "as it was.")
       .def_static("seals_for", &KVPages::seals_for, py::arg("tier"),
                   py::arg("tier_map") = microinfer::TierMap{},
                   py::arg("always_seal") = false,

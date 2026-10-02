@@ -198,8 +198,9 @@ class PagedCache(_Cache):
             # Any page may be downgraded to any tier (#93). A downgrade's
             # staging page needs no room of its own: the page it replaces is
             # not at the target tier, so that tier is never full of this
-            # cache's pages. Nor does the FP16 page a downgrade from a shadow
-            # uploads to (#95): the page it replaces is then below FP16.
+            # cache's pages. Nor does the FP16 page a move from a shadow to a
+            # quantised tier uploads to (#95, #96): the page it replaces is
+            # then below FP16. An upgrade is the same move, the other way.
             held = set(Tier.__members__.values())
         capacity = [0] * 4
         for t in held:
