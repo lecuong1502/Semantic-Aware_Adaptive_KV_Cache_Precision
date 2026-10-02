@@ -612,7 +612,8 @@ void bind_device(py::module_ &parent)
              const std::optional<Span> &k_bias,
              const microinfer::RopeTable *rope, const Span &out, int seq_q,
              int seq_k, int heads, int kv_heads, int head_dim,
-             const std::optional<Span> &keys, const std::optional<Span> &values)
+             const std::optional<Span> &keys, const std::optional<Span> &values,
+             DeviceFloats *mass)
           {
             if (seq_q > seq_k)
             {
@@ -635,18 +636,37 @@ void bind_device(py::module_ &parent)
             {
               need(*values, product(seq_q, kv_heads, head_dim), "values");
             }
+            if (mass != nullptr)
+            {
+              const std::size_t pages =
+                  (static_cast<std::size_t>(seq_k) + c.page_tokens() - 1) /
+                  c.page_tokens();
+              if (mass->count() < pages * heads)
+              {
+                throw std::invalid_argument(
+                    "the per-page attention mass needs " +
+                    std::to_string(pages * heads) +
+                    " floats, (heads, pages); "
+                    "got " +
+                    std::to_string(mass->count()));
+              }
+            }
             c.attention(layer, q.ptr, k_bias ? k_bias->ptr : nullptr, rope,
                         out.ptr, seq_q, seq_k, heads, kv_heads, head_dim,
                         keys ? keys->ptr : nullptr,
-                        values ? values->ptr : nullptr);
+                        values ? values->ptr : nullptr,
+                        mass != nullptr ? mass->data() : nullptr);
           },
           py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
           py::arg("q"), py::arg("k_bias"), py::arg("rope"), py::arg("out"),
           py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
           py::arg("kv_heads"), py::arg("head_dim"),
           py::arg("keys") = py::none(), py::arg("values") = py::none(),
+          py::arg("mass") = py::none(),
           "At a quantised tier, keys and values are the rows the queries "
-          "stored, from which each query reads its own page.")
+          "stored, from which each query reads its own page. `mass`, an fp32 "
+          "tensor of (heads, pages), receives a decode step's per-page "
+          "attention mass (#98).")
       .def(
           "page_tier", [](const KVPages &c, int layer, int page)
           { return c.page_tier({layer, page}); }, py::arg("layer"),

@@ -664,7 +664,7 @@ namespace microinfer
   void KVPages::attention(int layer, const __half *q, const __half *k_bias,
                           const RopeTable *rope, __half *out, int seq_q,
                           int seq_k, int heads, int kv_heads, int head_dim,
-                          const __half *keys, const __half *values)
+                          const __half *keys, const __half *values, float *mass)
   {
     if (static_cast<std::size_t>(kv_heads) * head_dim != kv_width_)
     {
@@ -686,7 +686,7 @@ namespace microinfer
     {
       device::attention_paged(q, resolve(layer).pages, page_tokens_, k_bias,
                               rope, out, seq_q, seq_k, heads, kv_heads,
-                              head_dim);
+                              head_dim, mass);
       return;
     }
     if (keys == nullptr || values == nullptr)
@@ -701,10 +701,10 @@ namespace microinfer
     }
     // Each page is read at the tier the page table records for it (#91).
     const LayerTable table = resolve(layer);
-    device::attention_paged_causal(q, table.pages, table.tiers, may_be_at_,
-                                   open_page(layer, attend_open_[layer]), keys,
-                                   values, page_tokens_, k_bias, rope, out,
-                                   seq_q, seq_k, heads, kv_heads, head_dim);
+    device::attention_paged_causal(
+        q, table.pages, table.tiers, may_be_at_,
+        open_page(layer, attend_open_[layer]), keys, values, page_tokens_,
+        k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim, mass);
   }
 
 } // namespace microinfer

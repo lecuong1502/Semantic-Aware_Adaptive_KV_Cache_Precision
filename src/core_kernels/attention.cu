@@ -53,6 +53,14 @@ namespace microinfer
     // Layout is (tokens, heads, head_dim), row-major, for q and out, and
     // (tokens, kv_heads, head_dim) for k and v.
     //
+    // A decode step may also ask for its per-page attention mass (#98): each
+    // page's share of each query head's softmax, for the scorer. It is the
+    // same kernel with PageMass compiled in: the one query's thread sums
+    // each page's exp(s - m) from the scores the bookkeeping below already
+    // computes, and normalises them once m and l are final. Without it the
+    // kernel is compiled as it always was, and no bit of `out` differs with
+    // it or without.
+    //
     // Grouped-query attention is an indexing rule, nothing more: the block for
     // query head h reads KV head h / group, where group = heads / kv_heads.
     // That is HuggingFace's repeat_kv order — contiguous groups, not
@@ -309,13 +317,61 @@ namespace microinfer
       }
     };
 
-    template <typename KV>
-    __global__ void attention_kernel(const __half *__restrict__ q, KV kv,
-                                     const __half *__restrict__ k_bias,
-                                     __half *__restrict__ out, int seq_q,
-                                     int seq_k, int heads, int kv_heads,
-                                     int head_dim, float scale,
-                                     const float *__restrict__ rope, int lead)
+    // A decode step's per-page attention mass (#98), kept by the thread of
+    // its one query as the key tiles go by. Pages come in order, so one is
+    // open at a time: its sum of exp(s - m) and that m, rescaled as m rises.
+    // A finished page is left in `mass` as log(sum) + m, one float, and
+    // normalise() makes each page's share once m and l are final: exp(log(sum)
+    // + m_page - m) / l.
+    struct PageMass
+    {
+      float *mass;
+      int page_tokens;
+      int pages;
+      int open = -1;
+      float sum = 0.0f;
+      float max = -INFINITY;
+
+      __device__ void add(int position, float p, float m)
+      {
+        const int page = position / page_tokens;
+        if (page != open)
+        {
+          close();
+          open = page;
+          sum = 0.0f;
+          max = m;
+        }
+        else if (max < m)
+        {
+          sum *= expf(max - m);
+          max = m;
+        }
+        sum += p;
+      }
+      __device__ void close()
+      {
+        if (open >= 0)
+        {
+          mass[open] = logf(sum) + max;
+        }
+      }
+      __device__ void normalise(float m, float l)
+      {
+        close();
+        for (int page = 0; page < pages; ++page)
+        {
+          mass[page] = expf(mass[page] - m) / l;
+        }
+      }
+    };
+
+    template <typename KV, bool kMass>
+    __global__ void attention_kernel(
+        const __half *__restrict__ q, KV kv, const __half *__restrict__ k_bias,
+        __half *__restrict__ out, int seq_q, int seq_k, int heads, int kv_heads,
+        int head_dim, float scale, const float *__restrict__ rope, int lead,
+        float *__restrict__ mass, int mass_page_tokens)
     {
       extern __shared__ float smem[];
       float *q_s = smem; // kAttentionTileQ x head_dim
@@ -364,6 +420,16 @@ namespace microinfer
         l_s[r] = 0.0f;
       }
       __syncthreads();
+
+      // The per-page attention mass, compiled only into the kernel that
+      // writes it, so that the one that does not is the kernel it was.
+      [[maybe_unused]] PageMass page_mass{};
+      if constexpr (kMass)
+      {
+        const int pages = (seq_k + mass_page_tokens - 1) / mass_page_tokens;
+        page_mass = PageMass{mass + static_cast<size_t>(head) * pages,
+                             mass_page_tokens, pages};
+      }
 
       // The last key the block's last query can see. Uniform across the block,
       // so every thread runs the same number of iterations.
@@ -432,6 +498,16 @@ namespace microinfer
           l_s[r] = l_s[r] * rescale + sum;
           m_s[r] = m_new;
           rescale_s[r] = rescale;
+          if constexpr (kMass)
+          {
+            if (q_first + r == 0)
+            {
+              for (int c = 0; c < kAttentionTileK && k_first + c < seq_k; ++c)
+              {
+                page_mass.add(k_first + c, row[c], m_new);
+              }
+            }
+          }
         }
         __syncthreads();
 
@@ -460,6 +536,18 @@ namespace microinfer
         {
           out[(q_first + r) * token_stride + head_offset + d] =
               __float2half(o_s[i] / l_s[r]);
+        }
+      }
+      // The same thread kept the query's row above, so it reads its own
+      // writes.
+      if constexpr (kMass)
+      {
+        for (int r = threadIdx.x; r < kAttentionTileQ; r += blockDim.x)
+        {
+          if (q_first + r == 0)
+          {
+            page_mass.normalise(m_s[r], l_s[r]);
+          }
         }
       }
     }
@@ -506,12 +594,28 @@ namespace microinfer
   namespace
   {
 
+    // Where a decode step's per-page attention mass goes, and the pages it
+    // is summed over. MassOutput{}, value-initialised, is none.
+    struct MassOutput
+    {
+      float *mass;
+      int page_tokens;
+    };
+
     template <typename KV>
     void launch(const __half *q, KV kv, const __half *k_bias,
                 const RopeTable *rope, __half *out, int seq_q, int seq_k,
-                int heads, int kv_heads, int head_dim, int lead = 0)
+                int heads, int kv_heads, int head_dim, int lead = 0,
+                MassOutput mass = {})
     {
       check_grouping(heads, kv_heads);
+      if (mass.mass != nullptr && seq_q != 1)
+      {
+        throw std::invalid_argument(
+            "the per-page attention mass is a decode step's, of one query; "
+            "got " +
+            std::to_string(seq_q) + " queries");
+      }
       if (seq_q <= 0 || heads == 0 || head_dim <= 0)
       {
         return;
@@ -535,23 +639,34 @@ namespace microinfer
       // releases the GIL: two threads may both make the call, which is
       // harmless, but not race on the variable.
       const size_t smem = shared_bytes(head_dim);
-      static std::atomic<size_t> opted_in{0};
-      if (smem > opted_in.load())
-      {
-        cuda_check(
-            cudaFuncSetAttribute(attention_kernel<KV>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(smem)),
-            "cudaFuncSetAttribute attention shared memory");
-        opted_in = smem;
-      }
-
       const dim3 grid((lead + seq_q + kAttentionTileQ - 1) / kAttentionTileQ,
                       heads);
       const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-      attention_kernel<KV><<<grid, kBlockThreads, smem>>>(
-          q, kv, k_bias, out, seq_q, seq_k, heads, kv_heads, head_dim, scale,
-          k_bias != nullptr ? rope->data() : nullptr, lead);
+      const auto run = [&](auto kernel, std::atomic<size_t> &opted_in)
+      {
+        if (smem > opted_in.load())
+        {
+          cuda_check(cudaFuncSetAttribute(
+                         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem)),
+                     "cudaFuncSetAttribute attention shared memory");
+          opted_in = smem;
+        }
+        kernel<<<grid, kBlockThreads, smem>>>(
+            q, kv, k_bias, out, seq_q, seq_k, heads, kv_heads, head_dim, scale,
+            k_bias != nullptr ? rope->data() : nullptr, lead, mass.mass,
+            mass.page_tokens);
+      };
+      static std::atomic<size_t> opted_in{0};
+      static std::atomic<size_t> opted_in_with_mass{0};
+      if (mass.mass != nullptr)
+      {
+        run(attention_kernel<KV, true>, opted_in_with_mass);
+      }
+      else
+      {
+        run(attention_kernel<KV, false>, opted_in);
+      }
       cuda_check(cudaGetLastError(), "attention kernel launch");
     }
 
@@ -570,7 +685,8 @@ namespace microinfer
   void device::attention_paged(const __half *q, const unsigned long long *pages,
                                int page_tokens, const __half *k_bias,
                                const RopeTable *rope, __half *out, int seq_q,
-                               int seq_k, int heads, int kv_heads, int head_dim)
+                               int seq_k, int heads, int kv_heads, int head_dim,
+                               float *mass)
   {
     if (page_tokens <= 0)
     {
@@ -579,7 +695,7 @@ namespace microinfer
     }
     const size_t row = static_cast<size_t>(kv_heads) * head_dim;
     launch(q, PagedKV{pages, page_tokens, row}, k_bias, rope, out, seq_q, seq_k,
-           heads, kv_heads, head_dim);
+           heads, kv_heads, head_dim, 0, MassOutput{mass, page_tokens});
   }
 
   void device::attention_paged_causal(
@@ -587,7 +703,7 @@ namespace microinfer
       const std::uint8_t *tiers, const std::array<bool, kTierCount> &may_be_at,
       const __half *open, const __half *chunk_k, const __half *chunk_v,
       int page_tokens, const __half *k_bias, const RopeTable *rope, __half *out,
-      int seq_q, int seq_k, int heads, int kv_heads, int head_dim)
+      int seq_q, int seq_k, int heads, int kv_heads, int head_dim, float *mass)
   {
     if (page_tokens <= 0 || page_tokens % kAttentionTileQ != 0)
     {
@@ -618,7 +734,8 @@ namespace microinfer
     launch(q,
            CausalPagedKV{sealed, open, chunk_k, chunk_v, page_tokens, start,
                          row, formats},
-           k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim, lead);
+           k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim, lead,
+           MassOutput{mass, page_tokens});
   }
 
   void attention(const float *q, const float *k, const float *v,
