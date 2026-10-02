@@ -160,10 +160,16 @@ namespace microinfer
     // tier `keys` and `values` are the rows the queries stored, (seq_q,
     // kv_width) each, from which each query reads its own page (see above);
     // at FP16 they are not read and may be null.
+    //
+    // `mass`, if given, receives a decode step's per-page attention mass
+    // (#98): (heads, pages) fp32, each page's share of each query head's
+    // softmax, for the pages of positions [0, seq_k), the last of them the
+    // query's own, open page. Only for one query, seq_q 1. Asking for it
+    // changes no bit of `out`.
     void attention(int layer, const __half *q, const __half *k_bias,
                    const RopeTable *rope, __half *out, int seq_q, int seq_k,
                    int heads, int kv_heads, int head_dim, const __half *keys,
-                   const __half *values);
+                   const __half *values, float *mass = nullptr);
 
     // Moves page `page` of `layer`, a page of positions sealed at FP16, to
     // the lower tier `target` at runtime (#93): allocated at `target`, its

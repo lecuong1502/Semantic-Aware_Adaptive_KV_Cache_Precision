@@ -150,6 +150,13 @@ A page's accumulated share of attention mass, as maintained by the Attention
 Scorer. It is an input to a requantisation plan, not a tier.
 _Avoid_: attention score, relevance, weight, saliency
 
+**Attention mass** (of a page):
+A page's share of one query head's softmax in one decode step: the sum of
+the attention weights over the page's positions, so that a layer's pages,
+for each head, sum to 1. The attention kernel writes it when asked (#98);
+the scorer turns it into an importance score.
+_Avoid_: attention score (a score is a pre-softmax logit), page weight
+
 **Requantisation plan**:
 The list of `(layer, page, current_tier, target_tier)` entries the Precision
 Controller emits in response to a pressure level. Producing a plan is a pure

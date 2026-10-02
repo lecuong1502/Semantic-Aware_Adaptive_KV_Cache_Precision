@@ -73,10 +73,16 @@ namespace microinfer
     // holds page_tokens rows of keys, (kv_heads, head_dim) each, then as many
     // rows of values. Only addressing differs from attention() above, so the
     // two give bit-identical output on the same keys and values.
+    //
+    // `mass`, if given, is (heads, pages) fp32 of one query's attention, a
+    // decode step's: each page's share of each query head's softmax mass,
+    // pages of page_tokens positions from position 0 (#98). Refused for
+    // seq_q other than 1. Asking for it changes no bit of `out`.
     void attention_paged(const __half *q, const unsigned long long *pages,
                          int page_tokens, const __half *k_bias,
                          const RopeTable *rope, __half *out, int seq_q,
-                         int seq_k, int heads, int kv_heads, int head_dim);
+                         int seq_k, int heads, int kv_heads, int head_dim,
+                         float *mass = nullptr);
 
     // The same attention over a cache that seals, read causally (#18,
     // ADR-0011): a query reads every page before its own as sealed, and its
@@ -88,7 +94,7 @@ namespace microinfer
     // may be at. Of the query's own page, positions before the first query's,
     // seq_k - seq_q, are read from `open`, an FP16 page; the rest from
     // chunk_k and chunk_v, the seq_q rows the queries brought. page_tokens
-    // must be a multiple of kAttentionTileQ.
+    // must be a multiple of kAttentionTileQ. `mass` as attention_paged's.
     void attention_paged_causal(const __half *q,
                                 const unsigned long long *sealed,
                                 const std::uint8_t *tiers,
@@ -97,7 +103,8 @@ namespace microinfer
                                 const __half *chunk_v, int page_tokens,
                                 const __half *k_bias, const RopeTable *rope,
                                 __half *out, int seq_q, int seq_k, int heads,
-                                int kv_heads, int head_dim);
+                                int kv_heads, int head_dim,
+                                float *mass = nullptr);
 
     // Writes n tokens' key and value rows into their pages, token t at
     // position start + t. `pages` as for attention_paged.
