@@ -746,3 +746,82 @@ def test_a_page_has_one_shadow_taken_once():
     assert store.bytes == 2 * per_allocation * page_bytes
     with pytest.raises(_microinfer.PageNotFound):
         store.shadow(5, 5)
+
+
+# -- downgrading further, from the shadow (#95) -----------------------------------
+
+
+def test_a_page_downgraded_in_steps_is_one_quantised_straight_from_fp16():
+    """A page already below FP16 moves lower by quantising its FP16 shadow,
+    never its current codes: after every step of FP16 to INT8 to INT4 to
+    INT2, and after INT8 straight to INT2, the page is quantise_page's bytes
+    for its positions at that tier, as a page born there would be, and the
+    shadow, taken once, is unchanged. Attention over the cache then reads,
+    to the bit, as a cache built at the final tiers, at both page sizes."""
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    heads = CFG.num_attention_heads
+
+    def chained(page_tokens):
+        rng = np.random.default_rng(95)
+        seq = 4 * page_tokens + 3
+        k = [normal(rng, seq, kv_heads, hd) for _ in range(LAYERS)]
+        v = [normal(rng, seq, kv_heads, hd) for _ in range(LAYERS)]
+        runs = [page_tokens + 5, seq - page_tokens - 5]
+        allocator, cache = sealing_at_fp16(page_tokens)
+        for layer in range(LAYERS):
+            start = store_in_runs(cache, layer, k[layer], v[layer], runs)
+        steps = {(0, 1): [Tier.INT8, Tier.INT4, Tier.INT2], (1, 2): [Tier.INT8, Tier.INT2],
+                 (1, 0): [Tier.INT4, Tier.INT2], (0, 3): [Tier.INT8]}
+        fp16 = snapshot(allocator)
+        for (layer, page), path in steps.items():
+            span = slice(page * page_tokens, (page + 1) * page_tokens)
+            for tier in path:
+                cache.downgrade(layer, page, tier)
+                assert cache.page_tier(layer, page) == tier
+                np.testing.assert_array_equal(
+                    allocator.read(layer, page),
+                    _microinfer.quantise_page(k[layer][span], v[layer][span], tier, page_tokens),
+                    err_msg=f"layer {layer} page {page} at {tier.name}")
+                np.testing.assert_array_equal(cache.shadow(layer, page), fp16[(layer, page)])
+        assert cache.shadow_count == len(steps)
+        staging = (device.staging_page, device.shadow_upload_page)
+        assert not [key for key in snapshot(allocator) if key[1] in staging], (
+            "a downgrade left a page of its own behind")
+
+        final = [[Tier.FP16] * (seq // page_tokens) for _ in range(LAYERS)]
+        for (layer, page), path in steps.items():
+            final[layer][page] = path[-1]
+        _, built = pages_for(CFG, page_tokens, Tier.FP16, tier_map=final)
+        for layer in range(LAYERS):
+            store_in_runs(built, layer, k[layer], v[layer], runs)
+            q = normal(rng, seq - start, heads, hd)
+            np.testing.assert_array_equal(
+                attend(CFG, cache, layer, q, k[layer], v[layer], None, start),
+                attend(CFG, built, layer, q, k[layer], v[layer], None, start))
+
+    each(PAGE_TOKENS, chained, name=lambda p: f"P={p}")
+
+
+def test_what_a_further_downgrade_refuses():
+    """Only to a lower tier: not to the tier a page is at, nor to a higher
+    one, which is an upgrade's. And only from a shadow: a page born at a
+    quantised tier never had FP16 bytes in the cache, so it has nothing to
+    quantise from and does not move. Each refusal changes nothing."""
+    page_tokens = PAGE_TOKENS[0]
+    rng = np.random.default_rng(951)
+    kv_heads, hd = CFG.num_key_value_heads, CFG.head_dim
+    seq = 3 * page_tokens
+    born = [[Tier.INT8, Tier.FP16, Tier.FP16]] * LAYERS
+    allocator, cache = pages_for(CFG, page_tokens, Tier.FP16, tier_map=born)
+    store_in_runs(cache, 0, normal(rng, seq, kv_heads, hd), normal(rng, seq, kv_heads, hd), [seq])
+    cache.downgrade(0, 1, Tier.INT4)
+    before = snapshot(allocator)
+    for layer, page, target, match in ((0, 1, Tier.INT4, "lower"), (0, 1, Tier.INT8, "lower"),
+                                       (0, 0, Tier.INT4, "shadow")):
+        with pytest.raises(ValueError, match=match):
+            cache.downgrade(layer, page, target)
+        after = snapshot(allocator)
+        assert after.keys() == before.keys()
+        for key in before:
+            np.testing.assert_array_equal(after[key], before[key], err_msg=str(key))
+    assert cache.shadow_count == 1

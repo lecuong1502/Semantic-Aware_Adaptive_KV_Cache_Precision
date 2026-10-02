@@ -244,3 +244,16 @@ downgrades: its pages are FP16 by its definition.
 Downgrading from a page already quantised, upgrades, and the FP16 shadow
 they need are later tickets of #88. The decision as a whole, with the
 options it rejected, is #109's ADR.
+
+## Amendment (#94, #95): every downgrade quantises from FP16
+
+Before a page's first downgrade its FP16 bytes are copied to its *shadow*
+in pinned host memory, and the page is freed only once the copy is
+complete (#94). A page already below FP16 moves lower by quantising its
+shadow, uploaded to an FP16 page of the allocator's, `(layer, -4)`, held
+only for the downgrade, never its current codes
+(#95); this replaces the #93 amendment's note that it was later work. A
+page at tier T is therefore always exactly `quantise_page(FP16,
+T)`, however many steps it took to get there, and each tier has one error,
+the one Milestone 0 measured. A page born at a quantised tier has no shadow,
+and never moves. Upgrades are still a later ticket of #88.

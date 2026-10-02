@@ -24,6 +24,13 @@ namespace microinfer
 
   constexpr int kTierCount = 4;
 
+  // Whether `a` is a lower tier than `b`: fewer bits a value. Tiers are
+  // numbered from FP16 down, so a lower tier is a larger number.
+  inline bool is_lower(Tier a, Tier b)
+  {
+    return static_cast<int>(a) > static_cast<int>(b);
+  }
+
   // The tier's name, as the project writes it, for messages.
   inline const char *tier_name(Tier tier)
   {

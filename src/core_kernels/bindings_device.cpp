@@ -687,11 +687,12 @@ void bind_device(py::module_ &parent)
       .def("downgrade", &KVPages::downgrade,
            py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
            py::arg("page"), py::arg("target"),
-           "Move a page of positions sealed at FP16 to the quantised tier "
-           "`target` at runtime (#93): allocated there, quantised from the "
-           "FP16 page, put in its place in the page table, and the FP16 page "
-           "freed, its tier's tail moving into the slot (ADR-0007). If the "
-           "allocation fails, the cache is as it was.")
+           "Move a page of positions sealed at FP16 to the lower tier "
+           "`target` at runtime (#93): allocated there, quantised from FP16 "
+           "(the page itself while it is FP16, its shadow once below, #95), "
+           "put in its place in the page table, and the old page freed, its "
+           "tier's tail moving into the slot (ADR-0007). If the allocation "
+           "fails, the cache is as it was.")
       .def_static("seals_for", &KVPages::seals_for, py::arg("tier"),
                   py::arg("tier_map") = microinfer::TierMap{},
                   py::arg("always_seal") = false,
@@ -706,6 +707,8 @@ void bind_device(py::module_ &parent)
 
   m.attr("open_pages") =
       py::make_tuple(microinfer::kOpenPages[0], microinfer::kOpenPages[1]);
+  m.attr("staging_page") = microinfer::kStagingPage;
+  m.attr("shadow_upload_page") = microinfer::kShadowUploadPage;
 
   m.def("page_bytes", &KVPages::page_bytes_for, py::arg("page_tokens"),
         py::arg("kv_width"),
