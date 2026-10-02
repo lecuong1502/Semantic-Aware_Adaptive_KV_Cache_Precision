@@ -491,45 +491,94 @@ namespace microinfer
     {
       throw std::invalid_argument("a downgrade is to a quantised tier");
     }
-    const Tier current = page_tier({layer, page});
-    if (current != Tier::FP16)
+    const PageKey key{layer, page};
+    const Tier current = page_tier(key);
+    if (!is_lower(target, current))
     {
       throw std::invalid_argument(name + " is at " + tier_name(current) +
-                                  "; only an FP16 page downgrades (#93)");
+                                  "; a downgrade is to a lower "
+                                  "tier, and " +
+                                  tier_name(target) + " is not");
+    }
+    // Below FP16 the page's own bytes are codes, and a downgrade quantises
+    // from FP16 only (#95): from the page's shadow, which a page born at a
+    // quantised tier never had.
+    const bool from_shadow = current != Tier::FP16;
+    if (from_shadow && !shadows_.contains(key))
+    {
+      throw std::invalid_argument(
+          name + " was born at " + tier_name(current) +
+          " and has no FP16 shadow to quantise from; only a page sealed at "
+          "FP16 downgrades");
     }
     require_page_size(target, "a page of positions");
 
-    // 1. The page at its target tier, under a key of its own while the FP16
-    // page is still read. If this fails, nothing has changed.
-    const PageKey key{layer, page};
+    // 1. The page at its target tier, under a key of its own while the
+    // page it replaces is still read; and, from a shadow, an FP16 page to
+    // upload it to, from the allocator, so that the cache's memory is all
+    // the allocator's (ADR-0007), freed again before this returns. If
+    // either fails, nothing has changed.
     const PageKey staged{layer, kStagingPage};
+    const PageKey upload{layer, kShadowUploadPage};
     allocator_.allocate(staged, target);
+    if (from_shadow)
+    {
+      try
+      {
+        allocator_.allocate(upload, Tier::FP16);
+      }
+      catch (...)
+      {
+        allocator_.free(staged);
+        throw;
+      }
+    }
     try
     {
-      // Before its first downgrade, the page's FP16 bytes go to its shadow
+      // 2. Quantised from FP16, exactly as a page born at the target is
+      // from its rows: the page itself while it is FP16, its shadow after
+      // (#95), so that a page at tier T is always quantise_page(FP16, T).
+      // Before its first downgrade the page's FP16 bytes go to its shadow
       // (#94), and the copy is complete before the page is freed below.
-      if (!shadows_.contains(key))
-      {
-        shadows_.take(
-            key, reinterpret_cast<const void *>(resolve_page(key).address));
-      }
-      // 2. Quantised from the FP16 page, exactly as a page born at the
-      // target is from its rows, which the FP16 page holds as they came.
-      // Both are resolved here, between allocator operations, and used at
+      // Pages are resolved here, between allocator operations, and used at
       // once.
-      const auto *rows =
-          reinterpret_cast<const __half *>(resolve_page(key).address);
+      const __half *rows = nullptr;
+      if (!from_shadow)
+      {
+        rows = reinterpret_cast<const __half *>(resolve_page(key).address);
+        if (!shadows_.contains(key))
+        {
+          shadows_.take(key, rows);
+        }
+      }
+      else
+      {
+        rows = reinterpret_cast<const __half *>(resolve_page(upload).address);
+        cuda_check(cudaMemcpy(const_cast<__half *>(rows), shadows_.shadow(key),
+                              bytes_at(Tier::FP16), cudaMemcpyHostToDevice),
+                   "cudaMemcpy a page's FP16 shadow host-to-device");
+      }
       device::quantise_page(
           rows, rows + static_cast<std::size_t>(page_tokens_) * kv_width_,
           reinterpret_cast<std::uint8_t *>(resolve_page(staged).address),
           target, page_tokens_, page_tokens_, kv_heads_, head_dim_);
+      // The upload page is FP16's tail, so its free moves nothing, and it
+      // synchronises, so the quantisation has read it before it goes.
+      if (from_shadow)
+      {
+        allocator_.free(upload);
+      }
     }
     catch (...)
     {
+      if (from_shadow && allocator_.contains(upload))
+      {
+        allocator_.free(upload);
+      }
       allocator_.free(staged);
       throw;
     }
-    // 3 and 4. The page table names the new page, and the FP16 page is
+    // 3 and 4. The page table names the new page, and the old page is
     // freed, its tier's tail moving into the slot (ADR-0007). The free's
     // copy is ordered after the quantisation on the legacy default stream,
     // and it synchronises before any granule is unmapped.

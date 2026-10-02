@@ -30,10 +30,14 @@ namespace microinfer
   // position's page, so they cannot collide with one.
   constexpr std::array<int, 2> kOpenPages{-1, -2};
 
-  // The page_index a downgrade's new page is allocated under while the FP16
-  // page it replaces is still read (#93): never a position's page, nor an
-  // open page.
+  // The page_index a downgrade's new page is allocated under while the page
+  // it replaces is still read (#93): never a position's page, nor an open
+  // page.
   constexpr int kStagingPage = -3;
+
+  // The page_index of the FP16 page a downgrade from a shadow uploads the
+  // shadow to, to quantise from (#95), freed before the downgrade returns.
+  constexpr int kShadowUploadPage = -4;
 
   // Which halves of a page a quantised tier quantises. Both is the tier; the
   // other two are a diagnostic (#18): the page is stored at FP16, and when it
@@ -158,10 +162,13 @@ namespace microinfer
                    const __half *values);
 
     // Moves page `page` of `layer`, a page of positions sealed at FP16, to
-    // the quantised tier `target` at runtime (#93): allocated at `target`,
-    // its FP16 bytes copied to its shadow if it has none (#94), quantised
-    // from the FP16 page, put in its place in the page table, and the FP16
-    // page freed, its tier's tail moving into the slot (ADR-0007).
+    // the lower tier `target` at runtime (#93): allocated at `target`, its
+    // FP16 bytes copied to its shadow if it has none (#94), quantised from
+    // FP16, put in its place in the page table, and the old page freed, its
+    // tier's tail moving into the slot (ADR-0007). Quantised from the page
+    // itself while it is FP16, and from its shadow once it is below (#95),
+    // never from its codes: a page at tier T is always quantise_page(FP16,
+    // T). A page born at a quantised tier has no shadow, and never moves.
     // The page then holds quantise_page's bytes for its positions at
     // `target`, as a page born there does, and attention reads it there. If
     // the allocation fails, as it will when contention leaves no memory, the

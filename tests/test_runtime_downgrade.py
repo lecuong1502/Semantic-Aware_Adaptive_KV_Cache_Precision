@@ -1,8 +1,9 @@
-"""Downgrading a sealed FP16 page at runtime, end to end (#93, Seam A).
+"""Downgrading a sealed FP16 page at runtime, end to end (#93, #95, Seam A).
 
 KVPages.downgrade moves a page of positions sealed at FP16 to a lower tier
-mid-session: allocated at the target tier, quantised from the FP16 page, put
-in its place in the page table, the FP16 page freed. Seam B
+mid-session: allocated at the target tier, quantised from FP16 (the page
+itself while it is FP16, its shadow once below), put in its place in the
+page table, the old page freed. Seam B
 (test_quantised_pages.py) proves the page's bytes and attention over it.
 What is left here is the model and the driver: a session that downgrades
 its pages as it goes reads, to the bit, what a session over a cache built at
@@ -41,9 +42,11 @@ def golden() -> GoldenSet:
 
 def test_after_runtime_downgrades_the_logits_are_a_cache_built_at_those_tiers(engine, golden):
     """Two caches holding one prompt's keys and values. One holds every page
-    at FP16, and seals (always_seal); after the prefill, and after every decode step that seals a page, it
-    downgrades each page it holds to the page's final tier, page 0 staying
-    FP16 and the others going down the tiers in turn. The other is born at
+    at FP16, and seals (always_seal); after the prefill, and after every
+    decode step that seals a page, it downgrades each page it holds to the
+    page's final tier, page 0 staying FP16 and the others going down the
+    tiers in turn: in one step, or, chained, through INT8 first and from
+    there on down from the page's shadow (#95). The other is born at
     those final tiers, from the same rows: the prefill's keys and values,
     which the first holds, to the bit, before it downgrades anything. From
     the first decode step on, every step's logits are the same, to the bit,
@@ -57,7 +60,7 @@ def test_after_runtime_downgrades_the_logits_are_a_cache_built_at_those_tiers(en
     def final_tier(layer, i):
         return Tier.FP16 if i == 0 else LADDER[(layer + i) % 3]
 
-    def session(prompt_id):
+    def session(prompt_id, chained):
         ids = golden[prompt_id].token_ids
         new = 2 * P + 5
         pages = (len(ids) + new) // P
@@ -87,8 +90,11 @@ def test_after_runtime_downgrades_the_logits_are_a_cache_built_at_those_tiers(en
             nonlocal moved
             for i in range(moved, moving.pages.pages_per_layer):
                 for layer in range(layers):
-                    if final[layer][i] != Tier.FP16:
-                        moving.pages.downgrade(layer, i, final[layer][i])
+                    target = final[layer][i]
+                    if chained and int(target) > int(Tier.INT8):
+                        moving.pages.downgrade(layer, i, Tier.INT8)
+                    if target != Tier.FP16:
+                        moving.pages.downgrade(layer, i, target)
             moved = moving.pages.pages_per_layer
 
         downgrade_sealed()
@@ -106,7 +112,8 @@ def test_after_runtime_downgrades_the_logits_are_a_cache_built_at_those_tiers(en
             for i in range(pages):
                 assert moving.pages.page_tier(layer, i) == final[layer][i], (layer, i)
 
-    each(("medium-01", "long-03"), session)
+    each([(p, c) for p in ("medium-01", "long-03") for c in (False, True)], session,
+         name=lambda c: f"{c[0]}{' chained' if c[1] else ''}")
 
 
 def test_the_driver_sees_the_memory_tier_page_bytes_predicts_returned():
