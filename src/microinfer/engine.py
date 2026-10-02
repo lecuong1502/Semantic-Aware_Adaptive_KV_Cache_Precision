@@ -202,6 +202,11 @@ class Engine:
     #: one kv_tier_map names for it (#92).
     KV_TIERS = ("FP16", "INT8", "INT4", "INT2")
 
+    #: With kv_scoring, how many decode steps apart the scores take a step's
+    #: attention mass (#100): every step cost Qwen2.5-0.5B's decode more
+    #: than noise at 512 positions, and #88 makes every R-th its fallback.
+    DEFAULT_SCORE_EVERY = 4
+
     #: Which halves of a page a quantised tier quantises. "both" is the tier;
     #: "keys" and "values" are a diagnostic that splits its cost (kv_pages.h).
     KV_HALVES = ("both", "keys", "values")
@@ -209,6 +214,7 @@ class Engine:
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
                  kv_tier: str = "FP16", kv_halves: str = "both",
                  kv_tier_map: list[list[str]] | None = None, kv_scoring: bool = False,
+                 kv_score_every: int | None = None,
                  prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
@@ -223,6 +229,8 @@ class Engine:
         self.config = ModelConfig.from_model_dir(self.model_dir)
         self.kv_tier_map = kv_tier_map
         self.kv_scoring = kv_scoring
+        self.kv_score_every = (self.DEFAULT_SCORE_EVERY if kv_score_every is None
+                               else kv_score_every)
 
         if verify:
             expected = VERIFIED.get(self.config.name)
@@ -348,6 +356,21 @@ class Engine:
         if scoring and self.kv_cache == "contiguous":
             raise ValueError("the contiguous cache has no pages to score")
         self._kv_scoring = bool(scoring)
+
+    @property
+    def kv_score_every(self) -> int:
+        """With kv_scoring, how many decode steps apart the scores take a
+        step's attention mass: every step at 1 (#99), every R-th at R, the
+        fallback #88 allows where every step costs more than noise (#100).
+        Setting it applies to the next cache."""
+        return self._kv_score_every
+
+    @kv_score_every.setter
+    def kv_score_every(self, every: int) -> None:
+        if not isinstance(every, int) or every < 1:
+            raise ValueError(f"kv_score_every is a count of decode steps, at least 1; "
+                             f"got {every!r}")
+        self._kv_score_every = every
 
     @property
     def kv_tier_map(self) -> list[list[str]] | None:
@@ -648,12 +671,12 @@ class Engine:
         tier = getattr(Tier, self.kv_tier)
         if self.kv_halves == "both":
             return model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map),
-                                    scoring=self.kv_scoring)
+                                    scoring=self.kv_scoring, score_every=self.kv_score_every)
         if tier == Tier.FP16:
             raise ValueError("kv_halves splits a quantised tier; FP16 has nothing to split")
         return model.PagedCache(self.config, tier,
                                 getattr(_microinfer.device.Halves, self.kv_halves.title()),
-                                scoring=self.kv_scoring)
+                                scoring=self.kv_scoring, score_every=self.kv_score_every)
 
     @contextmanager
     def _holding(self, cache, ws: model.Workspace):

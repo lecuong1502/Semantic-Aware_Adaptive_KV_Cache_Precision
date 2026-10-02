@@ -6,6 +6,7 @@
     .venv/bin/python tools/throughput.py --kv-tier INT4 ...
     .venv/bin/python tools/throughput.py --monitor --lengths 512 --repeat 10
     .venv/bin/python tools/throughput.py --monitor --scorer --lengths 512 --repeat 10
+    .venv/bin/python tools/throughput.py --monitor --scorer --score-every 1 ...
 
 They are two different regimes, so they are two entries per length:
 - **Prefill** runs many positions through each projection at once and is
@@ -33,9 +34,9 @@ see, so the entry carries that read's own cost, timed apart.
 
 --monitor --scorer measures the monitor and the importance scorer (#99,
 #100) together the same way: decode with both on against both off. With
-the scorer on, every decode step writes each page's attention mass and
-folds it into the scores on the device. It logs "monitor-scorer-overhead"
-entries.
+the scorer on, every R-th decode step, --score-every (the engine's default
+unless given), writes each page's attention mass and folds it into the
+scores on the device. It logs "monitor-scorer-overhead" entries.
 """
 
 from __future__ import annotations
@@ -100,10 +101,14 @@ def decode_rate(engine: Engine, prompt: np.ndarray) -> float:
 
 
 def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: int,
-                     scorer: bool = False) -> dict:
+                     scorer: bool = False, score_every: int | None = None) -> dict:
     """Decode throughput with the pressure monitor on and off, `repeat`
     times each, interleaved, the order alternating; with `scorer`, the
-    importance scorer on and off with it."""
+    importance scorer on and off with it, scoring every `score_every`-th
+    step, the engine's default if None."""
+    before = engine.kv_score_every
+    if score_every is not None:
+        engine.kv_score_every = score_every
     for _ in range(warmup):
         decode_rate(engine, prompt)
     rates: dict[bool, list[float]] = {False: [], True: []}
@@ -127,6 +132,7 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
         return {"runs": values, "mean": statistics.mean(values),
                 "stdev": statistics.stdev(values) if len(values) > 1 else 0.0}
 
+    engine.kv_score_every = before
     off, on = summary(rates[False]), summary(rates[True])
     noise = 2 * (off["stdev"] ** 2 / repeat + on["stdev"] ** 2 / repeat) ** 0.5
     difference = on["mean"] - off["mean"]
@@ -145,7 +151,8 @@ def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
     """Measure and log what the pressure monitor, and with --scorer the
     importance scorer, cost decoding after `ids`."""
     prompt = decode_prompt(engine, ids)
-    results = monitor_overhead(engine, prompt, args.repeat, args.warmup, args.scorer)
+    results = monitor_overhead(engine, prompt, args.repeat, args.warmup, args.scorer,
+                               args.score_every)
     thresholds = monitor.DEFAULT
     config = {**method, "statistic": "mean", "steps": DECODE_STEPS,
               "order": "interleaved, alternating", "poll_s": monitor.POLL_S,
@@ -155,6 +162,7 @@ def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
                              "thresholds_adr": 13}}
     if args.scorer:
         config["scorer"] = {"alpha": _microinfer.device.ImportanceScores.default_alpha,
+                            "score_every": args.score_every or engine.kv_score_every,
                             "issue": 99}
     what = "the monitor and scorer" if args.scorer else "the monitor"
     print(f"decode after {len(prompt):6}: {results['off']['mean']:8.1f} tok/s without "
@@ -183,6 +191,9 @@ def main(argv: list[str]) -> int:
                         help="measure the pressure monitor's cost to decoding, instead")
     parser.add_argument("--scorer", action="store_true",
                         help="with --monitor, the importance scorer on with the monitor")
+    parser.add_argument("--score-every", type=int, default=None,
+                        help="with --scorer, score every this many decode steps; the "
+                             "engine's default otherwise")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     if args.monitor and args.repeat < 2:

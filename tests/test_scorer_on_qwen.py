@@ -43,12 +43,13 @@ def golden_for(name):
 
 
 def test_the_first_page_scores_among_the_highest_without_protection():
-    """After a prompt and 64 decoded tokens, the first page's score,
+    """After a prompt and 64 decoded tokens, scoring every step and every
+    R-th as the engine does by default (#100), the first page's score,
     averaged over the layers, is the highest of every page's; and in at
     least three layers in four it is among the three highest."""
-    def sink(engine, golden, prompt_id):
+    def sink(engine, golden, prompt_id, every):
         ids = golden[prompt_id].token_ids
-        cache = model.PagedCache(engine.config, scoring=True)
+        cache = model.PagedCache(engine.config, scoring=True, score_every=every)
         new = 64
         decode(engine, ids, new, cache)
         attended = -(-(len(ids) + new - 1) // P)  # the pages the last step read
@@ -62,7 +63,8 @@ def test_the_first_page_scores_among_the_highest_without_protection():
         engine = Engine(require_model(name))
         engine.load_weights()
         golden = golden_for(name)
-        each(PROMPTS, lambda p: sink(engine, golden, p), name=lambda p: f"{name} {p}")
+        each([(p, e) for p in PROMPTS for e in (1, Engine.DEFAULT_SCORE_EVERY)],
+             lambda p, e: sink(engine, golden, p, e), name=lambda c: f"{name} {c[0]} R={c[1]}")
         del engine
 
 
@@ -73,7 +75,9 @@ def test_the_overhead_measurement_runs_and_leaves_the_engine_as_it_was():
     engine = Engine(require_model(MODELS[0]))
     engine.load_weights()
     prompt = np.arange(1000, 1000 + 2 * P, dtype=np.int32)
-    results = throughput.monitor_overhead(engine, prompt, repeat=2, warmup=0, scorer=True)
+    results = throughput.monitor_overhead(engine, prompt, repeat=2, warmup=0, scorer=True,
+                                          score_every=2)
     assert len(results["on"]["runs"]) == len(results["off"]["runs"]) == 2
     assert results["on"]["mean"] > 0 and results["off"]["mean"] > 0
     assert engine.kv_scoring is False and engine._monitor is None
+    assert engine.kv_score_every == Engine.DEFAULT_SCORE_EVERY

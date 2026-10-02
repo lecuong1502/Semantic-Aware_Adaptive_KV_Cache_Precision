@@ -182,14 +182,16 @@ class PagedCache(_Cache):
 
     With `scoring`, the cache keeps the importance score of every page
     (#99): each decode step's per-page attention mass, folded on the device
-    into an EWMA with weight `alpha` (0.2 by default). The scores and the
+    into an EWMA with weight `alpha` (0.2 by default); or, with
+    `score_every` R, every R-th step's, the fallback #88 allows where every
+    step costs decode more than noise (#100). The scores and the
     mass they are folded from are counted in `nbytes`, since they exist only
     for the cache. Nothing is copied to the host until `scores.download()`.
     """
 
     def __init__(self, cfg: ModelConfig, tier=None, halves=None, tier_map=None,
                  always_seal=False, scoring=False,
-                 alpha=device.ImportanceScores.default_alpha):
+                 alpha=device.ImportanceScores.default_alpha, score_every=1):
         super().__init__(cfg)
         Tier = _microinfer.Tier
         self.tier = Tier.FP16 if tier is None else tier
@@ -220,6 +222,10 @@ class PagedCache(_Cache):
         #: The importance scores, if the cache keeps them (#99): every decode
         #: step's per-page attention mass, folded in on the device. None if not.
         self.scores = None
+        if score_every < 1:
+            raise ValueError(f"score_every is a count of decode steps, at least 1; "
+                             f"got {score_every}")
+        self.score_every = score_every
         if scoring:
             self.scores = device.ImportanceScores(layers, pages_per_layer, alpha)
             self._mass = device.empty_f32(self.heads * pages_per_layer)
@@ -239,10 +245,13 @@ class PagedCache(_Cache):
 
     def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int,
                keys=None, values=None) -> None:
-        # A step of one query's masses go into the scores: every decode step,
-        # and a prefill chunk of one position, which is the same computation.
-        # A longer prefill chunk's are not taken.
-        scored = self.scores is not None and seq_q == 1
+        # A step of one query's masses go into the scores: a decode step's,
+        # or a prefill chunk's of one position, which is the same
+        # computation, when the positions it attends number a multiple of
+        # score_every; every layer of such a step alike. A longer prefill
+        # chunk's are not taken.
+        scored = (self.scores is not None and seq_q == 1
+                  and seq_k % self.score_every == 0)
         self.pages.attention(layer, q, k_bias, self.rope, out, seq_q, seq_k,
                              self.heads, self.kv_heads, self.head_dim, keys, values,
                              self._mass if scored else None)
