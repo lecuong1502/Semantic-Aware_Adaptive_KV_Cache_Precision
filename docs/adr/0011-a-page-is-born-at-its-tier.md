@@ -199,3 +199,19 @@ the cache's tier. Two things change for such a cache.
 A cache whose map names no tier but its own builds, byte for byte, what
 this ADR's static operation builds. A sealed page still never changes tier
 here; that is #93's, and its own ADR (#109).
+
+## Amendment (#91): attention reads each page at its own tier
+
+Attention reads each sealed page at the tier the page table records for it,
+not at the cache's. Beside each layer's table of page addresses, the cache
+uploads each page's tier, and the kernel picks the page's format as it
+loads it: quant.h's layout at a quantised tier, dequantised as above, or
+the FP16 layout. A query's own page is still read at FP16, from the open
+page and the step's rows, so causality is unchanged, page by page.
+
+There is still one kernel and one pass, with no workspace. The branch on a
+page's tier does not diverge within a warp: a key tile is loaded one key
+row at a time, and head_dim, 64 or 128 here, is a multiple of the warp's 32
+lanes, so all the lanes of a warp load one page. A cache born at one tier
+reads, bit for bit, as the static path did, since each element is decoded
+by the same arithmetic.

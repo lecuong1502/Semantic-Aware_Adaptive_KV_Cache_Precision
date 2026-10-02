@@ -72,12 +72,11 @@ namespace microinfer
   //
   // A page's tier is the page table's: the allocator records it for every
   // (layer, page). This class reads it there to address a page, at its own
-  // tier's size, and to seal a page of positions, at its own tier. The open
-  // pages are always FP16. The cache's own tier is the tier its pages of
-  // positions are born at, and two things still go by it: attention, which
-  // reads a whole layer at that one tier until it reads each page at its
-  // own (#91), and the diagnostic Halves' round trip, whose tier is the
-  // cache's by definition.
+  // tier's size, to seal a page of positions, at its own tier, and to tell
+  // attention the tier each sealed page is read at (#91). The open pages
+  // are always FP16. The cache's own tier is the tier a page of positions
+  // is born at where the map names none; the diagnostic Halves' round trip
+  // goes by it too, its tier being the cache's by definition.
   //
   // The allocator may move any page whenever it frees one (ADR-0007), so this
   // class never keeps a page's address. store() and attention() each resolve
@@ -191,11 +190,19 @@ namespace microinfer
     ResolvedPage resolve_page(PageKey key) const;
 
     // The layer's table of pages of positions on the device, for the pages
-    // held now. Every layer's table is resolved at once, and again whenever
+    // held now: each page's address, and the tier the page table records
+    // for it. Every layer's table is resolved at once, and again whenever
     // the allocator's generation has moved since: no address outlives an
     // allocate or a free, anyone's, and a decode step with no allocator
-    // operation between its launches uploads nothing.
-    const unsigned long long *resolve(int layer);
+    // operation between its launches uploads nothing. A page reaches
+    // another tier only by an allocation, so its tier is never staler than
+    // its address. Both are null while no page of positions is held.
+    struct LayerTable
+    {
+      const unsigned long long *pages;
+      const std::uint8_t *tiers;
+    };
+    LayerTable resolve(int layer);
 
     PagedKVCache &allocator_;
     int layers_;
@@ -207,6 +214,8 @@ namespace microinfer
     Halves halves_;
     Tier storage_tier_;
     TierMap tier_map_;
+    // Every tier a page of positions is born at: the cache's, and the map's.
+    std::array<bool, kTierCount> born_{};
     bool seals_ = false;
     bool mixed_ = false;
     std::size_t page_bytes_;
@@ -221,7 +230,8 @@ namespace microinfer
     // halves, the scratch a seal goes through.
     std::unique_ptr<DeviceBuffer> scratch_page_;
     std::unique_ptr<DeviceBuffer> scratch_halves_;
-    // layers_ tables of table_stride_ entries each.
+    // layers_ tables of table_stride_ addresses each, then layers_ of as
+    // many tiers.
     std::unique_ptr<DeviceBuffer> tables_;
     int table_stride_ = 0;
     int resolved_pages_ = -1;
