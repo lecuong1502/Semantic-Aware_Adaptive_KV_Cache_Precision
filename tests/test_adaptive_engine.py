@@ -39,6 +39,7 @@ def golden_ids(name, prompt_id):
         pytest.skip(str(exc))
 
 
+@pytest.mark.slow
 def test_a_simulated_red_makes_the_engine_return_memory_the_driver_sees():
     """RED: the plan is applied at once, in the step after the event, every
     downgrade of it; the cache's allocator gives memory back, and what this
@@ -73,6 +74,7 @@ def test_a_simulated_red_makes_the_engine_return_memory_the_driver_sees():
     assert abs(seen - returned) <= _microinfer.granule_bytes()
 
 
+@pytest.mark.slow
 def test_at_yellow_no_step_is_delayed_beyond_the_budget():
     """YELLOW: the plan is applied over several steps, each step's planning
     and downgrades within the budget, the batches one after another, until
@@ -145,6 +147,7 @@ def test_a_red_mid_decode_plans_from_the_scorers_scores():
     assert red[0].ended == "applied" and len(red[0].batches) == 1
 
 
+@pytest.mark.slow
 def test_pressure_that_persists_is_planned_for_again_as_pages_are_sealed():
     """A RED that holds: the first plan takes every page outside the recency
     floor, short of its target; as decoding seals more pages and they leave
@@ -168,6 +171,7 @@ def test_pressure_that_persists_is_planned_for_again_as_pages_are_sealed():
     assert all(int(p.plan.pages.min()) > newest for p in later)
 
 
+@pytest.mark.slow
 def test_real_contention_makes_the_engine_downgrade():
     """Not a monitor told what to read: the contention simulator, a process
     of its own, takes device memory mid-decode until headroom by NVML is

@@ -399,6 +399,7 @@ def test_an_interrupted_recorder_finishes_its_files_and_holds_no_device_memory(t
     assert proc.pid not in set(rows["pid"])
 
 
+@pytest.mark.slow
 def test_a_gpu_process_is_recorded_only_while_it_lives(tmp_path):
     """A process that takes a CUDA context mid-recording shows up in the
     samples taken while it holds it, and in none after it exits."""

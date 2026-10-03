@@ -90,6 +90,7 @@ def check(x, w, b):
     return within_gate(_microinfer.linear(x, w, b), x, w, b)
 
 
+@pytest.mark.slow
 def test_matches_float64_reference_at_every_shape():
     """Every projection of both models, at rows=1, a decode step, and rows=64,
     a prefill, since cuBLAS picks different algorithms for the two; the LM

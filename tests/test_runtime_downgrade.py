@@ -41,6 +41,7 @@ def golden() -> GoldenSet:
         pytest.skip(str(exc))
 
 
+@pytest.mark.slow
 def test_after_runtime_downgrades_the_logits_are_a_cache_built_at_those_tiers(engine, golden):
     """Two caches holding one prompt's keys and values. One holds every page
     at FP16, and seals (always_seal); after the prefill, and after every
