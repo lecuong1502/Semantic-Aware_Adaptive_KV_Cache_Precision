@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cuda.h>
 
 #include <stdexcept>
@@ -235,31 +236,49 @@ namespace microinfer
     ++generation_;
   }
 
+  void PagedKVCache::map_granule(Range &r)
+  {
+    const CUdeviceptr at = r.base + r.granules.size() * granule_;
+    CUmemGenericAllocationHandle handle;
+    driver_check(cuMemCreate(&handle, granule_, &prop_, 0), "cuMemCreate");
+    CUresult mapped = cuMemMap(at, granule_, 0, handle, 0);
+    if (mapped != CUDA_SUCCESS)
+    {
+      cuMemRelease(handle);
+      driver_check(mapped, "cuMemMap");
+    }
+    r.granules.push_back(handle);
+
+    CUmemAccessDesc access{};
+    access.location = prop_.location;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    driver_check(cuMemSetAccess(at, granule_, &access, 1), "cuMemSetAccess");
+  }
+
   void PagedKVCache::fit_granules(Range &r)
   {
     const std::size_t needed =
         round_up(r.slots.size() * r.page_bytes, granule_) / granule_;
+    const std::size_t kept =
+        std::min(needed + r.spare_granules, r.reserved / granule_);
 
     while (r.granules.size() < needed)
     {
-      const CUdeviceptr at = r.base + r.granules.size() * granule_;
-      CUmemGenericAllocationHandle handle;
-      driver_check(cuMemCreate(&handle, granule_, &prop_, 0), "cuMemCreate");
-      CUresult mapped = cuMemMap(at, granule_, 0, handle, 0);
-      if (mapped != CUDA_SUCCESS)
+      map_granule(r);
+    }
+    try
+    {
+      while (r.granules.size() < kept)
       {
-        cuMemRelease(handle);
-        driver_check(mapped, "cuMemMap");
+        map_granule(r);
       }
-      r.granules.push_back(handle);
-
-      CUmemAccessDesc access{};
-      access.location = prop_.location;
-      access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-      driver_check(cuMemSetAccess(at, granule_, &access, 1), "cuMemSetAccess");
+    }
+    catch (const OutOfMemory &)
+    {
+      // A spare is room kept for later, not room this page needs.
     }
 
-    while (r.granules.size() > needed)
+    while (r.granules.size() > kept)
     {
       const std::size_t last = r.granules.size() - 1;
       driver_check(cuMemUnmap(r.base + last * granule_, granule_),
@@ -269,6 +288,19 @@ namespace microinfer
       driver_check(cuMemRelease(r.granules.back()), "cuMemRelease");
       r.granules.pop_back();
     }
+  }
+
+  void PagedKVCache::keep_spare_granules(Tier tier, std::size_t granules)
+  {
+    Range &r = range(tier);
+    ContextScope scope(ctx_);
+    r.spare_granules = granules;
+    fit_granules(r);
+  }
+
+  std::size_t PagedKVCache::spare_granules(Tier tier) const
+  {
+    return range(tier).spare_granules;
   }
 
   void PagedKVCache::write(PageKey key, const void *host, std::size_t bytes)

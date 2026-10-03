@@ -149,3 +149,25 @@ rebuilds it. A test that builds and drops caches then reads 87 MiB that no
 reservation took. The engine holds the context through the runtime API for its
 whole life, so this does not affect it, but any measurement of the cache must
 be taken with the context already alive.
+
+## Amendment: a tier may keep spare granules mapped (#107)
+
+A tier now maps granules only as its pages need them **unless it is asked to
+keep spares**: `keep_spare_granules(tier, n)` keeps up to `n` empty granules
+mapped beyond the tail. A spare is mapped as far as the driver allows and the
+tier's reserved address space reaches. A spare the driver refuses is not an
+error: an allocate fails only if the page itself cannot be backed.
+
+The reason is the order of a downgrade. It maps the page's new copy at the
+lower tier before it frees the FP16 page, so it needs memory before it gives
+any back. When contention has taken every granule, an emergency plan's first
+downgrade would be refused, and the plan could free nothing. An adaptive
+engine's cache therefore keeps one spare at each quantised tier, 3 granules.
+The first downgrades go into those spares. Once enough FP16 pages have gone to
+empty a granule, the tail swap returns that granule to the driver, and the
+rest of the plan has room. With the device filled, the tests show a plan that
+starts this way and the session recovering (`tests/test_emergency_downgrade.py`).
+Without spares, the same session ends exhausted.
+
+Every other cache keeps none, and maps exactly what its pages reach, as
+before.
