@@ -116,6 +116,25 @@ _SOURCES: dict[str, Callable] = {
 SOURCES = tuple(_SOURCES)
 
 
+def score_array(source: str, layers: int, pages: int, *, semantic: np.ndarray | None = None,
+                seed: int | None = None) -> np.ndarray:
+    """scores_for, for every page of positions of a cache of `layers` layers
+    of `pages` pages each, as a (layers, pages) array, page i of layer l at
+    [l, i]: what the engine plans from (#105), without a dict of them."""
+    if source not in _SOURCES:
+        raise ValueError(f"a score source is one of {SOURCES}; got {source!r}")
+    if source == "semantic":
+        if semantic is None:
+            raise ValueError("the semantic source reads the scorer's scores; pass semantic=")
+        if semantic.shape[0] < layers or semantic.shape[1] < pages:
+            raise ValueError(f"{layers} layers of {pages} pages are outside the scorer's "
+                             f"{semantic.shape[0]} layers of {semantic.shape[1]} pages")
+        return np.asarray(semantic[:layers, :pages], dtype=np.float64)
+    keys = [(layer, page) for layer in range(layers) for page in range(pages)]
+    flat = (uniform_scores(keys) if source == "uniform" else _random(keys, None, seed))
+    return np.array([flat[key] for key in keys], dtype=np.float64).reshape(layers, pages)
+
+
 def scores_for(source: str, pages: Pages, *, semantic: np.ndarray | None = None,
                seed: int | None = None) -> Scores:
     """Each (layer, page)'s score from `source`: `semantic` is the scorer's

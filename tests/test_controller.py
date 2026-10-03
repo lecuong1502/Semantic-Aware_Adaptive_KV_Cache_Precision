@@ -9,6 +9,8 @@ Milestone 0's roundtrips logged. At YELLOW the plan is split into batches
 within a per-step time budget; at RED it is one batch.
 """
 
+import heapq
+import math
 import time
 
 import numpy as np
@@ -347,3 +349,58 @@ def test_the_clock_is_monotonic_and_one():
     assert recent.upgrades == () and "cooldown" in recent.held_by
     with pytest.raises(ValueError, match="clock"):
         make_upgrades(roomy, scores, tiers, now=100.0, last_downgrade=1.7e9)  # wall time
+
+
+# -- the vectorised plan against the greedy it computes (#105) ------------------
+
+
+def greedy_reference(target, scores, tiers, positions, floor=controller.DEFAULT_RECENCY_FLOOR):
+    """#101's plan as it was first written, a heap of each page's next
+    downgrade, popped cheapest first until the target is met: the
+    definition the vectorised plan must reproduce, move for move."""
+    first_kept = positions - floor
+    candidates = {(layer, page): tier for (layer, page), tier in tiers.items()
+                  if page >= 0 and (page + 1) * P <= first_kept}
+    scored = [scores[k] for k in candidates if not math.isnan(scores[k])]
+    neutral = sum(scored) / len(scored) if scored else 1.0
+
+    def nxt(key, current):
+        down = controller.TIERS.index(current) + 1
+        if down == len(controller.TIERS):
+            return None
+        lower = controller.TIERS[down]
+        saved = PAGE_BYTES[current] - PAGE_BYTES[lower]
+        score = neutral if math.isnan(scores[key]) else scores[key]
+        cost = score * (ERRORS[lower] - ERRORS[current]) / saved
+        return (cost, score, key[1], key[0], current, lower, saved)
+
+    heap = [m for m in (nxt(k, t) for k, t in candidates.items()) if m is not None]
+    heapq.heapify(heap)
+    chosen, reclaimed = [], 0
+    while heap and reclaimed < target:
+        cost, score, page, layer, current, lower, saved = heapq.heappop(heap)
+        chosen.append((layer, page, current, lower))
+        reclaimed += saved
+        further = nxt((layer, page), lower)
+        if further is not None:
+            heapq.heappush(heap, further)
+    return chosen
+
+
+def test_the_plan_is_the_greedy_move_for_move():
+    """Over random caches, tiers, scores (some not yet scored), floors and
+    targets, the plan's downgrades are the greedy's, in its order."""
+    rng = np.random.default_rng(105)
+    for trial in range(40):
+        layers, pages = int(rng.integers(1, 5)), int(rng.integers(1, 60))
+        tiers = {key: str(rng.choice(controller.TIERS, p=[0.55, 0.2, 0.15, 0.1]))
+                 for key in cache(layers, pages)}
+        scores = {k: float("nan") if rng.random() < 0.1 else float(rng.random()) for k in tiers}
+        if rng.random() < 0.3:  # equal scores, ties everywhere
+            scores = {k: 0.5 for k in tiers}
+        positions = int(rng.integers(0, (pages + 6) * P))
+        floor = int(rng.choice([0, 32, 128]))
+        need = int(rng.integers(1, 400_000))
+        p = make_plan(yellow_short_by(need), scores, tiers, positions=positions, floor=floor)
+        got = [(m.layer, m.page, m.current_tier, m.target_tier) for m in p.downgrades]
+        assert got == greedy_reference(need, scores, tiers, positions, floor), trial

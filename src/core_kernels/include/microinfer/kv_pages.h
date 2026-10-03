@@ -227,6 +227,7 @@ namespace microinfer
     int page_tokens() const { return page_tokens_; }
     // Pages of positions held in each layer; the open pages are not counted.
     int pages_per_layer() const { return pages_; }
+    int layers() const { return layers_; }
     int capacity_tokens() const
     {
       return (pages_ + (seals() ? 1 : 0)) * page_tokens_;

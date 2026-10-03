@@ -20,8 +20,9 @@ that they still are. #45 names them T_low, T_high and K:
   at INT8, at the bandwidth decoding reaches in RQ1's configuration, the
   model at its longest logged context, its weights read once per token.
 
-No plan is applied yet (Milestone 2), so its time is an estimate, and
-ADR-0013 says why this one: the slowest the log supports.
+It was set before any plan was applied (#105 applies them), so its time
+is an estimate, and ADR-0013 says why this one: the slowest the log
+supports.
 """
 
 from __future__ import annotations

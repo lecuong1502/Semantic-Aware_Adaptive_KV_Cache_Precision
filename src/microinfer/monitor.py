@@ -48,7 +48,8 @@ changes need not sum to the headroom's. A split the driver cannot give is
 None; it never stops the monitor.
 
 The engine starts a monitor, drains its events between steps and records
-them (Engine.start_monitor); it does not react to them yet.
+them (Engine.start_monitor); an adaptive engine also plans and downgrades
+on YELLOW and RED (#105).
 """
 
 from __future__ import annotations

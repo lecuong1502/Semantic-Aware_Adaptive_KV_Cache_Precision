@@ -132,7 +132,8 @@ A transition between pressure levels, as the monitor reports it: when, the
 levels before and after, the headroom that settled it, and its **own/others
 split**, the device memory the engine's process holds and every other
 process holds, with how much each changed since the transition before. The
-engine drains pressure events between steps and records them.
+engine drains pressure events between steps and records them; an adaptive
+engine answers the latest YELLOW or RED with a requantisation plan (#105).
 _Avoid_: attribution (that names the process a spike is laid to), alert
 
 **Headroom**:
@@ -166,9 +167,10 @@ byte target (#104). Only semantic scores are importance scores.
 _Avoid_: policy (a source changes the scores, not the planner), scorer
 
 **Requantisation plan**:
-The list of `(layer, page, current_tier, target_tier)` entries the Precision
-Controller emits in response to a pressure level. Producing a plan is a pure
-decision; nothing has moved until the KV Cache Manager applies it.
+The `(layer, page, current_tier, target_tier)` entries the Precision
+Controller emits in response to a pressure level, in the order they are to
+be applied (held as parallel arrays, one entry each). Producing a plan is a
+pure decision; nothing has moved until the KV Cache Manager applies it.
 _Avoid_: re-quant plan, migration, schedule
 
 **Byte target**:
@@ -194,10 +196,17 @@ The time an upgrade waits after the last downgrade, 5 s by default, so
 that pages are not moved back as soon as they were moved down (#103).
 _Avoid_: hysteresis (#88 dropped a hysteresis of its own), backoff
 
+**Plan record**:
+A requantisation plan the engine made, with the pressure event it answered,
+the plan batches it applied and how it ended: applied, cancelled at GREEN,
+replaced by a later plan, or stopped (#105).
+_Avoid_: plan log, history
+
 **Plan batch**:
 The downgrades of a requantisation plan, or the upgrades of an upgrade
 plan, applied between two decode steps: at YELLOW and at GREEN, as many as
-fit a per-step time budget; at RED, the whole plan.
+fit a per-step time budget, by the time the engine measures, the plan
+having estimated them; at RED, the whole plan.
 Not a batch of sequences: there is one sequence.
 _Avoid_: chunk (a prefill chunk is positions)
 
