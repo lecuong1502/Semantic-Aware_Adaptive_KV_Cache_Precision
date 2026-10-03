@@ -29,8 +29,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import require_model, stable_free_bytes
-from microinfer import Engine, model
+from conftest import require_model
+from microinfer import Engine, model, nvml
 from microinfer.gate import kl_divergence
 from microinfer.golden import GoldenError, GoldenSet
 
@@ -137,21 +137,30 @@ def test_generation_after_a_chunked_prefill_matches(engine, golden):
 
 def test_prefill_workspace_does_not_grow_with_the_prompt(engine):
     """Measured, not only computed: across prompts from 1 to 4 chunks long, the
-    workspace the engine reports is one chunk's, and what the driver lost
-    beyond the KV cache stays the same, to within the noise other processes
-    put on the reading (ADR-0007, notes from #10 and #12)."""
+    workspace the engine reports is one chunk's, and what this process holds
+    beyond the KV cache, while the last chunk's workspace and the cache are
+    alive, stays the same (ADR-0007, notes from #10 and #12).
+
+    The reading is the driver's account of this process alone
+    (nvml.own_used_bytes), whole granules, which no other process moves.
+    Device free memory, which this test read before, moved by up to 45 MiB
+    between prompts as a browser's GPU process took and gave back memory."""
     chunk = engine.prefill_chunk
     beyond_cache = []
     for chunks in (1, 2, 4):
         ids = np.arange(100, 100 + chunks * chunk, dtype=np.int32)
         engine.forward(ids)  # warm: cuBLAS loads kernels for new shapes once
         engine.reset_peak()
-        before = stable_free_bytes()
         engine.forward(ids)
-        peak = engine.peak_footprint()
-        assert peak.workspace == model.Workspace(engine.config, rows=chunk).nbytes
-        beyond_cache.append(before - peak.device_free - peak.kv_cache)
-    print("\ndriver memory beyond the KV cache, MiB:", [round(b / MIB, 1) for b in beyond_cache])
+        assert engine.peak_footprint().workspace == model.Workspace(engine.config,
+                                                                    rows=chunk).nbytes
+        before = nvml.settled_own_used_bytes()
+        cache = engine._new_cache(capacity=len(ids))
+        for _, _, _, last in engine._prefill(cache, ids):
+            if last:  # the cache full and the workspace alive
+                beyond_cache.append(nvml.own_used_bytes() - before - cache.nbytes)
+        del cache
+    print("\nprocess memory beyond the KV cache, MiB:", [round(b / MIB, 1) for b in beyond_cache])
     assert max(beyond_cache) - min(beyond_cache) < 8 * MIB
 
 
