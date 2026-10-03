@@ -193,13 +193,18 @@ _Avoid_: benefit, priority
 
 **Upgrade cooldown**:
 The time an upgrade waits after the last downgrade, 5 s by default, so
-that pages are not moved back as soon as they were moved down (#103).
+that pages are not moved back as soon as they were moved down (#103). In
+the engine it runs from the last downgrade or the end of the last
+pressure, the later, so that a pulse train whose later pulses find nothing
+to downgrade holds upgrades back until it stops (#106).
 _Avoid_: hysteresis (#88 dropped a hysteresis of its own), backoff
 
 **Plan record**:
 A requantisation plan the engine made, with the pressure event it answered,
 the plan batches it applied and how it ended: applied, cancelled at GREEN,
-replaced by a later plan, or stopped (#105).
+replaced by a later plan, or stopped (#105). Upgrades the engine makes at
+GREEN are recorded the same way, with the event that brought GREEN, and a
+YELLOW or RED cancels those not yet made (#106).
 _Avoid_: plan log, history
 
 **Plan batch**:

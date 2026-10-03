@@ -404,3 +404,56 @@ def test_the_plan_is_the_greedy_move_for_move():
         p = make_plan(yellow_short_by(need), scores, tiers, positions=positions, floor=floor)
         got = [(m.layer, m.page, m.current_tier, m.target_tier) for m in p.downgrades]
         assert got == greedy_reference(need, scores, tiers, positions, floor), trial
+
+
+# -- the vectorised upgrade plan against its greedy (#106) ----------------------
+
+
+def upgrade_greedy_reference(available, scores, tiers, shadowed, page_bytes=PAGE_BYTES,
+                             errors=ERRORS):
+    """#103's upgrade plan as it was first written, a heap of each shadowed
+    page's next upgrade, popped largest gain first until the next does not
+    fit: the definition the vectorised plan must reproduce."""
+    upgradable = {k: t for k, t in tiers.items() if t != "FP16" and k in shadowed}
+    scored = [scores[k] for k in upgradable if not math.isnan(scores[k])]
+    neutral = sum(scored) / len(scored) if scored else 1.0
+
+    def nxt(key, current):
+        up = controller.TIERS.index(current) - 1
+        if up < 0:
+            return None
+        higher = controller.TIERS[up]
+        taken = page_bytes[higher] - page_bytes[current]
+        score = neutral if math.isnan(scores[key]) else scores[key]
+        gain = score * (errors[current] - errors[higher]) / taken
+        return (-gain, -score, -key[1], -key[0], current, higher, taken)
+
+    heap = [m for m in (nxt(k, t) for k, t in upgradable.items()) if m is not None]
+    heapq.heapify(heap)
+    chosen, left = [], available
+    while heap and heap[0][-1] <= left:
+        _, _, page, layer, current, higher, taken = heapq.heappop(heap)
+        chosen.append((-layer, -page, current, higher))
+        left -= taken
+        further = nxt((-layer, -page), higher)
+        if further is not None:
+            heapq.heappush(heap, further)
+    return chosen
+
+
+def test_the_upgrade_plan_is_the_greedy_move_for_move():
+    """Over random caches, tiers, shadows, scores and headroom, the upgrade
+    plan's upgrades are the greedy's, in its order."""
+    rng = np.random.default_rng(106)
+    for trial in range(40):
+        layers, pages = int(rng.integers(1, 5)), int(rng.integers(1, 60))
+        tiers = {key: str(rng.choice(controller.TIERS, p=[0.3, 0.25, 0.25, 0.2]))
+                 for key in cache(layers, pages)}
+        scores = {k: float("nan") if rng.random() < 0.1 else float(rng.random()) for k in tiers}
+        if rng.random() < 0.3:
+            scores = {k: 0.5 for k in tiers}
+        shadowed = {k for k in tiers if rng.random() < 0.85}
+        available = int(rng.integers(0, 600_000))
+        u = make_upgrades(UPGRADE_LINE + available, scores, tiers, shadowed=shadowed)
+        got = [(m.layer, m.page, m.current_tier, m.target_tier) for m in u.upgrades]
+        assert got == upgrade_greedy_reference(available, scores, tiers, shadowed), trial

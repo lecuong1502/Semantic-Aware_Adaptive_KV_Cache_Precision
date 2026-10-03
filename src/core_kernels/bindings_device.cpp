@@ -753,6 +753,25 @@ void bind_device(py::module_ &parent)
       .def_property_readonly("pages_per_layer", &KVPages::pages_per_layer)
       .def_property_readonly("layers", &KVPages::layers)
       .def(
+          "shadowed",
+          [](const KVPages &c)
+          {
+            const int layers = c.layers();
+            const int pages = c.pages_per_layer();
+            py::array_t<bool> out({layers, pages});
+            auto view = out.mutable_unchecked<2>();
+            for (int l = 0; l < layers; ++l)
+            {
+              for (int i = 0; i < pages; ++i)
+              {
+                view(l, i) = c.shadows().contains({l, i});
+              }
+            }
+            return out;
+          },
+          "Whether each page of positions holds an FP16 shadow, (layers, "
+          "pages_per_layer): the pages an upgrade plan may restore (#106).")
+      .def(
           "page_tiers",
           [](const KVPages &c)
           {
