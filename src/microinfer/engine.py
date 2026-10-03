@@ -9,6 +9,7 @@ experiment behind it.
 
 from __future__ import annotations
 
+import collections
 import json
 import threading
 import time
@@ -20,11 +21,12 @@ from typing import Callable
 
 import numpy as np
 
-from . import _microinfer, model, weights
+from . import _microinfer, controller, model, nvml, weights
 from .config import ConfigMismatch, ModelConfig
 from .footprint import Footprint
 from .models import VERIFIED
-from .monitor import Monitor, PressureEvent
+from .monitor import GREEN, RED, YELLOW, Monitor, PressureEvent, Thresholds
+from .score_sources import SOURCES, score_array
 
 
 def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
@@ -183,6 +185,52 @@ class PressureRecord:
     drained_ns: int
 
 
+#: The least room a YELLOW step keeps in its budget for its next downgrade.
+MOVE_MARGIN_SECONDS = 0.002
+
+
+@dataclass
+class AppliedBatch:
+    """The part of a plan one step applied: its downgrades [start, end),
+    the step's wall time for them, the plan's making included in the step
+    that made it, and the memory the cache held before and after, by its
+    allocator and, when the engine measures plans, by the driver's account
+    of this process."""
+
+    start: int
+    end: int
+    seconds: float
+    cache_bytes_before: int
+    cache_bytes_after: int
+    own_bytes_before: int | None = None
+    own_bytes_after: int | None = None
+
+
+@dataclass
+class PlanRecord:
+    """A plan the engine made, with the pressure event that caused it, and
+    what became of it: the batches applied, the downgrades skipped (their
+    page had moved since), and how it ended, "applied", "cancelled at
+    GREEN", "replaced" by a later plan, or the error that stopped it."""
+
+    pressure: PressureRecord
+    plan: controller.Plan
+    planning_seconds: float
+    batches: list[AppliedBatch]
+    skipped: int = 0
+    ended: str = ""
+    #: The headroom the plan was made for: the event's, or, for a plan made
+    #: because pressure persisted, the monitor's latest reading.
+    headroom_bytes: int = 0
+    #: Made not on an event but because the level stayed YELLOW or RED while
+    #: the cache sealed more pages.
+    persisting: bool = False
+
+    @property
+    def applied(self) -> int:
+        return sum(b.end - b.start for b in self.batches)
+
+
 class Engine:
     """Seam A. Everything a test or a caller touches goes through here."""
 
@@ -214,7 +262,9 @@ class Engine:
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
                  kv_tier: str = "FP16", kv_halves: str = "both",
                  kv_tier_map: list[list[str]] | None = None, kv_scoring: bool = False,
-                 kv_score_every: int | None = None,
+                 kv_score_every: int | None = None, kv_adaptive: bool = False,
+                 kv_score_source: str = "semantic", kv_score_seed: int = 0,
+                 kv_plan_budget_seconds: float = controller.DEFAULT_BUDGET_SECONDS,
                  prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
@@ -231,6 +281,32 @@ class Engine:
         self.kv_scoring = kv_scoring
         self.kv_score_every = (self.DEFAULT_SCORE_EVERY if kv_score_every is None
                                else kv_score_every)
+        if kv_score_source not in SOURCES:
+            raise ValueError(f"kv_score_source is one of {SOURCES}, got {kv_score_source!r}")
+        if kv_adaptive and (kv_cache == "contiguous" or kv_halves != "both"):
+            raise ValueError("an adaptive cache is paged, and no diagnostic kv_halves")
+        #: Whether pressure events make the engine downgrade pages (#105):
+        #: on YELLOW or RED, a plan from the scores, applied between steps.
+        self.kv_adaptive = kv_adaptive
+        #: Where a plan's scores come from (#104), and the random one's seed.
+        self.kv_score_source, self.kv_score_seed = kv_score_source, kv_score_seed
+        #: The time a YELLOW plan may take of one step, planning included.
+        self.kv_plan_budget_seconds = kv_plan_budget_seconds
+        #: Read what this process holds by the driver's account around every
+        #: batch a plan applies; off, as each reading costs a millisecond.
+        self.measure_plans = False
+        #: Every plan made, with its event and what became of it.
+        self.plans: list[PlanRecord] = []
+        #: When the last downgrade was applied, on time.monotonic().
+        self.last_downgrade_seconds: float | None = None
+        self._pending: PlanRecord | None = None
+        self._cursor = 0
+        self._last_pressure: PressureRecord | None = None
+        self._planned_pages = 0
+        #: How long the last downgrades took, the longest of them the guess
+        #: for the next: an outlier passes out of it, as none would of a max.
+        self._recent_moves: collections.deque[float] = collections.deque(maxlen=64)
+        self._thresholds: Thresholds | None = None
 
         if verify:
             expected = VERIFIED.get(self.config.name)
@@ -405,7 +481,8 @@ class Engine:
         for kv_tier and kv_tier_map. A diagnostic kv_halves is at a quantised
         kv_tier, so it seals too."""
         return _microinfer.device.KVPages.seals_for(
-            getattr(_microinfer.Tier, self.kv_tier), tier_map_of(self.kv_tier_map))
+            getattr(_microinfer.Tier, self.kv_tier), tier_map_of(self.kv_tier_map),
+            self.kv_adaptive)
 
     @property
     def tensors(self) -> dict[str, _microinfer.DeviceTensor]:
@@ -565,12 +642,18 @@ class Engine:
         which it starts empty, as it does monitor_error. A step is a decoded
         token, and a prefill chunk too: a 32K-token prefill takes minutes,
         and its chunks are where it can be interrupted. The engine records
-        the events and does not react to them: that is Milestone 2's.
-        Returns the monitor."""
+        the events; with kv_adaptive it also plans and downgrades on YELLOW
+        and RED (#105), and records each plan in `plans`, which it starts
+        empty. Returns the monitor."""
         if self._monitor is not None:
             raise RuntimeError("a pressure monitor is already running; stop it first")
         self.pressure_events, self.monitor_error, self._positions_held = [], None, 0
+        self.plans, self._pending, self.last_downgrade_seconds = [], None, None
+        self._last_pressure, self._planned_pages = None, 0
+        if self.kv_adaptive:
+            self._plan_inputs  # read from the log now, not in a step a plan delays
         self._monitor = (monitor or Monitor()).start()
+        self._thresholds = self._monitor.thresholds
         return self._monitor
 
     def stop_monitor(self) -> None:
@@ -596,7 +679,139 @@ class Engine:
         now = time.monotonic_ns()
         if cache is not None:
             self._positions_held = cache.length
-        self.pressure_events += [PressureRecord(e, self._positions_held, now) for e in events]
+        drained = [PressureRecord(e, self._positions_held, now) for e in events]
+        self.pressure_events += drained
+        if self.kv_adaptive and isinstance(cache, model.PagedCache):
+            self._react(cache, drained)
+
+    # -- plans (#105) --------------------------------------------------------
+
+    def _react(self, cache: model.PagedCache, drained: list[PressureRecord]) -> None:
+        """Between two steps: make a plan for the latest YELLOW or RED among
+        the events just drained, replacing any not yet done; cancel one at
+        GREEN; and apply what this step may of the plan in hand. At RED a
+        plan is applied at once. At YELLOW a step takes no more than the
+        budget, planning included: downgrades are applied while the time
+        spent, and twice the longest of the last 64 downgrades, fit it,
+        every one timed, so that a step is held to the budget, not to an
+        estimate of it; never less than MOVE_MARGIN_SECONDS, a downgrade
+        that pins another allocation of shadows taking half a millisecond
+        (#97), a garbage collection more. A step that makes no plan applies
+        one downgrade at least."""
+        own_before = self._own_bytes()
+        started = time.perf_counter()
+        planned = False
+        # The latest level is the one to answer: one plan a step at most.
+        latest = drained[-1] if drained else None
+        if latest is not None:
+            self._last_pressure = latest
+        if latest is not None and latest.event.level == GREEN and self._pending is not None:
+            self._pending.ended, self._pending = "cancelled at GREEN", None
+        elif latest is not None and latest.event.level in (YELLOW, RED):
+            if self._pending is not None:
+                self._pending.ended = "replaced"
+            self._recent_moves.clear()  # a new plan's moves are timed afresh
+            self._pending = self._make_plan(cache, latest, latest.event.headroom_bytes, started)
+            self._cursor, planned = 0, True
+        elif self._persisting(cache):
+            # The level held, no plan is in hand, and the cache has sealed
+            # pages since the last plan: plan again, for the headroom now.
+            self._recent_moves.clear()
+            self._pending = self._make_plan(cache, self._last_pressure,
+                                            self._monitor.headroom_bytes, started,
+                                            persisting=True)
+            self._cursor, planned = 0, self._pending is not None
+        if self._pending is not None:
+            self._apply(cache, started, planned, own_before)
+
+    def _persisting(self, cache: model.PagedCache) -> bool:
+        return (self._pending is None and self._monitor is not None
+                and self._last_pressure is not None
+                and self._monitor.level in (YELLOW, RED)
+                and self._monitor.headroom_bytes is not None
+                and cache.pages.pages_per_layer > self._planned_pages)
+
+    def _make_plan(self, cache: model.PagedCache, record: PressureRecord, headroom: int,
+                   started: float, persisting: bool = False) -> PlanRecord | None:
+        """A plan for this headroom, recorded with the event it answers;
+        None if it has nothing to do, recorded as applied, unless it was
+        made because pressure persisted, when nothing is recorded."""
+        self._planned_pages = cache.pages.pages_per_layer
+        pages = cache.pages
+        tiers = pages.page_tiers()
+        layers, count = tiers.shape
+        semantic = cache.scores.download() if self.kv_score_source == "semantic" else None
+        scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
+                             seed=self.kv_score_seed)
+        page_bytes, errors, seconds = self._plan_inputs
+        plan = controller.plan_arrays(
+            headroom, self._thresholds, scores, tiers, page_bytes, errors,
+            move_seconds=seconds, positions=cache.length, page_tokens=pages.page_tokens,
+            budget_seconds=self.kv_plan_budget_seconds)
+        entry = PlanRecord(record, plan, time.perf_counter() - started, [],
+                           headroom_bytes=headroom, persisting=persisting)
+        if len(plan) == 0 and persisting:
+            return None
+        self.plans.append(entry)
+        if len(plan) == 0:
+            entry.ended = "applied"
+            return None
+        self._recent_moves.append(float(plan.seconds.max()))  # until one is timed
+        return entry
+
+    @cached_property
+    def _plan_inputs(self):
+        """Each tier's page bytes, its logged roundtrip error, and each
+        downgrade's logged latency: this model's, or, not measured, any
+        model's as an estimate."""
+        page_bytes = dict(zip(controller.TIERS, model.tier_page_bytes(self.config)))
+        errors = controller.logged_tier_errors(self.config.name)
+        try:
+            seconds = controller.logged_move_seconds(self.config.name)
+        except ValueError:
+            seconds = controller.logged_move_seconds(None)
+        return page_bytes, errors, seconds
+
+    def _apply(self, cache: model.PagedCache, started: float, planned: bool,
+               own_before: int | None) -> None:
+        entry = self._pending
+        plan, pages = entry.plan, cache.pages
+        tier_of = [getattr(_microinfer.Tier, t) for t in controller.TIERS]
+        cache_before, start, i = cache.nbytes, self._cursor, self._cursor
+        budget = self.kv_plan_budget_seconds
+        try:
+            while i < len(plan):
+                if plan.level != RED:
+                    spent = time.perf_counter() - started
+                    next_move = max(2 * max(self._recent_moves), MOVE_MARGIN_SECONDS)
+                    if spent + next_move > budget and (i > start or planned):
+                        break
+                layer, page = int(plan.layers[i]), int(plan.pages[i])
+                if pages.page_tier(layer, page) != tier_of[plan.current[i]]:
+                    entry.skipped += 1
+                else:
+                    moving = time.perf_counter()
+                    pages.downgrade(layer, page, tier_of[plan.lower[i]])
+                    self._recent_moves.append(time.perf_counter() - moving)
+                    self.last_downgrade_seconds = time.monotonic()
+                i += 1
+        except _microinfer.OutOfMemory as exc:  # the emergency is #107's to answer
+            entry.ended, self._pending = f"stopped: {exc}", None
+        seconds = time.perf_counter() - started
+        if i > start:
+            entry.batches.append(AppliedBatch(start, i, seconds, cache_before, cache.nbytes,
+                                              own_before, self._own_bytes()))
+        self._cursor = i
+        if self._pending is not None and i == len(plan):
+            entry.ended, self._pending = "applied", None
+
+    def _own_bytes(self) -> int | None:
+        if not self.measure_plans:
+            return None
+        try:
+            return nvml.settled_own_used_bytes()
+        except nvml.NvmlUnavailable:
+            return None
 
     def cached_kv(self, token_ids) -> tuple[np.ndarray, np.ndarray]:
         """What the cache holds after prefilling one sequence: keys and values,
@@ -670,8 +885,12 @@ class Engine:
         Tier = _microinfer.Tier
         tier = getattr(Tier, self.kv_tier)
         if self.kv_halves == "both":
+            # An adaptive cache seals, so that any page can be downgraded, and
+            # scores its pages when a plan reads the scorer's scores.
+            scoring = self.kv_scoring or (self.kv_adaptive and self.kv_score_source == "semantic")
             return model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map),
-                                    scoring=self.kv_scoring, score_every=self.kv_score_every)
+                                    always_seal=self.kv_adaptive, scoring=scoring,
+                                    score_every=self.kv_score_every)
         if tier == Tier.FP16:
             raise ValueError("kv_halves splits a quantised tier; FP16 has nothing to split")
         return model.PagedCache(self.config, tier,

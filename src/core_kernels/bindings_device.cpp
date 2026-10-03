@@ -751,6 +751,26 @@ void bind_device(py::module_ &parent)
           "The pinned host memory the shadows hold, in whole allocations.")
       .def_property_readonly("page_tokens", &KVPages::page_tokens)
       .def_property_readonly("pages_per_layer", &KVPages::pages_per_layer)
+      .def_property_readonly("layers", &KVPages::layers)
+      .def(
+          "page_tiers",
+          [](const KVPages &c)
+          {
+            const int layers = c.layers();
+            const int pages = c.pages_per_layer();
+            py::array_t<std::int8_t> out({layers, pages});
+            auto view = out.mutable_unchecked<2>();
+            for (int l = 0; l < layers; ++l)
+            {
+              for (int i = 0; i < pages; ++i)
+              {
+                view(l, i) = static_cast<std::int8_t>(c.page_tier({l, i}));
+              }
+            }
+            return out;
+          },
+          "Every page of positions' tier, (layers, pages_per_layer), as the "
+          "page table records it: one call, for a plan (#105).")
       .def_property_readonly("capacity_tokens", &KVPages::capacity_tokens)
       .def_property_readonly("page_bytes", &KVPages::page_bytes)
       .def_property_readonly("kv_width", &KVPages::kv_width)

@@ -48,7 +48,8 @@ changes need not sum to the headroom's. A split the driver cannot give is
 None; it never stops the monitor.
 
 The engine starts a monitor, drains its events between steps and records
-them (Engine.start_monitor); it does not react to them yet.
+them (Engine.start_monitor); an adaptive engine also plans and downgrades
+on YELLOW and RED (#105).
 """
 
 from __future__ import annotations
@@ -214,6 +215,8 @@ class Monitor:
         self.error: BaseException | None = None
         self.level: Level | None = None
         self.missed = 0  # the polls whose deadlines passed unread, once stopped
+        #: The latest reading, every poll, transition or not; None before one.
+        self.headroom_bytes: int | None = None
 
     @property
     def running(self) -> bool:
@@ -258,7 +261,9 @@ class Monitor:
 
         def poll() -> None:
             nonlocal last
-            event = hysteresis.feed(time.monotonic_ns(), self._reader())
+            headroom = self._reader()
+            self.headroom_bytes = headroom
+            event = hysteresis.feed(time.monotonic_ns(), headroom)
             if event is None:
                 return
             try:

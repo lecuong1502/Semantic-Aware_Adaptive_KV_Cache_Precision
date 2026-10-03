@@ -48,18 +48,22 @@ roundtrips (tools/quant_roundtrip.py); FP16's is 0. Values dominate it
 below INT8, being the harder to quantise. At YELLOW the plan is split into
 batches of downgrades whose estimated time, from #97's logged latencies,
 is within a per-step budget, so that decoding goes on between them; at RED
-it is one batch, reclaimed at once. The budget is about 20 ms (#88): at
+it is one batch, reclaimed at once. The engine holds each step to the
+budget by the time it measures, the batches being the plan's estimate. The budget is about 20 ms (#88): at
 the 0.02-0.04 ms a downgrade took on Qwen2.5-1.5B, some 500 a batch.
 """
 
 from __future__ import annotations
 
+import functools
 import heapq
 import math
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 from . import benchlog
 from .footprint import MIB
@@ -96,23 +100,63 @@ class Downgrade:
     seconds: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Plan:
     """The downgrades, in the order they were chosen, and the batches they
     are applied in. `short` if every page outside the recency floor went as
     low as it can and the byte target was still not met. `recency_floor`
-    is the W the plan kept."""
+    is the W the plan kept.
+
+    The downgrades are held as arrays, one entry each, tiers as indices
+    into TIERS, so that a plan of thousands costs a step no objects (#105);
+    `downgrades`, `batches` and `batch_bounds`, each batch's [start, end) in
+    them, are made on first reading. The batches are the plan's estimate:
+    the engine holds each step to the budget by the time it measures."""
 
     level: Level
     target_bytes: int
-    downgrades: tuple[Downgrade, ...]
-    batches: tuple[tuple[Downgrade, ...], ...]
     short: bool
     recency_floor: int
+    layers: np.ndarray
+    pages: np.ndarray
+    current: np.ndarray
+    lower: np.ndarray
+    saved: np.ndarray
+    costs: np.ndarray
+    scores: np.ndarray
+    seconds: np.ndarray
+    budget_seconds: float
+
+    @functools.cached_property
+    def batch_bounds(self) -> tuple[tuple[int, int], ...]:
+        return batch_bounds(self.seconds, self.level, self.budget_seconds)
 
     @property
     def reclaimed_bytes(self) -> int:
-        return sum(d.bytes_saved for d in self.downgrades)
+        return int(self.saved.sum())
+
+    def __len__(self) -> int:
+        return len(self.layers)
+
+    @functools.cached_property
+    def downgrades(self) -> tuple[Downgrade, ...]:
+        return tuple(self.downgrade(i) for i in range(len(self)))
+
+    @functools.cached_property
+    def batches(self) -> tuple[tuple[Downgrade, ...], ...]:
+        return tuple(self.downgrades[a:b] for a, b in self.batch_bounds)
+
+    def downgrade(self, i: int) -> Downgrade:
+        return Downgrade(int(self.layers[i]), int(self.pages[i]), TIERS[self.current[i]],
+                         TIERS[self.lower[i]], int(self.saved[i]), float(self.costs[i]),
+                         float(self.scores[i]), float(self.seconds[i]))
+
+
+def _empty_plan(level: Level, recency_floor: int, budget_seconds: float) -> Plan:
+    none, nothing = np.zeros(0, dtype=np.int64), np.zeros(0)
+    return Plan(level=level, target_bytes=0, short=False, recency_floor=recency_floor,
+                layers=none, pages=none, current=none, lower=none, saved=none, costs=nothing,
+                scores=nothing, seconds=nothing, budget_seconds=budget_seconds)
 
 
 def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, int], float],
@@ -126,59 +170,119 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
     for the cache's pages; `page_bytes` and `errors` by tier; `move_seconds`
     by (current, target) tier. The cache holds `positions` positions, pages
     of `page_tokens` each; no page with a position among the last
-    `recency_floor` is downgraded."""
+    `recency_floor` is downgraded. plan_arrays, on arrays."""
+    _check_pages(scores, tiers)
+    keys = [key for key in tiers if key[1] >= 0]  # an open page is never a candidate
+    layers = max((layer for layer, _ in keys), default=-1) + 1
+    pages = max((page for _, page in keys), default=-1) + 1
+    tier_index = np.full((layers, pages), -1, dtype=np.int8)
+    score_array = np.full((layers, pages), np.nan)
+    for layer, page in keys:
+        tier_index[layer, page] = TIERS.index(tiers[(layer, page)])
+        score_array[layer, page] = scores[(layer, page)]
+    return plan_arrays(headroom_bytes, thresholds, score_array, tier_index, page_bytes, errors,
+                       move_seconds=move_seconds, positions=positions, page_tokens=page_tokens,
+                       recency_floor=recency_floor, margin_bytes=margin_bytes,
+                       budget_seconds=budget_seconds)
+
+
+def plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.ndarray,
+                tiers: np.ndarray, page_bytes: dict[str, int], errors: dict[str, float], *,
+                move_seconds: dict[tuple[str, str], float], positions: int, page_tokens: int,
+                recency_floor: int = DEFAULT_RECENCY_FLOOR,
+                margin_bytes: int = DEFAULT_MARGIN_BYTES,
+                budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> Plan:
+    """plan(), on arrays: `scores` and `tiers`, (layers, pages), page i of
+    layer l at [l, i], a tier as its index into TIERS, -1 for a page the
+    cache does not hold, NaN for a score not yet given.
+
+    It computes the greedy by sorting: each page's downgrades cost more,
+    tier after tier, so taking the cheapest of every page's next downgrade
+    again and again takes every downgrade in order of cost, ties to the
+    lower score, then the oldest page, then the layer, then the tier. It is
+    exactly the greedy while costs rise tier after tier, as the logged
+    errors make them. Were they logged out of order, a page's downgrade is
+    taken no sooner than the one before it, at that one's cost, which the
+    greedy would order slightly differently among pages tied there. Only as
+    many of the cheapest as can meet the target are sorted, so a YELLOW
+    plan for a whole 32K window costs a step a few milliseconds (#105)."""
     if recency_floor < 0:
         raise ValueError(f"the recency floor is a count of positions, >= 0; got {recency_floor}")
     if page_tokens <= 0 or positions < 0:
         raise ValueError(f"a cache holds positions >= 0 on pages of > 0; got {positions} "
                          f"positions on pages of {page_tokens}")
-    _check_pages(scores, tiers)
+    if np.any(scores[tiers >= 0] < 0):
+        raise ValueError("a score is a mass, >= 0")
 
     level = thresholds.classify(headroom_bytes)
     target_bytes = max(0, thresholds.yellow_below_bytes + margin_bytes - headroom_bytes)
     if level == GREEN or target_bytes == 0:
-        return Plan(level, 0, (), (), False, recency_floor)
+        return _empty_plan(level, recency_floor, budget_seconds)
 
     # A page is a candidate only if it is a page of positions whose last
     # position comes before the floor's first: no open page is, and the
     # partly filled last page never is.
-    first_kept = positions - recency_floor
-    candidates = {(layer, page): tier for (layer, page), tier in tiers.items()
-                  if page >= 0 and (page + 1) * page_tokens <= first_kept}
+    layers, pages = tiers.shape
+    held = tiers >= 0
+    ends = (np.arange(pages) + 1) * page_tokens
+    candidate = held & (ends <= positions - recency_floor)[None, :]
+    scored = scores[candidate & ~np.isnan(scores)]
+    neutral = float(scored.mean()) if scored.size else 1.0
+    score = np.where(np.isnan(scores), neutral, scores)
 
-    neutral = _neutral(scores, candidates)
+    steps = len(TIERS) - 1  # step k takes a page from tier k to k + 1
+    bytes_at = np.array([page_bytes[t] for t in TIERS], dtype=np.int64)
+    error_at = np.array([errors[t] for t in TIERS], dtype=np.float64)
+    saved = bytes_at[:-1] - bytes_at[1:]
+    seconds = np.array([move_seconds[(TIERS[k], TIERS[k + 1])] for k in range(steps)])
+    k = np.arange(steps)[None, None, :]
+    taken = k >= tiers[:, :, None]
+    # score x added error / bytes saved, rounded in that order, as the
+    # greedy's own arithmetic is.
+    cost = score[:, :, None] * (error_at[1:] - error_at[:-1])[None, None, :] / saved
+    cost = np.maximum.accumulate(np.where(taken, cost, -np.inf), axis=2)
+    li, pi, ki = np.nonzero(taken & candidate[:, :, None])
+    costs, step_scores = cost[li, pi, ki], score[li, pi]
 
-    def next_downgrade(key: tuple[int, int], current: str) -> Downgrade | None:
-        down = TIERS.index(current) + 1
-        if down == len(TIERS):
-            return None
-        lower = TIERS[down]
-        saved = page_bytes[current] - page_bytes[lower]
-        score = neutral if math.isnan(scores[key]) else scores[key]
-        cost = score * (errors[lower] - errors[current]) / saved
-        layer, page = key
-        return Downgrade(layer, page, current, lower, saved, cost, score,
-                         move_seconds[(current, lower)])
+    # Only the cheapest that could meet the target need sorting: no more
+    # than target / the smallest saving of them.
+    need = min(len(costs), int(-(-target_bytes // int(saved.min()))) + 1)
+    if need < len(costs):
+        kth = np.partition(costs, need - 1)[need - 1]
+        keep = np.nonzero(costs <= kth)[0]
+    else:
+        keep = np.arange(len(costs))
+    order = keep[np.lexsort((ki[keep], li[keep], pi[keep], step_scores[keep], costs[keep]))]
+    reclaimed = np.cumsum(saved[ki[order]])
+    count = int(np.searchsorted(reclaimed, target_bytes)) + 1
+    short = len(order) == 0 or reclaimed[-1] < target_bytes
+    order = order[:count]
 
-    def entry(d: Downgrade):
-        # Ties to the lower score, then the oldest page, then the layer.
-        return d.cost, d.score, d.page, d.layer, d
+    steps_taken = ki[order].astype(np.int64)
+    return Plan(level=level, target_bytes=target_bytes, short=bool(short),
+                recency_floor=recency_floor, layers=li[order].astype(np.int64),
+                pages=pi[order].astype(np.int64), current=steps_taken, lower=steps_taken + 1,
+                saved=saved[steps_taken], costs=costs[order], scores=step_scores[order],
+                seconds=seconds[steps_taken], budget_seconds=budget_seconds)
 
-    heap = [entry(d) for d in (next_downgrade(key, tier) for key, tier in candidates.items())
-            if d is not None]
-    heapq.heapify(heap)
 
-    chosen, reclaimed = [], 0
-    while heap and reclaimed < target_bytes:
-        downgrade = heapq.heappop(heap)[-1]
-        chosen.append(downgrade)
-        reclaimed += downgrade.bytes_saved
-        further = next_downgrade((downgrade.layer, downgrade.page), downgrade.target_tier)
-        if further is not None:
-            heapq.heappush(heap, entry(further))
-
-    return Plan(level, target_bytes, tuple(chosen), batches(chosen, level, budget_seconds),
-                reclaimed < target_bytes, recency_floor)
+def batch_bounds(seconds: np.ndarray, level: Level,
+                 budget_seconds: float) -> tuple[tuple[int, int], ...]:
+    """Each batch's [start, end) in moves of these estimated `seconds`: at
+    RED, one of them all; otherwise as full as the budget allows, one longer
+    than the budget a batch of its own, and over it."""
+    if len(seconds) == 0:
+        return ()
+    if level == RED:
+        return ((0, len(seconds)),)
+    bounds, start, spent = [], 0, 0.0
+    for i, s in enumerate(seconds.tolist()):
+        if i > start and spent + s > budget_seconds:
+            bounds.append((start, i))
+            start, spent = i, 0.0
+        spent += s
+    bounds.append((start, len(seconds)))
+    return tuple(bounds)
 
 
 def _check_pages(scores: dict[tuple[int, int], float], tiers: dict[tuple[int, int], str]) -> None:
@@ -320,22 +424,9 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
 
 
 def batches(moves: list, level: Level, budget_seconds: float) -> tuple[tuple, ...]:
-    """Downgrades or upgrades in batches. At RED, every move at once.
-    Otherwise the moves, in order, in batches as full as the budget allows;
-    one longer than the budget is a batch of its own, and over it."""
-    if not moves:
-        return ()
-    if level == RED:
-        return (tuple(moves),)
-    out, batch, spent = [], [], 0.0
-    for move in moves:
-        if batch and spent + move.seconds > budget_seconds:
-            out.append(tuple(batch))
-            batch, spent = [], 0.0
-        batch.append(move)
-        spent += move.seconds
-    out.append(tuple(batch))
-    return tuple(out)
+    """Downgrades or upgrades in batches, by batch_bounds on their seconds."""
+    seconds = np.array([m.seconds for m in moves], dtype=np.float64)
+    return tuple(tuple(moves[a:b]) for a, b in batch_bounds(seconds, level, budget_seconds))
 
 
 def logged_tier_errors(model: str, log: str | Path = benchlog.DEFAULT_LOG) -> dict[str, float]:
@@ -354,15 +445,18 @@ def logged_tier_errors(model: str, log: str | Path = benchlog.DEFAULT_LOG) -> di
     return errors
 
 
-def logged_move_seconds(model: str,
+def logged_move_seconds(model: str | None,
                         log: str | Path = benchlog.DEFAULT_LOG) -> dict[tuple[str, str], float]:
     """Each move's median time, by (current, target) tier, for `model`, from
     the requantisation-latency entries of the last commit that logged them
     for it (#97). A plan does not know which pages hold a shadow, so a
     downgrade from FP16 takes the slower of a first downgrade's and one with
-    the shadow held."""
-    entries = [e for e in benchlog.read(log)
-               if e["kind"] == "requantisation-latency" and e["model"] == model]
+    the shadow held. With `model` None, any model's: an estimate for one not
+    yet measured."""
+    entries = [e for e in benchlog.read(log) if e["kind"] == "requantisation-latency"
+               and (model is None or e["model"] == model)]
+    if not entries:
+        raise ValueError(f"no requantisation latency logged for {model or 'any model'}")
     last = [e for e in entries if e["git_commit"] == entries[-1]["git_commit"]]
     seconds: dict[tuple[str, str], float] = {}
     for entry in last:
