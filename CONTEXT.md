@@ -187,9 +187,11 @@ to recover quality once pressure passes. Always name the direction; "requantise"
 alone is ambiguous.
 
 **Recency floor**:
-The most recent `N` token positions, excluded from downgrade regardless of
-importance score, on the assumption that recent context is almost always
-relevant.
+The most recent `W` token positions, `W = 128` by default and a parameter
+every plan records, excluded from downgrade regardless of importance score
+and policy, on the assumption that recent context is almost always relevant
+(#102). A page any of whose positions is among them is never downgraded,
+the open page with them.
 _Avoid_: recency window, protected window, sliding window
 
 ### The measurements
