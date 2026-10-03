@@ -238,3 +238,79 @@ def test_the_floor_is_a_parameter_recorded_in_every_plan():
     assert {m.page for m in partly.downgrades} == set(range(19))  # page 19 is being filled
     with pytest.raises(ValueError, match="floor"):
         make_plan(yellow_short_by(1), scores, tiers, floor=-1)
+
+
+# -- the upgrade policy (#103) ----------------------------------------------------
+
+#: Headroom at which upgrades may begin: GREEN's threshold, T_high, and a
+#: P90 spike above it.
+UPGRADE_LINE = THRESHOLDS.yellow_below_bytes + controller.DEFAULT_UPGRADE_SPIKE_BYTES
+
+
+def make_upgrades(headroom, scores, tiers, now=100.0, last_downgrade=0.0, budget=0.020):
+    return controller.upgrade_plan(headroom, THRESHOLDS, scores, tiers, PAGE_BYTES, ERRORS,
+                                   move_seconds=SECONDS, now_seconds=now,
+                                   last_downgrade_seconds=last_downgrade, budget_seconds=budget)
+
+
+def test_no_upgrade_within_five_seconds_of_a_downgrade():
+    """An upgrade waits 5 s after the last downgrade: none at 4.99 s, some
+    at 5; and with no downgrade yet, nothing holds it back."""
+    tiers = cache(1, 4, tier="INT4")
+    scores = {k: 1.0 for k in tiers}
+    roomy = UPGRADE_LINE + 10 * MIB
+    assert controller.DEFAULT_UPGRADE_COOLDOWN_SECONDS == 5.0
+    early = make_upgrades(roomy, scores, tiers, now=104.99, last_downgrade=100.0)
+    assert early.upgrades == () and "cooldown" in early.held_by
+    assert make_upgrades(roomy, scores, tiers, now=105.0, last_downgrade=100.0).upgrades
+    assert make_upgrades(roomy, scores, tiers, last_downgrade=None).upgrades
+
+
+def test_no_upgrade_leaves_headroom_below_the_line():
+    """Only at GREEN, and never past T_high + 512 MiB: the upgrades take at
+    most the headroom above that line, at any headroom; below it, or at
+    YELLOW or RED, there are none."""
+    rng = np.random.default_rng(103)
+    tiers = {key: str(rng.choice(["INT8", "INT4", "INT2"])) for key in cache(3, 30)}
+    for trial in range(30):
+        scores = {k: float(v) for k, v in zip(tiers, rng.random(len(tiers)))}
+        headroom = UPGRADE_LINE + int(rng.integers(0, 400_000))
+        u = make_upgrades(headroom, scores, tiers)
+        assert headroom - u.taken_bytes >= UPGRADE_LINE, trial
+        assert u.taken_bytes == sum(m.bytes_taken for m in u.upgrades)
+    for headroom, reason in ((UPGRADE_LINE - 1, "headroom"),
+                             (THRESHOLDS.yellow_below_bytes - 1, "GREEN"),
+                             (THRESHOLDS.red_below_bytes - 1, "GREEN")):
+        held = make_upgrades(headroom, {k: 1.0 for k in tiers}, tiers)
+        assert held.upgrades == () and reason in held.held_by, headroom
+
+
+def test_upgrades_come_in_reverse_marginal_cost_order():
+    """Each upgrade takes its page one tier up, and they come largest score
+    x error removed / bytes taken first. With room for everything, the
+    upgrades of what a downgrade plan did are that plan, backwards."""
+    rng = np.random.default_rng(31)
+    tiers = cache(3, 12)
+    scores = {k: float(v) for k, v in zip(tiers, rng.random(len(tiers)))}
+    down = make_plan(yellow_short_by(400_000), scores, tiers)
+    after = dict(tiers)
+    for m in down.downgrades:
+        after[(m.layer, m.page)] = m.target_tier
+    up = make_upgrades(UPGRADE_LINE + 10**9, scores, after)
+    ladder = controller.TIERS
+    for m in up.upgrades:
+        assert ladder.index(m.target_tier) == ladder.index(m.current_tier) - 1
+    gains = [m.gain for m in up.upgrades]
+    assert gains == sorted(gains, reverse=True)
+    assert [(m.layer, m.page, m.target_tier, m.current_tier) for m in up.upgrades] == [
+        (m.layer, m.page, m.current_tier, m.target_tier) for m in reversed(down.downgrades)]
+
+
+def test_upgrades_fall_into_batches_within_the_budget():
+    """Upgrades are made at GREEN, in batches within the per-step budget,
+    as a YELLOW plan's downgrades are."""
+    tiers = cache(2, 40, tier="INT2")
+    budget = 7 * SECONDS[("INT2", "INT4")]
+    u = make_upgrades(UPGRADE_LINE + 10**9, {k: 1.0 for k in tiers}, tiers, budget=budget)
+    assert len(u.batches) > 1 and [m for b in u.batches for m in b] == list(u.upgrades)
+    assert all(sum(m.seconds for m in b) <= budget + 1e-12 for b in u.batches)

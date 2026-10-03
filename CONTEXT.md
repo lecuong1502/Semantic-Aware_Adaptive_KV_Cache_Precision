@@ -175,9 +175,21 @@ downgrade saves. The controller takes the cheapest downgrade, again and
 again, until the byte target is met (#101).
 _Avoid_: priority, penalty
 
+**Marginal gain** (of an upgrade):
+A page's importance score times the error one tier up removes, per byte
+the upgrade takes: a downgrade's marginal cost, the other way. Upgrades
+come largest gain first, the reverse of downgrades (#103).
+_Avoid_: benefit, priority
+
+**Upgrade cooldown**:
+The time an upgrade waits after the last downgrade, 5 s by default, so
+that pages are not moved back as soon as they were moved down (#103).
+_Avoid_: hysteresis (#88 dropped a hysteresis of its own), backoff
+
 **Plan batch**:
-The downgrades of a requantisation plan applied between two decode steps:
-at YELLOW, as many as fit a per-step time budget; at RED, the whole plan.
+The downgrades of a requantisation plan, or the upgrades of an upgrade
+plan, applied between two decode steps: at YELLOW and at GREEN, as many as
+fit a per-step time budget; at RED, the whole plan.
 Not a batch of sequences: there is one sequence.
 _Avoid_: chunk (a prefill chunk is positions)
 

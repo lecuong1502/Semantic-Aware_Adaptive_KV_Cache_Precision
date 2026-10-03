@@ -31,6 +31,15 @@ partly filled last page with them, is no candidate, whatever its score
 and however short of memory the cache is, nor is an open page, (layer,
 -1) or (layer, -2), whatever `tiers` holds. Every plan records W.
 
+Upgrades (#103) are planned at GREEN only, at least 5 s after the last
+downgrade, and never past a headroom of GREEN's threshold, T_high, plus
+512 MiB, one P90 spike: in the reverse of a downgrade plan's order, the
+largest score x error removed / bytes taken first, in batches within the
+same budget. With room for every one, and the scores a plan was made from
+unchanged and all present, they undo it backwards: each tier down costs
+more error per byte than the last, so a plan's downgrades come in rising
+cost, and the upgrades' gains are those costs.
+
 A tier's error is its relative mean squared error on the keys and values
 the model caches, keys and values weighed alike, from Milestone 0's logged
 roundtrips (tools/quant_roundtrip.py); FP16's is 0. Values dominate it
@@ -60,6 +69,12 @@ DEFAULT_MARGIN_BYTES = 64 * MIB
 DEFAULT_BUDGET_SECONDS = 0.020
 #: The most recent positions no plan downgrades, the open page with them.
 DEFAULT_RECENCY_FLOOR = 128
+#: How long after the last downgrade an upgrade must wait (#88, #103).
+DEFAULT_UPGRADE_COOLDOWN_SECONDS = 5.0
+#: The headroom kept above GREEN's threshold, T_high, once upgrades are
+#: made: one P90 spike of everyday applications, ADR-0013's 506 MiB rounded
+#: up (#88).
+DEFAULT_UPGRADE_SPIKE_BYTES = 512 * MIB
 
 
 @dataclass(frozen=True)
@@ -112,13 +127,7 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
     if page_tokens <= 0 or positions < 0:
         raise ValueError(f"a cache holds positions >= 0 on pages of > 0; got {positions} "
                          f"positions on pages of {page_tokens}")
-    for key, tier in tiers.items():
-        if tier not in TIERS:
-            raise ValueError(f"page {key} is at {tier!r}; a tier is one of {TIERS}")
-        if key not in scores:
-            raise ValueError(f"page {key} has no score; give NaN for one not yet scored")
-        if scores[key] < 0:
-            raise ValueError(f"page {key}'s score is {scores[key]}; a score is a mass, >= 0")
+    _check_pages(scores, tiers)
 
     level = thresholds.classify(headroom_bytes)
     target_bytes = max(0, thresholds.yellow_below_bytes + margin_bytes - headroom_bytes)
@@ -132,8 +141,7 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
     candidates = {(layer, page): tier for (layer, page), tier in tiers.items()
                   if page >= 0 and (page + 1) * page_tokens <= first_kept}
 
-    scored = [scores[key] for key in candidates if not math.isnan(scores[key])]
-    neutral = sum(scored) / len(scored) if scored else 1.0
+    neutral = _neutral(scores, candidates)
 
     def next_downgrade(key: tuple[int, int], current: str) -> Downgrade | None:
         down = TIERS.index(current) + 1
@@ -167,22 +175,146 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
                 reclaimed < target_bytes, recency_floor)
 
 
-def batches(downgrades: list[Downgrade], level: Level,
-            budget_seconds: float) -> tuple[tuple[Downgrade, ...], ...]:
-    """At RED, every downgrade at once. Otherwise the downgrades, in order,
-    in batches as full as the budget allows; one longer than the budget is
-    a batch of its own, and over it."""
-    if not downgrades:
+def _check_pages(scores: dict[tuple[int, int], float], tiers: dict[tuple[int, int], str]) -> None:
+    for key, tier in tiers.items():
+        if tier not in TIERS:
+            raise ValueError(f"page {key} is at {tier!r}; a tier is one of {TIERS}")
+        if key not in scores:
+            raise ValueError(f"page {key} has no score; give NaN for one not yet scored")
+        if scores[key] < 0:
+            raise ValueError(f"page {key}'s score is {scores[key]}; a score is a mass, >= 0")
+
+
+def _neutral(scores: dict[tuple[int, int], float], keys: list[tuple[int, int]] | dict) -> float:
+    """The score a page not yet scored is taken at: the mean of the scored
+    pages among `keys`, or 1 if none is scored, all alike then."""
+    scored = [scores[key] for key in keys if not math.isnan(scores[key])]
+    return sum(scored) / len(scored) if scored else 1.0
+
+
+@dataclass(frozen=True)
+class Upgrade:
+    """One page, one tier up: what it takes, the marginal gain that orders
+    it, score x error removed / bytes taken, and its estimated time."""
+
+    layer: int
+    page: int
+    current_tier: str
+    target_tier: str
+    bytes_taken: int
+    gain: float
+    seconds: float
+
+
+@dataclass(frozen=True)
+class UpgradePlan:
+    """The upgrades, in the order they were chosen, and their batches; or
+    none, and `held_by` says what held them."""
+
+    level: Level
+    available_bytes: int
+    upgrades: tuple[Upgrade, ...]
+    batches: tuple[tuple[Upgrade, ...], ...]
+    held_by: str
+
+    @property
+    def taken_bytes(self) -> int:
+        return sum(u.bytes_taken for u in self.upgrades)
+
+
+def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
+                 scores: dict[tuple[int, int], float], tiers: dict[tuple[int, int], str],
+                 page_bytes: dict[str, int], errors: dict[str, float], *,
+                 move_seconds: dict[tuple[str, str], float], now_seconds: float,
+                 last_downgrade_seconds: float | None,
+                 cooldown_seconds: float = DEFAULT_UPGRADE_COOLDOWN_SECONDS,
+                 spike_bytes: int = DEFAULT_UPGRADE_SPIKE_BYTES,
+                 budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> UpgradePlan:
+    """The upgrades for this headroom (#103), at GREEN only: at least
+    `cooldown_seconds` after the last downgrade, and taking no more than the
+    headroom above GREEN's threshold, T_high, plus `spike_bytes`, a P90
+    spike (#88). `scores` and `tiers` by (layer, page), for the pages
+    that may be upgraded, each from its shadow (#96): a page born at a
+    quantised tier has none, and is the caller's to leave out. The clock is
+    the caller's, in seconds; `last_downgrade_seconds` None if none was made.
+
+    They come in the reverse of a downgrade plan's order: the upgrade with
+    the largest score x (error(current) - error(higher)) / (bytes(higher) -
+    bytes(current)) first, again and again, one tier at a time, until the
+    next does not fit what is left of the headroom: deliberately, so that
+    no upgrade comes before one of larger gain, at the cost of room a
+    smaller one could have used. Ties go to the newest page, the reverse of
+    a plan's. A page not yet scored takes the mean of the scored pages that
+    can be upgraded. The upgrades fall into batches within
+    `budget_seconds` each.
+
+    The headroom kept is the net of each upgrade. While one runs, its new
+    page is held beside the page it replaces, and, to a quantised tier, an
+    FP16 page the shadow is uploaded to as well, for as long as the upgrade
+    takes (#96)."""
+    _check_pages(scores, tiers)
+    level = thresholds.classify(headroom_bytes)
+    available = headroom_bytes - thresholds.yellow_below_bytes - spike_bytes
+
+    def held(reason: str) -> UpgradePlan:
+        return UpgradePlan(level, max(0, available), (), (), reason)
+
+    if level != GREEN:
+        return held(f"the level is {level.value}; upgrades are made at GREEN only")
+    if last_downgrade_seconds is not None and now_seconds - last_downgrade_seconds < cooldown_seconds:
+        return held(f"cooldown: {now_seconds - last_downgrade_seconds:.2f} s since the last downgrade, "
+                    f"{cooldown_seconds} s needed")
+    if available <= 0:
+        return held(f"headroom: {headroom_bytes} bytes leave none above T_high + "
+                    f"{spike_bytes} bytes")
+
+    neutral = _neutral(scores, [key for key, tier in tiers.items() if tier != "FP16"])
+
+    def next_upgrade(key: tuple[int, int], current: str) -> Upgrade | None:
+        up = TIERS.index(current) - 1
+        if up < 0:
+            return None
+        higher = TIERS[up]
+        taken = page_bytes[higher] - page_bytes[current]
+        score = neutral if math.isnan(scores[key]) else scores[key]
+        gain = score * (errors[current] - errors[higher]) / taken
+        layer, page = key
+        return Upgrade(layer, page, current, higher, taken, gain, move_seconds[(current, higher)])
+
+    def entry(u: Upgrade):
+        return -u.gain, -u.page, -u.layer, u  # ties to the newest page, then layer
+
+    heap = [entry(u) for u in (next_upgrade(key, tier) for key, tier in tiers.items())
+            if u is not None]
+    heapq.heapify(heap)
+
+    chosen, left = [], available
+    while heap and heap[0][-1].bytes_taken <= left:
+        upgrade = heapq.heappop(heap)[-1]
+        chosen.append(upgrade)
+        left -= upgrade.bytes_taken
+        further = next_upgrade((upgrade.layer, upgrade.page), upgrade.target_tier)
+        if further is not None:
+            heapq.heappush(heap, entry(further))
+    return UpgradePlan(level, available, tuple(chosen), batches(chosen, level, budget_seconds),
+                       "")
+
+
+def batches(moves: list, level: Level, budget_seconds: float) -> tuple[tuple, ...]:
+    """Downgrades or upgrades in batches. At RED, every move at once.
+    Otherwise the moves, in order, in batches as full as the budget allows;
+    one longer than the budget is a batch of its own, and over it."""
+    if not moves:
         return ()
     if level == RED:
-        return (tuple(downgrades),)
+        return (tuple(moves),)
     out, batch, spent = [], [], 0.0
-    for downgrade in downgrades:
-        if batch and spent + downgrade.seconds > budget_seconds:
+    for move in moves:
+        if batch and spent + move.seconds > budget_seconds:
             out.append(tuple(batch))
             batch, spent = [], 0.0
-        batch.append(downgrade)
-        spent += downgrade.seconds
+        batch.append(move)
+        spent += move.seconds
     out.append(tuple(batch))
     return tuple(out)
 
