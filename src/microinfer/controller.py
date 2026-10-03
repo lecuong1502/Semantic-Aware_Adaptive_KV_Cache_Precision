@@ -54,6 +54,8 @@ from __future__ import annotations
 
 import heapq
 import math
+import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -225,18 +227,22 @@ class UpgradePlan:
 def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
                  scores: dict[tuple[int, int], float], tiers: dict[tuple[int, int], str],
                  page_bytes: dict[str, int], errors: dict[str, float], *,
-                 move_seconds: dict[tuple[str, str], float], now_seconds: float,
+                 move_seconds: dict[tuple[str, str], float],
+                 shadowed: Collection[tuple[int, int]],
                  last_downgrade_seconds: float | None,
+                 now_seconds: float | None = None,
                  cooldown_seconds: float = DEFAULT_UPGRADE_COOLDOWN_SECONDS,
                  spike_bytes: int = DEFAULT_UPGRADE_SPIKE_BYTES,
                  budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> UpgradePlan:
     """The upgrades for this headroom (#103), at GREEN only: at least
     `cooldown_seconds` after the last downgrade, and taking no more than the
     headroom above GREEN's threshold, T_high, plus `spike_bytes`, a P90
-    spike (#88). `scores` and `tiers` by (layer, page), for the pages
-    that may be upgraded, each from its shadow (#96): a page born at a
-    quantised tier has none, and is the caller's to leave out. The clock is
-    the caller's, in seconds; `last_downgrade_seconds` None if none was made.
+    spike (#88). `scores` and `tiers` by (layer, page). Only the pages in
+    `shadowed`, those holding an FP16 shadow, are upgraded, each from it
+    (#96): a page born at a quantised tier never had FP16 bytes, and stays
+    where it is. The clock is time.monotonic(), `now_seconds` unless given;
+    `last_downgrade_seconds` is from the same clock, or None if no
+    downgrade was made. One later than now is a clock mixed up, refused.
 
     They come in the reverse of a downgrade plan's order: the upgrade with
     the largest score x (error(current) - error(higher)) / (bytes(higher) -
@@ -253,6 +259,11 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
     FP16 page the shadow is uploaded to as well, for as long as the upgrade
     takes (#96)."""
     _check_pages(scores, tiers)
+    now_seconds = time.monotonic() if now_seconds is None else now_seconds
+    if last_downgrade_seconds is not None and last_downgrade_seconds > now_seconds:
+        raise ValueError(f"the last downgrade, at {last_downgrade_seconds} s, is after now, "
+                         f"{now_seconds} s: both times must come from one clock, "
+                         f"time.monotonic()")
     level = thresholds.classify(headroom_bytes)
     available = headroom_bytes - thresholds.yellow_below_bytes - spike_bytes
 
@@ -268,7 +279,8 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
         return held(f"headroom: {headroom_bytes} bytes leave none above T_high + "
                     f"{spike_bytes} bytes")
 
-    neutral = _neutral(scores, [key for key, tier in tiers.items() if tier != "FP16"])
+    upgradable = {key: tier for key, tier in tiers.items() if tier != "FP16" and key in shadowed}
+    neutral = _neutral(scores, upgradable)
 
     def next_upgrade(key: tuple[int, int], current: str) -> Upgrade | None:
         up = TIERS.index(current) - 1
@@ -284,7 +296,7 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
     def entry(u: Upgrade):
         return -u.gain, -u.page, -u.layer, u  # ties to the newest page, then layer
 
-    heap = [entry(u) for u in (next_upgrade(key, tier) for key, tier in tiers.items())
+    heap = [entry(u) for u in (next_upgrade(key, tier) for key, tier in upgradable.items())
             if u is not None]
     heapq.heapify(heap)
 

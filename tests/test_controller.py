@@ -9,6 +9,8 @@ Milestone 0's roundtrips logged. At YELLOW the plan is split into batches
 within a per-step time budget; at RED it is one batch.
 """
 
+import time
+
 import numpy as np
 import pytest
 
@@ -247,10 +249,14 @@ def test_the_floor_is_a_parameter_recorded_in_every_plan():
 UPGRADE_LINE = THRESHOLDS.yellow_below_bytes + controller.DEFAULT_UPGRADE_SPIKE_BYTES
 
 
-def make_upgrades(headroom, scores, tiers, now=100.0, last_downgrade=0.0, budget=0.020):
+def make_upgrades(headroom, scores, tiers, now=100.0, last_downgrade=0.0, budget=0.020,
+                  shadowed=None):
+    """An upgrade plan over `tiers`, every page holding a shadow unless
+    `shadowed` says which do."""
     return controller.upgrade_plan(headroom, THRESHOLDS, scores, tiers, PAGE_BYTES, ERRORS,
                                    move_seconds=SECONDS, now_seconds=now,
-                                   last_downgrade_seconds=last_downgrade, budget_seconds=budget)
+                                   last_downgrade_seconds=last_downgrade, budget_seconds=budget,
+                                   shadowed=set(tiers) if shadowed is None else shadowed)
 
 
 def test_no_upgrade_within_five_seconds_of_a_downgrade():
@@ -314,3 +320,30 @@ def test_upgrades_fall_into_batches_within_the_budget():
     u = make_upgrades(UPGRADE_LINE + 10**9, {k: 1.0 for k in tiers}, tiers, budget=budget)
     assert len(u.batches) > 1 and [m for b in u.batches for m in b] == list(u.upgrades)
     assert all(sum(m.seconds for m in b) <= budget + 1e-12 for b in u.batches)
+
+
+def test_a_page_without_a_shadow_is_never_upgraded():
+    """A page born at a quantised tier never had FP16 bytes, and has no
+    shadow to be restored from (#96): only the pages the caller names as
+    shadowed are upgraded, whatever their scores and however much room."""
+    tiers = {(0, 0): "INT4", (0, 1): "INT2", (0, 2): "INT8", (1, 0): "INT2"}
+    scores = {k: 1.0 for k in tiers}
+    scores[(0, 1)] = 1e6  # the most worth restoring, and born at INT2
+    u = make_upgrades(UPGRADE_LINE + 10**9, scores, tiers, shadowed={(0, 0), (1, 0)})
+    assert {(m.layer, m.page) for m in u.upgrades} == {(0, 0), (1, 0)}
+    assert all(m.target_tier == "FP16" for m in u.upgrades if m.current_tier == "INT8")
+
+
+def test_the_clock_is_monotonic_and_one():
+    """`now_seconds` is time.monotonic() unless given, the clock the last
+    downgrade's time must come from too: a last downgrade later than now is
+    a clock mixed up, and refused rather than read as a cooldown."""
+    tiers = cache(1, 2, tier="INT4")
+    scores = {k: 1.0 for k in tiers}
+    roomy = UPGRADE_LINE + 10 * MIB
+    recent = controller.upgrade_plan(roomy, THRESHOLDS, scores, tiers, PAGE_BYTES, ERRORS,
+                                     move_seconds=SECONDS, shadowed=set(tiers),
+                                     last_downgrade_seconds=time.monotonic())
+    assert recent.upgrades == () and "cooldown" in recent.held_by
+    with pytest.raises(ValueError, match="clock"):
+        make_upgrades(roomy, scores, tiers, now=100.0, last_downgrade=1.7e9)  # wall time
