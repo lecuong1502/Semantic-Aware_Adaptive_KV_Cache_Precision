@@ -17,11 +17,19 @@ attends costs almost nothing at every tier, and goes deep first. INT2's
 error puts it last unless a score outweighs it.
 
 A page with no score yet (NaN) is given a neutral one: the mean of the
-scored pages', or, before any page has a score, the same for every page.
+scored candidates', or, before any has a score, the same for every page.
+Pages within the floor are no candidates, and do not set it.
 Before any score exists the plan therefore goes breadth first in position
 order, the oldest page first (#88), and a page not yet scored, usually one
 of the newest, goes no deeper than a page of average importance. Ties are
 broken by page, then by layer: the oldest first.
+
+The recency floor (#102): the open pages and the last W positions, W = 128
+by default, are never downgraded, under every policy: every policy's plan
+is made here. A page any of whose positions is among the last W, the
+partly filled last page with them, is no candidate, whatever its score
+and however short of memory the cache is, nor is an open page, (layer,
+-1) or (layer, -2), whatever `tiers` holds. Every plan records W.
 
 A tier's error is its relative mean squared error on the keys and values
 the model caches, keys and values weighed alike, from Milestone 0's logged
@@ -50,6 +58,8 @@ TIERS = ("FP16", "INT8", "INT4", "INT2")
 DEFAULT_MARGIN_BYTES = 64 * MIB
 #: The time one batch of moves may take between two decode steps.
 DEFAULT_BUDGET_SECONDS = 0.020
+#: The most recent positions no plan downgrades, the open page with them.
+DEFAULT_RECENCY_FLOOR = 128
 
 
 @dataclass(frozen=True)
@@ -69,14 +79,16 @@ class Downgrade:
 @dataclass(frozen=True)
 class Plan:
     """The downgrades, in the order they were chosen, and the batches they
-    are applied in. `short` if every page went as low as it can and the
-    byte target was still not met."""
+    are applied in. `short` if every page outside the recency floor went as
+    low as it can and the byte target was still not met. `recency_floor`
+    is the W the plan kept."""
 
     level: Level
     target_bytes: int
     downgrades: tuple[Downgrade, ...]
     batches: tuple[tuple[Downgrade, ...], ...]
     short: bool
+    recency_floor: int
 
     @property
     def reclaimed_bytes(self) -> int:
@@ -86,11 +98,20 @@ class Plan:
 def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, int], float],
          tiers: dict[tuple[int, int], str], page_bytes: dict[str, int],
          errors: dict[str, float], *, move_seconds: dict[tuple[str, str], float],
+         positions: int, page_tokens: int,
+         recency_floor: int = DEFAULT_RECENCY_FLOOR,
          margin_bytes: int = DEFAULT_MARGIN_BYTES,
          budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> Plan:
     """The plan for this headroom: `scores` and `tiers` by (layer, page),
-    for every page that may be downgraded; `page_bytes` and `errors` by
-    tier; `move_seconds` by (current, target) tier."""
+    for the cache's pages; `page_bytes` and `errors` by tier; `move_seconds`
+    by (current, target) tier. The cache holds `positions` positions, pages
+    of `page_tokens` each; no page with a position among the last
+    `recency_floor` is downgraded."""
+    if recency_floor < 0:
+        raise ValueError(f"the recency floor is a count of positions, >= 0; got {recency_floor}")
+    if page_tokens <= 0 or positions < 0:
+        raise ValueError(f"a cache holds positions >= 0 on pages of > 0; got {positions} "
+                         f"positions on pages of {page_tokens}")
     for key, tier in tiers.items():
         if tier not in TIERS:
             raise ValueError(f"page {key} is at {tier!r}; a tier is one of {TIERS}")
@@ -102,9 +123,16 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
     level = thresholds.classify(headroom_bytes)
     target_bytes = max(0, thresholds.yellow_below_bytes + margin_bytes - headroom_bytes)
     if level == GREEN or target_bytes == 0:
-        return Plan(level, 0, (), (), False)
+        return Plan(level, 0, (), (), False, recency_floor)
 
-    scored = [scores[key] for key in tiers if not math.isnan(scores[key])]
+    # A page is a candidate only if it is a page of positions whose last
+    # position comes before the floor's first: no open page is, and the
+    # partly filled last page never is.
+    first_kept = positions - recency_floor
+    candidates = {(layer, page): tier for (layer, page), tier in tiers.items()
+                  if page >= 0 and (page + 1) * page_tokens <= first_kept}
+
+    scored = [scores[key] for key in candidates if not math.isnan(scores[key])]
     neutral = sum(scored) / len(scored) if scored else 1.0
 
     def next_downgrade(key: tuple[int, int], current: str) -> Downgrade | None:
@@ -122,7 +150,7 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
     def entry(d: Downgrade):
         return d.cost, d.page, d.layer, d  # ties to the oldest page, then layer
 
-    heap = [entry(d) for d in (next_downgrade(key, tier) for key, tier in tiers.items())
+    heap = [entry(d) for d in (next_downgrade(key, tier) for key, tier in candidates.items())
             if d is not None]
     heapq.heapify(heap)
 
@@ -136,7 +164,7 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
             heapq.heappush(heap, entry(further))
 
     return Plan(level, target_bytes, tuple(chosen), batches(chosen, level, budget_seconds),
-                reclaimed < target_bytes)
+                reclaimed < target_bytes, recency_floor)
 
 
 def batches(downgrades: list[Downgrade], level: Level,

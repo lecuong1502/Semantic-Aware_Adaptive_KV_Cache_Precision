@@ -29,9 +29,20 @@ def cache(layers, pages, tier="FP16"):
     return {(layer, page): tier for layer in range(layers) for page in range(pages)}
 
 
-def make_plan(headroom, scores, tiers, margin=0, budget=0.020):
+#: Positions per page, as the default build's P.
+P = 32
+
+
+def make_plan(headroom, scores, tiers, margin=0, budget=0.020, positions=None, floor=None):
+    """A plan over `tiers`. Unless `positions` says otherwise, the cache
+    holds a recency floor's worth beyond every page given, so that no page
+    is within it."""
+    floor = controller.DEFAULT_RECENCY_FLOOR if floor is None else floor
+    if positions is None:
+        positions = (max(page for _, page in tiers) + 1) * P + floor
     return plan(headroom, THRESHOLDS, scores, tiers, PAGE_BYTES, ERRORS,
-                margin_bytes=margin, move_seconds=SECONDS, budget_seconds=budget)
+                margin_bytes=margin, move_seconds=SECONDS, budget_seconds=budget,
+                positions=positions, page_tokens=P, recency_floor=floor)
 
 
 def yellow_short_by(nbytes, margin=0):
@@ -181,3 +192,49 @@ def test_what_the_controller_refuses():
     with pytest.raises(ValueError, match="score"):
         make_plan(yellow_short_by(1), {(0, 0): -1.0, (0, 1): 1.0}, tiers)
     assert isinstance(make_plan(yellow_short_by(1), {k: 1.0 for k in tiers}, tiers), Plan)
+
+
+# -- the recency floor (#102) -----------------------------------------------------
+
+
+def test_no_plan_names_a_page_within_the_recency_floor():
+    """The last W positions are never downgraded, nor the open pages: a
+    page any of whose positions is among the last W, the partly filled last
+    page with them, at any score and however short of memory, is in no
+    plan, at YELLOW or at RED, nor is an open page, (layer, -1) or (layer,
+    -2), given among the pages. A page whose last position is just before
+    the floor may be."""
+    rng = np.random.default_rng(102)
+    for trial in range(30):
+        floor = int(rng.choice([0, 1, 31, 32, 33, 64, 128, 200]))
+        positions = int(rng.integers(1, 40 * P))
+        tiers = cache(3, -(-positions // P))  # every page of positions held
+        tiers |= {(layer, open_page): "FP16" for layer in range(3) for open_page in (-1, -2)}
+        scores = {k: float(v) for k, v in zip(tiers, rng.random(len(tiers)))}
+        for headroom in (yellow_short_by(10**9), THRESHOLDS.red_below_bytes - 1):
+            p = make_plan(headroom, scores, tiers, positions=positions, floor=floor)
+            assert p.recency_floor == floor
+            named = {m.page for m in p.downgrades}
+            for page in named:
+                assert (page + 1) * P <= positions - floor, (trial, page, positions, floor)
+            # Everything outside the floor may go, and does, so short of memory.
+            free = {page for page in range(-(-positions // P))
+                    if (page + 1) * P <= positions - floor}
+            assert named == free, (trial, positions, floor)
+
+
+def test_the_floor_is_a_parameter_recorded_in_every_plan():
+    """W is 128 by default, any non-negative count of positions otherwise,
+    and every plan says which, even one with nothing to do."""
+    tiers = cache(1, 20)
+    scores = {k: 1.0 for k in tiers}
+    assert controller.DEFAULT_RECENCY_FLOOR == 128
+    assert make_plan(yellow_short_by(1), scores, tiers).recency_floor == 128
+    green = make_plan(THRESHOLDS.yellow_below_bytes, scores, tiers, floor=64)
+    assert green.recency_floor == 64 and green.downgrades == ()
+    held = make_plan(yellow_short_by(10**9), scores, tiers, positions=20 * P, floor=5 * P)
+    assert {m.page for m in held.downgrades} == set(range(15))
+    partly = make_plan(yellow_short_by(10**9), scores, tiers, positions=19 * P + 7, floor=0)
+    assert {m.page for m in partly.downgrades} == set(range(19))  # page 19 is being filled
+    with pytest.raises(ValueError, match="floor"):
+        make_plan(yellow_short_by(1), scores, tiers, floor=-1)
