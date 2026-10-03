@@ -194,6 +194,7 @@ def test_the_video_call_waits_for_a_person_and_labels_the_wait():
         assert ask(stream, stop) is None
 
 
+@pytest.mark.slow
 def test_each_browser_opens_pages_evaluates_in_their_frames_and_leaves_nothing():
     """Chrome and Firefox, headless on a page this test serves: each opens a
     window, finds the frame inside it, evaluates there, and each page finds

@@ -54,6 +54,7 @@ SHAPES = sorted({(name, proj) for name, proj in CASES
                  if proj in ("q_proj", "k_proj", "gate_proj", "down_proj")})
 
 
+@pytest.mark.slow
 def test_both_kernels_match_the_reference_at_every_model_shape(study):
     """Decode (one row) and a prefill length that is not a multiple of any
     tile, at every distinct projection shape of both models."""

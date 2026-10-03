@@ -75,6 +75,7 @@ def test_an_unknown_model_is_refused_by_name_unless_waived(tmp_path):
 
 # -- against the real checkpoint --------------------------------------------
 
+@pytest.mark.slow
 def test_loads_and_reports_weights_within_one_percent_of_config():
     """Both models, and config.json names exactly the checkpoint's tensors:
     the arena is laid out from it before the checkpoint is read, so it must

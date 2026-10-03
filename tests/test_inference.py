@@ -55,6 +55,7 @@ def golden() -> GoldenSet:
 # -- the gate ---------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_the_gate(engine, golden):
     """ADR-0006's merge gate. The report states both terms, and the KL term's
     sample size, because they are different kinds of number."""
@@ -65,6 +66,7 @@ def test_the_gate(engine, golden):
     assert report.kl_mean < KL_MAX, report.render()
 
 
+@pytest.mark.slow
 def test_the_kl_sample_does_not_decide_the_gate(engine, golden):
     """The gate's KL term is a sample of 16 positions per prompt (ADR-0006). The
     reference keeps every position for two prompts, and the sample errs on
@@ -147,6 +149,7 @@ def test_decoding_continues_as_a_full_prefill_would(engine, golden):
         np.testing.assert_array_equal(full.argmax(-1)[len(ids) - 1:], out, err_msg=prompt_id)
 
 
+@pytest.mark.slow
 def test_smoke_greedy_generation_matches_huggingface(engine, golden):
     """ADR-0006's smoke test. Not a gate: a near-tie flips an argmax and every
     token after it, without any bug. Red is investigated, so it reports as

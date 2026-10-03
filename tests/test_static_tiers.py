@@ -72,6 +72,7 @@ def test_the_tier_is_chosen_by_configuration():
         Engine(path, kv_cache="contiguous", kv_tier="INT8")
 
 
+@pytest.mark.slow
 def test_every_tier_runs_and_each_narrower_one_costs_more(engine, golden):
     """The gate, run at every tier. FP16 passes it, as ADR-0006 requires. The
     others are not held to it, since quantisation is meant to cost something;
@@ -92,6 +93,7 @@ def test_every_tier_runs_and_each_narrower_one_costs_more(engine, golden):
     assert all(a >= b for a, b in zip(top1, top1[1:])), top1
 
 
+@pytest.mark.slow
 def test_decoding_continues_as_a_full_prefill_would_at_every_tier(engine, golden):
     """Attention at a quantised tier is causal as decode is (ADR-0011): a
     query reads its own page at FP16 and every page before it sealed, however

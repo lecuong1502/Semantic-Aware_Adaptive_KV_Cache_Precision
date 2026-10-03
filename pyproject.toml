@@ -26,3 +26,6 @@ build-dir = "build/{wheel_tag}"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: decodes a real model or times real work, 5 s or more; run with --runslow",
+]

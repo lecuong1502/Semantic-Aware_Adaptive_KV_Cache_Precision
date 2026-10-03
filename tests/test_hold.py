@@ -183,6 +183,7 @@ while time.monotonic() < end:
 """
 
 
+@pytest.mark.slow
 def test_out_of_memory_is_recorded_and_the_tool_exits_with_nothing_held(tmp_path):
     """Another process takes every granule the device has left while the
     hold is still growing its cache: the next allocation fails. The status
