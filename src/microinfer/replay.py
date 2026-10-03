@@ -393,11 +393,10 @@ def _measure(t_s: np.ndarray, level: np.ndarray, spike: spikes.Spike,
     return amplitude, float(t0 + (t1 - t0) * (amplitude / 2 - l0) / (l1 - l0))
 
 
-def _streams(processes, simulator_pid: int, started_ns: int, idle_s: float,
-             original: OthersHeld) -> dict:
-    """From the replay's processes stream: how far the simulator's own
-    memory strayed from the schedule, and how far the rest of the desktop
-    moved from its idle level, over the replay, in MiB."""
+def split_processes(processes, simulator_pid: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A replay's processes stream, (states, procs), as three series on the
+    stream's own sample times: the times, the simulator's memory, and the
+    rest of the desktop's, in bytes, by the driver's account of each."""
     states, procs = processes
     times = states["t_mono_ns"]
     at = np.searchsorted(times, procs["t_mono_ns"])
@@ -406,6 +405,15 @@ def _streams(processes, simulator_pid: int, started_ns: int, idle_s: float,
     desktop = np.zeros(len(times), dtype=np.int64)
     np.add.at(simulator, at[mine], np.maximum(procs["used_bytes"][mine], 0))
     np.add.at(desktop, at[~mine], np.maximum(procs["used_bytes"][~mine], 0))
+    return times, simulator, desktop
+
+
+def _streams(processes, simulator_pid: int, started_ns: int, idle_s: float,
+             original: OthersHeld) -> dict:
+    """From the replay's processes stream: how far the simulator's own
+    memory strayed from the schedule, and how far the rest of the desktop
+    moved from its idle level, over the replay, in MiB."""
+    times, simulator, desktop = split_processes(processes, simulator_pid)
     s = (times - started_ns) / 1e9
     idle = (s >= -idle_s) & (s < 0)
     during = (s >= 0) & (s <= original.t_s[-1])

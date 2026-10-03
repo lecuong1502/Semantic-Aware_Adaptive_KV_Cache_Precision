@@ -129,7 +129,13 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     """The simulator, a process of its own, takes the schedule while the
     recorder records; the recording of the replay shows its step when the
     schedule says. Only that is asserted: how well a replay matches is
-    measured on an idle desktop, and logged (tools/replay_contention.py)."""
+    measured on an idle desktop, and logged (tools/replay_contention.py).
+
+    The recording is of the whole device, which the rest of the desktop
+    moves too: a browser's GPU process alone moved it by 18 MiB across the
+    step in a run of this test, past the bound. So the step is taken net of
+    what every process but the simulator moved over the same windows, by
+    the driver's account of each in the processes stream."""
     out = tmp_path / "new" / "replay.csv.gz"  # its directory made as it is written
     steps = np.arange(100)
     held = replay.OthersHeld(steps * 0.02, np.where(steps >= 25, 256 * MiB, 0).astype(np.int64))
@@ -137,13 +143,21 @@ def test_a_replay_on_the_device_is_recorded_with_the_schedule_in_place(tmp_path)
     # The lead's two points, the step, and the end.
     assert len(recorder.companion(out, ".events.jsonl").read_text().splitlines()) == 4
     _, samples = recorder.read(out)
-    s = (samples["t_mono_ns"] - started) / 1e9
-    used = samples["used_bytes"]
-    before, during = np.median(used[(s > 0) & (s < 0.45)]), np.median(used[(s > 0.7) & (s < 1.95)])
-    assert abs(during - before - 256 * MiB) <= replay.AMPLITUDE_BOUND_MIB * MiB
-    # The simulator's own memory, by the processes stream, is the schedule's.
     pid = json.loads(recorder.companion(out, ".replay.json").read_text())["simulator_pid"]
     _, states, procs = recorder.read_processes(recorder.processes_path(out))
+
+    def step(times, level):
+        s = (times - started) / 1e9
+        return (np.median(level[(s > 0.7) & (s < 1.95)])
+                - np.median(level[(s > 0) & (s < 0.45)]))
+
+    times, _, desktop = replay.split_processes((states, procs), pid)
+    raw, moved = step(samples["t_mono_ns"], samples["used_bytes"]), step(times, desktop)
+    device_step = raw - moved
+    print(f"\nthe step: {raw / MiB:.1f} MiB on the device, {moved / MiB:+.1f} of it the "
+          f"desktop's, {device_step / MiB:.1f} the replay's")
+    assert abs(device_step - 256 * MiB) <= replay.AMPLITUDE_BOUND_MIB * MiB
+    # The simulator's own memory, by the processes stream, is the schedule's.
     result = replay.compare(held, samples, started, processes=(states, procs),
                             simulator_pid=pid)
     assert result["simulator_error_mib"]["p90"] <= 2
