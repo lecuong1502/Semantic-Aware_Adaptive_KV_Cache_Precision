@@ -215,6 +215,8 @@ class Monitor:
         self.error: BaseException | None = None
         self.level: Level | None = None
         self.missed = 0  # the polls whose deadlines passed unread, once stopped
+        #: The latest reading, every poll, transition or not; None before one.
+        self.headroom_bytes: int | None = None
 
     @property
     def running(self) -> bool:
@@ -259,7 +261,9 @@ class Monitor:
 
         def poll() -> None:
             nonlocal last
-            event = hysteresis.feed(time.monotonic_ns(), self._reader())
+            headroom = self._reader()
+            self.headroom_bytes = headroom
+            event = hysteresis.feed(time.monotonic_ns(), headroom)
             if event is None:
                 return
             try:

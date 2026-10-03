@@ -12,8 +12,12 @@ chooses. What the engine does about it is real: pages are downgraded, and
 what this process holds by the driver's own account falls.
 """
 
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pytest
+from test_simulator import simulating
 
 from conftest import require_model
 from microinfer import Engine, _microinfer, monitor
@@ -139,3 +143,54 @@ def test_a_red_mid_decode_plans_from_the_scorers_scores():
     scores = red[0].plan.scores
     assert np.isfinite(scores).all() and np.unique(scores).size > 10
     assert red[0].ended == "applied" and len(red[0].batches) == 1
+
+
+def test_pressure_that_persists_is_planned_for_again_as_pages_are_sealed():
+    """A RED that holds: the first plan takes every page outside the recency
+    floor, short of its target; as decoding seals more pages and they leave
+    the floor, the engine plans again, for the headroom it reads now, and
+    downgrades them too. Such a plan is marked as answering pressure that
+    persisted, with the event that began it."""
+    name = "qwen2.5-0.5b-instruct"
+    engine = Engine(require_model(name), kv_adaptive=True, prefill_chunk=None)
+    engine.load_weights()
+    ids = np.random.default_rng(108).integers(1000, 100_000, 1024).astype(np.int32)
+    engine.start_monitor(simulated(100))
+    try:
+        engine.generate(ids, 3 * _microinfer.device.page_tokens + 4, stop_at_eos=False)
+    finally:
+        engine.stop_monitor()
+    first, *later = engine.plans
+    assert first.plan.level == monitor.RED and first.plan.short and not first.persisting
+    assert later and all(p.persisting and p.pressure is first.pressure for p in later)
+    assert all(p.headroom_bytes == 100 * MIB and p.ended == "applied" for p in later)
+    newest = int(first.plan.pages.max())
+    assert all(int(p.plan.pages.min()) > newest for p in later)
+
+
+def test_real_contention_makes_the_engine_downgrade():
+    """Not a monitor told what to read: the contention simulator, a process
+    of its own, takes device memory mid-decode until headroom by NVML is
+    RED, and the engine, its monitor reading NVML, answers with a plan that
+    returns memory. Qwen2.5-0.5B on 2048 positions, the simulator taking all
+    but 380 MiB of what the engine left free at its peak a run before."""
+    name = "qwen2.5-0.5b-instruct"
+    engine = Engine(require_model(name), kv_adaptive=True, prefill_chunk=None)
+    engine.load_weights()
+    ids = np.random.default_rng(109).integers(1000, 100_000, 2048).astype(np.int32)
+    engine.generate(ids, 96, stop_at_eos=False)  # warm, and the free memory at its peak
+    left = engine.peak_footprint().device_free
+    take = left - 380 * MIB
+    assert take > 0
+    with tempfile.TemporaryDirectory() as tmp, simulating(Path(tmp), [(0.0, 0), (1.0, take),
+                                                                        (60.0, take)]):
+        engine.start_monitor()
+        try:
+            engine.generate(ids, 96, stop_at_eos=False)
+        finally:
+            engine.stop_monitor()
+    red = [p for p in engine.plans if p.plan.level == monitor.RED]
+    assert red, [r.event.level for r in engine.pressure_events]
+    record = red[0]
+    assert record.applied > 0
+    assert record.batches[0].cache_bytes_before > record.batches[0].cache_bytes_after

@@ -219,6 +219,12 @@ class PlanRecord:
     batches: list[AppliedBatch]
     skipped: int = 0
     ended: str = ""
+    #: The headroom the plan was made for: the event's, or, for a plan made
+    #: because pressure persisted, the monitor's latest reading.
+    headroom_bytes: int = 0
+    #: Made not on an event but because the level stayed YELLOW or RED while
+    #: the cache sealed more pages.
+    persisting: bool = False
 
     @property
     def applied(self) -> int:
@@ -295,6 +301,8 @@ class Engine:
         self.last_downgrade_seconds: float | None = None
         self._pending: PlanRecord | None = None
         self._cursor = 0
+        self._last_pressure: PressureRecord | None = None
+        self._planned_pages = 0
         #: How long the last downgrades took, the longest of them the guess
         #: for the next: an outlier passes out of it, as none would of a max.
         self._recent_moves: collections.deque[float] = collections.deque(maxlen=64)
@@ -641,6 +649,7 @@ class Engine:
             raise RuntimeError("a pressure monitor is already running; stop it first")
         self.pressure_events, self.monitor_error, self._positions_held = [], None, 0
         self.plans, self._pending, self.last_downgrade_seconds = [], None, None
+        self._last_pressure, self._planned_pages = None, 0
         if self.kv_adaptive:
             self._plan_inputs  # read from the log now, not in a step a plan delays
         self._monitor = (monitor or Monitor()).start()
@@ -694,21 +703,40 @@ class Engine:
         planned = False
         # The latest level is the one to answer: one plan a step at most.
         latest = drained[-1] if drained else None
+        if latest is not None:
+            self._last_pressure = latest
         if latest is not None and latest.event.level == GREEN and self._pending is not None:
             self._pending.ended, self._pending = "cancelled at GREEN", None
         elif latest is not None and latest.event.level in (YELLOW, RED):
             if self._pending is not None:
                 self._pending.ended = "replaced"
             self._recent_moves.clear()  # a new plan's moves are timed afresh
-            self._pending = self._make_plan(cache, latest, started)
+            self._pending = self._make_plan(cache, latest, latest.event.headroom_bytes, started)
             self._cursor, planned = 0, True
+        elif self._persisting(cache):
+            # The level held, no plan is in hand, and the cache has sealed
+            # pages since the last plan: plan again, for the headroom now.
+            self._recent_moves.clear()
+            self._pending = self._make_plan(cache, self._last_pressure,
+                                            self._monitor.headroom_bytes, started,
+                                            persisting=True)
+            self._cursor, planned = 0, self._pending is not None
         if self._pending is not None:
             self._apply(cache, started, planned, own_before)
 
-    def _make_plan(self, cache: model.PagedCache, record: PressureRecord,
-                   started: float) -> PlanRecord | None:
-        """A plan for this event, recorded; None, recorded as applied, if it
-        has nothing to do."""
+    def _persisting(self, cache: model.PagedCache) -> bool:
+        return (self._pending is None and self._monitor is not None
+                and self._last_pressure is not None
+                and self._monitor.level in (YELLOW, RED)
+                and self._monitor.headroom_bytes is not None
+                and cache.pages.pages_per_layer > self._planned_pages)
+
+    def _make_plan(self, cache: model.PagedCache, record: PressureRecord, headroom: int,
+                   started: float, persisting: bool = False) -> PlanRecord | None:
+        """A plan for this headroom, recorded with the event it answers;
+        None if it has nothing to do, recorded as applied, unless it was
+        made because pressure persisted, when nothing is recorded."""
+        self._planned_pages = cache.pages.pages_per_layer
         pages = cache.pages
         tiers = pages.page_tiers()
         layers, count = tiers.shape
@@ -717,10 +745,13 @@ class Engine:
                              seed=self.kv_score_seed)
         page_bytes, errors, seconds = self._plan_inputs
         plan = controller.plan_arrays(
-            record.event.headroom_bytes, self._thresholds, scores, tiers, page_bytes, errors,
+            headroom, self._thresholds, scores, tiers, page_bytes, errors,
             move_seconds=seconds, positions=cache.length, page_tokens=pages.page_tokens,
             budget_seconds=self.kv_plan_budget_seconds)
-        entry = PlanRecord(record, plan, time.perf_counter() - started, [])
+        entry = PlanRecord(record, plan, time.perf_counter() - started, [],
+                           headroom_bytes=headroom, persisting=persisting)
+        if len(plan) == 0 and persisting:
+            return None
         self.plans.append(entry)
         if len(plan) == 0:
             entry.ended = "applied"
