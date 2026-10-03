@@ -25,6 +25,7 @@ from . import _microinfer, controller, model, nvml, weights
 from .config import ConfigMismatch, ModelConfig
 from .footprint import Footprint
 from .models import VERIFIED
+from .monitor import DEFAULT as DEFAULT_THRESHOLDS
 from .monitor import GREEN, RED, YELLOW, Monitor, PressureEvent, Thresholds
 from .score_sources import SOURCES, score_array
 
@@ -173,6 +174,24 @@ def paged_cache_bytes(cfg: ModelConfig, context_length: int, tier: str = "FP16",
 
 #: What Engine.hold reports after each prefill chunk and each decoded token.
 PREFILLING, DECODING = "prefilling", "decoding"
+#: How a generation ended (#107): every token asked for, or up to an end of
+#: sequence; or stopped gracefully, memory exhausted.
+COMPLETE, EXHAUSTED = "complete", "exhausted"
+
+
+@dataclass(frozen=True)
+class Ending:
+    """How a generation ended: its state, COMPLETE or EXHAUSTED, the
+    positions its cache held, the tokens it kept, and, if exhausted, why."""
+
+    state: str
+    positions: int
+    tokens: np.ndarray
+    reason: str = ""
+
+
+class _Exhausted(Exception):
+    """A step's allocation failed and an emergency plan did not answer it."""
 
 
 @dataclass(frozen=True)
@@ -187,6 +206,9 @@ class PressureRecord:
 
 #: The least room a YELLOW step keeps in its budget for its next downgrade.
 MOVE_MARGIN_SECONDS = 0.002
+#: The empty granules an adaptive cache keeps mapped at each quantised tier,
+#: so that an emergency plan's first downgrades have room (#107).
+EMERGENCY_SPARES = 1
 #: How often, at GREEN with no plan in hand, the engine looks for upgrades to
 #: make (#106): not every step, most of which would find none.
 UPGRADE_RETRY_SECONDS = 0.25
@@ -217,9 +239,11 @@ class PlanRecord:
     event that caused it, and what became of it: the batches applied, the
     moves skipped (their page had moved since), and how it ended,
     "applied", "cancelled at GREEN", "replaced" by a later plan,
-    "cancelled by pressure" (upgrades), or the error that stopped it."""
+    "cancelled by pressure" (upgrades), or the error that stopped it. An
+    emergency plan answers an allocation that failed, not an event: its
+    `pressure` is the last event, if any, and `emergency` the error."""
 
-    pressure: PressureRecord
+    pressure: PressureRecord | None
     plan: controller.Plan | controller.UpgradePlan
     planning_seconds: float
     batches: list[AppliedBatch]
@@ -231,6 +255,8 @@ class PlanRecord:
     #: Made not on an event but because the level stayed YELLOW or RED while
     #: the cache sealed more pages.
     persisting: bool = False
+    #: The OutOfMemory an emergency plan answers (#107); None for any other.
+    emergency: str | None = None
 
     @property
     def applied(self) -> int:
@@ -326,6 +352,9 @@ class Engine:
         #: for the next: an outlier passes out of it, as none would of a max.
         self._recent_moves: collections.deque[float] = collections.deque(maxlen=64)
         self._thresholds: Thresholds | None = None
+        #: How the last generation ended (#107); None before the first, and
+        #: while one runs.
+        self.ending: Ending | None = None
 
         if verify:
             expected = VERIFIED.get(self.config.name)
@@ -573,16 +602,70 @@ class Engine:
         # The last new token is never fed back, so the cache needs one row less
         # than prompt plus output.
         self._check_window(len(ids) + max_new_tokens - 1)
+        self.ending = None
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
-        out = [self._first_token(cache, ids)]
+        out: list[int] = []
+        try:
+            out.append(self._first_token(cache, ids))
+            step = model.Workspace(self.config, rows=1)
+            with self._holding(cache, step):
+                while len(out) < max_new_tokens and not (stop_at_eos
+                                                         and out[-1] in self.eos_token_ids):
+                    self._run(step, cache, np.array(out[-1:], np.int32))
+                    out.append(self._model.greedy_last(step, 1))
+                    self._drain_pressure(cache)
+        except (_Exhausted, _microinfer.OutOfMemory) as exc:
+            # Out of memory anywhere else, a workspace or a step's logits, is
+            # answered as one the emergency plan could not answer.
+            if not (isinstance(exc, _Exhausted) or self._adapts(cache)):
+                raise
+            return self._end(Ending(EXHAUSTED, cache.length, np.asarray(out, np.int32),
+                                    str(exc)))
+        return self._end(Ending(COMPLETE, cache.length, np.asarray(out, np.int32)))
 
-        step = model.Workspace(self.config, rows=1)
-        with self._holding(cache, step):
-            while len(out) < max_new_tokens and not (stop_at_eos and out[-1] in self.eos_token_ids):
-                self._model.run(step, cache, np.array(out[-1:], np.int32))
-                out.append(self._model.greedy_last(step, 1))
-                self._drain_pressure(cache)
-        return np.asarray(out, dtype=np.int32)
+    def _end(self, ending: Ending) -> np.ndarray:
+        self.ending = ending
+        return ending.tokens
+
+    def _adapts(self, cache) -> bool:
+        return self.kv_adaptive and isinstance(cache, model.PagedCache)
+
+    def _run(self, ws: model.Workspace, cache, ids: np.ndarray, captured=None) -> None:
+        """One step, a decoded token or a prefill chunk. In an adaptive
+        engine, a step whose allocation fails is answered by an emergency
+        plan, and run once more (#107): a RED plan for no headroom, applied
+        at once. A step that fails reserves nothing (KVPages::reserve), so
+        it can be run again. If the plan has nothing to downgrade, frees
+        nothing, or the step fails again, the generation is exhausted. An
+        engine that does not adapt raises OutOfMemory, as it did."""
+        for attempt in range(2):
+            try:
+                self._model.run(ws, cache, ids, captured)
+                return
+            except _microinfer.OutOfMemory as exc:
+                if not self._adapts(cache):
+                    raise
+                if attempt == 1:
+                    raise _Exhausted(f"{exc}, again after an emergency plan") from exc
+                self._emergency(cache, exc)
+
+    def _emergency(self, cache: model.PagedCache, exc: Exception) -> None:
+        """Plan and apply every downgrade for no headroom; raises _Exhausted
+        if that freed no cache memory, with why."""
+        started = time.perf_counter()
+        if self._pending is not None:
+            self._pending.ended, self._pending = "replaced", None
+        self._recent_moves.clear()
+        before = cache.nbytes
+        entry = self._make_plan(cache, self._last_pressure, 0, started, emergency=str(exc))
+        if entry is None:
+            raise _Exhausted(f"{exc}; nothing to downgrade") from exc
+        self._pending, self._cursor = entry, 0
+        self._apply(cache, started, True, self._own_bytes())
+        if self._pending is not None:  # only a RED plan is applied at once
+            raise RuntimeError(f"an emergency plan was left part done: {entry.ended}")
+        if cache.nbytes >= before:
+            raise _Exhausted(f"{exc}; the emergency plan freed nothing ({entry.ended})") from exc
 
     def hold(self, prompt, *, context: int | None = None, stop: threading.Event,
              report: Callable[[str, int, int | None], None] | None = None) -> None:
@@ -808,11 +891,13 @@ class Engine:
                 and self._monitor.headroom_bytes is not None
                 and cache.pages.pages_per_layer > self._planned_pages)
 
-    def _make_plan(self, cache: model.PagedCache, record: PressureRecord, headroom: int,
-                   started: float, persisting: bool = False) -> PlanRecord | None:
-        """A plan for this headroom, recorded with the event it answers;
-        None if it has nothing to do, recorded as applied, unless it was
-        made because pressure persisted, when nothing is recorded."""
+    def _make_plan(self, cache: model.PagedCache, record: PressureRecord | None, headroom: int,
+                   started: float, persisting: bool = False,
+                   emergency: str | None = None) -> PlanRecord | None:
+        """A plan for this headroom, recorded with the event it answers, or
+        the error an emergency plan answers; None if it has nothing to do,
+        recorded as applied, unless it was made because pressure persisted,
+        when nothing is recorded."""
         self._planned_pages = cache.pages.pages_per_layer
         pages = cache.pages
         tiers = pages.page_tiers()
@@ -821,17 +906,19 @@ class Engine:
         scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
                              seed=self.kv_score_seed)
         page_bytes, errors, seconds = self._plan_inputs
+        # The monitor's thresholds; ADR-0013's for an emergency plan made
+        # with no monitor running.
         plan = controller.plan_arrays(
-            headroom, self._thresholds, scores, tiers, page_bytes, errors,
+            headroom, self._thresholds or DEFAULT_THRESHOLDS, scores, tiers, page_bytes, errors,
             move_seconds=seconds, positions=cache.length, page_tokens=pages.page_tokens,
             budget_seconds=self.kv_plan_budget_seconds)
         entry = PlanRecord(record, plan, time.perf_counter() - started, [],
-                           headroom_bytes=headroom, persisting=persisting)
+                           headroom_bytes=headroom, persisting=persisting, emergency=emergency)
         if len(plan) == 0 and persisting:
             return None
         self.plans.append(entry)
         if len(plan) == 0:
-            entry.ended = "applied"
+            entry.ended = "nothing to downgrade" if emergency else "applied"
             return None
         self._recent_moves.append(float(plan.seconds.max()))  # until one is timed
         return entry
@@ -952,7 +1039,7 @@ class Engine:
             for start in range(0, n, size):
                 chunk = ids[start:start + size]
                 captured = [] if hidden_states else None
-                self._model.run(ws, cache, chunk, captured)
+                self._run(ws, cache, chunk, captured)
                 yield chunk, ws, captured, start + size >= n
 
     def _new_cache(self, capacity: int):
@@ -967,9 +1054,18 @@ class Engine:
             # An adaptive cache seals, so that any page can be downgraded, and
             # scores its pages when a plan reads the scorer's scores.
             scoring = self.kv_scoring or (self.kv_adaptive and self.kv_score_source == "semantic")
-            return model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map),
-                                    always_seal=self.kv_adaptive, scoring=scoring,
-                                    score_every=self.kv_score_every)
+            cache = model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map),
+                                     always_seal=self.kv_adaptive, scoring=scoring,
+                                     score_every=self.kv_score_every)
+            if self.kv_adaptive:
+                # A spare granule at each quantised tier (#107): a downgrade
+                # maps its new page before it frees the old, so with none, an
+                # emergency plan, made when the driver has nothing to give,
+                # could not start. Once it has freed enough FP16 pages to
+                # empty a granule, the driver has room again.
+                for t in controller.TIERS[1:]:
+                    cache.allocator.keep_spare_granules(getattr(Tier, t), EMERGENCY_SPARES)
+            return cache
         if tier == Tier.FP16:
             raise ValueError("kv_halves splits a quantised tier; FP16 has nothing to split")
         return model.PagedCache(self.config, tier,

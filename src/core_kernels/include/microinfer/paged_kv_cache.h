@@ -148,8 +148,19 @@ namespace microinfer
 
     std::size_t page_bytes(Tier tier) const;
     std::size_t reserved_bytes(Tier tier) const;
-    // Device memory currently backing the tier: whole granules only.
+    // Device memory currently backing the tier: whole granules only, the
+    // spare granules among them.
     std::size_t mapped_bytes(Tier tier) const;
+
+    // Keeps up to `granules` empty granules mapped beyond the tier's tail
+    // (#107): room the next pages at the tier take without asking the
+    // driver, so that an emergency downgrade into the tier can start when
+    // the driver has nothing left to give. Mapped now and kept as the tail
+    // grows, as far as the driver allows and the tier's reserved address
+    // space reaches: a spare the driver refuses is not an error, and an
+    // allocate fails only if the page itself cannot be backed.
+    void keep_spare_granules(Tier tier, std::size_t granules);
+    std::size_t spare_granules(Tier tier) const;
     // From cuMemGetAllocationGranularity, never assumed.
     std::size_t granule_bytes() const { return granule_; }
 
@@ -166,6 +177,7 @@ namespace microinfer
       std::size_t capacity_pages = 0;
       std::vector<PageKey> slots;
       std::vector<CUmemGenericAllocationHandle> granules;
+      std::size_t spare_granules = 0;
     };
 
     Range &range(Tier tier) { return ranges_[static_cast<int>(tier)]; }
@@ -177,10 +189,14 @@ namespace microinfer
     // free() of any page in the same tier. Checks that `bytes` is the page's
     // size, since every caller is about to copy that many.
     CUdeviceptr address(PageKey key, std::size_t bytes) const;
-    // Maps or releases granules until exactly those the slots reach remain.
     // Undoes the slot the failed allocate took, giving back its granules.
     void roll_back(Range &r);
-    void fit_granules(Range &r);
+    // Maps or releases granules until those the slots reach remain, and the
+    // spares beyond them: mapped, if `map_spares`, as far as the driver
+    // gives; kept, and never mapped, by a free or a roll back, which only
+    // give memory back.
+    void fit_granules(Range &r, bool map_spares);
+    void map_granule(Range &r);
     void release_everything() noexcept;
 
     // Counts every allocate and free. A page may move on any of them, so an

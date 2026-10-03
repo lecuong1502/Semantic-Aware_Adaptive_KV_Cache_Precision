@@ -38,6 +38,14 @@ memory, as `cuMemGetAllocationGranularity` reports it. Memory returns to the
 driver a whole granule at a time, and only once no live page reaches into it.
 _Avoid_: chunk, block, slab
 
+**Spare granule**:
+An empty granule a tier keeps mapped beyond its tail, so that the next
+pages at the tier need nothing from the driver. An adaptive cache keeps one
+at each quantised tier, for an emergency plan's first downgrades: a
+downgrade maps its new page before it frees the old (#107). Kept as far as
+the driver allows; a spare it refuses is not an error.
+_Avoid_: reserve (reserving is address space, ADR-0007), headroom
+
 **Precision tier**:
 The numeric format a page's keys and values are stored in: `FP16`, `INT8`,
 `INT4`, or `INT2`. A tier belongs to a `(layer, page)` pair, not to a token
@@ -206,6 +214,28 @@ replaced by a later plan, or stopped (#105). Upgrades the engine makes at
 GREEN are recorded the same way, with the event that brought GREEN, and a
 YELLOW or RED cancels those not yet made (#106).
 _Avoid_: plan log, history
+
+**Emergency plan**:
+A RED plan for no headroom, made when allocating a step's pages raised
+OutOfMemory, applied at once; the step is then run once more (#107). Its
+plan record carries the error rather than a pressure event.
+_Avoid_: panic plan, OOM handler
+
+**Ending**:
+How a generation ended, `Engine.ending`: its state, complete or exhausted,
+the positions its cache held, the tokens it kept, and, if exhausted, why
+(#107). Complete is every token asked for, or up to an end of sequence.
+_Avoid_: session (a passive session is a recording), result, status
+
+**Exhausted**:
+The ending of a generation in an adaptive engine that ran out of memory
+and could not go on: an allocation failed and an emergency plan did not
+answer it, having nothing to downgrade, freeing nothing, or the step
+failing again; or memory was refused outside a step's pages. The engine
+returns the tokens kept, records the positions reached, and releases the
+cache; nothing is raised (#107). An engine that does not adapt raises
+OutOfMemory, as it did.
+_Avoid_: crashed, aborted, OOM-killed
 
 **Plan batch**:
 The downgrades of a requantisation plan, or the upgrades of an upgrade

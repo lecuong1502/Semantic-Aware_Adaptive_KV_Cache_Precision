@@ -410,3 +410,66 @@ def test_running_out_is_an_error_of_its_own_that_names_the_page_and_takes_nothin
         assert (0, held) not in cache
     finally:
         del cache
+
+
+# -- spare granules (#107) ----------------------------------------------------
+
+
+def test_spare_granules_are_mapped_at_once_and_kept_beyond_the_tail():
+    """A tier keeping one spare maps it at once, and keeps one empty granule
+    beyond its tail as pages come and go: the pages a granule holds are
+    taken without another granule mapped, and one more maps the next spare.
+    Never beyond the tier's reserved address space; and none for a tier
+    that keeps none. NVML sees the spare as it sees any granule."""
+    g = granule()
+    page = g // 4
+    cache = make_cache([page] * 4, capacity_pages=[16, 16, 6, 16])
+    before = nvml.free_bytes()
+    cache.keep_spare_granules(Tier.INT8, 1)
+    assert cache.spare_granules(Tier.INT8) == 1 and cache.spare_granules(Tier.FP16) == 0
+    assert cache.mapped_bytes(Tier.INT8) == g
+    assert abs((before - nvml.free_bytes()) - g) < g / 2
+    for i in range(4):
+        cache.allocate(0, i, Tier.INT8)
+        assert cache.mapped_bytes(Tier.INT8) == 2 * g, i
+    cache.allocate(0, 4, Tier.INT8)
+    assert cache.mapped_bytes(Tier.INT8) == 3 * g
+    for i in range(4, 0, -1):
+        cache.free(0, i)
+    assert cache.mapped_bytes(Tier.INT8) == 2 * g
+    cache.keep_spare_granules(Tier.INT8, 0)
+    assert cache.mapped_bytes(Tier.INT8) == g
+    # 6 pages of a quarter granule each reserve 2 granules: spares stop there.
+    cache.keep_spare_granules(Tier.INT4, 5)
+    assert cache.mapped_bytes(Tier.INT4) == cache.reserved_bytes(Tier.INT4) == 2 * g
+    for i in range(6):
+        cache.allocate(1, i, Tier.INT4)
+    assert cache.mapped_bytes(Tier.INT4) == 2 * g
+    assert cache.mapped_bytes(Tier.FP16) == 0
+
+
+def test_a_spare_the_driver_refuses_is_not_an_error():
+    """With the device full, a page that fits in a mapped granule is placed
+    though the spare beyond it cannot be mapped; and asking for spares the
+    driver cannot give maps none and raises nothing."""
+    size = granule()
+    capacity = _microinfer.device_memory_info()["free"] // size + 64
+    cache = make_cache([size, size // 2, size, size], capacity_pages=capacity)
+    filler = make_cache([size] * 4, capacity_pages=capacity)
+    held = 0
+    try:
+        cache.keep_spare_granules(Tier.INT8, 1)
+        assert cache.mapped_bytes(Tier.INT8) == size
+        with pytest.raises(_microinfer.OutOfMemory):
+            while True:
+                filler.allocate(0, held, Tier.FP16)
+                held += 1
+        cache.allocate(0, 0, Tier.INT8)  # into the spare; the next is refused
+        cache.allocate(0, 1, Tier.INT8)
+        assert cache.mapped_bytes(Tier.INT8) == size
+        with pytest.raises(_microinfer.OutOfMemory):
+            cache.allocate(0, 2, Tier.INT8)  # the page itself needs a granule
+        cache.keep_spare_granules(Tier.INT4, 3)
+        assert cache.mapped_bytes(Tier.INT4) == 0
+    finally:
+        del filler, cache

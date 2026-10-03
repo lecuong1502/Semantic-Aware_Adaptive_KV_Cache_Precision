@@ -637,6 +637,17 @@ PYBIND11_MODULE(_microinfer, m)
       .def("reserved_bytes", &PagedKVCache::reserved_bytes, py::arg("tier"))
       .def("mapped_bytes", &PagedKVCache::mapped_bytes, py::arg("tier"),
            "Device memory backing the tier now: whole granules.")
+      .def(
+          "keep_spare_granules",
+          [](PagedKVCache &c, Tier tier, std::size_t granules)
+          {
+            py::gil_scoped_release release;
+            c.keep_spare_granules(tier, granules);
+          },
+          py::arg("tier"), py::arg("granules"),
+          "Keep up to this many empty granules mapped beyond the tier's "
+          "tail, as far as the driver allows (#107).")
+      .def("spare_granules", &PagedKVCache::spare_granules, py::arg("tier"))
       .def_property_readonly("granule_bytes", &PagedKVCache::granule_bytes,
                              "From cuMemGetAllocationGranularity.");
 }

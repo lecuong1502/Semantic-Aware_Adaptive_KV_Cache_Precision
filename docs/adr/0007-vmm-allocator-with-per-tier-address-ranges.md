@@ -149,3 +149,50 @@ rebuilds it. A test that builds and drops caches then reads 87 MiB that no
 reservation took. The engine holds the context through the runtime API for its
 whole life, so this does not affect it, but any measurement of the cache must
 be taken with the context already alive.
+
+## Amendment: a tier may keep spare granules mapped (#107)
+
+A tier now maps granules only as its pages need them **unless it is asked to
+keep spares**: `keep_spare_granules(tier, n)` keeps up to `n` empty granules
+mapped beyond the tail. A spare is mapped as far as the driver allows and the
+tier's reserved address space reaches. A spare the driver refuses is not an
+error: an allocate fails only if the page itself cannot be backed.
+
+The reason is the order of a downgrade. It maps the page's new copy at the
+lower tier before it frees the FP16 page, so it needs memory before it gives
+any back. When contention has taken every granule, an emergency plan's first
+downgrade would be refused, and the plan could free nothing. An adaptive
+engine's cache therefore keeps one spare at each quantised tier, 3 granules.
+The first downgrades go into those spares. Once enough FP16 pages have gone to
+empty a granule, the tail swap returns that granule to the driver, and the
+rest of the plan has room. With the device filled, the tests show a plan that
+starts this way and the generation recovering
+(`tests/test_emergency_downgrade.py`). Without spares, the same generation ends
+exhausted.
+
+Every other cache keeps none, and maps exactly what its pages reach, as
+before. A free or a roll back never maps a spare: they only give memory back,
+so a driver error there cannot leave `KVPages::reserve` half undone.
+
+This amends the rule above that memory a cache does not need goes back to the
+driver. Three granules stay mapped beyond what the pages reach, a hold of
+6 MiB at a 2 MiB granule, in exchange for an emergency plan that can start.
+
+**Rejected.**
+- *Free before mapping.* The downgrade would free the FP16 page and then write
+  the new one, from its shadow. But the shadow is made by the first downgrade
+  from the FP16 page, so a page with no shadow would be lost if the new page
+  could not be mapped. A page kept readable until its replacement is in place
+  is what #93 built `replace` for.
+- *A larger pool, or one shared by every tier.* One granule a tier is enough
+  for the first downgrades to empty an FP16 granule: 128 FP16 pages of 16 KiB
+  fill one, for Qwen2.5-0.5B, against 256 INT8 pages in a spare. A shared pool
+  needs moves across tiers' address ranges, which ADR-0007's per-tier ranges
+  rule out.
+- *Plan only into tiers with room.* Before any downgrade, no quantised tier
+  has room, so the plan would be empty exactly when it is needed.
+
+**Known limit.** No FP16 spare is kept. A move from a quantised page uploads
+its shadow to an FP16 page first (#96), so an emergency plan whose first move
+starts below FP16, after earlier plans, can still be refused on a full device.
+The generation then ends exhausted, as gracefully.
