@@ -163,6 +163,24 @@ Controller emits in response to a pressure level. Producing a plan is a pure
 decision; nothing has moved until the KV Cache Manager applies it.
 _Avoid_: re-quant plan, migration, schedule
 
+**Byte target**:
+What a requantisation plan reclaims: the bytes that bring headroom back to
+YELLOW's threshold plus a margin (ADR-0013, #101). A plan meets it with
+downgrades, and overshoots by less than its last one.
+_Avoid_: quota, budget (the budget is a plan batch's time)
+
+**Marginal cost** (of a downgrade):
+A page's importance score times the error one tier down adds, per byte the
+downgrade saves. The controller takes the cheapest downgrade, again and
+again, until the byte target is met (#101).
+_Avoid_: priority, penalty
+
+**Plan batch**:
+The downgrades of a requantisation plan applied between two decode steps:
+at YELLOW, as many as fit a per-step time budget; at RED, the whole plan.
+Not a batch of sequences: there is one sequence.
+_Avoid_: chunk (a prefill chunk is positions)
+
 **Downgrade / Upgrade**:
 Moving a page to a lower-precision tier to reclaim bytes, or back toward FP16
 to recover quality once pressure passes. Always name the direction; "requantise"
