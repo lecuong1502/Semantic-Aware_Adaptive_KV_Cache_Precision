@@ -24,8 +24,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from conftest import require_model, stable_free_bytes
-from microinfer import Engine
+from conftest import require_model
+from microinfer import Engine, nvml
 from microinfer.gate import (KL_MAX, LAYER_COSINE_MIN, TOP1_MIN, kl_divergence,
                              layer_report, run_gate)
 from microinfer.golden import GoldenError, GoldenSet, load_prompts
@@ -220,9 +220,10 @@ def test_one_sequence_of_known_tokens_on_loaded_weights_and_no_pytorch(engine):
 def test_peak_memory_is_reported_and_matches_what_the_driver_saw(engine):
     """The peak footprint names what the engine held at its most: the weights,
     the contiguous cache for prompt plus output, and one step's workspace. What
-    the driver lost over the same run agrees with the cache and workspace to
-    within 8 MiB: the 6 MiB other processes put on the reading (ADR-0007, note
-    from #10), and a 2 MiB granule besides.
+    the driver gives this process for them, by its account of this process
+    alone, agrees with the cache and workspace to within 8 MiB: whole granules
+    in each of the cache's ranges and the workspace's allocations (ADR-0007,
+    note from #10). Measured here, 68.0 MiB for 65.2 MiB, every run.
 
     The run is made once before it is measured. The first time a GEMM shape is
     used, the driver loads cuBLAS kernels for it and keeps about 16 MiB,
@@ -238,7 +239,6 @@ def test_peak_memory_is_reported_and_matches_what_the_driver_saw(engine):
     ids = np.arange(100, 100 + prompt, dtype=np.int32)
     engine.generate(ids, new, stop_at_eos=False)  # warm: see the docstring
     engine.reset_peak()
-    before = stable_free_bytes()
     engine.generate(ids, new, stop_at_eos=False)
     peak = engine.peak_footprint()
     print("\n" + peak.render())
@@ -253,10 +253,21 @@ def test_peak_memory_is_reported_and_matches_what_the_driver_saw(engine):
     assert peak.weights == sum(t.nbytes for t in engine.tensors.values())
     assert peak.engine_total == peak.weights + peak.kv_cache + peak.workspace
 
-    taken = before - peak.device_free
-    held = peak.kv_cache + peak.workspace
+    # What this process holds by the driver's own account while the cache
+    # and the last chunk's workspace are alive, which no other process
+    # moves: device free memory, which this read before, moved by tens of
+    # MiB as a browser's GPU process did (#123's two tests, and this one).
+    before = nvml.settled_own_used_bytes()
+    cache = engine._new_cache(capacity=prompt)
+    for _, chunk_ws, _, last in engine._prefill(cache, ids):
+        if last:
+            taken = nvml.own_used_bytes() - before
+            held = cache.nbytes + chunk_ws.nbytes
+        del chunk_ws
+    del cache
+    assert held == peak.kv_cache + peak.workspace
     assert abs(taken - held) <= 8 * MIB, (
-        f"the driver lost {taken / MIB:.1f} MiB while the engine held {held / MIB:.1f} MiB "
-        f"of cache and workspace")
+        f"the driver gave this process {taken / MIB:.1f} MiB while the engine held "
+        f"{held / MIB:.1f} MiB of cache and workspace")
     assert engine.footprint().kv_cache == 0 and engine.footprint().workspace == 0, (
         "cache and workspace are released when generation ends")
