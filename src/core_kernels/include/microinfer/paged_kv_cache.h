@@ -192,8 +192,10 @@ namespace microinfer
     // Undoes the slot the failed allocate took, giving back its granules.
     void roll_back(Range &r);
     // Maps or releases granules until those the slots reach remain, and the
-    // spares beyond them that the driver gives.
-    void fit_granules(Range &r);
+    // spares beyond them: mapped, if `map_spares`, as far as the driver
+    // gives; kept, and never mapped, by a free or a roll back, which only
+    // give memory back.
+    void fit_granules(Range &r, bool map_spares);
     void map_granule(Range &r);
     void release_everything() noexcept;
 

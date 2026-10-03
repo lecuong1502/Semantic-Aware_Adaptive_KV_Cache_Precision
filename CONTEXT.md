@@ -221,12 +221,20 @@ OutOfMemory, applied at once; the step is then run once more (#107). Its
 plan record carries the error rather than a pressure event.
 _Avoid_: panic plan, OOM handler
 
+**Ending**:
+How a generation ended, `Engine.ending`: its state, complete or exhausted,
+the positions its cache held, the tokens it kept, and, if exhausted, why
+(#107). Complete is every token asked for, or up to an end of sequence.
+_Avoid_: session (a passive session is a recording), result, status
+
 **Exhausted**:
-How a session ends when an allocation failed and an emergency plan did not
-answer it: it had nothing to downgrade, freed nothing, or the step failed
-again. The engine returns the tokens kept, records the positions reached,
-and releases the cache; nothing is raised (#107). The other ending is
-complete.
+The ending of a generation in an adaptive engine that ran out of memory
+and could not go on: an allocation failed and an emergency plan did not
+answer it, having nothing to downgrade, freeing nothing, or the step
+failing again; or memory was refused outside a step's pages. The engine
+returns the tokens kept, records the positions reached, and releases the
+cache; nothing is raised (#107). An engine that does not adapt raises
+OutOfMemory, as it did.
 _Avoid_: crashed, aborted, OOM-killed
 
 **Plan batch**:

@@ -1,6 +1,6 @@
-#include <algorithm>
 #include <cuda.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -155,7 +155,7 @@ namespace microinfer
     r.slots.push_back(key);
     try
     {
-      fit_granules(r);
+      fit_granules(r, true);
     }
     catch (const OutOfMemory &e)
     {
@@ -185,7 +185,8 @@ namespace microinfer
     r.slots.pop_back();
     try
     {
-      fit_granules(r); // Give back any granule mapped before the failure.
+      // Give back any granule mapped before the failure.
+      fit_granules(r, false);
     }
     catch (...)
     {
@@ -216,7 +217,7 @@ namespace microinfer
 
     // The copy must land before the granule it read from can be unmapped.
     driver_check(cuCtxSynchronize(), "cuCtxSynchronize");
-    fit_granules(r);
+    fit_granules(r, false);
   }
 
   void PagedKVCache::replace(PageKey key, PageKey staged)
@@ -255,7 +256,7 @@ namespace microinfer
     driver_check(cuMemSetAccess(at, granule_, &access, 1), "cuMemSetAccess");
   }
 
-  void PagedKVCache::fit_granules(Range &r)
+  void PagedKVCache::fit_granules(Range &r, bool map_spares)
   {
     const std::size_t needed =
         round_up(r.slots.size() * r.page_bytes, granule_) / granule_;
@@ -268,7 +269,7 @@ namespace microinfer
     }
     try
     {
-      while (r.granules.size() < kept)
+      while (map_spares && r.granules.size() < kept)
       {
         map_granule(r);
       }
@@ -295,7 +296,7 @@ namespace microinfer
     Range &r = range(tier);
     ContextScope scope(ctx_);
     r.spare_granules = granules;
-    fit_granules(r);
+    fit_granules(r, true);
   }
 
   std::size_t PagedKVCache::spare_granules(Tier tier) const

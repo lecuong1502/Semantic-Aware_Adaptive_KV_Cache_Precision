@@ -180,8 +180,8 @@ COMPLETE, EXHAUSTED = "complete", "exhausted"
 
 
 @dataclass(frozen=True)
-class Session:
-    """How the last generation ended: its state, COMPLETE or EXHAUSTED, the
+class Ending:
+    """How a generation ended: its state, COMPLETE or EXHAUSTED, the
     positions its cache held, the tokens it kept, and, if exhausted, why."""
 
     state: str
@@ -352,8 +352,9 @@ class Engine:
         #: for the next: an outlier passes out of it, as none would of a max.
         self._recent_moves: collections.deque[float] = collections.deque(maxlen=64)
         self._thresholds: Thresholds | None = None
-        #: How the last generation ended (#107); None before the first.
-        self.session: Session | None = None
+        #: How the last generation ended (#107); None before the first, and
+        #: while one runs.
+        self.ending: Ending | None = None
 
         if verify:
             expected = VERIFIED.get(self.config.name)
@@ -601,6 +602,7 @@ class Engine:
         # The last new token is never fed back, so the cache needs one row less
         # than prompt plus output.
         self._check_window(len(ids) + max_new_tokens - 1)
+        self.ending = None
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
         out: list[int] = []
         try:
@@ -612,13 +614,21 @@ class Engine:
                     self._run(step, cache, np.array(out[-1:], np.int32))
                     out.append(self._model.greedy_last(step, 1))
                     self._drain_pressure(cache)
-        except _Exhausted as exc:
-            tokens = np.asarray(out, dtype=np.int32)
-            self.session = Session(EXHAUSTED, cache.length, tokens, str(exc))
-            return tokens
-        tokens = np.asarray(out, dtype=np.int32)
-        self.session = Session(COMPLETE, cache.length, tokens)
-        return tokens
+        except (_Exhausted, _microinfer.OutOfMemory) as exc:
+            # Out of memory anywhere else, a workspace or a step's logits, is
+            # answered as one the emergency plan could not answer.
+            if not (isinstance(exc, _Exhausted) or self._adapts(cache)):
+                raise
+            return self._end(Ending(EXHAUSTED, cache.length, np.asarray(out, np.int32),
+                                    str(exc)))
+        return self._end(Ending(COMPLETE, cache.length, np.asarray(out, np.int32)))
+
+    def _end(self, ending: Ending) -> np.ndarray:
+        self.ending = ending
+        return ending.tokens
+
+    def _adapts(self, cache) -> bool:
+        return self.kv_adaptive and isinstance(cache, model.PagedCache)
 
     def _run(self, ws: model.Workspace, cache, ids: np.ndarray, captured=None) -> None:
         """One step, a decoded token or a prefill chunk. In an adaptive
@@ -626,25 +636,22 @@ class Engine:
         plan, and run once more (#107): a RED plan for no headroom, applied
         at once. A step that fails reserves nothing (KVPages::reserve), so
         it can be run again. If the plan has nothing to downgrade, frees
-        nothing, or the step fails again, the session is exhausted."""
-        if not (self.kv_adaptive and isinstance(cache, model.PagedCache)):
-            self._model.run(ws, cache, ids, captured)
-            return
-        try:
-            self._model.run(ws, cache, ids, captured)
-            return
-        except _microinfer.OutOfMemory as exc:
-            reason = self._emergency(cache, exc)
-            if reason:
-                raise _Exhausted(f"{exc}; {reason}") from exc
-        try:
-            self._model.run(ws, cache, ids, captured)
-        except _microinfer.OutOfMemory as exc:
-            raise _Exhausted(f"{exc}, again after an emergency plan") from exc
+        nothing, or the step fails again, the generation is exhausted. An
+        engine that does not adapt raises OutOfMemory, as it did."""
+        for attempt in range(2):
+            try:
+                self._model.run(ws, cache, ids, captured)
+                return
+            except _microinfer.OutOfMemory as exc:
+                if not self._adapts(cache):
+                    raise
+                if attempt == 1:
+                    raise _Exhausted(f"{exc}, again after an emergency plan") from exc
+                self._emergency(cache, exc)
 
-    def _emergency(self, cache: model.PagedCache, exc: Exception) -> str:
-        """Plan and apply every downgrade for no headroom; "" if that freed
-        cache memory, else why it did not."""
+    def _emergency(self, cache: model.PagedCache, exc: Exception) -> None:
+        """Plan and apply every downgrade for no headroom; raises _Exhausted
+        if that freed no cache memory, with why."""
         started = time.perf_counter()
         if self._pending is not None:
             self._pending.ended, self._pending = "replaced", None
@@ -652,14 +659,13 @@ class Engine:
         before = cache.nbytes
         entry = self._make_plan(cache, self._last_pressure, 0, started, emergency=str(exc))
         if entry is None:
-            return "nothing to downgrade"
+            raise _Exhausted(f"{exc}; nothing to downgrade") from exc
         self._pending, self._cursor = entry, 0
         self._apply(cache, started, True, self._own_bytes())
         if self._pending is not None:  # only a RED plan is applied at once
             raise RuntimeError(f"an emergency plan was left part done: {entry.ended}")
         if cache.nbytes >= before:
-            return f"the emergency plan freed nothing ({entry.ended})"
-        return ""
+            raise _Exhausted(f"{exc}; the emergency plan freed nothing ({entry.ended})") from exc
 
     def hold(self, prompt, *, context: int | None = None, stop: threading.Event,
              report: Callable[[str, int, int | None], None] | None = None) -> None:
@@ -900,6 +906,8 @@ class Engine:
         scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
                              seed=self.kv_score_seed)
         page_bytes, errors, seconds = self._plan_inputs
+        # The monitor's thresholds; ADR-0013's for an emergency plan made
+        # with no monitor running.
         plan = controller.plan_arrays(
             headroom, self._thresholds or DEFAULT_THRESHOLDS, scores, tiers, page_bytes, errors,
             move_seconds=seconds, positions=cache.length, page_tokens=pages.page_tokens,
