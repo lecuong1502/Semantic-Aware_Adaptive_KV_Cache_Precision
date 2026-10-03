@@ -157,6 +157,14 @@ for each head, sum to 1. The attention kernel writes it when asked (#98);
 the scorer turns it into an importance score.
 _Avoid_: attention score (a score is a pre-softmax logit), page weight
 
+**Score source**:
+Where a requantisation plan's scores come from: the scorer's importance
+scores (semantic), or one of two baselines that stand in for them, uniform
+(RQ3's main baseline, every page alike, a partial step spread across
+positions) and random (a seeded control). Every source plans to the same
+byte target (#104). Only semantic scores are importance scores.
+_Avoid_: policy (a source changes the scores, not the planner), scorer
+
 **Requantisation plan**:
 The list of `(layer, page, current_tier, target_tier)` entries the Precision
 Controller emits in response to a pressure level. Producing a plan is a pure
