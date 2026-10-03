@@ -14,9 +14,10 @@ a headroom the test chooses, and the moves are real.
 import time
 
 import numpy as np
+from test_controller import upgrade_greedy_reference
 
 from conftest import require_model
-from microinfer import Engine, _microinfer, monitor
+from microinfer import Engine, _microinfer, controller, monitor
 
 MIB = 2**20
 NAME = "qwen2.5-0.5b-instruct"
@@ -64,9 +65,20 @@ def test_after_contention_passes_pages_return_to_fp16_in_the_policy_s_order():
     """A RED mid-decode downgrades pages; once headroom is ample again and
     the cooldown has passed, an upgrade plan restores every page with a
     shadow to FP16, each step within the budget. Its upgrades are applied
-    in its order, which is the policy's, gain never rising, and none comes
-    sooner than the cooldown after the last downgrade."""
+    in its order, which is the policy's: the greedy of #103 on the tiers,
+    shadows and scores the engine planned from. None comes sooner than the
+    cooldown after the last downgrade."""
     engine = adaptive_engine()
+    planned_from = []
+    real = controller.upgrade_plan_arrays
+
+    def recording(headroom, thresholds, scores, tiers, shadowed, *args, **kwargs):
+        inputs = (headroom, thresholds, scores.copy(), tiers.copy(), shadowed.copy())
+        plan = real(headroom, thresholds, scores, tiers, shadowed, *args, **kwargs)
+        planned_from.append((plan, inputs))
+        return plan
+
+    controller.upgrade_plan_arrays = recording
     ids = np.random.default_rng(206).integers(1000, 100_000, 2048).astype(np.int32)
 
     def headroom(cache):  # RED for a few decode steps, then ample
@@ -75,7 +87,10 @@ def test_after_contention_passes_pages_return_to_fp16_in_the_policy_s_order():
             return 100 * MIB
         return (AMPLE_MIB if length > len(ids) else 2000) * MIB
 
-    cache = run(engine, ids, 160, headroom)
+    try:
+        cache = run(engine, ids, 160, headroom)
+    finally:
+        controller.upgrade_plan_arrays = real
     downgrades = [p for p in engine.plans if not p.upgrades]
     upgrades = [p for p in engine.plans if p.upgrades]
     assert downgrades and downgrades[0].plan.level == monitor.RED
@@ -89,7 +104,16 @@ def test_after_contention_passes_pages_return_to_fp16_in_the_policy_s_order():
     assert record.ended == "applied" and record.applied + record.skipped == len(plan)
     assert [b.start for b in record.batches] == [0] + [b.end for b in record.batches[:-1]]
     assert all(b.seconds <= engine.kv_plan_budget_seconds for b in record.batches)
-    assert (np.diff(plan.gains) <= 1e-12).all(), "an upgrade came before one of larger gain"
+    headroom_bytes, thresholds, scores, tiers, shadowed = next(
+        inputs for made, inputs in planned_from if made is plan)
+    keys = list(zip(*np.nonzero(tiers >= 0)))
+    available = headroom_bytes - thresholds.yellow_below_bytes - controller.DEFAULT_UPGRADE_SPIKE_BYTES
+    assert [(u.layer, u.page, u.current_tier, u.target_tier) for u in plan.upgrades] == \
+        upgrade_greedy_reference(
+            available, {(int(l), int(p)): float(scores[l, p]) for l, p in keys},
+            {(int(l), int(p)): controller.TIERS[tiers[l, p]] for l, p in keys},
+            {(int(l), int(p)) for l, p in keys if shadowed[l, p]},
+            page_bytes=engine._plan_inputs[0], errors=engine._plan_inputs[1])
     assert record.batches[0].at_seconds - downgrades[-1].batches[-1].at_seconds >= COOLDOWN
     assert record.batches[-1].cache_bytes_after > downgrades[0].batches[0].cache_bytes_after
     assert_restored(cache)
@@ -127,4 +151,38 @@ def test_a_pulse_train_makes_no_downgrade_upgrade_thrash():
     assert first_up - last_down >= COOLDOWN
     last_pulse_ended = train[0] + 0.9 + 0.04
     assert first_up - last_pulse_ended >= COOLDOWN
+    assert_restored(cache)
+
+
+def test_a_blip_of_pressure_while_upgrading_cancels_the_upgrades_left():
+    """A RED that rises and falls within a step or two, while upgrades are
+    under way, cancels those not yet made, though the latest event the step
+    drains is GREEN: the cooldown runs again from the blip's end, and only
+    then are the pages restored."""
+    engine = adaptive_engine()
+    ids = np.random.default_rng(208).integers(1000, 100_000, 2048).astype(np.int32)
+    blip = []
+
+    def headroom(cache):
+        length = cache.length if cache is not None else 0
+        if len(ids) + 4 < length <= len(ids) + 8:
+            return 100 * MIB
+        pending = engine._pending
+        upgrading = pending is not None and pending.upgrades and pending.batches
+        now = time.monotonic()
+        if upgrading and not blip:
+            blip.append(now)
+        if blip and now - blip[0] < 0.012:
+            return 100 * MIB
+        return (AMPLE_MIB if length > len(ids) else 2000) * MIB
+
+    cache = run(engine, ids, 200, headroom)
+    upgrades = [p for p in engine.plans if p.upgrades]
+    print(f"\nupgrade plans: {[(len(p.plan), p.applied, p.ended) for p in upgrades]}")
+    assert blip and len(upgrades) >= 2
+    first, *later = upgrades
+    assert first.ended == "cancelled by pressure" and 0 < first.applied < len(first.plan)
+    assert engine.pressure_ended_seconds > blip[0]
+    assert later[0].batches[0].at_seconds - engine.pressure_ended_seconds >= COOLDOWN
+    assert later[-1].ended == "applied"
     assert_restored(cache)

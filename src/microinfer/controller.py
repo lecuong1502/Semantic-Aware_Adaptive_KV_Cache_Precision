@@ -56,7 +56,6 @@ the 0.02-0.04 ms a downgrade took on Qwen2.5-1.5B, some 500 a batch.
 from __future__ import annotations
 
 import functools
-import math
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -300,13 +299,6 @@ def _check_pages(scores: dict[tuple[int, int], float], tiers: dict[tuple[int, in
             raise ValueError(f"page {key}'s score is {scores[key]}; a score is a mass, >= 0")
 
 
-def _neutral(scores: dict[tuple[int, int], float], keys: list[tuple[int, int]] | dict) -> float:
-    """The score a page not yet scored is taken at: the mean of the scored
-    pages among `keys`, or 1 if none is scored, all alike then."""
-    scored = [scores[key] for key in keys if not math.isnan(scores[key])]
-    return sum(scored) / len(scored) if scored else 1.0
-
-
 @dataclass(frozen=True)
 class Upgrade:
     """One page, one tier up: what it takes, the marginal gain that orders
@@ -408,7 +400,8 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
     The headroom kept is the net of each upgrade. While one runs, its new
     page is held beside the page it replaces, and, to a quantised tier, an
     FP16 page the shadow is uploaded to as well, for as long as the upgrade
-    takes (#96). upgrade_plan_arrays, on arrays."""
+    takes (#96). It converts its inputs to arrays and calls
+    upgrade_plan_arrays()."""
     _check_pages(scores, tiers)
     keys = [key for key in tiers if key[1] >= 0]  # an open page is never upgraded
     layers = max((layer for layer, _ in keys), default=-1) + 1
@@ -445,7 +438,7 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
     gain, ties to the higher score, then the newest page, then the layer,
     then the lower tier first; and the plan stops at the first that does
     not fit. A page whose gains did not fall has each taken no sooner than
-    the one before it, at that one's gain."""
+    the one before it: ordered at that one's gain, recorded at its own."""
     now_seconds = time.monotonic() if now_seconds is None else now_seconds
     if last_downgrade_seconds is not None and last_downgrade_seconds > now_seconds:
         raise ValueError(f"the last downgrade, at {last_downgrade_seconds} s, is after now, "
@@ -483,13 +476,13 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
     seconds_by = np.array([move_seconds[(TIERS[k], TIERS[k - 1])] for k in range(1, len(TIERS))])
     k = np.arange(1, len(TIERS))[None, None, :]
     possible = k <= tiers[:, :, None]
-    gain = score[:, :, None] * removed_by[None, None, :] / taken_by
+    own = score[:, :, None] * removed_by[None, None, :] / taken_by
     # A page's later upgrades, to lower k, come no sooner than its earlier.
-    gain = np.where(possible, gain, np.inf)
-    gain = np.minimum.accumulate(gain[:, :, ::-1], axis=2)[:, :, ::-1]
+    rank = np.where(possible, own, np.inf)
+    rank = np.minimum.accumulate(rank[:, :, ::-1], axis=2)[:, :, ::-1]
     li, pi, si = np.nonzero(possible & upgradable[:, :, None])
     steps = si + 1  # the tier each upgrade leaves
-    gains, step_scores = gain[li, pi, si], score[li, pi]
+    gains, step_scores = rank[li, pi, si], score[li, pi]
     taken = taken_by[si]
 
     # Only the largest that could fit need sorting.
@@ -507,14 +500,8 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
     return UpgradePlan(level=level, available_bytes=available, held_by="",
                        layers=li[order].astype(np.int64), pages=pi[order].astype(np.int64),
                        current=leaving, higher=leaving - 1, taken=taken[order],
-                       gains=gains[order], scores=step_scores[order],
+                       gains=own[li, pi, si][order], scores=step_scores[order],
                        seconds=seconds_by[leaving - 1], budget_seconds=budget_seconds)
-
-
-def batches(moves: list, level: Level, budget_seconds: float) -> tuple[tuple, ...]:
-    """Downgrades or upgrades in batches, by batch_bounds on their seconds."""
-    seconds = np.array([m.seconds for m in moves], dtype=np.float64)
-    return tuple(tuple(moves[a:b]) for a, b in batch_bounds(seconds, level, budget_seconds))
 
 
 def logged_tier_errors(model: str, log: str | Path = benchlog.DEFAULT_LOG) -> dict[str, float]:

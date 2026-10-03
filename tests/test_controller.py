@@ -409,7 +409,8 @@ def test_the_plan_is_the_greedy_move_for_move():
 # -- the vectorised upgrade plan against its greedy (#106) ----------------------
 
 
-def upgrade_greedy_reference(available, scores, tiers, shadowed):
+def upgrade_greedy_reference(available, scores, tiers, shadowed, page_bytes=PAGE_BYTES,
+                             errors=ERRORS):
     """#103's upgrade plan as it was first written, a heap of each shadowed
     page's next upgrade, popped largest gain first until the next does not
     fit: the definition the vectorised plan must reproduce."""
@@ -422,9 +423,9 @@ def upgrade_greedy_reference(available, scores, tiers, shadowed):
         if up < 0:
             return None
         higher = controller.TIERS[up]
-        taken = PAGE_BYTES[higher] - PAGE_BYTES[current]
+        taken = page_bytes[higher] - page_bytes[current]
         score = neutral if math.isnan(scores[key]) else scores[key]
-        gain = score * (ERRORS[current] - ERRORS[higher]) / taken
+        gain = score * (errors[current] - errors[higher]) / taken
         return (-gain, -score, -key[1], -key[0], current, higher, taken)
 
     heap = [m for m in (nxt(k, t) for k, t in upgradable.items()) if m is not None]

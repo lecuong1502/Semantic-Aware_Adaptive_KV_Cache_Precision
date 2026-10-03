@@ -216,8 +216,8 @@ class PlanRecord:
     """A plan the engine made, downgrades or upgrades, with the pressure
     event that caused it, and what became of it: the batches applied, the
     moves skipped (their page had moved since), and how it ended,
-    "applied", "cancelled at GREEN", "cancelled by pressure" (upgrades), "replaced" by a
-    later plan, or the error that stopped it."""
+    "applied", "cancelled at GREEN", "replaced" by a later plan,
+    "cancelled by pressure" (upgrades), or the error that stopped it."""
 
     pressure: PressureRecord
     plan: controller.Plan | controller.UpgradePlan
@@ -728,13 +728,17 @@ class Engine:
         for record in drained:
             if record.event.level == GREEN and record.event.previous in (YELLOW, RED):
                 self.pressure_ended_seconds = record.event.t_mono_ns / 1e9
+        if (self._pending is not None and self._pending.upgrades
+                and any(r.event.level in (YELLOW, RED) for r in drained)):
+            # Pressure, though it may have passed within the step: the
+            # upgrades not yet made wait for the cooldown again.
+            self._pending.ended, self._pending = "cancelled by pressure", None
         if (latest is not None and latest.event.level == GREEN and self._pending is not None
                 and not self._pending.upgrades):
             self._pending.ended, self._pending = "cancelled at GREEN", None
         elif latest is not None and latest.event.level in (YELLOW, RED):
             if self._pending is not None:
-                self._pending.ended = ("cancelled by pressure" if self._pending.upgrades
-                                       else "replaced")
+                self._pending.ended = "replaced"
             self._recent_moves.clear()  # a new plan's moves are timed afresh
             self._pending = self._make_plan(cache, latest, latest.event.headroom_bytes, started)
             self._cursor, planned = 0, True
@@ -781,12 +785,12 @@ class Engine:
         scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
                              seed=self.kv_score_seed)
         page_bytes, errors, seconds = self._plan_inputs
+        cooldown_from = max(t for t in (self.last_downgrade_seconds, self.pressure_ended_seconds)
+                            if t is not None)
         plan = controller.upgrade_plan_arrays(
             self._monitor.headroom_bytes, self._thresholds, scores, tiers, pages.shadowed(),
             page_bytes, errors, move_seconds=seconds,
-            last_downgrade_seconds=max(t for t in (self.last_downgrade_seconds,
-                                                   self.pressure_ended_seconds)
-                                       if t is not None),
+            last_downgrade_seconds=cooldown_from,
             cooldown_seconds=self.kv_upgrade_cooldown_seconds,
             budget_seconds=self.kv_plan_budget_seconds)
         if len(plan) == 0:
