@@ -12,7 +12,7 @@ import pytest
 from test_controller import PAGE_BYTES, ERRORS, SECONDS, THRESHOLDS, P, cache, yellow_short_by
 
 from microinfer import controller, score_sources
-from microinfer.score_sources import scores_for
+from microinfer.score_sources import scores_for, uniform_scores
 
 
 def plan_from(scores, tiers, need=300_000, positions=None):
@@ -63,12 +63,61 @@ def test_semantic_scores_are_the_scorers():
         scores_for("semantic", cache(3, 2), semantic=download)
 
 
+def discrepancy(taken: list[int], positions: int) -> float:
+    """The most a window of positions holds more or fewer taken pages than
+    its even share: over every window [a, b) of [0, positions)."""
+    share = len(taken) / positions
+    held = np.concatenate([[0], np.cumsum(np.isin(np.arange(positions), taken))])
+    a, b = np.triu_indices(positions + 1)
+    return float(np.abs(held[b] - held[a] - (b - a) * share).max())
+
+
+def evenness_bound(positions: int) -> float:
+    """What bit-reversed order keeps every window within: measured at most
+    3.9 pages for every partial step of every count of positions below
+    300, growing as log2(positions) / 2. Taken oldest first, a window holds
+    the whole step."""
+    return np.log2(positions) / 2 + 1
+
+
+def test_bit_reversed_order_is_even_for_any_step():
+    """Over every count of positions to 130 and every partial step of it,
+    no window of positions is off its even share by more than the bound;
+    and where both are powers of two, the pages taken are evenly spaced,
+    every k-th exactly."""
+    for positions in range(2, 131):
+        scores = uniform_scores([(0, p) for p in range(positions)])
+        order = sorted(range(positions), key=lambda p: scores[(0, p)])
+        for k in range(1, positions + 1):
+            assert discrepancy(order[:k], positions) <= evenness_bound(positions), (positions, k)
+    for positions, k in ((64, 8), (128, 32), (32, 2)):
+        scores = uniform_scores([(0, p) for p in range(positions)])
+        taken = sorted(sorted(range(positions), key=lambda p: scores[(0, p)])[:k])
+        assert set(np.diff(taken)) == {positions // k} and taken[0] == 0
+
+
+def test_uniform_spreads_where_a_step_adds_no_error():
+    """Were two tiers' logged errors equal, a step between them would cost
+    every page nothing; the plan breaks ties by score, so uniform still
+    spreads the step rather than taking the oldest pages first."""
+    errors = dict(ERRORS, INT8=0.0)
+    tiers = cache(1, 64)
+    scores = scores_for("uniform", tiers)
+    need = 16 * (PAGE_BYTES["FP16"] - PAGE_BYTES["INT8"])
+    positions = 64 * P + controller.DEFAULT_RECENCY_FLOOR
+    plan = controller.plan(yellow_short_by(need), THRESHOLDS, scores, tiers, PAGE_BYTES, errors,
+                           move_seconds=SECONDS, positions=positions, page_tokens=P,
+                           margin_bytes=0)
+    taken = sorted(m.page for m in plan.downgrades)
+    assert all(m.cost == 0 for m in plan.downgrades)
+    assert set(np.diff(taken)) == {4}, taken
+
+
 def test_uniform_spreads_a_partial_step_evenly_across_positions():
     """Uniform scores are alike, so the plan goes breadth first, as equal
     scores do (#101); and when a step is partial, the pages it takes are
-    spread evenly across positions, not the oldest first: between two
-    taken pages, and before the first and after the last, no gap of
-    positions is much more than the even spacing. Every layer of a
+    spread evenly across positions, not the oldest first: no window of
+    positions is off its even share by more than the bound. Every layer of a
     position goes together. With the recency floor taking the newest pages
     out, and on a later step, INT8 to INT4, too."""
     for pages, fraction, floor_pages, tier in ((64, 0.25, 0, "FP16"), (60, 0.3, 0, "FP16"),
@@ -91,9 +140,7 @@ def test_uniform_spreads_a_partial_step_evenly_across_positions():
             by_layer.setdefault(m.page, set()).add(m.layer)
         last = plan.downgrades[-1].page  # the target may be met partway through its layers
         assert all(len(layers) == 3 for page, layers in by_layer.items() if page != last)
-        spacing = candidates / len(taken)
-        gaps = np.diff([-0.5 * spacing] + taken + [candidates - 1 + 0.5 * spacing])
-        assert gaps.max() <= 2 * spacing + 1, (pages, fraction, taken)
+        assert discrepancy(taken, candidates) <= evenness_bound(candidates), (pages, taken)
 
 
 def test_random_is_the_same_for_the_same_seed():

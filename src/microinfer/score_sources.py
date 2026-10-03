@@ -13,10 +13,13 @@ baselines that stand in for them.
   evenly across positions, rather than taken oldest first. The scores
   differ, by a part in a million, only to order the positions so: in
   bit-reversed order, so that every prefix of them is spread across the
-  cache, as 0, 4, 2, 6, 1, 5, 3, 7 is across eight; for a count that is no
-  power of two, within about twice the even spacing. The order of the
-  positions held stays the same as the cache grows. Every layer of a
-  position scores alike, and goes with it.
+  cache, as 0, 4, 2, 6, 1, 5, 3, 7 is across eight: exactly every k-th
+  where both counts are powers of two, and otherwise no window of positions
+  off its even share by more than log2(positions) / 2 + 1 pages. The order
+  of the positions held stays the same as the cache grows. Every layer of
+  a position scores alike, and goes with it. The plan breaks ties in cost
+  by score (#101), so the order holds even across a step that adds no
+  error.
 - **random**: a secondary control, each page's score uniform in [0, 1),
   a hash of the seed, its layer and its page: the same for the same seed,
   and a page's score the same whatever other pages there are, so that one

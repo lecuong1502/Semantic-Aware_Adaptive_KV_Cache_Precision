@@ -21,8 +21,10 @@ scored candidates', or, before any has a score, the same for every page.
 Pages within the floor are no candidates, and do not set it.
 Before any score exists the plan therefore goes breadth first in position
 order, the oldest page first (#88), and a page not yet scored, usually one
-of the newest, goes no deeper than a page of average importance. Ties are
-broken by page, then by layer: the oldest first.
+of the newest, goes no deeper than a page of average importance. Ties in
+cost go to the lower score, then the oldest page, then the lowest layer:
+so that scores order pages even where a step adds no error, as one
+between two tiers whose logged errors were equal would.
 
 The recency floor (#102): the open pages and the last W positions, W = 128
 by default, are never downgraded, under every policy: every policy's plan
@@ -90,6 +92,7 @@ class Downgrade:
     target_tier: str
     bytes_saved: int
     cost: float
+    score: float
     seconds: float
 
 
@@ -154,11 +157,12 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
         score = neutral if math.isnan(scores[key]) else scores[key]
         cost = score * (errors[lower] - errors[current]) / saved
         layer, page = key
-        return Downgrade(layer, page, current, lower, saved, cost,
+        return Downgrade(layer, page, current, lower, saved, cost, score,
                          move_seconds[(current, lower)])
 
     def entry(d: Downgrade):
-        return d.cost, d.page, d.layer, d  # ties to the oldest page, then layer
+        # Ties to the lower score, then the oldest page, then the layer.
+        return d.cost, d.score, d.page, d.layer, d
 
     heap = [entry(d) for d in (next_downgrade(key, tier) for key, tier in candidates.items())
             if d is not None]
@@ -205,6 +209,7 @@ class Upgrade:
     target_tier: str
     bytes_taken: int
     gain: float
+    score: float
     seconds: float
 
 
@@ -249,8 +254,8 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
     bytes(current)) first, again and again, one tier at a time, until the
     next does not fit what is left of the headroom: deliberately, so that
     no upgrade comes before one of larger gain, at the cost of room a
-    smaller one could have used. Ties go to the newest page, the reverse of
-    a plan's. A page not yet scored takes the mean of the scored pages that
+    smaller one could have used. Ties go to the higher score, then the
+    newest page, the reverse of a plan's. A page not yet scored takes the mean of the scored pages that
     can be upgraded. The upgrades fall into batches within
     `budget_seconds` each.
 
@@ -291,10 +296,12 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
         score = neutral if math.isnan(scores[key]) else scores[key]
         gain = score * (errors[current] - errors[higher]) / taken
         layer, page = key
-        return Upgrade(layer, page, current, higher, taken, gain, move_seconds[(current, higher)])
+        return Upgrade(layer, page, current, higher, taken, gain, score,
+                       move_seconds[(current, higher)])
 
     def entry(u: Upgrade):
-        return -u.gain, -u.page, -u.layer, u  # ties to the newest page, then layer
+        # Ties to the higher score, then the newest page, then the layer.
+        return -u.gain, -u.score, -u.page, -u.layer, u
 
     heap = [entry(u) for u in (next_upgrade(key, tier) for key, tier in upgradable.items())
             if u is not None]
