@@ -204,7 +204,12 @@ clang-format -i $(git ls-files '*.cu' '*.cpp' '*.h')
 **Tests are deliberately not in the hook.** They need the CUDA extension built
 and a visible GPU, so a hook that ran them would block a commit made from a
 machine without one — and a commit hook is only worth having if it is cheap
-enough that nobody is tempted to skip it. Run `pytest` before pushing.
+enough that nobody is tempted to skip it.
+
+While working, `pytest` skips the tests marked `slow`: those that decode a
+real model or time real work, 5 s or more each, among them the correctness
+gate (ADR-0006). Run `pytest --runslow` before pushing, which runs them all.
+Mark a new test `@pytest.mark.slow` if it takes 5 s or more.
 
 ### The two guards
 

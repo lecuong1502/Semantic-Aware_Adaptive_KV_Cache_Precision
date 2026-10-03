@@ -80,6 +80,7 @@ def assert_same_output(single, chunked, what):
 # -- the same output -------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_chunked_prefill_matches_single_shot(engine, golden):
     """37 tokens one position at a time and with a ragged last chunk; 501
     tokens; the longest prompt, 1,090 tokens."""
@@ -135,6 +136,7 @@ def test_generation_after_a_chunked_prefill_matches(engine, golden):
 # -- memory -------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_prefill_workspace_does_not_grow_with_the_prompt(engine):
     """Measured, not only computed: across prompts from 1 to 4 chunks long, the
     workspace the engine reports is one chunk's, and what this process holds

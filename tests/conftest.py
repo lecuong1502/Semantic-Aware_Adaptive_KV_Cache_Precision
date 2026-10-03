@@ -16,6 +16,22 @@ from microinfer.models import UPSTREAM
 MODELS = Path(__file__).resolve().parent.parent / "models"
 
 
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true",
+                     help="also run the tests marked slow, as before pushing")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip the slow tests unless --runslow: a run while working takes a
+    third of the time, and the run before pushing takes them all."""
+    if config.getoption("--runslow"):
+        return
+    skip = pytest.mark.skip(reason="slow: run with --runslow")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip)
+
+
 def require_model(name: str) -> Path:
     """The model directory, or skip with the command that would fetch it.
 

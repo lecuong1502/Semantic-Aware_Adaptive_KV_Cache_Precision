@@ -93,6 +93,7 @@ def test_the_fp16_range_check_catches_what_bf16_can_hold_and_fp16_cannot():
 
 # --- against the real checkpoint -------------------------------------------
 
+@pytest.mark.slow
 def test_real_checkpoints_are_bf16_throughout_and_fit_fp16():
     """The engine stores fp16, and bf16 reaches far past fp16's 65504: this is
     the check that the conversion is safe for these particular weights, not a

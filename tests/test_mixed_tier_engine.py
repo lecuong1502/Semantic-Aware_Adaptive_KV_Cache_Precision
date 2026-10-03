@@ -89,6 +89,7 @@ def test_a_session_runs_over_the_cache_its_map_builds(engine, golden):
     assert seen == set(TIERS)
 
 
+@pytest.mark.slow
 def test_decoding_continues_as_a_full_prefill_would_over_a_mixed_map(engine, golden):
     """ADR-0011's property, with a tier map: a query reads its own page at
     FP16 and every page before it at that page's own tier, however many
@@ -121,6 +122,7 @@ def test_decoding_continues_as_a_full_prefill_would_over_a_mixed_map(engine, gol
     each([(t, c, p) for t in ("FP16", "INT4") for c in (None, 40) for p in PROMPTS], continues)
 
 
+@pytest.mark.slow
 def test_a_map_of_one_tier_is_the_static_engine(engine, golden):
     """At every tier, a map naming that tier on every page chooses the static
     engine's tokens, and gives its logits, to the bit: over a cache at that
