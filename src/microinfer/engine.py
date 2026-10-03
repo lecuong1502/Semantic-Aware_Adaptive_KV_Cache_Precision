@@ -187,6 +187,9 @@ class PressureRecord:
 
 #: The least room a YELLOW step keeps in its budget for its next downgrade.
 MOVE_MARGIN_SECONDS = 0.002
+#: How often, at GREEN with no plan in hand, the engine looks for upgrades to
+#: make (#106): not every step, most of which would find none.
+UPGRADE_RETRY_SECONDS = 0.25
 
 
 @dataclass
@@ -204,17 +207,20 @@ class AppliedBatch:
     cache_bytes_after: int
     own_bytes_before: int | None = None
     own_bytes_after: int | None = None
+    #: When the step finished, on time.monotonic().
+    at_seconds: float = 0.0
 
 
 @dataclass
 class PlanRecord:
-    """A plan the engine made, with the pressure event that caused it, and
-    what became of it: the batches applied, the downgrades skipped (their
-    page had moved since), and how it ended, "applied", "cancelled at
-    GREEN", "replaced" by a later plan, or the error that stopped it."""
+    """A plan the engine made, downgrades or upgrades, with the pressure
+    event that caused it, and what became of it: the batches applied, the
+    moves skipped (their page had moved since), and how it ended,
+    "applied", "cancelled at GREEN", "cancelled by pressure" (upgrades), "replaced" by a
+    later plan, or the error that stopped it."""
 
     pressure: PressureRecord
-    plan: controller.Plan
+    plan: controller.Plan | controller.UpgradePlan
     planning_seconds: float
     batches: list[AppliedBatch]
     skipped: int = 0
@@ -229,6 +235,10 @@ class PlanRecord:
     @property
     def applied(self) -> int:
         return sum(b.end - b.start for b in self.batches)
+
+    @property
+    def upgrades(self) -> bool:
+        return isinstance(self.plan, controller.UpgradePlan)
 
 
 class Engine:
@@ -265,6 +275,7 @@ class Engine:
                  kv_score_every: int | None = None, kv_adaptive: bool = False,
                  kv_score_source: str = "semantic", kv_score_seed: int = 0,
                  kv_plan_budget_seconds: float = controller.DEFAULT_BUDGET_SECONDS,
+                 kv_upgrade_cooldown_seconds: float = controller.DEFAULT_UPGRADE_COOLDOWN_SECONDS,
                  prefill_chunk: int | None = DEFAULT_PREFILL_CHUNK):
         if kv_cache not in self.KV_CACHES:
             raise ValueError(f"kv_cache is one of {self.KV_CACHES}, got {kv_cache!r}")
@@ -290,8 +301,11 @@ class Engine:
         self.kv_adaptive = kv_adaptive
         #: Where a plan's scores come from (#104), and the random one's seed.
         self.kv_score_source, self.kv_score_seed = kv_score_source, kv_score_seed
-        #: The time a YELLOW plan may take of one step, planning included.
+        #: The time a YELLOW plan, or upgrades at GREEN, may take of one step,
+        #: planning included.
         self.kv_plan_budget_seconds = kv_plan_budget_seconds
+        #: How long after the last downgrade an upgrade waits (#103, #106).
+        self.kv_upgrade_cooldown_seconds = kv_upgrade_cooldown_seconds
         #: Read what this process holds by the driver's account around every
         #: batch a plan applies; off, as each reading costs a millisecond.
         self.measure_plans = False
@@ -299,10 +313,15 @@ class Engine:
         self.plans: list[PlanRecord] = []
         #: When the last downgrade was applied, on time.monotonic().
         self.last_downgrade_seconds: float | None = None
+        #: When pressure last ended, the monitor's GREEN after a YELLOW or a
+        #: RED, on time.monotonic(): the upgrade cooldown runs from this or
+        #: the last downgrade, the later (#106).
+        self.pressure_ended_seconds: float | None = None
         self._pending: PlanRecord | None = None
         self._cursor = 0
         self._last_pressure: PressureRecord | None = None
         self._planned_pages = 0
+        self._upgrades_looked_at: float | None = None
         #: How long the last downgrades took, the longest of them the guess
         #: for the next: an outlier passes out of it, as none would of a max.
         self._recent_moves: collections.deque[float] = collections.deque(maxlen=64)
@@ -650,6 +669,7 @@ class Engine:
         self.pressure_events, self.monitor_error, self._positions_held = [], None, 0
         self.plans, self._pending, self.last_downgrade_seconds = [], None, None
         self._last_pressure, self._planned_pages = None, 0
+        self._upgrades_looked_at, self.pressure_ended_seconds = None, None
         if self.kv_adaptive:
             self._plan_inputs  # read from the log now, not in a step a plan delays
         self._monitor = (monitor or Monitor()).start()
@@ -705,11 +725,16 @@ class Engine:
         latest = drained[-1] if drained else None
         if latest is not None:
             self._last_pressure = latest
-        if latest is not None and latest.event.level == GREEN and self._pending is not None:
+        for record in drained:
+            if record.event.level == GREEN and record.event.previous in (YELLOW, RED):
+                self.pressure_ended_seconds = record.event.t_mono_ns / 1e9
+        if (latest is not None and latest.event.level == GREEN and self._pending is not None
+                and not self._pending.upgrades):
             self._pending.ended, self._pending = "cancelled at GREEN", None
         elif latest is not None and latest.event.level in (YELLOW, RED):
             if self._pending is not None:
-                self._pending.ended = "replaced"
+                self._pending.ended = ("cancelled by pressure" if self._pending.upgrades
+                                       else "replaced")
             self._recent_moves.clear()  # a new plan's moves are timed afresh
             self._pending = self._make_plan(cache, latest, latest.event.headroom_bytes, started)
             self._cursor, planned = 0, True
@@ -721,8 +746,56 @@ class Engine:
                                             self._monitor.headroom_bytes, started,
                                             persisting=True)
             self._cursor, planned = 0, self._pending is not None
+        elif self._upgrades_due():
+            # GREEN, no plan in hand: restore pages, as the policy allows.
+            self._recent_moves.clear()
+            self._pending = self._make_upgrade_plan(cache, started)
+            self._cursor, planned = 0, self._pending is not None
         if self._pending is not None:
             self._apply(cache, started, planned, own_before)
+
+    def _upgrades_due(self) -> bool:
+        if (self._pending is not None or self._monitor is None
+                or self._monitor.level != GREEN or self._monitor.headroom_bytes is None
+                or self.last_downgrade_seconds is None):
+            return False
+        now = time.monotonic()
+        if (self._upgrades_looked_at is not None
+                and now - self._upgrades_looked_at < UPGRADE_RETRY_SECONDS):
+            return False
+        self._upgrades_looked_at = now
+        return True
+
+    def _make_upgrade_plan(self, cache: model.PagedCache, started: float) -> PlanRecord | None:
+        """Upgrades for the headroom the monitor reads now (#106): from each
+        page's shadow, in the policy's order (#103), recorded with the
+        pressure event that brought GREEN; None, unrecorded, if the policy
+        holds them or there are none to make. The cooldown runs from the
+        last downgrade or the end of the last pressure, the later: under a
+        train of pulses whose later ones find nothing left to downgrade,
+        upgrades between them would be undone by the next."""
+        pages = cache.pages
+        tiers = pages.page_tiers()
+        layers, count = tiers.shape
+        semantic = cache.scores.download() if self.kv_score_source == "semantic" else None
+        scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
+                             seed=self.kv_score_seed)
+        page_bytes, errors, seconds = self._plan_inputs
+        plan = controller.upgrade_plan_arrays(
+            self._monitor.headroom_bytes, self._thresholds, scores, tiers, pages.shadowed(),
+            page_bytes, errors, move_seconds=seconds,
+            last_downgrade_seconds=max(t for t in (self.last_downgrade_seconds,
+                                                   self.pressure_ended_seconds)
+                                       if t is not None),
+            cooldown_seconds=self.kv_upgrade_cooldown_seconds,
+            budget_seconds=self.kv_plan_budget_seconds)
+        if len(plan) == 0:
+            return None
+        entry = PlanRecord(self._last_pressure, plan, time.perf_counter() - started, [],
+                           headroom_bytes=self._monitor.headroom_bytes)
+        self.plans.append(entry)
+        self._recent_moves.append(float(plan.seconds.max()))  # until one is timed
+        return entry
 
     def _persisting(self, cache: model.PagedCache) -> bool:
         return (self._pending is None and self._monitor is not None
@@ -779,6 +852,7 @@ class Engine:
         tier_of = [getattr(_microinfer.Tier, t) for t in controller.TIERS]
         cache_before, start, i = cache.nbytes, self._cursor, self._cursor
         budget = self.kv_plan_budget_seconds
+        move = pages.upgrade if entry.upgrades else pages.downgrade
         try:
             while i < len(plan):
                 if plan.level != RED:
@@ -791,16 +865,17 @@ class Engine:
                     entry.skipped += 1
                 else:
                     moving = time.perf_counter()
-                    pages.downgrade(layer, page, tier_of[plan.lower[i]])
+                    move(layer, page, tier_of[plan.target[i]])
                     self._recent_moves.append(time.perf_counter() - moving)
-                    self.last_downgrade_seconds = time.monotonic()
+                    if not entry.upgrades:
+                        self.last_downgrade_seconds = time.monotonic()
                 i += 1
         except _microinfer.OutOfMemory as exc:  # the emergency is #107's to answer
             entry.ended, self._pending = f"stopped: {exc}", None
         seconds = time.perf_counter() - started
         if i > start:
             entry.batches.append(AppliedBatch(start, i, seconds, cache_before, cache.nbytes,
-                                              own_before, self._own_bytes()))
+                                              own_before, self._own_bytes(), time.monotonic()))
         self._cursor = i
         if self._pending is not None and i == len(plan):
             entry.ended, self._pending = "applied", None

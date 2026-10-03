@@ -56,7 +56,6 @@ the 0.02-0.04 ms a downgrade took on Qwen2.5-1.5B, some 500 a batch.
 from __future__ import annotations
 
 import functools
-import heapq
 import math
 import time
 from collections.abc import Collection
@@ -130,6 +129,12 @@ class Plan:
     @functools.cached_property
     def batch_bounds(self) -> tuple[tuple[int, int], ...]:
         return batch_bounds(self.seconds, self.level, self.budget_seconds)
+
+    @property
+    def target(self) -> np.ndarray:
+        """Each downgrade's target tier: `lower`, named as an UpgradePlan's
+        `target` is, so that one loop applies either."""
+        return self.lower
 
     @property
     def reclaimed_bytes(self) -> int:
@@ -317,20 +322,57 @@ class Upgrade:
     seconds: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class UpgradePlan:
     """The upgrades, in the order they were chosen, and their batches; or
-    none, and `held_by` says what held them."""
+    none, and `held_by` says what held them.
+
+    Held as arrays, one entry each, tiers as indices into TIERS, as a Plan
+    is (#106); `upgrades`, `batches` and `batch_bounds` are made on first
+    reading."""
 
     level: Level
     available_bytes: int
-    upgrades: tuple[Upgrade, ...]
-    batches: tuple[tuple[Upgrade, ...], ...]
     held_by: str
+    layers: np.ndarray
+    pages: np.ndarray
+    current: np.ndarray
+    higher: np.ndarray
+    taken: np.ndarray
+    gains: np.ndarray
+    scores: np.ndarray
+    seconds: np.ndarray
+    budget_seconds: float
+
+    @property
+    def target(self) -> np.ndarray:
+        """Each upgrade's target tier, as a Plan's `target` is each
+        downgrade's."""
+        return self.higher
 
     @property
     def taken_bytes(self) -> int:
-        return sum(u.bytes_taken for u in self.upgrades)
+        return int(self.taken.sum())
+
+    def __len__(self) -> int:
+        return len(self.layers)
+
+    @functools.cached_property
+    def batch_bounds(self) -> tuple[tuple[int, int], ...]:
+        return batch_bounds(self.seconds, self.level, self.budget_seconds)
+
+    @functools.cached_property
+    def upgrades(self) -> tuple[Upgrade, ...]:
+        return tuple(self.upgrade(i) for i in range(len(self)))
+
+    @functools.cached_property
+    def batches(self) -> tuple[tuple[Upgrade, ...], ...]:
+        return tuple(self.upgrades[a:b] for a, b in self.batch_bounds)
+
+    def upgrade(self, i: int) -> Upgrade:
+        return Upgrade(int(self.layers[i]), int(self.pages[i]), TIERS[self.current[i]],
+                       TIERS[self.higher[i]], int(self.taken[i]), float(self.gains[i]),
+                       float(self.scores[i]), float(self.seconds[i]))
 
 
 def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
@@ -359,15 +401,51 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
     next does not fit what is left of the headroom: deliberately, so that
     no upgrade comes before one of larger gain, at the cost of room a
     smaller one could have used. Ties go to the higher score, then the
-    newest page, the reverse of a plan's. A page not yet scored takes the mean of the scored pages that
-    can be upgraded. The upgrades fall into batches within
-    `budget_seconds` each.
+    newest page, the reverse of a plan's. A page not yet scored takes the
+    mean of the scored pages that can be upgraded. The upgrades fall into
+    batches within `budget_seconds` each.
 
     The headroom kept is the net of each upgrade. While one runs, its new
     page is held beside the page it replaces, and, to a quantised tier, an
     FP16 page the shadow is uploaded to as well, for as long as the upgrade
-    takes (#96)."""
+    takes (#96). upgrade_plan_arrays, on arrays."""
     _check_pages(scores, tiers)
+    keys = [key for key in tiers if key[1] >= 0]  # an open page is never upgraded
+    layers = max((layer for layer, _ in keys), default=-1) + 1
+    pages = max((page for _, page in keys), default=-1) + 1
+    tier_index = np.full((layers, pages), -1, dtype=np.int8)
+    score_array = np.full((layers, pages), np.nan)
+    shadow_array = np.zeros((layers, pages), dtype=bool)
+    for layer, page in keys:
+        tier_index[layer, page] = TIERS.index(tiers[(layer, page)])
+        score_array[layer, page] = scores[(layer, page)]
+        shadow_array[layer, page] = (layer, page) in shadowed
+    return upgrade_plan_arrays(
+        headroom_bytes, thresholds, score_array, tier_index, shadow_array, page_bytes, errors,
+        move_seconds=move_seconds, last_downgrade_seconds=last_downgrade_seconds,
+        now_seconds=now_seconds, cooldown_seconds=cooldown_seconds, spike_bytes=spike_bytes,
+        budget_seconds=budget_seconds)
+
+
+def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.ndarray,
+                        tiers: np.ndarray, shadowed: np.ndarray, page_bytes: dict[str, int],
+                        errors: dict[str, float], *, move_seconds: dict[tuple[str, str], float],
+                        last_downgrade_seconds: float | None,
+                        now_seconds: float | None = None,
+                        cooldown_seconds: float = DEFAULT_UPGRADE_COOLDOWN_SECONDS,
+                        spike_bytes: int = DEFAULT_UPGRADE_SPIKE_BYTES,
+                        budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> UpgradePlan:
+    """upgrade_plan(), on arrays: `scores`, `tiers` and `shadowed`,
+    (layers, pages), page i of layer l at [l, i], a tier as its index into
+    TIERS, -1 for a page the cache does not hold.
+
+    It computes the greedy by sorting, as plan_arrays does: each page's
+    upgrades gain less, tier after tier up, so taking the largest of every
+    page's next upgrade again and again takes every upgrade in order of
+    gain, ties to the higher score, then the newest page, then the layer,
+    then the lower tier first; and the plan stops at the first that does
+    not fit. A page whose gains did not fall has each taken no sooner than
+    the one before it, at that one's gain."""
     now_seconds = time.monotonic() if now_seconds is None else now_seconds
     if last_downgrade_seconds is not None and last_downgrade_seconds > now_seconds:
         raise ValueError(f"the last downgrade, at {last_downgrade_seconds} s, is after now, "
@@ -377,50 +455,60 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
     available = headroom_bytes - thresholds.yellow_below_bytes - spike_bytes
 
     def held(reason: str) -> UpgradePlan:
-        return UpgradePlan(level, max(0, available), (), (), reason)
+        none, nothing = np.zeros(0, dtype=np.int64), np.zeros(0)
+        return UpgradePlan(level=level, available_bytes=max(0, available), held_by=reason,
+                           layers=none, pages=none, current=none, higher=none, taken=none,
+                           gains=nothing, scores=nothing, seconds=nothing,
+                           budget_seconds=budget_seconds)
 
     if level != GREEN:
         return held(f"the level is {level.value}; upgrades are made at GREEN only")
     if last_downgrade_seconds is not None and now_seconds - last_downgrade_seconds < cooldown_seconds:
-        return held(f"cooldown: {now_seconds - last_downgrade_seconds:.2f} s since the last downgrade, "
-                    f"{cooldown_seconds} s needed")
+        return held(f"cooldown: {now_seconds - last_downgrade_seconds:.2f} s since the last "
+                    f"downgrade, {cooldown_seconds} s needed")
     if available <= 0:
         return held(f"headroom: {headroom_bytes} bytes leave none above T_high + "
                     f"{spike_bytes} bytes")
 
-    upgradable = {key: tier for key, tier in tiers.items() if tier != "FP16" and key in shadowed}
-    neutral = _neutral(scores, upgradable)
+    upgradable = (tiers > 0) & shadowed
+    scored = scores[upgradable & ~np.isnan(scores)]
+    neutral = float(scored.mean()) if scored.size else 1.0
+    score = np.where(np.isnan(scores), neutral, scores)
 
-    def next_upgrade(key: tuple[int, int], current: str) -> Upgrade | None:
-        up = TIERS.index(current) - 1
-        if up < 0:
-            return None
-        higher = TIERS[up]
-        taken = page_bytes[higher] - page_bytes[current]
-        score = neutral if math.isnan(scores[key]) else scores[key]
-        gain = score * (errors[current] - errors[higher]) / taken
-        layer, page = key
-        return Upgrade(layer, page, current, higher, taken, gain, score,
-                       move_seconds[(current, higher)])
+    # Step k takes a page from tier k up to k - 1, for k from 3 down to 1.
+    bytes_at = np.array([page_bytes[t] for t in TIERS], dtype=np.int64)
+    error_at = np.array([errors[t] for t in TIERS], dtype=np.float64)
+    taken_by = bytes_at[:-1] - bytes_at[1:]  # [k - 1]: what step k takes
+    removed_by = error_at[1:] - error_at[:-1]  # [k - 1]: what step k removes
+    seconds_by = np.array([move_seconds[(TIERS[k], TIERS[k - 1])] for k in range(1, len(TIERS))])
+    k = np.arange(1, len(TIERS))[None, None, :]
+    possible = k <= tiers[:, :, None]
+    gain = score[:, :, None] * removed_by[None, None, :] / taken_by
+    # A page's later upgrades, to lower k, come no sooner than its earlier.
+    gain = np.where(possible, gain, np.inf)
+    gain = np.minimum.accumulate(gain[:, :, ::-1], axis=2)[:, :, ::-1]
+    li, pi, si = np.nonzero(possible & upgradable[:, :, None])
+    steps = si + 1  # the tier each upgrade leaves
+    gains, step_scores = gain[li, pi, si], score[li, pi]
+    taken = taken_by[si]
 
-    def entry(u: Upgrade):
-        # Ties to the higher score, then the newest page, then the layer.
-        return -u.gain, -u.score, -u.page, -u.layer, u
-
-    heap = [entry(u) for u in (next_upgrade(key, tier) for key, tier in upgradable.items())
-            if u is not None]
-    heapq.heapify(heap)
-
-    chosen, left = [], available
-    while heap and heap[0][-1].bytes_taken <= left:
-        upgrade = heapq.heappop(heap)[-1]
-        chosen.append(upgrade)
-        left -= upgrade.bytes_taken
-        further = next_upgrade((upgrade.layer, upgrade.page), upgrade.target_tier)
-        if further is not None:
-            heapq.heappush(heap, entry(further))
-    return UpgradePlan(level, available, tuple(chosen), batches(chosen, level, budget_seconds),
-                       "")
+    # Only the largest that could fit need sorting.
+    need = min(len(gains), int(available // int(taken_by.min())) + 1)
+    if need < len(gains):
+        kth = -np.partition(-gains, need - 1)[need - 1]
+        keep = np.nonzero(gains >= kth)[0]
+    else:
+        keep = np.arange(len(gains))
+    order = keep[np.lexsort((-steps[keep], -li[keep], -pi[keep], -step_scores[keep],
+                             -gains[keep]))]
+    count = int(np.searchsorted(np.cumsum(taken[order]), available, side="right"))
+    order = order[:count]
+    leaving = steps[order].astype(np.int64)
+    return UpgradePlan(level=level, available_bytes=available, held_by="",
+                       layers=li[order].astype(np.int64), pages=pi[order].astype(np.int64),
+                       current=leaving, higher=leaving - 1, taken=taken[order],
+                       gains=gains[order], scores=step_scores[order],
+                       seconds=seconds_by[leaving - 1], budget_seconds=budget_seconds)
 
 
 def batches(moves: list, level: Level, budget_seconds: float) -> tuple[tuple, ...]:
