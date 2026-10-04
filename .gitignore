@@ -29,3 +29,4 @@ tests/golden/
 # Held-out evaluation text, fetched by the tool that uses it and checked
 # against a pinned hash there (tools/perplexity.py). Not ours to redistribute.
 data/
+report/
