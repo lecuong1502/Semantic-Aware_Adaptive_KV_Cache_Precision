@@ -585,14 +585,21 @@ class Engine:
             return logits, np.concatenate(states, axis=1)
         return logits
 
-    def generate(self, prompt, max_new_tokens: int = 64, *, stop_at_eos: bool = True) -> np.ndarray:
+    def generate(self, prompt, max_new_tokens: int = 64, *, stop_at_eos: bool = True,
+                 report: Callable[[str, int, int | None], None] | None = None) -> np.ndarray:
         """Greedy continuation of one prompt: the new token ids only.
 
         `prompt` is text, which is tokenised, or token ids. The prompt is
         prefilled in chunks of `prefill_chunk` positions, then each new token
         is decoded against the cache. Stops after `max_new_tokens`, or at an end-of-sequence token,
         which is included, as HuggingFace's generate includes it.
+
+        `report`, if given, is called as hold calls it (#108): after each
+        prefill chunk, as (PREFILLING, positions so far, None), and after
+        each decoded token, as (DECODING, the position after it, the token).
+        The first new token is the prefill's, and is not reported.
         """
+        report = report or (lambda *_: None)
         ids = self.encode(prompt) if isinstance(prompt, str) else self._check_ids(prompt)
         if max_new_tokens < 0:
             raise ValueError(f"max_new_tokens must not be negative, got {max_new_tokens}")
@@ -605,8 +612,12 @@ class Engine:
         self.ending = None
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
         out: list[int] = []
+        def prefilled() -> bool:
+            report(PREFILLING, cache.length, None)
+            return True
+
         try:
-            out.append(self._first_token(cache, ids))
+            out.append(self._first_token(cache, ids, go_on=prefilled))
             step = model.Workspace(self.config, rows=1)
             with self._holding(cache, step):
                 while len(out) < max_new_tokens and not (stop_at_eos
@@ -614,6 +625,7 @@ class Engine:
                     self._run(step, cache, np.array(out[-1:], np.int32))
                     out.append(self._model.greedy_last(step, 1))
                     self._drain_pressure(cache)
+                    report(DECODING, cache.length, out[-1])
         except (_Exhausted, _microinfer.OutOfMemory) as exc:
             # Out of memory anywhere else, a workspace or a step's logits, is
             # answered as one the emergency plan could not answer.
