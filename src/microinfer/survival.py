@@ -15,7 +15,8 @@ takes what leaves it `shortfall` short of that.
 **What a run comes to** is whether it survived, how it ended, and every plan
 the engine made: the memory each returned, by the cache's allocator and by
 the driver's account of the engine's process, whether the two agree to a
-granule (#88's gate), and how long it took.
+granule (#88's gate), and how long it took; and how long each pressure
+event waited for the step boundary at which the engine drained it (#135).
 
 **The run** pauses the generation at the chosen position until the
 simulator has taken its memory, so that contention arrives at the same place
@@ -34,6 +35,7 @@ import numpy as np
 
 from . import _microinfer, nvml, recorder, replay
 from .config import ModelConfig
+from .contention import spread
 from .engine import COMPLETE, Ending, Engine, PlanRecord, PressureRecord, paged_cache_bytes
 from .footprint import MIB
 from .schedule import Schedule
@@ -126,6 +128,32 @@ def _plan(record: PlanRecord, granule: int) -> dict:
             "event_to_applied_ms": round((batches[-1].at_seconds
                                           - record.pressure.event.t_mono_ns / 1e9) * 1e3, 3)
             if on_event else None}
+
+
+def waits(pressure_events: Sequence[PressureRecord], plans: Sequence[PlanRecord]) -> dict:
+    """Each pressure event, with how long it waited from the monitor's
+    transition to the step boundary at which the engine drained it, and its
+    time to its plan: that wait and the plan's making, for an event a plan
+    was made on (#135). With the median, P90 and max of each, over the
+    YELLOW and RED events, the ones a plan answers. A persisting or an
+    emergency plan is made on no event."""
+    made = {id(p.pressure): p.planning_seconds for p in plans
+            if p.pressure is not None and not p.persisting and p.emergency is None}
+    rows = []
+    for r in pressure_events:
+        wait_ms = round(r.waited_ns / 1e6, 3)
+        planning = made.get(id(r))
+        event = r.event
+        rows.append({"level": event.level.value,
+                     "previous": None if event.previous is None else event.previous.value,
+                     "headroom_mib": event.headroom_bytes / MIB, "positions": r.positions_held,
+                     "wait_ms": wait_ms,
+                     "to_plan_ms": None if planning is None
+                     else round(wait_ms + planning * 1e3, 3)})
+    pressed = [r for r in rows if r["level"] in ("YELLOW", "RED")]
+    return {"events": rows, "pressure_wait_ms": spread([r["wait_ms"] for r in pressed]),
+            "to_plan_ms": spread([r["to_plan_ms"] for r in pressed
+                                  if r["to_plan_ms"] is not None])}
 
 
 @dataclass

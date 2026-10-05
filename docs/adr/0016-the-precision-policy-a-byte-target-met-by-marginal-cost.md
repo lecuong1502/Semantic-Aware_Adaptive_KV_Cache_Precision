@@ -155,8 +155,133 @@ The controller is pure logic with no device code (#101).
     its plan.
   - The run survived because the first RED left more headroom than one
     chunk's pages need.
-  - Shortening steps under pressure is #135. Until it is decided, a sharp
-    contention mid-prefill is answered by the emergency plan.
+  - #135 shortens steps under pressure; see the amendment below.
 - **RQ3's comparison is fixed here:** semantic against uniform at the same
   byte target, with random as a control. A change to the planner after RQ3's
   results are read changes what they mean, and needs a new ADR.
+
+## Amendment (#135): prefill chunks bounded by time under pressure
+
+While an adaptive engine's monitor reads YELLOW or RED, each prefill chunk
+is sized from what the steps before it cost (`StepCost`). A step's time is
+taken as a fixed part and a part per position.
+- The per-position part comes from comparing the step with the one just
+  before it, if their sizes are at least a factor of two apart. A step from
+  further back ran at a shorter context, where a position cost less, and
+  would make the per-position part too small: a first version that compared
+  with such steps sized its chunks up to 512 under RED.
+- Until a split is made, a chunk is at most half the one before, so that two
+  steps in a row are wide apart.
+- A comparison that makes no sense, as noise can make a larger step the
+  quicker, is ignored, and the estimate stands.
+- The fixed part follows every step, since it grows with the context.
+
+The chunk is then chosen by how the fixed part compares with
+`pressure_chunk_seconds`.
+- **If the fixed part is within it:** the chunk holds as many positions as
+  are left after the fixed part. It is one tile at least, which may take a
+  little longer.
+- **If the fixed part alone overruns it,** as at long contexts it does, no
+  chunk can meet the time. The chunk is then the positions worth the fixed
+  part again, so that a step takes about twice its fixed part.
+- **In every case:** whole query tiles, the attention kernel's (ADR-0011),
+  at least one tile, and no more than `prefill_chunk`.
+
+`pressure_chunk_seconds` is 0.8 s, below #135's target of 1 s from an event
+to its plan by what a plan between steps and a step's growth can add. At
+GREEN, and in an engine that does not adapt, chunks stay at
+`prefill_chunk`.
+
+**The first design, and what it measured.** The first design sized a chunk
+from the time a position of the chunk before took, as though a step had no
+fixed part, within 0.5 s. The survival experiment was run again with it
+(`survival` entry `27567876…`, at 8e3ccf0), against the run without it
+(`1fdbeebd…`):
+
+| | Chunks of 512 | First design |
+|---|---:|---:|
+| Event to plan, after an episode's first event, median | 13.2 s | 1.5 s |
+| Events within 1 s | 0 | 24 of 74 |
+| From the take to the end | 668 s | 1617 s |
+
+- **From 26K positions every step was one tile,** 16 positions, and still
+  took about 1.7 s.
+- **A step has a large fixed part**, which on this engine grows with the
+  context, and a per-position estimate charged all of it to 16 positions.
+  One tile was therefore always chosen, though a larger chunk would have
+  cost a step little more.
+- **Prefill under pressure ran at a third of its speed,** with no gain in
+  latency.
+
+The present design separates the two parts. It was probed, unlogged, on
+Qwen2.5-1.5B with a prompt of 8192 positions under a simulated RED, which
+downgrades the cache as it grows. A step there took 0.43 s before its first
+position and 4.3 ms per position. These are the costs of a quantised cache,
+which differ from those of an FP16 one. Prefill ran at 130 tokens per second
+with 0.8 s, and at 106 with 0.5 s, against 190 with no pressure. With 0.8 s,
+steps took 0.75 s at the median and 1.26 s at most.
+
+**Measured at 32K** (`survival` entry `04b95e3f…`, at acd2217). The survival
+experiment, run again with the present design:
+
+| | Chunks of 512 | First design | Present design |
+|---|---:|---:|---:|
+| Episode's first event, to its plan | 11.1 s | 11.1 s | 11.1 s |
+| Later events, to their plans, median | 13.2 s | 1.5 s | 0.86 s |
+| Later events within 1 s | 0 | 24 of 74 | 3 of 5 |
+| From the take to the end | 668 s | 1617 s | 1588 s |
+
+- **The session survived** with 489 plans, every one seen by the driver to a
+  granule.
+- **The latency met the target at the median.** The sample is small: the
+  level held more steadily this time, so most plans were persisting ones,
+  made on no event. The slowest event, 1.87 s, came during decoding, where a
+  step at 32K positions takes about 1.5 s.
+- **The run took no less time than the first design's.** At these contexts a
+  step's fixed part dominates. Short steps therefore cost about 2.4 times
+  the prefill time of chunks of 512 under pressure, whatever the estimate.
+  That is the price of acting within a second or two rather than within
+  13 s.
+
+**Considered options.**
+
+- **Bound every chunk by time, at GREEN too.** This is the only option that
+  also bounds the first event, GREEN to YELLOW or RED. Rejected for its cost.
+  Measured on Qwen2.5-1.5B with a prompt of 8192 positions, at 6K to 8K
+  positions, one unlogged run each:
+
+  | Chunk | Prefill throughput | Per position |
+  |---|---:|---:|
+  | 512 | 190 tok/s | 9.1 ms |
+  | 128 | 151 tok/s | 11.4 ms |
+  | 64 | 129 tok/s | 13.3 ms |
+  | 32 | 115 tok/s | 14.7 ms |
+
+  A 1 s bound at GREEN would cost 30 to 60% of prefill throughput with no
+  contention at all.
+- **A fixed small chunk under pressure.** Rejected. The time a chunk takes
+  grows with the context, so a fixed size bounds nothing at long contexts.
+- **Size by time per position alone.** The first design, rejected on its
+  measurement above.
+
+**The accepted limits.**
+
+- **The first event of every episode** of pressure, each transition from
+  GREEN to YELLOW or RED, still waits for the chunk in progress, at
+  `prefill_chunk`. In a train of pulses, that is every pulse. The engine is
+  not at risk while it waits, since a step reserves all of its pages before
+  it runs (`KVPages::reserve`). The process that took the memory is the one
+  kept waiting.
+- **Where a step's fixed part exceeds the target, the target cannot be
+  met.** On Qwen2.5-1.5B this is the case at long contexts: in the first
+  design's run, every step from 26K positions took over 1.5 s. Draining
+  events only at step boundaries cannot do better than one step, and the
+  chunk is sized to keep a step about twice its fixed part.
+- **Prefill under pressure at long contexts takes about 2.4 times as long**
+  as with chunks of 512, as measured above.
+- **A step can overrun its time** where the cost changes from one step to
+  the next, as it does when a plan has just moved pages: the longest step
+  in the 8K probe took 1.26 s against 0.8 s.
+
+Every pressure event's wait, and its time to its plan, is logged by the
+survival experiment.
