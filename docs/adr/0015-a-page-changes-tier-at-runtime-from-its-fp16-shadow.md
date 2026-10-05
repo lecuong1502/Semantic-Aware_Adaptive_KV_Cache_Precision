@@ -1,6 +1,6 @@
 # A page changes tier at runtime, from its FP16 shadow
 
-Amends ADR-0011. That ADR held each page at the tier it was born at for the
+Amends ADR-0011, superseding its rule that a page keeps its tier. That ADR held each page at the tier it was born at for the
 life of the cache: static operation, Milestone 0's. It left room for the
 next step: "a page could be requantised into a new allocation at another
 tier and the old one freed". Milestone 2 (#88) takes that step. Under
@@ -44,7 +44,7 @@ Three requirements meet here.
 If step 1 cannot allocate, the cache is as it was.
 
 **The shadow** (#94). Before a page's first downgrade, its FP16 bytes are
-copied to pinned host memory, and they are kept for the session. The old
+copied to pinned host memory, and they are kept until the cache is released. The old
 page is freed only once the copy is complete. A page born at a quantised
 tier has no shadow and never moves.
 
@@ -75,7 +75,7 @@ not otherwise begin.
   codes. Rejected: errors compound along the path a page took. A page at
   INT4 would no longer have INT4's measured error, and the controller's
   marginal costs would be wrong.
-- **Requantise in place.** Rejected: pages at different tiers have
+- **Downgrade in place.** Rejected: pages at different tiers have
   different sizes, and ADR-0007 packs each tier's pages in its own address
   range. A smaller page written into a larger slot frees nothing the driver
   sees. The research notes record this as the one approach that cannot
@@ -102,8 +102,8 @@ not otherwise begin.
 - A cache that reached its tiers through runtime moves reads, bit for bit,
   as one built at those tiers.
 - An upgrade to FP16 restores the page's bytes bit for bit.
-- After every plan, the driver sees the memory the allocator returned, to a
-  granule.
+- After every plan, the driver sees the memory returned that
+  `tier_page_bytes` predicts and the allocator reports, to a granule.
 
 **What a move costs** (`requantisation-latency`, Qwen2.5-1.5B, one page of
 one layer, median of 256, at 51cb21f):
@@ -129,5 +129,5 @@ one layer, median of 256, at 51cb21f):
   token.
 
 **Host memory now holds part of the cache's state.** A shadow lives as long
-as the session, so the host memory an adaptive engine uses grows with the
+as its cache, so the host memory an adaptive engine uses grows with the
 pages it has downgraded.

@@ -265,7 +265,7 @@ for the whole context window through the virtual memory management interface
 time, as pages arrive. A tier's live pages occupy its lowest slots with no holes:
 freeing a page moves the tier's last page into its slot, and a granule no page
 reaches into is unmapped and returned to the driver. The engine therefore holds
-exactly what its pages need, by the driver's own account. A private pool would
+what its pages need, by the driver's own account. A private pool would
 keep what it freed, and the monitor would read that as contention.
 
 \paragraph{Reading.} A page is allocated at the tier it is born at once all its
@@ -285,7 +285,8 @@ the old page is still read, quantises it, points the page table at it, and frees
 the old page. If the allocation fails, the cache is as it was.
 
 \paragraph{The shadow.} Before a page's first downgrade, its FP16 bytes are
-copied to pinned host memory, its \textit{shadow}, and kept for the session.
+copied to pinned host memory, its \textit{shadow}, and kept until the cache is
+released.
 Every move quantises from FP16: from the page itself while it is FP16, and from
 the shadow after that, never from the current codes. A page at tier $T$ is
 therefore always exactly the quantisation of its FP16 rows at $T$, however many
@@ -300,7 +301,7 @@ positions take about 0.9\,GiB of host memory.
 
 \paragraph{Correctness and cost.} A cache that reached its tiers through moves
 yields, bit for bit, the logits of one built at those tiers, and an upgrade to
-FP16 restores them. On Qwen2.5-1.5B a move of one page of one layer takes 13 to
+FP16 restores them. On Qwen2.5-1.5B a move of one page of one layer takes 8 to
 39\,$\mu$s at the median. The first downgrade's shadow copy is about 7\,$\mu$s
 of that.
 
@@ -353,7 +354,7 @@ score outweighs it.
 last $W = 128$ positions are never downgraded, under every policy.
 
 \paragraph{Upgrades.} At GREEN only, pages are restored largest gain first, the
-reverse of a downgrade plan. An upgrade waits at least 5\,s after the later of
+reverse of a downgrade plan, in batches within the same per-step budget. An upgrade waits at least 5\,s after the later of
 the last downgrade and the end of the last pressure, and never takes headroom
 below $T_\mathrm{high}$ plus 512\,MiB, one P90 spike.
 

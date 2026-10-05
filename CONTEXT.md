@@ -83,9 +83,9 @@ later (#88).
 
 **Shadow**:
 A downgraded page's FP16 bytes, copied to pinned host memory before its
-first downgrade and kept for the session, so that a later downgrade can
-quantise from FP16 and an upgrade can restore the page bit for bit (#88,
-#94). A page has one. A move from it to a quantised tier, down or up,
+first downgrade and kept until the cache is released, so that a later
+downgrade can quantise from FP16 and an upgrade can restore the page bit
+for bit (#88, #94). A page has one. A move from it to a quantised tier, down or up,
 uploads it to an FP16 page of the allocator's, `(layer, -4)`, for as long as
 the move takes (#95, #96); an upgrade to FP16 copies it into the new page.
 _Avoid_: backup, host copy, offload (offloading moves a page off the device;
@@ -165,7 +165,9 @@ _Avoid_: sample (the recorder's word), tick
 **Attention scorer**:
 What keeps every page's importance score: each decode step's attention mass,
 from the attention kernel, folded on the device into an EWMA, every 4th
-step by default (ADR-0016). It scores; it decides nothing.
+step by default (ADR-0016). It scores; it decides nothing. The paper and
+the thesis call it the *attention importance scorer*, and ADR-0016 the
+importance scorer; the three name the same thing.
 _Avoid_: importance model, scorer policy
 
 **Importance score**:

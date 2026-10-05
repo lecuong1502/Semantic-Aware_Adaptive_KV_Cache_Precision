@@ -59,7 +59,8 @@ The controller is pure logic with no device code (#101).
     last pressure;
   - only while headroom stays at or above `T_high` + 512 MiB, one P90
     spike;
-  - in the reverse of a downgrade plan's order, largest gain first.
+  - in the reverse of a downgrade plan's order, largest gain first;
+  - in batches within the same per-step time budget as YELLOW's downgrades.
 - **Three score sources plug into the same planner** (#104). All three meet
   the same byte target, to within one page's move. Only the scores differ,
   so a difference between them is a difference of allocation, not of
@@ -104,21 +105,28 @@ The controller is pure logic with no device code (#101).
 - **Key-norm proxies for importance.** Rejected: they are not attention.
 - **Scoring every step.** Measured and rejected, because it was outside
   noise on Qwen2.5-0.5B at 512 positions:
-  - every step: −0.71% decode throughput against a noise of 0.38
-    (`cadce177…`);
-  - every 4th step: −0.65% against a noise of 1.34, within noise
-    (`f9166c24…`);
-  - on Qwen2.5-1.5B, every 4th step: −0.02% (`a2f8cc80…`).
+  - every step: −0.71% decode throughput against a noise of 0.68%
+    (`cadce177…`, at fa73af3);
+  - every 4th step: −0.65% against a noise of 2.5%, within noise
+    (`f9166c24…`, at 6a09671);
+  - on Qwen2.5-1.5B, every 4th step: −0.02% against a noise of 4.6%
+    (`a2f8cc80…`, at 6a09671).
 - **Hard protection of the first page.** Not needed. The scorer rates it
   highly on its own, and a hard rule would protect a sink page in a model
   that had none.
-- **Hysteresis per policy, re-planning at most every M steps.** Dropped.
+- **Hysteresis per policy, planning again at most every M steps.** Dropped.
   The monitor's K = 3, the budgeted batches and the upgrade cooldown already
   cover it.
 - **An upgrade cooldown from the last downgrade only.** Amended in #106.
   Under a train of pulses whose later pulses find nothing left to
   downgrade, upgrades between pulses would be undone by the next one. The
   cooldown therefore also runs from the end of the last pressure.
+- **A uniform partial step spread every k-th page.** #88's wording.
+  Replaced by bit-reversed order over positions, which spreads every prefix
+  of a partial step across the cache even where the page count is not a
+  multiple of k. With powers of two it is exactly every k-th page, and
+  otherwise no window of positions is off its even share by more than
+  log2(positions) / 2 + 1 pages (#104).
 - **Re-scoring on a topic shift.** Deferred to Milestone 3's multi-turn
   dialogue, if the EWMA proves too slow there.
 - **On OutOfMemory, offload pages to the host or evict tokens.** Rejected:
