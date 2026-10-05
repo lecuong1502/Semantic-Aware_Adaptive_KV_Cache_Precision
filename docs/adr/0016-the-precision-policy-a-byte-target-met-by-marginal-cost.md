@@ -164,15 +164,26 @@ The controller is pure logic with no device code (#101).
 
 While an adaptive engine's monitor reads YELLOW or RED, each prefill chunk
 is sized from what the steps before it cost (`StepCost`). A step's time is
-taken as a fixed part and a part per position. The per-position part comes
-from two steps in a row whose sizes are at least a factor of two apart. The
-fixed part is refreshed at every step, since it grows with the context.
+taken as a fixed part and a part per position.
+- The per-position part comes from comparing the step with the one just
+  before it, if their sizes are at least a factor of two apart. A step from
+  further back ran at a shorter context, where a position cost less, and
+  would make the per-position part too small: a first version that compared
+  with such steps sized its chunks up to 512 under RED.
+- Until a split is made, a chunk is at most half the one before, so that two
+  steps in a row are wide apart.
+- A comparison that makes no sense, as noise can make a larger step the
+  quicker, is ignored, and the estimate stands.
+- The fixed part follows every step, since it grows with the context.
 
-- **If one tile fits:** the chunk holds as many positions as
-  `pressure_chunk_seconds` leaves after the fixed part.
+The chunk is then chosen by how the fixed part compares with
+`pressure_chunk_seconds`.
+- **If the fixed part is within it:** the chunk holds as many positions as
+  are left after the fixed part. It is one tile at least, which may take a
+  little longer.
 - **If the fixed part alone overruns it,** as at long contexts it does, no
   chunk can meet the time. The chunk is then the positions worth the fixed
-  part again, so that a step takes at most twice what one tile's would.
+  part again, so that a step takes about twice its fixed part.
 - **In every case:** whole query tiles, the attention kernel's (ADR-0011),
   at least one tile, and no more than `prefill_chunk`.
 
@@ -202,11 +213,13 @@ fixed part, within 0.5 s. The survival experiment was run again with it
 - **Prefill under pressure ran at a third of its speed,** with no gain in
   latency.
 
-The present design separates the two parts. Probed on Qwen2.5-1.5B with a
-prompt of 8192 positions under a simulated RED, unlogged, a step there took
-0.43 s before its first position and 4.3 ms per position. Prefill ran at 128
-tokens per second with 0.8 s, and at 86 with 0.5 s, against 190 with no
-pressure. With 0.8 s, steps took 0.76 s at the median and 1.15 s at most.
+The present design separates the two parts. It was probed, unlogged, on
+Qwen2.5-1.5B with a prompt of 8192 positions under a simulated RED, which
+downgrades the cache as it grows. A step there took 0.43 s before its first
+position and 4.3 ms per position. These are the costs of a quantised cache,
+which differ from those of an FP16 one. Prefill ran at 130 tokens per second
+with 0.8 s, and at 106 with 0.5 s, against 190 with no pressure. With 0.8 s,
+steps took 0.75 s at the median and 1.26 s at most.
 
 **Considered options.**
 
@@ -238,10 +251,13 @@ pressure. With 0.8 s, steps took 0.76 s at the median and 1.15 s at most.
   it runs (`KVPages::reserve`). The process that took the memory is the one
   kept waiting.
 - **Where a step's fixed part exceeds the target, the target cannot be
-  met.** This is the case on Qwen2.5-1.5B from about 26K positions, where a
-  step costs over 1 s before its first position. Draining events only at
-  step boundaries cannot do better than one step, and the chunk is sized to
-  keep a step within twice that.
+  met.** On Qwen2.5-1.5B this is the case at long contexts: in the first
+  design's run, every step from 26K positions took over 1.5 s. Draining
+  events only at step boundaries cannot do better than one step, and the
+  chunk is sized to keep a step about twice its fixed part.
+- **A step can overrun its time** where the cost changes from one step to
+  the next, as it does when a plan has just moved pages: the longest step
+  in the 8K probe took 1.26 s against 0.8 s.
 
 Every pressure event's wait, and its time to its plan, is logged by the
 survival experiment.
