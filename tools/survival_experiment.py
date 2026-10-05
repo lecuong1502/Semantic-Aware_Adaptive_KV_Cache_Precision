@@ -13,7 +13,7 @@ FP16, with its pressure monitor on (microinfer.survival.run). When the cache
 reaches --contention-at positions, the contention simulator, a process of
 its own, takes what leaves the engine --shortfall MiB short of its full
 cache, and keeps it to the end, as most of RQ1's spikes kept theirs; the
-generation waits at that position until the simulator holds it. The
+generation waits at that position until the simulator has taken it. The
 recorder records the device throughout.
 
 - `static` holds every page at FP16 and does not adapt: it runs out of
@@ -23,7 +23,7 @@ recorder records the device throughout.
   allocation that fails (#105, #107), from --score-source's scores: it is
   to finish, every token decoded. Every plan is logged with the memory its
   cache returned, what the driver saw the engine's process give back, and
-  how long it took.
+  whether the two agree to a granule, and how long it took.
 
 The rule, not a number, sets what the simulator takes, so that the two runs
 face the same contention whatever else the desktop holds. Each run is one

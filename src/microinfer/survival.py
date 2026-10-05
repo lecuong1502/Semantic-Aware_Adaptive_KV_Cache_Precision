@@ -1,7 +1,7 @@
 """The survival experiment (#108): the run, and the logic it is made of.
 
-A generation holds a long context at FP16 while the contention simulator,
-a process of its own, takes memory mid-session and keeps it, as most of
+A generation fills a long context at FP16 while the contention simulator,
+a process of its own, takes memory part way through and keeps it, as most of
 RQ1's spikes kept theirs (ADR-0014). The simulator takes enough that a
 static engine runs out before its cache is full; an adaptive one is to
 downgrade, give the memory back to the driver, and finish.
@@ -14,10 +14,11 @@ takes what leaves it `shortfall` short of that.
 
 **What a run comes to** is whether it survived, how it ended, and every plan
 the engine made: the memory each returned, by the cache's allocator and by
-the driver's account of the engine's process, and how long it took.
+the driver's account of the engine's process, whether the two agree to a
+granule (#88's gate), and how long it took.
 
 **The run** pauses the generation at the chosen position until the
-simulator holds what it took, so that contention arrives at the same place
+simulator has taken its memory, so that contention arrives at the same place
 in every run however fast the engine and the simulator start.
 """
 
@@ -34,19 +35,19 @@ import numpy as np
 from . import _microinfer, nvml, recorder, replay
 from .config import ModelConfig
 from .engine import COMPLETE, Ending, Engine, PlanRecord, PressureRecord, paged_cache_bytes
+from .footprint import MIB
 from .schedule import Schedule
 
 #: How a static run that ran out ends: generate raises, it does not end.
 OUT_OF_MEMORY = "out of memory"
 
-MIB = 2**20
 #: How long the simulator waits, its context in place, before it takes.
 LEAD_S = 0.2
 #: The longest a generation waits at the chosen position for the take.
 TAKE_TIMEOUT_S = 60.0
-#: The longest the simulator keeps its take, the generation ending first:
-#: a 32K prefill and its decoding take minutes, not a day.
-HOLD_S = 24 * 3600.0
+#: The longest the simulator keeps what it took, the generation ending
+#: first: a 32K prefill and its decoding take minutes, not a day.
+KEEP_S = 24 * 3600.0
 
 
 def contention_bytes(cfg: ModelConfig, *, headroom_bytes: int, positions: int, context: int,
@@ -62,7 +63,7 @@ def contention_bytes(cfg: ModelConfig, *, headroom_bytes: int, positions: int, c
     still_to_grow = paged_cache_bytes(cfg, context) - paged_cache_bytes(cfg, positions)
     room = headroom_bytes - simulator_context_bytes - still_to_grow
     if room < 0:
-        raise ValueError(f"the engine is short already: {room / 2**20:.0f} MiB with nothing "
+        raise ValueError(f"the engine is short already: {room / MIB:.0f} MiB with nothing "
                          f"taken")
     granule = _microinfer.granule_bytes()
     return -(-(room + shortfall_bytes) // granule) * granule
@@ -79,21 +80,26 @@ def summarise(plans: Sequence[PlanRecord], *, ending: Ending | None = None,
                  "tokens": len(ending.tokens), "reason": ending.reason}
     else:
         ended = {"state": OUT_OF_MEMORY, "positions": positions_reached, "error": error}
-    rows = [_plan(record) for record in plans]
+    granule = _microinfer.granule_bytes()
+    rows = [_plan(record, granule) for record in plans]
     seen = [r["seen_mib"] for r in rows]
+    agreed = [r["seen_within_granule"] for r in rows]
     totals = {"plans": len(rows),
               "emergency_plans": sum(r["emergency"] is not None for r in rows),
               "downgrades_applied": sum(r["applied"] for r in rows if not r["upgrades"]),
               "upgrades_applied": sum(r["applied"] for r in rows if r["upgrades"]),
               "returned_mib": sum(r["returned_mib"] for r in rows),
-              "seen_mib": None if None in seen else sum(seen)}
+              "seen_mib": None if None in seen else sum(seen),
+              "every_plan_seen_within_granule": None if not rows or None in agreed
+              else all(agreed)}
     return {"survived": ending is not None and ending.state == COMPLETE, "ending": ended,
             "plans": rows, "totals": totals}
 
 
-def _plan(record: PlanRecord) -> dict:
+def _plan(record: PlanRecord, granule: int) -> dict:
     """One plan: what it was for, what became of it, the memory it returned
-    and the time it took. Its time from the event to its last batch is
+    and the time it took. The driver saw what the cache returned if, batch
+    by batch, the two differ by a granule at most. Its time from the event to its last batch is
     given for a plan made on its event, not for one made because pressure
     persisted or an allocation failed."""
     batches = record.batches
@@ -101,6 +107,9 @@ def _plan(record: PlanRecord) -> dict:
     measured = all(b.own_bytes_before is not None and b.own_bytes_after is not None
                    for b in batches)
     seen = sum(b.own_bytes_before - b.own_bytes_after for b in batches) if measured else None
+    agreed = all(abs((b.own_bytes_before - b.own_bytes_after)
+                     - (b.cache_bytes_before - b.cache_bytes_after)) <= granule
+                 for b in batches) if measured else None
     on_event = (record.pressure is not None and batches and not record.persisting
                 and record.emergency is None)
     plan = record.plan
@@ -113,6 +122,7 @@ def _plan(record: PlanRecord) -> dict:
             "planning_ms": round(record.planning_seconds * 1e3, 3),
             "applying_ms": round(sum(b.seconds for b in batches) * 1e3, 3),
             "returned_mib": returned / MIB, "seen_mib": None if seen is None else seen / MIB,
+            "seen_within_granule": agreed,
             "event_to_applied_ms": round((batches[-1].at_seconds
                                           - record.pressure.event.t_mono_ns / 1e9) * 1e3, 3)
             if on_event else None}
@@ -153,7 +163,7 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
     def contend() -> None:
         try:
             took["started_ns"] = replay.replay(Schedule([(0.0, took["bytes"])]), out,
-                                               lead_s=LEAD_S, tail_s=HOLD_S, stop=done)
+                                               lead_s=LEAD_S, tail_s=KEEP_S, stop=done)
         except BaseException as exc:  # noqa: BLE001 - raised by the caller's thread
             failure.append(exc)
 

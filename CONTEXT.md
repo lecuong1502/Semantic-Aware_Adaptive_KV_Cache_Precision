@@ -315,6 +315,23 @@ replay is recorded as the trace was, and compared with it sample by sample and
 spike by spike.
 _Avoid_: playback, re-run (a scenario run again is a new trace, not a replay)
 
+**Survival experiment**:
+Milestone 2's closing measurement (#108): a generation fills a long context
+at FP16 while simulated contention, taken when the cache reaches a chosen
+position and kept to the end, leaves the engine its **shortfall** short of
+its full cache. A static engine runs out; an adaptive one is to downgrade
+and complete. The generation waits at that position until the simulator has
+taken its memory, so contention arrives at the same place in every run.
+_Avoid_: stress test, survival test (it is logged, not asserted)
+
+**Shortfall**:
+The device memory a survival experiment's contention leaves an engine short
+of its full FP16 cache: the simulator takes the headroom, less its own
+context and what the cache has still to grow, plus the shortfall. A rule,
+not a number of bytes, so that a static and an adaptive run face the same
+contention whatever else the desktop holds.
+_Avoid_: deficit (a spike's), overshoot (a plan's, of its byte target)
+
 **Contention trace**:
 A recording of contention as the recorder takes it, in two streams on one
 monotonic clock: the **device stream**, the driver's free and used memory at

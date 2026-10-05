@@ -1,5 +1,5 @@
 """The survival experiment (#108): a generation the simulator takes memory
-from mid-session, run on a static engine and on an adaptive one.
+from part way through, run on a static engine and on an adaptive one.
 
 Three seams. Engine.generate reports its progress, as Engine.hold does, so
 that contention can arrive at a position the experiment chooses (Seam A).
@@ -17,9 +17,9 @@ from conftest import require_model
 from microinfer import Engine, ModelConfig, monitor, replay, survival
 from microinfer.engine import (COMPLETE, DECODING, EXHAUSTED, PREFILLING, AppliedBatch, Ending,
                                PlanRecord, PressureRecord)
+from microinfer.footprint import MIB
 
 NAME = "qwen2.5-0.5b-instruct"
-MIB = 2**20
 
 
 def prompt(n, seed):
@@ -86,7 +86,7 @@ def test_an_engine_already_short_of_memory_is_refused():
 
 class Moves:
     """A plan as a summary reads it: its level, byte target, whether it fell
-    short, and how many moves it holds."""
+    short, and how many moves are in it."""
 
     def __init__(self, level, target_bytes, moves, short=False):
         self.level, self.target_bytes, self.short, self._moves = level, target_bytes, short, moves
@@ -123,11 +123,24 @@ def test_a_run_that_completes_survived_and_its_plans_say_what_they_returned():
                      "ended": "applied", "headroom_mib": 200.0, "target_mib": 888.0,
                      "short": True, "moves": 300, "applied": 300, "skipped": 0, "batches": 1,
                      "planning_ms": 4.0, "applying_ms": 50.0, "returned_mib": 400.0,
-                     "seen_mib": 400.0, "event_to_applied_ms": 80.0}
+                     "seen_mib": 400.0, "seen_within_granule": True,
+                     "event_to_applied_ms": 80.0}
     assert s["plans"][1]["persisting"] is True
     assert s["plans"][1]["event_to_applied_ms"] is None  # not made on its event
     assert s["totals"] == {"plans": 2, "emergency_plans": 0, "downgrades_applied": 340,
-                           "upgrades_applied": 0, "returned_mib": 410.0, "seen_mib": 410.0}
+                           "upgrades_applied": 0, "returned_mib": 410.0, "seen_mib": 410.0,
+                           "every_plan_seen_within_granule": True}
+
+
+def test_a_plan_the_driver_saw_return_more_than_a_granule_less_is_flagged():
+    """#88's gate: after every plan, the driver sees what the cache returned,
+    to a granule. 400 MiB returned and 396 seen is two granules off."""
+    record = red_at_ten_seconds()
+    record.batches[0].own_bytes_after += 4 * MIB
+    s = survival.summarise([record], ending=Ending(COMPLETE, 1, np.arange(1, dtype=np.int32)))
+    assert s["plans"][0]["seen_mib"] == 396.0
+    assert s["plans"][0]["seen_within_granule"] is False
+    assert s["totals"]["every_plan_seen_within_granule"] is False
 
 
 def test_a_static_run_that_ran_out_did_not_survive_and_says_where():
@@ -183,5 +196,6 @@ def test_the_static_engine_runs_out_where_the_adaptive_one_survives(tmp_path):
     assert s["survived"] is True
     assert s["ending"] == {"state": COMPLETE, "positions": 8192 + 31, "tokens": 32, "reason": ""}
     assert s["totals"]["downgrades_applied"] > 0
-    assert s["totals"]["returned_mib"] > 0 and s["totals"]["seen_mib"] > 0
+    assert s["totals"]["returned_mib"] > 0
+    assert s["totals"]["every_plan_seen_within_granule"] is True
     assert (tmp_path / "adaptive.csv.gz").exists()
