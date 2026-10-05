@@ -155,8 +155,46 @@ The controller is pure logic with no device code (#101).
     its plan.
   - The run survived because the first RED left more headroom than one
     chunk's pages need.
-  - Shortening steps under pressure is #135. Until it is decided, a sharp
-    contention mid-prefill is answered by the emergency plan.
+  - #135 shortens steps under pressure; see the amendment below.
 - **RQ3's comparison is fixed here:** semantic against uniform at the same
   byte target, with random as a control. A change to the planner after RQ3's
   results are read changes what they mean, and needs a new ADR.
+
+## Amendment (#135): prefill chunks bounded by time under pressure
+
+While an adaptive engine's last drained level is YELLOW or RED, each prefill
+chunk is sized from the time a position of the chunk before took:
+
+- as many positions as `pressure_chunk_seconds` holds, 0.5 s by default;
+- in whole query tiles of 16 (ADR-0011), and one tile at least;
+- no more than `prefill_chunk`.
+
+The budget is half of #135's target of 1 s from an event to its plan,
+because a chunk sized from the one before can overrun it: a position costs
+more as the context grows. At GREEN, and in an engine that does not adapt,
+chunks stay at `prefill_chunk`.
+
+**Considered options.**
+
+- **Bound every chunk by time, at GREEN too.** This is the only option that
+  also bounds the first event, GREEN to YELLOW or RED. Rejected for its cost.
+  Measured on Qwen2.5-1.5B with a prompt of 8192 positions, at 6K to 8K
+  positions, one unlogged run each:
+
+  | Chunk | Prefill throughput | Per position |
+  |---|---:|---:|
+  | 512 | 190 tok/s | 9.1 ms |
+  | 128 | 151 tok/s | 11.4 ms |
+  | 64 | 129 tok/s | 13.3 ms |
+  | 32 | 115 tok/s | 14.7 ms |
+
+  A 1 s bound at GREEN would cost 30 to 60% of prefill throughput with no
+  contention at all.
+- **A fixed small chunk under pressure.** Rejected. The time a chunk takes
+  grows with the context, so a fixed size bounds nothing at long contexts.
+
+**The accepted limit.** The first event of an episode still waits for the
+chunk in progress, at `prefill_chunk`. The engine is not at risk while it
+waits, since a step reserves all of its pages before it runs
+(`KVPages::reserve`). The process that took the memory is the one kept
+waiting. Every pressure event's wait is logged by the survival experiment.

@@ -127,8 +127,11 @@ _Avoid_: bit-width (that is the nominal code width)
 A span of consecutive token positions of a prompt that one step of prefill
 runs through the model together, `prefill_chunk` of them at a time. It is a
 unit of work, not of memory: it sizes the workspace, never the cache, and its
-boundaries bear no relation to pages or granules. The bare word "chunk" means
-this and nothing else.
+boundaries bear no relation to pages or granules. While an adaptive engine's
+last drained level is YELLOW or RED, a chunk is fewer positions, sized from
+the time a position of the chunk before took, so that a step stays within
+`pressure_chunk_seconds` (#135). The bare word "chunk" means this and
+nothing else.
 _Avoid_: batch (there is one sequence), block, window (that is the model's
 context window)
 
