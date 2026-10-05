@@ -15,7 +15,8 @@ takes what leaves it `shortfall` short of that.
 **What a run comes to** is whether it survived, how it ended, and every plan
 the engine made: the memory each returned, by the cache's allocator and by
 the driver's account of the engine's process, whether the two agree to a
-granule (#88's gate), and how long it took.
+granule (#88's gate), and how long it took; and how long each pressure
+event waited for the step boundary at which the engine drained it (#135).
 
 **The run** pauses the generation at the chosen position until the
 simulator has taken its memory, so that contention arrives at the same place
@@ -34,6 +35,7 @@ import numpy as np
 
 from . import _microinfer, nvml, recorder, replay
 from .config import ModelConfig
+from .contention import spread
 from .engine import COMPLETE, Ending, Engine, PlanRecord, PressureRecord, paged_cache_bytes
 from .footprint import MIB
 from .schedule import Schedule
@@ -127,6 +129,21 @@ def _plan(record: PlanRecord, granule: int) -> dict:
                                           - record.pressure.event.t_mono_ns / 1e9) * 1e3, 3)
             if on_event else None}
 
+
+def waits(pressure_events: Sequence[PressureRecord]) -> dict:
+    """Each pressure event, with how long it waited from the monitor's
+    transition to the step boundary at which the engine drained it, and the
+    median, P90 and max of the waits of the YELLOW and RED events, the ones
+    a plan answers (#135). The engine plans for an event as it drains it,
+    so the wait is the most of an event's time to its plan."""
+    rows = [{"level": r.event.level.value,
+             "previous": None if r.event.previous is None else r.event.previous.value,
+             "headroom_mib": r.event.headroom_bytes / MIB, "positions": r.positions_held,
+             "wait_ms": round((r.drained_ns - r.event.t_mono_ns) / 1e6, 3)}
+            for r in pressure_events]
+    return {"events": rows,
+            "pressure_wait_ms": spread([r["wait_ms"] for r in rows
+                                        if r["level"] in ("YELLOW", "RED")])}
 
 @dataclass
 class Run:

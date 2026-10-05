@@ -158,6 +158,31 @@ def test_an_exhausted_run_did_not_survive():
     assert s["ending"]["state"] == EXHAUSTED and s["ending"]["reason"] == "nothing to downgrade"
 
 
+def record(level, previous, at_s, wait_ms, positions):
+    event = monitor.PressureEvent(t_mono_ns=int(at_s * 1e9), poll=0, previous=previous,
+                                  level=level, headroom_bytes=600 * MIB)
+    return PressureRecord(event, positions, int(at_s * 1e9 + wait_ms * 1e6))
+
+
+def test_each_event_says_how_long_it_waited_for_a_step_boundary():
+    """#135: the time from an event to the step boundary at which the engine
+    drained it, for each event, and over the YELLOW and RED ones, the ones
+    a plan answers. The first GREEN, when the monitor starts, answers
+    nothing and is left out of the spread."""
+    events = [record(monitor.GREEN, None, 1.0, 479.0, 512),
+              record(monitor.RED, monitor.GREEN, 20.0, 30.0, 16896),
+              record(monitor.YELLOW, monitor.RED, 21.0, 900.0, 16928)]
+    w = survival.waits(events)
+    assert w["events"][1] == {"level": "RED", "previous": "GREEN", "headroom_mib": 600.0,
+                              "positions": 16896, "wait_ms": 30.0}
+    assert w["events"][0]["previous"] is None
+    assert w["pressure_wait_ms"] == {"median": 465.0, "p90": 813.0, "max": 900.0}
+
+
+def test_no_pressure_has_no_spread():
+    assert survival.waits([record(monitor.GREEN, None, 1.0, 5.0, 0)])["pressure_wait_ms"] is None
+
+
 # -- the run, small -----------------------------------------------------------------------
 
 @pytest.mark.slow

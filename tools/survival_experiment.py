@@ -23,7 +23,10 @@ recorder records the device throughout.
   allocation that fails (#105, #107), from --score-source's scores: it is
   to finish, every token decoded. Every plan is logged with the memory its
   cache returned, what the driver saw the engine's process give back, and
-  whether the two agree to a granule, and how long it took.
+  whether the two agree to a granule, and how long it took. Every pressure
+  event is logged with how long it waited for the step boundary at which
+  the engine drained it: under pressure, prefill chunks are sized to keep
+  that short (#135).
 
 The rule, not a number, sets what the simulator takes, so that the two runs
 face the same contention whatever else the desktop holds. Each run is one
@@ -103,17 +106,17 @@ def main(argv: list[str]) -> int:
               "prompt_positions": args.prompt_positions, "new_tokens": args.new_tokens,
               "prompt_seed": SEED, "prefill_chunk": engine.prefill_chunk,
               "contention_at": args.contention_at, "shortfall_mib": args.shortfall,
+              "pressure_chunk_seconds": engine.pressure_chunk_seconds if adaptive else None,
               "contention_rule": "the simulator takes what leaves the engine the shortfall "
                                  "short of its full FP16 cache, from the headroom when the "
                                  "cache reaches contention_at, and keeps it to the end",
               "simulator_context_bytes": context_bytes, "poll_s": monitor.POLL_S,
               "thresholds": asdict(monitor.DEFAULT),
               "files": {f.name: benchlog.file_sha256(f) for f in files if f.exists()}}
-    levels = [r.event.level.value for r in result.pressure_events]
     results = {**result.summary, "contention_position": result.contention_position,
                "headroom_at_contention_mib": result.headroom_bytes / MIB,
-               "taken_mib": result.taken_bytes / MIB, "pressure_events": len(levels),
-               "pressure_levels": levels}
+               "taken_mib": result.taken_bytes / MIB,
+               "pressure": survival.waits(result.pressure_events)}
     # An adaptive cache ends mixed, page by page; its plans say how.
     benchlog.append("survival", model=args.model, context_length=context,
                     precision_tiers=None if adaptive else {"FP16": 1.0}, config=config,
