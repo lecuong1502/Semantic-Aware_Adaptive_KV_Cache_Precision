@@ -162,16 +162,17 @@ The controller is pure logic with no device code (#101).
 
 ## Amendment (#135): prefill chunks bounded by time under pressure
 
-While an adaptive engine's last drained level is YELLOW or RED, each prefill
-chunk is sized from the time a position of the chunk before took:
+While an adaptive engine's monitor reads YELLOW or RED, each prefill chunk
+is sized from the time a position of the chunk before took:
 
 - as many positions as `pressure_chunk_seconds` holds, 0.5 s by default;
-- in whole query tiles of 16 (ADR-0011), and one tile at least;
+- in whole query tiles, the attention kernel's (ADR-0011), and one tile at
+  least;
 - no more than `prefill_chunk`.
 
-The budget is half of #135's target of 1 s from an event to its plan,
+The chunk time is half of #135's target of 1 s from an event to its plan,
 because a chunk sized from the one before can overrun it: a position costs
-more as the context grows. At GREEN, and in an engine that does not adapt,
+more as the context grows, and in a small chunk than in a large one. At GREEN, and in an engine that does not adapt,
 chunks stay at `prefill_chunk`.
 
 **Considered options.**
@@ -193,8 +194,17 @@ chunks stay at `prefill_chunk`.
 - **A fixed small chunk under pressure.** Rejected. The time a chunk takes
   grows with the context, so a fixed size bounds nothing at long contexts.
 
-**The accepted limit.** The first event of an episode still waits for the
-chunk in progress, at `prefill_chunk`. The engine is not at risk while it
+**The accepted limits.**
+
+- **The first event of every episode** of pressure, each transition from
+  GREEN to YELLOW or RED, still waits for the chunk in progress, at
+  `prefill_chunk`. In a train of pulses, that is every pulse.
+- **One tile is the floor.** A chunk is never less than one query tile, so
+  where one position costs more than 1/16 of the target, as at very long
+  contexts it may, a step outlasts it. The survival experiment's logged
+  waits show whether it does.
+
+On the first: the engine is not at risk while it
 waits, since a step reserves all of its pages before it runs
 (`KVPages::reserve`). The process that took the memory is the one kept
 waiting. Every pressure event's wait is logged by the survival experiment.

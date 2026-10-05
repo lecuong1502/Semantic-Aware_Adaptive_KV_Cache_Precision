@@ -116,7 +116,9 @@ def main(argv: list[str]) -> int:
     results = {**result.summary, "contention_position": result.contention_position,
                "headroom_at_contention_mib": result.headroom_bytes / MIB,
                "taken_mib": result.taken_bytes / MIB,
-               "pressure": survival.waits(result.pressure_events)}
+               "pressure_events": len(result.pressure_events),
+               "pressure_levels": [r.event.level.value for r in result.pressure_events],
+               "pressure": survival.waits(result.pressure_events, engine.plans)}
     # An adaptive cache ends mixed, page by page; its plans say how.
     benchlog.append("survival", model=args.model, context_length=context,
                     precision_tiers=None if adaptive else {"FP16": 1.0}, config=config,

@@ -203,23 +203,23 @@ class PressureRecord:
     positions_held: int
     drained_ns: int
 
+    @property
+    def waited_ns(self) -> int:
+        """How long the event waited for the step boundary that drained it."""
+        return self.drained_ns - self.event.t_mono_ns
 
-#: The attention kernel's query tile (ADR-0011): a prefill chunk sized under
-#: pressure is a whole number of tiles, and one at least.
-QUERY_TILE = 16
 
-
-def pressure_chunk(seconds_per_position: float, *, budget_seconds: float,
+def pressure_chunk(seconds_per_position: float, *, seconds: float, tile: int,
                    cap: int | None) -> int:
     """The positions of a prefill chunk run under pressure (#135): as many
-    as `budget_seconds` holds at `seconds_per_position`, the time a
-    position of the chunk before took, in whole query tiles; one tile at
-    least, and no more than `cap`, the engine's prefill_chunk, if it has
-    one."""
+    as `seconds` holds at `seconds_per_position`, the time a position of
+    the chunk before took, in whole `tile`s, the attention kernel's query
+    tile (ADR-0011); one tile at least, though it may take longer, and no
+    more than `cap`, the engine's prefill_chunk, if it has one."""
     if seconds_per_position <= 0:
         raise ValueError(f"a time per position is positive; got {seconds_per_position}")
-    tiles = int(budget_seconds / seconds_per_position) // QUERY_TILE
-    positions = max(1, tiles) * QUERY_TILE
+    tiles = int(seconds / seconds_per_position) // tile
+    positions = max(1, tiles) * tile
     return positions if cap is None else min(positions, cap)
 
 
@@ -305,7 +305,7 @@ class Engine:
     #: one kv_tier_map names for it (#92).
     KV_TIERS = ("FP16", "INT8", "INT4", "INT2")
 
-    #: The time a prefill chunk may take under pressure (#135). A chunk sized
+    #: The time a prefill chunk aims at under pressure (#135). A chunk sized
     #: from the one before can overrun it, a position costing more as the
     #: context grows, so it is half #135's target of 1 s from an event to
     #: its plan.
@@ -341,9 +341,9 @@ class Engine:
         self.kv_halves = kv_halves
         #: None prefills a prompt in one step, with a workspace for all of it.
         self.prefill_chunk = prefill_chunk
-        #: The time a prefill chunk may take while an adaptive engine's last
-        #: drained level is YELLOW or RED (#135): each such chunk is sized
-        #: from the chunk before it, so that the next event is drained, and
+        #: The time a prefill chunk aims at while an adaptive engine's
+        #: monitor reads YELLOW or RED (#135): each such chunk is sized from
+        #: the chunk before it, so that the next event is drained, and
         #: planned for, within about this long.
         self.pressure_chunk_seconds = pressure_chunk_seconds
         self.model_dir = Path(model_dir)
@@ -931,9 +931,8 @@ class Engine:
         return entry
 
     def _persisting(self, cache: model.PagedCache) -> bool:
-        return (self._pending is None and self._monitor is not None
+        return (self._pending is None and self._under_pressure(cache)
                 and self._last_pressure is not None
-                and self._monitor.level in (YELLOW, RED)
                 and self._monitor.headroom_bytes is not None
                 and cache.pages.pages_per_layer > self._planned_pages)
 
@@ -1079,9 +1078,9 @@ class Engine:
         each chunk's positions, its RoPE angles and its causal mask follow from
         where the one before it stopped.
 
-        While an adaptive engine's last drained level is YELLOW or RED, a
-        chunk is sized by pressure_chunk from the time a position of the
-        chunk before took (#135), so that the events the monitor raises
+        While an adaptive engine's monitor reads YELLOW or RED, a chunk is
+        sized by pressure_chunk from the time a position of the chunk before
+        took (#135), so that the events the monitor raises
         meanwhile are drained between short steps. At GREEN a chunk is
         prefill_chunk, as without a monitor."""
         n = len(ids)
@@ -1094,7 +1093,8 @@ class Engine:
                 step = size
                 if seconds_per_position is not None and self._under_pressure(cache):
                     step = pressure_chunk(seconds_per_position,
-                                          budget_seconds=self.pressure_chunk_seconds, cap=size)
+                                          seconds=self.pressure_chunk_seconds,
+                                          tile=_microinfer.attention_tiles["query"], cap=size)
                 chunk = ids[start:start + step]
                 captured = [] if hidden_states else None
                 began = time.perf_counter()
@@ -1104,11 +1104,10 @@ class Engine:
                 yield chunk, ws, captured, start >= n
 
     def _under_pressure(self, cache) -> bool:
-        """Whether the level this adaptive engine last drained is YELLOW or
-        RED: a monitor that stopped, or none, is no pressure to size by."""
+        """Whether this engine adapts and its monitor's level is YELLOW or
+        RED: a monitor that stopped, or none, is no pressure to act on."""
         return (self._adapts(cache) and self._monitor is not None
-                and self._last_pressure is not None
-                and self._last_pressure.event.level in (YELLOW, RED))
+                and self._monitor.level in (YELLOW, RED))
 
     def _new_cache(self, capacity: int):
         """A cache for one sequence. The contiguous one is sized for `capacity`
