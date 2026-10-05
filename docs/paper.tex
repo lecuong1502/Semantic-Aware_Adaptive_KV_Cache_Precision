@@ -239,14 +239,142 @@ amplitude. The plan is the one that must finish before RED arrives: enough FP16
 pages downgraded to INT8 to give the amplitude back.
 \end{itemize}
 Measured spikes give a P90 amplitude of 506\,MiB and a P10 rise time of 242\,ms,
-so RED lies below 512\,MiB and $K = 3$. No plan is applied until the controller
-exists, so the plan's time is estimated at the bandwidth decoding reaches in the
-experimental configuration, Qwen2.5-1.5B at 32K positions: 2.1\,GB/s. At that
+so RED lies below 512\,MiB and $K = 3$. The rule was set before any plan had
+been applied, so it estimates the plan's time at the bandwidth decoding reaches
+in the experimental configuration, Qwen2.5-1.5B at 32K positions: 2.1\,GB/s. At that
 rate the plan outlasts a fast spike's ramp, the margin is the whole amplitude,
 and YELLOW lies below 1024\,MiB.
 
-% TODO: the scorer, the controller and the paged mixed-precision cache
-% (ADR-0005, ADR-0007, ADR-0008, ADR-0011).
+\subsection{The Paged Mixed-Precision Cache}
+\label{sec:cache}
+
+\paragraph{Pages and tiers.} A page holds the keys and values of $P = 32$
+consecutive positions of one layer, at one of four tiers. The quantised tiers
+follow KIVI \cite{liu2024kivi}: keys are quantised asymmetrically with a scale
+and zero-point per (head, channel) across the page's 32 positions, and values
+per (head, position). One layout serves every quantised tier, and only the
+width of a code changes. Its scale metadata, 1280 bytes per page on
+Qwen2.5-1.5B, does not shrink with the code. INT8, INT4 and INT2 therefore
+spend 8.63, 4.63 and 2.63 \textit{effective bits} per element, and every
+compression ratio in this paper is quoted from those. The page still being
+filled stays at FP16, since a key channel's scale spans the whole page.
+
+\paragraph{Memory.} Each tier has its own range of virtual addresses, reserved
+for the whole context window through the virtual memory management interface
+\cite{cudavmm}. Physical memory is mapped into a range a 2\,MiB granule at a
+time, as pages arrive. A tier's live pages occupy its lowest slots with no holes:
+freeing a page moves the tier's last page into its slot, and a granule no page
+reaches into is unmapped and returned to the driver. The engine therefore holds
+what its pages need, by the driver's own account. A private pool would
+keep what it freed, and the monitor would read that as contention.
+
+\paragraph{Reading.} A page is allocated at the tier it is born at once all its
+positions are reserved, and is sealed, quantised once, when its last position is
+stored. One attention kernel reads each page at the tier the page table records
+for it, dequantising codes as it loads them, in one pass and with no workspace.
+Its query tiles are aligned to pages, so a tile reads one tier, and a query reads
+its own page at FP16, as a decoding query does.
+
+\subsection{Runtime Requantisation}
+\label{sec:requantisation}
+
+A page changes tier between decoding steps, never inside a kernel launch.
+
+\paragraph{Downgrades.} A downgrade allocates the page at the target tier while
+the old page is still read, quantises it, points the page table at it, and frees
+the old page. If the allocation fails, the cache is as it was.
+
+\paragraph{The shadow.} Before a page's first downgrade, its FP16 bytes are
+copied to pinned host memory, its \textit{shadow}, and kept until the cache is
+released.
+Every move quantises from FP16: from the page itself while it is FP16, and from
+the shadow after that, never from the current codes. A page at tier $T$ is
+therefore always exactly the quantisation of its FP16 rows at $T$, however many
+moves it took to get there. Each tier then has one error, the one measured
+offline, and errors do not compound along a page's path.
+
+\paragraph{Upgrades.} An upgrade restores from the shadow. To FP16, the shadow
+is copied back, and the page is again bit for bit what it was before its first
+downgrade. Decoding the codes back up was rejected: it would give FP16's size at
+the lower tier's error. The shadows of every page of Qwen2.5-1.5B at 32K
+positions take about 0.9\,GiB of host memory.
+
+\paragraph{Correctness and cost.} A cache that reached its tiers through moves
+yields, bit for bit, the logits of one built at those tiers, and an upgrade to
+FP16 restores them. On Qwen2.5-1.5B a move of one page of one layer takes 8 to
+39\,$\mu$s at the median. The first downgrade's shadow copy is about 7\,$\mu$s
+of that.
+
+\subsection{The Attention Importance Scorer}
+\label{sec:scorer}
+
+During decoding, the attention kernel optionally writes each page's share of
+each query head's attention mass. Each tile is one page and writes its partial
+sum of $\exp(s - m)$ with its running maximum $m$. Once the softmax's maximum
+and sum are final, the partial sums are normalised, so that a layer's pages sum
+to one for each head. No second pass over the cache is needed. The mass is
+averaged over a layer's query heads and folded on the device into an
+exponentially weighted moving average,
+\begin{equation}
+  \mathrm{score}_{\ell,i} \leftarrow \alpha\, \bar{a}_{\ell,i}
+    + (1 - \alpha)\, \mathrm{score}_{\ell,i}, \qquad \alpha = 0.2,
+\end{equation}
+where $\bar{a}_{\ell,i}$ is the mean mass on page $i$ of layer $\ell$. A
+page's first observation seeds its score. The scorer folds in every fourth
+step. Every step cost Qwen2.5-0.5B 0.71\% of its decode throughput, outside
+noise, and every fourth step is within noise on both models. Attention sinks
+receive no special protection. On both models the scorer rates the first page
+highest when averaged over layers.
+
+\subsection{The Precision Controller}
+\label{sec:controller}
+
+The controller turns a pressure level, the headroom, the scores and the
+current tiers into a plan. It contains no device code.
+
+\paragraph{A byte target.} A plan reclaims what brings headroom back above
+YELLOW's threshold with a 64\,MiB margin, $T_\mathrm{high} + 64\,\mathrm{MiB} -
+\text{headroom}$. A plan's size is therefore set by what the machine needs
+back, not by a fixed fraction of the cache.
+
+\paragraph{Greedy by marginal cost.} The controller repeatedly takes the
+cheapest next move, a page one tier down, until the target is met. A move's
+marginal cost is
+\begin{equation}
+  c_{\ell,i}(t \to t') = \mathrm{score}_{\ell,i} \cdot
+    \frac{e(t') - e(t)}{b(t) - b(t')},
+\end{equation}
+where $e$ is a tier's relative mean squared error from offline round trips
+and $b$ its bytes per page. With equal scores, each tier down costs more per
+byte than the last, so pages go one tier at a time, breadth first. A page the
+model hardly attends to goes deep first. INT2's error puts it last unless a
+score outweighs it.
+
+\paragraph{The recency floor.} The open pages and every page reaching into the
+last $W = 128$ positions are never downgraded, under every policy.
+
+\paragraph{Upgrades.} At GREEN only, pages are restored largest gain first, the
+reverse of a downgrade plan, in batches within the same per-step budget. An upgrade waits at least 5\,s after the later of
+the last downgrade and the end of the last pressure, and never takes headroom
+below $T_\mathrm{high}$ plus 512\,MiB, one P90 spike.
+
+\paragraph{Score sources.} Three sources of scores plug into the same planner
+and meet the same byte target to within one page's move:
+\begin{itemize}
+\item the scorer's scores (\textit{semantic});
+\item equal scores (\textit{uniform}), the main baseline, with a partial step
+spread evenly across positions;
+\item seeded random scores, a control.
+\end{itemize}
+A difference between them is a difference of allocation, not of compression.
+
+\paragraph{The engine's reaction.} On a YELLOW event the engine applies the
+plan a batch per step, each step's moves timed and held within a 20\,ms
+budget. On RED it applies the whole plan at once. While the level stays YELLOW
+or RED, it plans again each time the cache seals new pages. If an allocation
+fails outright, it makes an emergency plan for no headroom and retries the step
+once. Failing that, the generation ends gracefully, \textit{exhausted}, with
+the tokens it produced.
 
 \section{Implementation}
 \label{sec:implementation}
