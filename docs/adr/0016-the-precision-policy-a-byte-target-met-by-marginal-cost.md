@@ -221,6 +221,28 @@ which differ from those of an FP16 one. Prefill ran at 130 tokens per second
 with 0.8 s, and at 106 with 0.5 s, against 190 with no pressure. With 0.8 s,
 steps took 0.75 s at the median and 1.26 s at most.
 
+**Measured at 32K** (`survival` entry `04b95e3f…`, at acd2217). The survival
+experiment, run again with the present design:
+
+| | Chunks of 512 | First design | Present design |
+|---|---:|---:|---:|
+| Episode's first event, to its plan | 11.1 s | 11.1 s | 11.1 s |
+| Later events, to their plans, median | 13.2 s | 1.5 s | 0.86 s |
+| Later events within 1 s | 0 | 24 of 74 | 3 of 5 |
+| From the take to the end | 668 s | 1617 s | 1588 s |
+
+- **The session survived** with 489 plans, every one seen by the driver to a
+  granule.
+- **The latency met the target at the median.** The sample is small: the
+  level held more steadily this time, so most plans were persisting ones,
+  made on no event. The slowest event, 1.87 s, came during decoding, where a
+  step at 32K positions takes about 1.5 s.
+- **The run took no less time than the first design's.** At these contexts a
+  step's fixed part dominates. Short steps therefore cost about 2.4 times
+  the prefill time of chunks of 512 under pressure, whatever the estimate.
+  That is the price of acting within a second or two rather than within
+  13 s.
+
 **Considered options.**
 
 - **Bound every chunk by time, at GREEN too.** This is the only option that
@@ -255,6 +277,8 @@ steps took 0.75 s at the median and 1.26 s at most.
   design's run, every step from 26K positions took over 1.5 s. Draining
   events only at step boundaries cannot do better than one step, and the
   chunk is sized to keep a step about twice its fixed part.
+- **Prefill under pressure at long contexts takes about 2.4 times as long**
+  as with chunks of 512, as measured above.
 - **A step can overrun its time** where the cost changes from one step to
   the next, as it does when a plan has just moved pages: the longest step
   in the 8K probe took 1.26 s against 0.8 s.
