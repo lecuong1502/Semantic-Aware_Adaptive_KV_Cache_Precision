@@ -268,3 +268,10 @@ downgrade from it would be. The steps are a downgrade's (a page at the
 target under the staging page, then the page table, then the old page
 freed), and the shadow is kept. Dequantising the codes up is rejected, as
 #88 decided: it recovers nothing.
+
+## Amendment (#109): the decision as a whole
+
+The amendments above, #90 to #96, together let a page change tier at
+runtime. ADR-0015 states that decision as a whole, with the options it
+rejected, and supersedes this ADR's rule that a page keeps its tier for the
+life of a cache. ADR-0016 records the policy that decides which pages move.

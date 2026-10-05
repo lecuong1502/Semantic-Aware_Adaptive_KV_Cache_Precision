@@ -68,6 +68,14 @@ row l for layer l, page i at [l][i], and the cache's own tier beyond a row.
 _Avoid_: precision map, quantisation plan (a requantisation plan moves pages
 that exist)
 
+**Mixed-tier cache**:
+A paged cache whose pages are not all at one tier: born at a tier map's
+tiers, or moved since by requantisation plans. One attention kernel reads
+each page at its own tier, from the page table (ADR-0015). The paper and
+the thesis call its manager the *paged mixed-precision cache manager*; the
+two name the same thing.
+_Avoid_: heterogeneous cache
+
 **Birth tier**:
 The tier a page of positions is allocated and sealed at: its tier map's, or
 its cache's. It is where a page starts; a requantisation plan may move it
@@ -154,6 +162,12 @@ One reading of headroom by the pressure monitor, on its fixed schedule, every
 50 ms. Hysteresis and detection latency are counted in polls.
 _Avoid_: sample (the recorder's word), tick
 
+**Attention scorer**:
+What keeps every page's importance score: each decode step's attention mass,
+from the attention kernel, folded on the device into an EWMA, every 4th
+step by default (ADR-0016). It scores; it decides nothing.
+_Avoid_: importance model, scorer policy
+
 **Importance score**:
 A page's accumulated share of attention mass, as maintained by the Attention
 Scorer. It is an input to a requantisation plan, not a tier.
@@ -180,6 +194,12 @@ Controller emits in response to a pressure level, in the order they are to
 be applied (held as parallel arrays, one entry each). Producing a plan is a
 pure decision; nothing has moved until the KV Cache Manager applies it.
 _Avoid_: re-quant plan, migration, schedule
+
+**Precision controller**:
+The pure logic, with no device code, that turns a pressure level, the
+headroom, the pages' scores and their tiers into a requantisation plan, or
+at GREEN into upgrades (ADR-0016). Every score source plans through it.
+_Avoid_: policy engine, scheduler (there is none to consult)
 
 **Byte target**:
 What a requantisation plan reclaims: the bytes that bring headroom back to
@@ -214,6 +234,12 @@ replaced by a later plan, or stopped (#105). Upgrades the engine makes at
 GREEN are recorded the same way, with the event that brought GREEN, and a
 YELLOW or RED cancels those not yet made (#106).
 _Avoid_: plan log, history
+
+**Persisting plan**:
+A requantisation plan made not on a pressure event but because the level
+stayed YELLOW or RED while the cache sealed new pages: it moves those pages,
+for the headroom the monitor reads now. Its plan record says so.
+_Avoid_: follow-up plan, re-plan
 
 **Emergency plan**:
 A RED plan for no headroom, made when allocating a step's pages raised
