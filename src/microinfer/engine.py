@@ -209,18 +209,61 @@ class PressureRecord:
         return self.drained_ns - self.event.t_mono_ns
 
 
-def pressure_chunk(seconds_per_position: float, *, seconds: float, tile: int,
-                   cap: int | None) -> int:
-    """The positions of a prefill chunk run under pressure (#135): as many
-    as `seconds` holds at `seconds_per_position`, the time a position of
-    the chunk before took, in whole `tile`s, the attention kernel's query
-    tile (ADR-0011); one tile at least, though it may take longer, and no
-    more than `cap`, the engine's prefill_chunk, if it has one."""
+def pressure_chunk(fixed_seconds: float, seconds_per_position: float, *, seconds: float,
+                   tile: int, cap: int | None) -> int:
+    """The positions of a prefill chunk run under pressure (#135), for a
+    step that costs `fixed_seconds` before its first position and
+    `seconds_per_position` for each: as many as `seconds` holds after the
+    fixed cost, in whole `tile`s, the attention kernel's query tile
+    (ADR-0011). Where the fixed cost alone overruns `seconds`, as at long
+    contexts it does, no chunk can meet it, and one tile would make every
+    step mostly fixed cost: the chunk is then the positions worth the fixed
+    cost again, so that a step takes at most twice what one tile's would.
+    One tile at least, and no more than `cap`, the engine's prefill_chunk,
+    if it has one."""
     if seconds_per_position <= 0:
         raise ValueError(f"a time per position is positive; got {seconds_per_position}")
-    tiles = int(seconds / seconds_per_position) // tile
-    positions = max(1, tiles) * tile
-    return positions if cap is None else min(positions, cap)
+    if fixed_seconds + tile * seconds_per_position <= seconds:
+        positions = (seconds - fixed_seconds) / seconds_per_position
+    else:
+        positions = fixed_seconds / seconds_per_position
+    chunk = max(1, int(positions) // tile) * tile
+    return chunk if cap is None else min(chunk, cap)
+
+
+class StepCost:
+    """What a prefill step costs, as a fixed part and a part per position,
+    estimated from the steps run (#135). Two steps in a row whose sizes are
+    wide apart split a step's time between the two: the per-position cost
+    from their difference, the fixed cost from the latest. Any other step
+    refreshes the fixed cost, which grows with the context, and keeps the
+    per-position cost. Before two sizes are seen, or where noise
+    makes a larger step the quicker, a step is taken as all per position."""
+
+    def __init__(self):
+        self.fixed_seconds = 0.0
+        self.seconds_per_position = 0.0
+        self._last: tuple[int, float] | None = None
+        self._split = False  # whether two sizes have split the cost
+
+    def observe(self, positions: int, seconds: float) -> None:
+        if self._last is not None and self._wide_apart(self._last[0], positions):
+            n, s = self._last
+            per = (s - seconds) / (n - positions)
+            self._split = per > 0 and seconds - per * positions >= 0
+            if self._split:
+                self.seconds_per_position = per
+        self._last = (positions, seconds)
+        if self._split:
+            self.fixed_seconds = max(0.0, seconds - self.seconds_per_position * positions)
+        else:
+            self.fixed_seconds, self.seconds_per_position = 0.0, seconds / positions
+
+    @staticmethod
+    def _wide_apart(a: int, b: int) -> bool:
+        """Two sizes far enough apart, one at least twice the other, for
+        their difference in time to stand above a step's noise."""
+        return max(a, b) >= 2 * min(a, b)
 
 
 #: The least room a YELLOW step keeps in its budget for its next downgrade.
@@ -305,11 +348,12 @@ class Engine:
     #: one kv_tier_map names for it (#92).
     KV_TIERS = ("FP16", "INT8", "INT4", "INT2")
 
-    #: The time a prefill chunk aims at under pressure (#135). A chunk sized
-    #: from the one before can overrun it, a position costing more as the
-    #: context grows, so it is half #135's target of 1 s from an event to
-    #: its plan.
-    DEFAULT_PRESSURE_CHUNK_SECONDS = 0.5
+    #: The time a prefill chunk aims at under pressure (#135), below #135's
+    #: target of 1 s from an event to its plan by what a plan between steps
+    #: and a step's growth can add. On Qwen2.5-1.5B at 8K positions under
+    #: RED, 0.8 s prefilled at 128 tokens per second and 0.5 s at 86, against
+    #: 190 with no pressure, a step taking 0.43 s before its first position.
+    DEFAULT_PRESSURE_CHUNK_SECONDS = 0.8
 
     #: With kv_scoring, how many decode steps apart the scores take a step's
     #: attention mass (#100): every step cost Qwen2.5-0.5B's decode more
@@ -1079,27 +1123,27 @@ class Engine:
         where the one before it stopped.
 
         While an adaptive engine's monitor reads YELLOW or RED, a chunk is
-        sized by pressure_chunk from the time a position of the chunk before
-        took (#135), so that the events the monitor raises
+        sized by pressure_chunk from what the steps before it cost, a fixed
+        part and a part per position (StepCost, #135), so that the events the monitor raises
         meanwhile are drained between short steps. At GREEN a chunk is
         prefill_chunk, as without a monitor."""
         n = len(ids)
         size = n if self.prefill_chunk is None else min(self.prefill_chunk, n)
         ws = model.Workspace(self.config, rows=size)
-        seconds_per_position = None
+        cost = StepCost()
         with self._holding(cache, ws):
             start = 0
             while start < n:
                 step = size
-                if seconds_per_position is not None and self._under_pressure(cache):
-                    step = pressure_chunk(seconds_per_position,
+                if cost.seconds_per_position > 0 and self._under_pressure(cache):
+                    step = pressure_chunk(cost.fixed_seconds, cost.seconds_per_position,
                                           seconds=self.pressure_chunk_seconds,
                                           tile=_microinfer.attention_tiles["query"], cap=size)
                 chunk = ids[start:start + step]
                 captured = [] if hidden_states else None
                 began = time.perf_counter()
                 self._run(ws, cache, chunk, captured)
-                seconds_per_position = (time.perf_counter() - began) / len(chunk)
+                cost.observe(len(chunk), time.perf_counter() - began)
                 start += len(chunk)
                 yield chunk, ws, captured, start >= n
 

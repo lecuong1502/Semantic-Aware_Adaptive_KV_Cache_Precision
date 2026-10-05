@@ -371,10 +371,12 @@ A difference between them is a difference of allocation, not of compression.
 \paragraph{The engine's reaction.} On a YELLOW event the engine applies the
 plan a batch per step, each step's moves timed and held within a 20\,ms
 budget. On RED it applies the whole plan at once. While the level stays YELLOW
-or RED, it plans again each time the cache seals new pages, and it sizes each
-prefill chunk from the one before so that a step takes about 0.5\,s. At
-GREEN, chunks stay at 512 positions. Bounding chunks at GREEN too would cost
-30 to 60\% of prefill throughput. If an allocation
+or RED, it plans again each time the cache seals new pages. It also sizes
+each prefill chunk from what the steps before it cost, a fixed part and a part
+per position, so that a step takes about 0.8\,s. Where the fixed part alone
+exceeds that, as from about 26K positions on Qwen2.5-1.5B, a step is kept
+within twice a one-tile step. At GREEN, chunks stay at 512 positions.
+Bounding them there too would cost 30 to 60\% of prefill throughput. If an allocation
 fails outright, it makes an emergency plan for no headroom and retries the step
 once. Failing that, the generation ends gracefully, \textit{exhausted}, with
 the tokens it produced.
