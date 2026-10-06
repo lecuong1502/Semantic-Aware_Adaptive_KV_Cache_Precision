@@ -196,7 +196,7 @@ asserts that `torch` is absent from `sys.modules` after importing the engine
 | [`CONTEXT.md`](CONTEXT.md) | The project glossary. `page`, never `block` |
 | [`docs/adr/`](docs/adr/) | Architectural decisions, with the rejected options |
 | [`docs_research/`](docs_research/) | Research notes, paper outline, knowledge roadmap |
-| [`docs/paper.tex`](docs/paper.tex) | Thesis source |
+| [`docs/paper_NeurIPS.tex`](docs/paper_NeurIPS.tex) | The paper, in the NeurIPS 2026 format |
 | [`docs/agents/`](docs/agents/) | Issue tracker and triage conventions for AI agents |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Conventions that are not negotiable, and why |
 
