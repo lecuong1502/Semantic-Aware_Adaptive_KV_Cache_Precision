@@ -12,11 +12,12 @@ repos:
     rev: v6.0.0
     hooks:
       # docs_research/ is the author's own research record, corrected by its
-      # author (see issue #4). A hook does not get to rewrite it.
+      # author (see issue #4). A hook does not get to rewrite it. Nor the
+      # official NeurIPS style file, which a submission must not alter.
       - id: trailing-whitespace
-        exclude: ^docs_research/
+        exclude: ^(docs_research/|docs/neurips_2026\.sty$)
       - id: end-of-file-fixer
-        exclude: ^docs_research/
+        exclude: ^(docs_research/|docs/neurips_2026\.sty$)
       - id: check-merge-conflict
       - id: check-toml
       - id: check-yaml

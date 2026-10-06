@@ -9,7 +9,8 @@ Research background, architecture, and the milestone build order live in
 
 Two documents present the work:
 
-- **The paper**, `docs/paper.tex`, tracked in this repo.
+- **The paper**, `docs/paper_NeurIPS.tex`, in the NeurIPS 2026 format
+  (`docs/neurips_2026.sty`), tracked in this repo.
 - **The graduation thesis**, `graduation_thesis/` (`main.tex` and
   `chapter/*.tex`). Git ignores it, so changes there have no commit or PR.
   The owner compiles it on the web, not on this machine, which has no LaTeX
