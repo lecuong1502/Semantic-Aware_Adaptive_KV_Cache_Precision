@@ -356,6 +356,32 @@ and complete. The generation waits at that position until the simulator has
 taken its memory, so contention arrives at the same place in every run.
 _Avoid_: stress test, survival test (it is logged, not asserted)
 
+**Turn**:
+One exchange of a conversation the engine continues over a single cache: a
+prompt appended to what the cache holds, and the tokens decoded after it.
+RQ3's experiments compress the cache between two turns (ADR-0017).
+_Avoid_: round, message (a turn holds both sides of the exchange)
+
+**Controlled plan**:
+A requantisation plan the engine is asked for between two turns, for a byte
+target and a score source given by the experiment rather than by a
+pressure event: the same planner, with no monitor or simulator involved,
+so that every source reclaims the same bytes (ADR-0017).
+_Avoid_: forced plan, synthetic pressure
+
+**Needle** / **Haystack**:
+A synthetic fact the model cannot guess, a named code, planted at a known
+depth in a haystack, articles of WikiText-2's test split joined to the
+context's length. The needle's depth fixes the page that holds it
+(ADR-0017).
+_Avoid_: probe, distractor (the haystack is not adversarial)
+
+**Question-blind** / **Question-aware**:
+Whether a controlled plan is made before the question is asked, from the
+attention of an earlier turn (question-blind, RQ3's primary experiment), or
+after the first tokens of an answer to it (question-aware, an upper bound).
+_Avoid_: offline, online (both are mid-session)
+
 **Shortfall**:
 The device memory a survival experiment's contention leaves an engine short
 of its full FP16 cache: the simulator takes the headroom, less its own
