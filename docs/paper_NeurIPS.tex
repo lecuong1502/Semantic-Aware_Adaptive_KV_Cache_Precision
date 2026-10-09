@@ -533,14 +533,20 @@ From the take to the end & 668\,s & 1617\,s & 1588\,s \\
 
 % TODO: RQ3's results, once measured. Nothing below may be stated as a result
 % until the benchmark log holds it.
-RQ3 compares the semantic, uniform and random score sources under the same
-contention. Because all three meet the same byte target through the same
-planner, a difference in quality between them is a difference in which pages
-were degraded, not in how many bytes were reclaimed. The tasks place the
-information an answer depends on at a known depth --- needle retrieval
-stratified by depth, long-document question answering, summarisation, and
-anchor-fact recall in multi-turn dialogue --- so that the page holding it, and
-its tier, are known. These measurements are in progress.
+RQ3 compares the semantic, uniform and random score sources at equal reclaimed
+bytes. Compression is imposed by a \textit{controlled plan} between two turns of
+a conversation: the engine is given a byte target, 70\% or 80\% of the FP16
+bytes outside the recency floor, and a score source, and the same planner meets
+it with no monitor involved, so that every source reclaims the same bytes and
+runs repeat exactly. In the primary, question-blind experiment, turn~1 asks for
+a summary of an 8K-position document, the plan is applied, and turn~2 asks for a
+code planted at one of ten depths; whether attention paid before the question
+predicts what is consulted after it is the premise under test. A
+question-aware experiment, compressing after the question, bounds what a
+query-aware allocation could do. Fifty samples, screened at FP16, are compared
+by McNemar's test, with static INT4 and INT2 as the uniform-quantisation
+baseline, a 32K subset, continuation fidelity and anchor-fact dialogue as
+secondary measures. These measurements are in progress.
 
 % =====================================================================
 \section{Limitations}
