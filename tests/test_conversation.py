@@ -162,3 +162,15 @@ def test_a_turn_that_raises_ends_the_conversation(fp16, monkeypatch):
         monkeypatch.undo()
         with pytest.raises(RuntimeError, match="ended"):
             chat.turn(prompt(6, 1461), 2)
+
+
+@pytest.mark.slow
+def test_between_turns_the_footprint_counts_the_conversation_s_cache(fp16):
+    """Between turns the cache is alive though no turn runs: the engine's
+    footprint counts it, as it does during a turn, and not once it is
+    released."""
+    with fp16.conversation() as chat:
+        chat.turn(prompt(2000, 147), 4, stop_at_eos=False)
+        between = fp16.footprint()
+        assert between.kv_cache == chat.nbytes > 0
+    assert fp16.footprint().kv_cache == 0

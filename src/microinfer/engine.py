@@ -13,6 +13,7 @@ import collections
 import json
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -353,6 +354,7 @@ class Conversation:
     def __init__(self, engine: Engine):
         self._engine = engine
         self._cache = engine._new_cache(capacity=engine.config.max_position_embeddings)
+        engine._conversations.add(self)
         #: The last token the last turn chose, not yet in the cache.
         self._unfed = np.empty(0, dtype=np.int32)
         self._ended: str | None = None
@@ -367,6 +369,11 @@ class Conversation:
     def positions(self) -> int:
         """The positions the cache holds."""
         return 0 if self._cache is None else self._cache.length
+
+    @property
+    def nbytes(self) -> int:
+        """What the cache holds of device memory, by its allocator."""
+        return 0 if self._cache is None else self._cache.nbytes
 
     def turn(self, prompt, max_new_tokens: int = 64, *, stop_at_eos: bool = True,
              report: Callable[[str, int, int | None], None] | None = None,
@@ -412,6 +419,7 @@ class Conversation:
         engine = self._engine
         if self._cache is not None and engine._pending is not None:
             engine._pending.ended, engine._pending = "cancelled: its cache was released", None
+        engine._conversations.discard(self)
         self._cache = None
 
 
@@ -535,6 +543,9 @@ class Engine:
         self._model: model.Model | None = None
         self._workspace_bytes = 0
         self._cache = None
+        #: The conversations open on this engine, whose caches live between
+        #: turns, when no step holds them (#141).
+        self._conversations: weakref.WeakSet[Conversation] = weakref.WeakSet()
         self._peak: Footprint | None = None
         self._monitor: Monitor | None = None
         #: Every pressure event drained, in order (start_monitor).
@@ -1339,10 +1350,14 @@ class Engine:
         through `project_kv_cache`.
         """
         info = _microinfer.device_memory_info()
+        # The cache a step holds, and those of the conversations open between
+        # their turns, each once: a turn's cache is its conversation's.
+        caches = {id(c): c for c in [self._cache, *(v._cache for v in self._conversations)]
+                  if c is not None}
         return Footprint(
             weights=sum(t.nbytes for t in self._tensors.values()),
             # Read now, not when the cache was made: a paged cache grows.
-            kv_cache=self._cache.nbytes if self._cache is not None else 0,
+            kv_cache=sum(c.nbytes for c in caches.values()),
             workspace=self._workspace_bytes,
             device_free=info["free"],
             device_total=info["total"],
