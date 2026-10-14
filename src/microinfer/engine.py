@@ -347,13 +347,14 @@ class Conversation:
     the token after it would be fed in one generation. The scorer's scores
     live with the cache, so each turn starts from the last one's. The cache
     is released when the conversation ends, by `close` or by leaving the
-    `with` block; a turn after that, or after one that ended exhausted, is
-    refused."""
+    `with` block, or when a turn ends exhausted or raises, since a turn that
+    raises leaves the cache half written; a turn after that is refused."""
 
     def __init__(self, engine: Engine):
         self._engine = engine
         self._cache = engine._new_cache(capacity=engine.config.max_position_embeddings)
-        self._pending = np.empty(0, dtype=np.int32)
+        #: The last token the last turn chose, not yet in the cache.
+        self._unfed = np.empty(0, dtype=np.int32)
         self._ended: str | None = None
 
     def __enter__(self) -> Conversation:
@@ -381,15 +382,19 @@ class Conversation:
         ids = engine.encode(prompt) if isinstance(prompt, str) else engine._check_ids(prompt)
         if max_new_tokens < 1:
             raise ValueError(f"a turn decodes one token at least, got {max_new_tokens}")
-        fed = np.concatenate([self._pending, ids])
+        fed = np.concatenate([self._unfed, ids])
         engine._check_window(self._cache.length + len(fed) + max_new_tokens - 1)
         engine.ending = None
-        ending = engine._turn(self._cache, fed, max_new_tokens, stop_at_eos,
-                              report or (lambda *_: None), logits)
+        try:
+            ending = engine._turn(self._cache, fed, max_new_tokens, stop_at_eos,
+                                  report or (lambda *_: None), logits)
+        except BaseException as exc:
+            self.close(f"a turn raised {type(exc).__name__}")
+            raise
         if ending.state == EXHAUSTED:
             self.close(f"a turn ended exhausted: {ending.reason}")
         else:
-            self._pending = ending.tokens[-1:]
+            self._unfed = ending.tokens[-1:]
         return engine._end(ending)
 
     def scores(self) -> np.ndarray | None:
@@ -400,9 +405,13 @@ class Conversation:
         return self._cache.scores.download()
 
     def close(self, why: str = "it was closed") -> None:
-        """Release the cache; later turns are refused."""
+        """Release the cache, and any plan not yet done on it, whose pages
+        would name another cache's; later turns are refused."""
         if self._ended is None:
             self._ended = why
+        engine = self._engine
+        if self._cache is not None and engine._pending is not None:
+            engine._pending.ended, engine._pending = "cancelled: its cache was released", None
         self._cache = None
 
 
