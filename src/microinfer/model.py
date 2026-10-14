@@ -382,6 +382,13 @@ class Model:
                                                     first, rows, cfg.hidden_size, cfg.vocab_size)
         return out
 
+    def last_logits(self, ws: Workspace, n: int) -> np.ndarray:
+        """fp32 logits after the last of the n rows in `ws.normed`, the row
+        the next token is chosen from (#141)."""
+        cfg = self.cfg
+        return device.logits(ws.normed, self.weights.head, ws.scratch, n - 1, 1,
+                             cfg.hidden_size, cfg.vocab_size)[0].copy()
+
     def greedy_last(self, ws: Workspace, n: int) -> int:
         """The argmax token after the last of the n rows in `ws.normed`."""
         return int(device.greedy(ws.normed, self.weights.head, ws.scratch, n - 1, 1,
