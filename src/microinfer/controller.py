@@ -210,26 +210,48 @@ def plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.ndarray,
     greedy would order slightly differently among pages tied there. Only as
     many of the cheapest as can meet the target are sorted, so a YELLOW
     plan for a whole 32K window costs a step a few milliseconds (#105)."""
-    if recency_floor < 0:
-        raise ValueError(f"the recency floor is a count of positions, >= 0; got {recency_floor}")
-    if page_tokens <= 0 or positions < 0:
-        raise ValueError(f"a cache holds positions >= 0 on pages of > 0; got {positions} "
-                         f"positions on pages of {page_tokens}")
-    if np.any(scores[tiers >= 0] < 0):
-        raise ValueError("a score is a mass, >= 0")
-
     level = thresholds.classify(headroom_bytes)
     target_bytes = max(0, thresholds.yellow_below_bytes + margin_bytes - headroom_bytes)
-    if level == GREEN or target_bytes == 0:
+    if level == GREEN:
+        _check_plan_inputs(scores, tiers, positions, page_tokens, recency_floor)
         return _empty_plan(level, recency_floor, budget_seconds)
+    return target_plan_arrays(target_bytes, level, scores, tiers, page_bytes, errors,
+                              move_seconds=move_seconds, positions=positions,
+                              page_tokens=page_tokens, recency_floor=recency_floor,
+                              budget_seconds=budget_seconds)
 
-    # A page is a candidate only if it is a page of positions whose last
-    # position comes before the floor's first: no open page is, and the
-    # partly filled last page never is.
-    layers, pages = tiers.shape
-    held = tiers >= 0
-    ends = (np.arange(pages) + 1) * page_tokens
-    candidate = held & (ends <= positions - recency_floor)[None, :]
+
+def share_target_bytes(share: float, tiers: np.ndarray, page_bytes: dict[str, int], *,
+                       positions: int, page_tokens: int,
+                       recency_floor: int = DEFAULT_RECENCY_FLOOR) -> int:
+    """The bytes a controlled plan reclaims for `share`, a fraction of the
+    FP16 bytes of the pages a plan may downgrade, those outside the recency
+    floor (ADR-0017): what those pages hold now, less what they would hold
+    were they `share` smaller than at FP16. A page already below FP16 has
+    given its part already. `tiers` as plan_arrays takes them."""
+    if not 0 <= share <= 1:
+        raise ValueError(f"a share is a fraction of the bytes, in [0, 1]; got {share}")
+    _check_plan_inputs(None, tiers, positions, page_tokens, recency_floor)
+    candidate = candidates(tiers, positions, page_tokens, recency_floor)
+    bytes_at = np.array([page_bytes[t] for t in TIERS], dtype=np.int64)
+    held = int(bytes_at[tiers[candidate]].sum())
+    left = (1 - share) * page_bytes["FP16"] * int(candidate.sum())
+    return max(0, int(np.ceil(held - left - 1e-9)))
+
+
+def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tiers: np.ndarray,
+                       page_bytes: dict[str, int], errors: dict[str, float], *,
+                       move_seconds: dict[tuple[str, str], float], positions: int,
+                       page_tokens: int, recency_floor: int = DEFAULT_RECENCY_FLOOR,
+                       budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> Plan:
+    """The plan that reclaims `target_bytes`, by the greedy plan_arrays
+    describes, whatever gives the target: a pressure event's headroom, or
+    a controlled plan's share (#142). `level` is the plan's, which sets how
+    it is applied: at RED, at once."""
+    _check_plan_inputs(scores, tiers, positions, page_tokens, recency_floor)
+    if target_bytes <= 0:
+        return _empty_plan(level, recency_floor, budget_seconds)
+    candidate = candidates(tiers, positions, page_tokens, recency_floor)
     scored = scores[candidate & ~np.isnan(scores)]
     neutral = float(scored.mean()) if scored.size else 1.0
     score = np.where(np.isnan(scores), neutral, scores)
@@ -268,6 +290,27 @@ def plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.ndarray,
                 pages=pi[order].astype(np.int64), current=steps_taken, lower=steps_taken + 1,
                 saved=saved[steps_taken], costs=costs[order], scores=step_scores[order],
                 seconds=seconds[steps_taken], budget_seconds=budget_seconds)
+
+
+def _check_plan_inputs(scores: np.ndarray | None, tiers: np.ndarray, positions: int,
+                       page_tokens: int, recency_floor: int) -> None:
+    if recency_floor < 0:
+        raise ValueError(f"the recency floor is a count of positions, >= 0; got {recency_floor}")
+    if page_tokens <= 0 or positions < 0:
+        raise ValueError(f"a cache holds positions >= 0 on pages of > 0; got {positions} "
+                         f"positions on pages of {page_tokens}")
+    if scores is not None and np.any(scores[tiers >= 0] < 0):
+        raise ValueError("a score is a mass, >= 0")
+
+
+def candidates(tiers: np.ndarray, positions: int, page_tokens: int,
+                recency_floor: int) -> np.ndarray:
+    """The pages a plan may downgrade: pages of positions whose last position
+    comes before the floor's first. No open page is one, and the partly
+    filled last page never is."""
+    pages = tiers.shape[1]
+    ends = (np.arange(pages) + 1) * page_tokens
+    return (tiers >= 0) & (ends <= positions - recency_floor)[None, :]
 
 
 def batch_bounds(seconds: np.ndarray, level: Level,
