@@ -329,6 +329,12 @@ class PlanRecord:
     persisting: bool = False
     #: The OutOfMemory an emergency plan answers (#107); None for any other.
     emergency: str | None = None
+    #: For a controlled plan (#142), made between turns for a share and a
+    #: score source rather than on an event: the source and its seed, the
+    #: share, the byte target and the bytes the plan reclaimed, whether it
+    #: met the target, and the average effective bits it left, over the
+    #: pages it could move and over every page of positions. None otherwise.
+    controlled: dict | None = None
 
     @property
     def applied(self) -> int:
@@ -403,6 +409,27 @@ class Conversation:
         else:
             self._unfed = ending.tokens[-1:]
         return engine._end(ending)
+
+    def plan(self, share: float, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
+        """Apply a controlled plan between turns (#142, ADR-0017): reclaim
+        `share` of the FP16 bytes of the pages outside the recency floor,
+        by the planner of a pressure event (ADR-0016), from `source`'s
+        scores, `seed` the random one's, at once. Needs an adaptive
+        engine, whose cache seals and so can downgrade, and, for semantic
+        scores, a cache that keeps them. The plan's record, in the engine's
+        `plans`."""
+        if self._ended is not None:
+            raise RuntimeError(f"the conversation has ended: {self._ended}")
+        engine = self._engine
+        if not engine.kv_adaptive:
+            raise ValueError("a controlled plan downgrades pages, which only an adaptive "
+                             "engine's cache can")
+        if engine._monitor is not None:
+            raise ValueError("a controlled plan involves no monitor: one running could "
+                             "replace it, add to it, or upgrade its pages back")
+        if source == "semantic" and self._cache.scores is None:
+            raise ValueError("semantic scores need a cache that keeps them: kv_scoring=True")
+        return engine._controlled_plan(self._cache, share, source, seed)
 
     def scores(self) -> np.ndarray | None:
         """The importance scores the cache holds, (layers, pages), NaN for a
@@ -1072,11 +1099,7 @@ class Engine:
         train of pulses whose later ones find nothing left to downgrade,
         upgrades between them would be undone by the next."""
         pages = cache.pages
-        tiers = pages.page_tiers()
-        layers, count = tiers.shape
-        semantic = cache.scores.download() if self.kv_score_source == "semantic" else None
-        scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
-                             seed=self.kv_score_seed)
+        tiers, scores = self._tiers_and_scores(cache, self.kv_score_source, self.kv_score_seed)
         page_bytes, errors, seconds = self._plan_inputs
         cooldown_from = max(t for t in (self.last_downgrade_seconds, self.pressure_ended_seconds)
                             if t is not None)
@@ -1094,6 +1117,70 @@ class Engine:
         self._recent_moves.append(float(plan.seconds.max()))  # until one is timed
         return entry
 
+    def _controlled_plan(self, cache: model.PagedCache, share: float, source: str,
+                         seed: int) -> PlanRecord:
+        """Conversation.plan: a RED plan for the share's byte target, so that
+        it is applied at once, recorded with no pressure event and with what
+        controlled it."""
+        own_before = self._own_bytes()
+        started = time.perf_counter()
+        pages = cache.pages
+        tiers, scores = self._tiers_and_scores(cache, source, seed)
+        page_bytes, errors, seconds = self._plan_inputs
+        target = controller.share_target_bytes(share, tiers, page_bytes,
+                                               positions=cache.length,
+                                               page_tokens=pages.page_tokens)
+        plan = controller.target_plan_arrays(
+            target, RED, scores, tiers, page_bytes, errors, move_seconds=seconds,
+            positions=cache.length, page_tokens=pages.page_tokens,
+            budget_seconds=self.kv_plan_budget_seconds)
+        entry = PlanRecord(None, plan, time.perf_counter() - started, [])
+        self.plans.append(entry)
+        if self._pending is not None:
+            self._pending.ended = "replaced"
+        if len(plan):
+            self._pending, self._cursor = entry, 0
+            self._recent_moves.clear()
+            self._apply(cache, started, True, own_before)
+        else:
+            self._pending, entry.ended = None, "applied"
+        # What the pages gave back, which a plan stopped part way, or one
+        # whose moves were skipped, makes less than was planned.
+        reclaimed = controller.bytes_given_back(tiers, pages.page_tiers(), page_bytes)
+        entry.controlled = {
+            "source": source, "seed": seed if source == "random" else None, "share": share,
+            "target_bytes": target, "reclaimed_bytes": reclaimed,
+            "target_met": entry.ended == "applied" and reclaimed >= target,
+            **self._effective_bits(cache, page_bytes, plan.recency_floor)}
+        return entry
+
+    def _tiers_and_scores(self, cache: model.PagedCache, source: str,
+                          seed: int) -> tuple[np.ndarray, np.ndarray]:
+        """The cache's page tiers, and the scores `source` gives its pages."""
+        tiers = cache.pages.page_tiers()
+        layers, count = tiers.shape
+        semantic = cache.scores.download() if source == "semantic" else None
+        return tiers, score_array(source, layers, count, semantic=semantic, seed=seed)
+
+    def _effective_bits(self, cache: model.PagedCache, page_bytes: dict[str, int],
+                        recency_floor: int) -> dict:
+        """The average effective bits per cached element of the pages a plan
+        may move, those outside `recency_floor`, and of every full page of
+        positions: each tier's bytes, metadata counted, over the elements a
+        full page holds. A page still being filled is left out of both."""
+        pages = cache.pages
+        tiers = pages.page_tiers()
+        bytes_at = np.array([page_bytes[t] for t in controller.TIERS], dtype=np.int64)
+        elements = 2 * pages.page_tokens * self.config.num_key_value_heads * self.config.head_dim
+        held = controller.candidates(tiers, cache.length, pages.page_tokens, 0)
+        movable = controller.candidates(tiers, cache.length, pages.page_tokens, recency_floor)
+
+        def bits(where: np.ndarray) -> float | None:
+            n = int(where.sum())
+            return None if n == 0 else float(bytes_at[tiers[where]].sum() * 8 / (n * elements))
+
+        return {"candidate_effective_bits": bits(movable), "effective_bits": bits(held)}
+
     def _persisting(self, cache: model.PagedCache) -> bool:
         return (self._pending is None and self._under_pressure(cache)
                 and self._last_pressure is not None
@@ -1109,11 +1196,7 @@ class Engine:
         when nothing is recorded."""
         self._planned_pages = cache.pages.pages_per_layer
         pages = cache.pages
-        tiers = pages.page_tiers()
-        layers, count = tiers.shape
-        semantic = cache.scores.download() if self.kv_score_source == "semantic" else None
-        scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
-                             seed=self.kv_score_seed)
+        tiers, scores = self._tiers_and_scores(cache, self.kv_score_source, self.kv_score_seed)
         page_bytes, errors, seconds = self._plan_inputs
         # The monitor's thresholds; ADR-0013's for an emergency plan made
         # with no monitor running.
