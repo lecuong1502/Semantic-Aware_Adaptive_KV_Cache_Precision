@@ -68,6 +68,15 @@ def test_a_plan_for_a_target_meets_it_within_one_move():
     assert plan.level == monitor.RED and plan.target_bytes == 6000
 
 
+def test_the_bytes_between_two_tier_maps_are_what_the_pages_gave_back():
+    """Two pages to INT8 and one to INT4 give back 2 x 450 + 700."""
+    before, _ = cache()
+    after = before.copy()
+    after[0, 0] = after[1, 3] = controller.TIERS.index("INT8")
+    after[0, 1] = controller.TIERS.index("INT4")
+    assert controller.bytes_given_back(before, after, PAGE_BYTES) == 1600
+
+
 def test_a_target_out_of_reach_is_short():
     """Every candidate at INT2 saves 12 x 830 = 9960, short of 10000."""
     tiers, scores = cache()
@@ -147,6 +156,35 @@ def test_the_record_gives_the_effective_bits_the_plan_leaves(engine):
     c = planned(engine, 0.8, "semantic").controlled
     assert c["candidate_effective_bits"] <= 16 * 0.2 + 1e-9
     assert c["candidate_effective_bits"] < c["effective_bits"] < 16
+
+
+@pytest.mark.slow
+def test_the_record_gives_the_bytes_the_pages_gave_back_not_those_planned(engine, monkeypatch):
+    """A plan the allocator stops before its first move records what its
+    pages gave back, nothing, and that the target was not met, though the
+    plan was made to meet it."""
+    def stopped(self, cache, started, planned, own_before):
+        self._pending.ended, self._pending = "stopped: simulated", None
+
+    monkeypatch.setattr(Engine, "_apply", stopped)
+    record = planned(engine, 0.8, "uniform")
+    c = record.controlled
+    assert record.ended == "stopped: simulated" and not record.plan.short
+    assert c["target_met"] is False and c["reclaimed_bytes"] == 0 < c["target_bytes"]
+
+
+@pytest.mark.slow
+def test_a_plan_is_refused_while_a_monitor_runs(engine):
+    """A controlled plan involves no monitor: one running could replace it,
+    add to it, or upgrade its pages back."""
+    with engine.conversation() as chat:
+        chat.turn(prompt(64, 144), 2, stop_at_eos=False)
+        engine.start_monitor(monitor.Monitor(reader=lambda: 8000 * 2**20, poll_s=0.01))
+        try:
+            with pytest.raises(ValueError, match="monitor"):
+                chat.plan(0.8, source="uniform")
+        finally:
+            engine.stop_monitor()
 
 
 @pytest.mark.slow

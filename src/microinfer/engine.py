@@ -420,10 +420,16 @@ class Conversation:
         `plans`."""
         if self._ended is not None:
             raise RuntimeError(f"the conversation has ended: {self._ended}")
-        if not self._engine.kv_adaptive:
+        engine = self._engine
+        if not engine.kv_adaptive:
             raise ValueError("a controlled plan downgrades pages, which only an adaptive "
                              "engine's cache can")
-        return self._engine._controlled_plan(self._cache, share, source, seed)
+        if engine._monitor is not None:
+            raise ValueError("a controlled plan involves no monitor: one running could "
+                             "replace it, add to it, or upgrade its pages back")
+        if source == "semantic" and self._cache.scores is None:
+            raise ValueError("semantic scores need a cache that keeps them: kv_scoring=True")
+        return engine._controlled_plan(self._cache, share, source, seed)
 
     def scores(self) -> np.ndarray | None:
         """The importance scores the cache holds, (layers, pages), NaN for a
@@ -1093,11 +1099,7 @@ class Engine:
         train of pulses whose later ones find nothing left to downgrade,
         upgrades between them would be undone by the next."""
         pages = cache.pages
-        tiers = pages.page_tiers()
-        layers, count = tiers.shape
-        semantic = cache.scores.download() if self.kv_score_source == "semantic" else None
-        scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
-                             seed=self.kv_score_seed)
+        tiers, scores = self._tiers_and_scores(cache, self.kv_score_source, self.kv_score_seed)
         page_bytes, errors, seconds = self._plan_inputs
         cooldown_from = max(t for t in (self.last_downgrade_seconds, self.pressure_ended_seconds)
                             if t is not None)
@@ -1123,12 +1125,7 @@ class Engine:
         own_before = self._own_bytes()
         started = time.perf_counter()
         pages = cache.pages
-        tiers = pages.page_tiers()
-        layers, count = tiers.shape
-        if source == "semantic" and cache.scores is None:
-            raise ValueError("semantic scores need a cache that keeps them: kv_scoring=True")
-        semantic = cache.scores.download() if source == "semantic" else None
-        scores = score_array(source, layers, count, semantic=semantic, seed=seed)
+        tiers, scores = self._tiers_and_scores(cache, source, seed)
         page_bytes, errors, seconds = self._plan_inputs
         target = controller.share_target_bytes(share, tiers, page_bytes,
                                                positions=cache.length,
@@ -1147,25 +1144,36 @@ class Engine:
             self._apply(cache, started, True, own_before)
         else:
             self._pending, entry.ended = None, "applied"
+        # What the pages gave back, which a plan stopped part way, or one
+        # whose moves were skipped, makes less than was planned.
+        reclaimed = controller.bytes_given_back(tiers, pages.page_tiers(), page_bytes)
         entry.controlled = {
             "source": source, "seed": seed if source == "random" else None, "share": share,
-            "target_bytes": target, "reclaimed_bytes": plan.reclaimed_bytes,
-            "target_met": not plan.short,
-            **self._effective_bits(cache, page_bytes)}
+            "target_bytes": target, "reclaimed_bytes": reclaimed,
+            "target_met": entry.ended == "applied" and reclaimed >= target,
+            **self._effective_bits(cache, page_bytes, plan.recency_floor)}
         return entry
 
-    def _effective_bits(self, cache: model.PagedCache, page_bytes: dict[str, int]) -> dict:
+    def _tiers_and_scores(self, cache: model.PagedCache, source: str,
+                          seed: int) -> tuple[np.ndarray, np.ndarray]:
+        """The cache's page tiers, and the scores `source` gives its pages."""
+        tiers = cache.pages.page_tiers()
+        layers, count = tiers.shape
+        semantic = cache.scores.download() if source == "semantic" else None
+        return tiers, score_array(source, layers, count, semantic=semantic, seed=seed)
+
+    def _effective_bits(self, cache: model.PagedCache, page_bytes: dict[str, int],
+                        recency_floor: int) -> dict:
         """The average effective bits per cached element of the pages a plan
-        may move, those outside the recency floor, and of every page of
+        may move, those outside `recency_floor`, and of every full page of
         positions: each tier's bytes, metadata counted, over the elements a
-        page holds."""
+        full page holds. A page still being filled is left out of both."""
         pages = cache.pages
         tiers = pages.page_tiers()
         bytes_at = np.array([page_bytes[t] for t in controller.TIERS], dtype=np.int64)
         elements = 2 * pages.page_tokens * self.config.num_key_value_heads * self.config.head_dim
-        held = tiers >= 0
-        movable = controller.candidates(tiers, cache.length, pages.page_tokens,
-                                        controller.DEFAULT_RECENCY_FLOOR)
+        held = controller.candidates(tiers, cache.length, pages.page_tokens, 0)
+        movable = controller.candidates(tiers, cache.length, pages.page_tokens, recency_floor)
 
         def bits(where: np.ndarray) -> float | None:
             n = int(where.sum())
@@ -1188,11 +1196,7 @@ class Engine:
         when nothing is recorded."""
         self._planned_pages = cache.pages.pages_per_layer
         pages = cache.pages
-        tiers = pages.page_tiers()
-        layers, count = tiers.shape
-        semantic = cache.scores.download() if self.kv_score_source == "semantic" else None
-        scores = score_array(self.kv_score_source, layers, count, semantic=semantic,
-                             seed=self.kv_score_seed)
+        tiers, scores = self._tiers_and_scores(cache, self.kv_score_source, self.kv_score_seed)
         page_bytes, errors, seconds = self._plan_inputs
         # The monitor's thresholds; ADR-0013's for an emergency plan made
         # with no monitor running.

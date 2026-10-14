@@ -56,9 +56,11 @@ the 0.02-0.04 ms a downgrade took on Qwen2.5-1.5B, some 500 a batch.
 from __future__ import annotations
 
 import functools
+import math
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -233,10 +235,23 @@ def share_target_bytes(share: float, tiers: np.ndarray, page_bytes: dict[str, in
         raise ValueError(f"a share is a fraction of the bytes, in [0, 1]; got {share}")
     _check_plan_inputs(None, tiers, positions, page_tokens, recency_floor)
     candidate = candidates(tiers, positions, page_tokens, recency_floor)
-    bytes_at = np.array([page_bytes[t] for t in TIERS], dtype=np.int64)
-    held = int(bytes_at[tiers[candidate]].sum())
-    left = (1 - share) * page_bytes["FP16"] * int(candidate.sum())
-    return max(0, int(np.ceil(held - left - 1e-9)))
+    held = int(_bytes_at(page_bytes)[tiers[candidate]].sum())
+    # In exact fractions: a share of 0.8 is 4/5, and the bytes are whole.
+    left = (1 - Fraction(str(share))) * page_bytes["FP16"] * int(candidate.sum())
+    return max(0, math.ceil(held - left))
+
+
+def bytes_given_back(before: np.ndarray, after: np.ndarray, page_bytes: dict[str, int]) -> int:
+    """What the pages gave back between two tier maps, as plan_arrays takes
+    them, both of the same pages: the bytes they held before less those
+    they hold after, each page at its tier's bytes."""
+    held = (before >= 0) & (after >= 0)
+    at = _bytes_at(page_bytes)
+    return int(at[before[held]].sum() - at[after[held]].sum())
+
+
+def _bytes_at(page_bytes: dict[str, int]) -> np.ndarray:
+    return np.array([page_bytes[t] for t in TIERS], dtype=np.int64)
 
 
 def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tiers: np.ndarray,
