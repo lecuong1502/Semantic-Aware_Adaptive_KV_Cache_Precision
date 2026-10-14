@@ -13,6 +13,7 @@ import collections
 import json
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -338,6 +339,90 @@ class PlanRecord:
         return isinstance(self.plan, controller.UpgradePlan)
 
 
+class Conversation:
+    """Turns over one paged cache (#141), from Engine.conversation.
+
+    A turn appends a prompt to what the cache holds and decodes after it,
+    greedily, as Engine.generate does. The last token a turn chose is not in
+    the cache yet: the next turn feeds it first, before its own prompt, as
+    the token after it would be fed in one generation. The scorer's scores
+    live with the cache, so each turn starts from the last one's. The cache
+    is released when the conversation ends, by `close` or by leaving the
+    `with` block, or when a turn ends exhausted or raises, since a turn that
+    raises leaves the cache half written; a turn after that is refused."""
+
+    def __init__(self, engine: Engine):
+        self._engine = engine
+        self._cache = engine._new_cache(capacity=engine.config.max_position_embeddings)
+        engine._conversations.add(self)
+        #: The last token the last turn chose, not yet in the cache.
+        self._unfed = np.empty(0, dtype=np.int32)
+        self._ended: str | None = None
+
+    def __enter__(self) -> Conversation:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    @property
+    def positions(self) -> int:
+        """The positions the cache holds."""
+        return 0 if self._cache is None else self._cache.length
+
+    @property
+    def nbytes(self) -> int:
+        """What the cache holds of device memory, by its allocator."""
+        return 0 if self._cache is None else self._cache.nbytes
+
+    def turn(self, prompt, max_new_tokens: int = 64, *, stop_at_eos: bool = True,
+             report: Callable[[str, int, int | None], None] | None = None,
+             logits: list[np.ndarray] | None = None) -> np.ndarray:
+        """Append `prompt`, text or token ids, and decode up to
+        `max_new_tokens`, one at least: the new token ids. `report` is called
+        as generate calls it, and the fp32 logits each new token was chosen
+        from are appended to `logits`, if given. How the turn ended is the
+        engine's `ending`."""
+        if self._ended is not None:
+            raise RuntimeError(f"the conversation has ended: {self._ended}")
+        engine = self._engine
+        ids = engine.encode(prompt) if isinstance(prompt, str) else engine._check_ids(prompt)
+        if max_new_tokens < 1:
+            raise ValueError(f"a turn decodes one token at least, got {max_new_tokens}")
+        fed = np.concatenate([self._unfed, ids])
+        engine._check_window(self._cache.length + len(fed) + max_new_tokens - 1)
+        engine.ending = None
+        try:
+            ending = engine._turn(self._cache, fed, max_new_tokens, stop_at_eos,
+                                  report or (lambda *_: None), logits)
+        except BaseException as exc:
+            self.close(f"a turn raised {type(exc).__name__}")
+            raise
+        if ending.state == EXHAUSTED:
+            self.close(f"a turn ended exhausted: {ending.reason}")
+        else:
+            self._unfed = ending.tokens[-1:]
+        return engine._end(ending)
+
+    def scores(self) -> np.ndarray | None:
+        """The importance scores the cache holds, (layers, pages), NaN for a
+        page never observed; None if it keeps none."""
+        if self._cache is None or self._cache.scores is None:
+            return None
+        return self._cache.scores.download()
+
+    def close(self, why: str = "it was closed") -> None:
+        """Release the cache, and any plan not yet done on it, whose pages
+        would name another cache's; later turns are refused."""
+        if self._ended is None:
+            self._ended = why
+        engine = self._engine
+        if self._cache is not None and engine._pending is not None:
+            engine._pending.ended, engine._pending = "cancelled: its cache was released", None
+        engine._conversations.discard(self)
+        self._cache = None
+
+
 class Engine:
     """Seam A. Everything a test or a caller touches goes through here."""
 
@@ -458,6 +543,9 @@ class Engine:
         self._model: model.Model | None = None
         self._workspace_bytes = 0
         self._cache = None
+        #: The conversations open on this engine, whose caches live between
+        #: turns, when no step holds them (#141).
+        self._conversations: weakref.WeakSet[Conversation] = weakref.WeakSet()
         self._peak: Footprint | None = None
         self._monitor: Monitor | None = None
         #: Every pressure event drained, in order (start_monitor).
@@ -698,18 +786,38 @@ class Engine:
         self._check_window(len(ids) + max_new_tokens - 1)
         self.ending = None
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
+        return self._end(self._turn(cache, ids, max_new_tokens, stop_at_eos, report))
+
+    def conversation(self) -> Conversation:
+        """A conversation of turns over one paged cache (#141), released when
+        the conversation ends; use it as a context manager. See Conversation."""
+        if self.kv_cache != "paged":
+            raise ValueError("a conversation keeps a paged cache; this engine's is "
+                             f"{self.kv_cache!r}")
+        return Conversation(self)
+
+    def _turn(self, cache, ids: np.ndarray, max_new_tokens: int, stop_at_eos: bool,
+              report: Callable[[str, int, int | None], None],
+              logits: list[np.ndarray] | None = None) -> Ending:
+        """Prefill `ids` after what `cache` holds and decode up to
+        `max_new_tokens` greedily after them, as generate describes; the
+        logits each token was chosen from are appended to `logits`, if
+        given. How the turn ended, the tokens with it."""
         out: list[int] = []
+
         def prefilled() -> bool:
             report(PREFILLING, cache.length, None)
             return True
 
         try:
-            out.append(self._first_token(cache, ids, go_on=prefilled))
+            out.append(self._first_token(cache, ids, go_on=prefilled, logits=logits))
             step = model.Workspace(self.config, rows=1)
             with self._holding(cache, step):
                 while len(out) < max_new_tokens and not (stop_at_eos
                                                          and out[-1] in self.eos_token_ids):
                     self._run(step, cache, np.array(out[-1:], np.int32))
+                    if logits is not None:
+                        logits.append(self._model.last_logits(step, 1))
                     out.append(self._model.greedy_last(step, 1))
                     self._drain_pressure(cache)
                     report(DECODING, cache.length, out[-1])
@@ -718,9 +826,8 @@ class Engine:
             # answered as one the emergency plan could not answer.
             if not (isinstance(exc, _Exhausted) or self._adapts(cache)):
                 raise
-            return self._end(Ending(EXHAUSTED, cache.length, np.asarray(out, np.int32),
-                                    str(exc)))
-        return self._end(Ending(COMPLETE, cache.length, np.asarray(out, np.int32)))
+            return Ending(EXHAUSTED, cache.length, np.asarray(out, np.int32), str(exc))
+        return Ending(COMPLETE, cache.length, np.asarray(out, np.int32))
 
     def _end(self, ending: Ending) -> np.ndarray:
         self.ending = ending
@@ -821,16 +928,20 @@ class Engine:
                 report(DECODING, cache.length, token)
 
     def _first_token(self, cache, ids: np.ndarray, *,
-                     go_on: Callable[[], bool] | None = None) -> int | None:
+                     go_on: Callable[[], bool] | None = None,
+                     logits: list[np.ndarray] | None = None) -> int | None:
         """Prefill `ids` into `cache`: the greedy choice the prompt's last row
-        makes, the first new token. `go_on`, if given, is asked after every
-        chunk; if it says no, prefilling stops there and this returns None."""
+        makes, the first new token, its logits appended to `logits` if
+        given. `go_on`, if given, is asked after every chunk; if it says no,
+        prefilling stops there and this returns None."""
         token = None
         for chunk, ws, _, last in self._prefill(cache, ids):
             self._drain_pressure(cache)
             if go_on is not None and not go_on():
                 return None
             if last:
+                if logits is not None:
+                    logits.append(self._model.last_logits(ws, len(chunk)))
                 token = self._model.greedy_last(ws, len(chunk))
         # Run out, not left: the prefill notes its peak footprint as it ends.
         return token
@@ -1239,10 +1350,14 @@ class Engine:
         through `project_kv_cache`.
         """
         info = _microinfer.device_memory_info()
+        # The cache a step holds, and those of the conversations open between
+        # their turns, each once: a turn's cache is its conversation's.
+        caches = {id(c): c for c in [self._cache, *(v._cache for v in self._conversations)]
+                  if c is not None}
         return Footprint(
             weights=sum(t.nbytes for t in self._tensors.values()),
             # Read now, not when the cache was made: a paged cache grows.
-            kv_cache=self._cache.nbytes if self._cache is not None else 0,
+            kv_cache=sum(c.nbytes for c in caches.values()),
             workspace=self._workspace_bytes,
             device_free=info["free"],
             device_total=info["total"],
