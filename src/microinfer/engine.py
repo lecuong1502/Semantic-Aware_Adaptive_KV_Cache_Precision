@@ -751,6 +751,10 @@ class Engine:
         if not isinstance(options, controller.PlanOptions):
             raise TypeError(f"kv_plan_options is a controller.PlanOptions; got "
                             f"{type(options).__name__}")
+        layers = self.config.num_hidden_layers
+        if options.layer_weights is not None and len(options.layer_weights) != layers:
+            raise ValueError(f"{len(options.layer_weights)} layer weights for a model of "
+                             f"{layers} layers")
         self._kv_plan_options = options
 
     @property
