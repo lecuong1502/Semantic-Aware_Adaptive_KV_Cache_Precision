@@ -400,6 +400,14 @@ context's length. The needle's depth fixes the page that holds it
 (ADR-0017).
 _Avoid_: probe, distractor (the haystack is not adversarial)
 
+**Screening** / **Screened set**:
+Running every needle sample at FP16 before the comparison, and replacing
+one answered wrongly by the next of its depth from the seed, a
+**replacement**, until each depth has five answered correctly: the
+screened set, so that the model's failures are not counted as the cache's
+(ADR-0017, #148).
+_Avoid_: filtering, cleaning (nothing is dropped unrecorded)
+
 **Question-blind** / **Question-aware**:
 Whether a controlled plan is made before the question is asked, from the
 attention of an earlier turn (question-blind, RQ3's primary experiment), or

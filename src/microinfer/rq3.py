@@ -31,6 +31,10 @@ too, for its own conversation, and puts them back after. NO_PLAN, the
 adaptive, scoring engine with no plan applied, is a check rather than a
 condition: its answer is FP16's.
 
+Screening's FP16 runs (#148) are logged as RQ3's are, with screening true
+in their config: they are the fp16 condition of the screened set, and an
+analysis that pairs runs tells them apart by it.
+
 The random source draws each sample's scores from a seed of its own,
 sample_seed, so that the samples of a depth do not rank the needle's page
 alike, and their outcomes stay unpaired but for the condition.
@@ -168,7 +172,8 @@ def _run(engine, sample: needles.Sample, cond: Condition, experiment: str, seed:
         "aware_opening": opening,
         "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
         "code_after_plan": None if opening is None else code_after(opening, sample.code),
-        "plan_positions": plan_positions, "plan": plan, "random_seed": seed,
+        "plan_positions": plan_positions, "plan": plan,
+        "random_seed": seed if cond.source == "random" else None,
         "effective_bits": bits["effective_bits"],
         "candidate_effective_bits": bits["candidate_effective_bits"],
         "tier_shares": {t: shares[t] / full.size for t in controller.TIERS if shares[t]},
@@ -187,14 +192,26 @@ def config(sample: needles.Sample, cond: Condition, experiment: str, **more) -> 
             **more}
 
 
+class ShortScreening(ValueError):
+    """A screening with a depth short of right answers: what it kept and
+    rejected, and each short depth's count of right ones."""
+
+    def __init__(self, kept: list, rejected: list, short: dict[float, int], per_depth: int):
+        self.kept, self.rejected, self.short = kept, rejected, short
+        depths = ", ".join(f"{round(d * 100)}%: {n}" for d, n in short.items())
+        super().__init__(f"depths short of {per_depth} answered correctly at FP16 ({depths}); "
+                         f"draw more")
+
+
 def screen(samples: Sequence, is_right: Callable[[needles.Sample], bool],
            per_depth: int = needles.SAMPLES_PER_DEPTH) -> tuple[list, list]:
     """ADR-0017's screening (#148): of `samples`, a set drawn with more than
     `per_depth` a depth, in its order, keep for each depth the first
     `per_depth` that FP16 answers correctly, `is_right`, and reject those
     before them that it does not. A sample past a depth's last kept is not
-    run. The kept and the rejected, each in the set's order."""
-    kept, rejected = [], []
+    run. The kept and the rejected, each in the set's order; every depth is
+    screened before a ShortScreening names those short of `per_depth`."""
+    kept, rejected, short = [], [], {}
     for depth in needles.DEPTHS:
         held = 0
         for sample in (s for s in samples if s.depth == depth):
@@ -206,21 +223,24 @@ def screen(samples: Sequence, is_right: Callable[[needles.Sample], bool],
             else:
                 rejected.append(sample)
         if held < per_depth:
-            raise ValueError(f"depth {round(depth * 100)}%: {held} of its samples drawn "
-                             f"answered correctly at FP16, {per_depth} needed; draw more")
+            short[depth] = held
+    if short:
+        raise ShortScreening(kept, rejected, short, per_depth)
     return kept, rejected
 
 
-def screened(model: str, needle_seed: int,
+def screened(model: str, needle_seed: int, haystack_tokens: int,
              log: str | Path = benchlog.DEFAULT_LOG) -> tuple[list[str], int]:
     """The screened set's sample ids, for `model` and the set of
-    `needle_seed`, from the last needle-screening entry logged for them, and
-    the samples a depth it was drawn with, which gives those ids their
-    samples."""
+    `needle_seed` and `haystack_tokens`, from the last complete
+    needle-screening entry logged for them, and the samples a depth it was
+    drawn with, which gives those ids their samples."""
     entries = [e for e in benchlog.read(log) if e["kind"] == "needle-screening"
-               and e["model"] == model and e["config"]["needle_seed"] == needle_seed]
+               and e["model"] == model and e["config"]["needle_seed"] == needle_seed
+               and e["config"]["haystack_tokens"] == haystack_tokens
+               and e["results"].get("complete", True)]
     if not entries:
-        raise ValueError(f"no needle-screening logged for {model} at seed {needle_seed}; "
-                         f"run tools/screen_needles.py")
-    results = entries[-1]["results"]
-    return results["kept"], results["samples_per_depth"]
+        raise ValueError(f"no complete needle-screening logged for {model} at seed "
+                         f"{needle_seed} over haystacks of {haystack_tokens} tokens; run "
+                         f"tools/screen_needles.py")
+    return entries[-1]["results"]["kept"], entries[-1]["config"]["draws"]

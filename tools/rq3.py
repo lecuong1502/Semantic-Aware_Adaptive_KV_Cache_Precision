@@ -29,13 +29,23 @@ from microinfer import Engine, benchlog, needles, rq3  # noqa: E402
 NEEDLE_SEED = 140
 
 
+def conditions_for(chosen: list[str] | None, *, screened: bool) -> list[str]:
+    """The conditions to run: those chosen, or every one, but for the
+    screened set fp16, which screening ran (#148)."""
+    if chosen is not None:
+        return chosen
+    return [c.name for c in rq3.CONDITIONS if not (screened and c.name == "fp16")]
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--issue", type=int, required=True,
                         help="the ticket these runs are made for")
     parser.add_argument("--model", default="qwen2.5-1.5b-instruct")
-    parser.add_argument("--conditions", nargs="+", default=[c.name for c in rq3.CONDITIONS],
-                        choices=[c.name for c in (*rq3.CONDITIONS, rq3.NO_PLAN)])
+    parser.add_argument("--conditions", nargs="+", default=None,
+                        choices=[c.name for c in (*rq3.CONDITIONS, rq3.NO_PLAN)],
+                        help="default: every condition, but fp16 with --screened, whose "
+                             "FP16 runs screening logged")
     parser.add_argument("--experiments", nargs="+", default=["question-blind"],
                         choices=rq3.EXPERIMENTS)
     parser.add_argument("--samples", nargs="+", default=None,
@@ -43,7 +53,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--screened", action="store_true",
                         help="the screened set, from the last needle-screening logged for "
                              "the model and seed")
-    parser.add_argument("--samples-per-depth", type=int, default=needles.SAMPLES_PER_DEPTH,
+    parser.add_argument("--samples-per-depth", type=int, default=None,
                         help="draw more a depth, for screening's replacements")
     parser.add_argument("--needle-seed", type=int, default=NEEDLE_SEED)
     parser.add_argument("--plan-seed", type=int, default=0,
@@ -56,11 +66,13 @@ def main(argv: list[str]) -> int:
         parser.error("tracked files have uncommitted changes; commit first, so that "
                      "each entry names the code that produced it")
 
-    per_depth = args.samples_per_depth
+    per_depth = args.samples_per_depth or needles.SAMPLES_PER_DEPTH
     if args.screened:
-        if args.samples is not None:
-            parser.error("--screened chooses the samples; give one or the other")
-        args.samples, per_depth = rq3.screened(args.model, args.needle_seed, args.log)
+        if args.samples is not None or args.samples_per_depth is not None:
+            parser.error("--screened chooses the samples, and how many a depth are drawn")
+        args.samples, per_depth = rq3.screened(args.model, args.needle_seed,
+                                               args.haystack_tokens, args.log)
+    args.conditions = conditions_for(args.conditions, screened=args.screened)
 
     engine = Engine(REPO / "models" / args.model)
     engine.load_weights()

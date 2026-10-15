@@ -120,7 +120,7 @@ def test_a_controlled_run_records_its_plan_and_what_the_needle_s_pages_hold(engi
     s = samples[5]
     r = rq3.run(engine, s, rq3.condition("uniform-80"), "question-blind")
     assert r["plan"]["source"] == "uniform" and r["plan"]["target_met"]
-    assert r["random_seed"] == rq3.sample_seed(s.sample_id, 0)
+    assert r["random_seed"] is None  # a seed only for the random source
     assert sum(r["tier_shares"].values()) == pytest.approx(1.0) and "INT2" in r["tier_shares"]
     assert r["candidate_effective_bits"] <= 16 * 0.2 + 1e-9  # a fifth of FP16's bytes
     assert r["candidate_effective_bits"] < r["effective_bits"] < 16  # the floor stays FP16
@@ -146,7 +146,8 @@ def test_question_aware_plans_after_the_answer_s_first_tokens(engine, samples):
 @pytest.mark.slow
 def test_a_run_leaves_the_engine_as_it_found_it(engine, samples):
     before = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
-    rq3.run(engine, samples[9], rq3.condition("random-70"), "question-blind")
+    r = rq3.run(engine, samples[9], rq3.condition("random-70"), "question-blind")
+    assert r["random_seed"] == r["plan"]["seed"] == rq3.sample_seed(samples[9].sample_id, 0)
     rq3.run(engine, samples[9], rq3.condition("static-int2"), "question-blind")
     assert (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring,
             engine.kv_score_source) == before
