@@ -68,7 +68,11 @@ def needle_text(name: str, code: str) -> str:
 
 
 def question_text(name: str) -> str:
-    return f"What is the access code for the {name} archive? Reply with the code only."
+    """The question for a needle. Its answer opens with "The access code is",
+    so that the code comes after the first tokens, which the question-aware
+    experiment decodes before it compresses (#147)."""
+    return (f"What is the access code for the {name} archive? Answer in one sentence, "
+            f'starting with "The access code is".')
 
 
 def piece(sentence: str) -> str:

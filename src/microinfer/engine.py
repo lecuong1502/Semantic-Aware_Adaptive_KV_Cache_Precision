@@ -399,11 +399,17 @@ class Conversation:
         `max_new_tokens`, one at least: the new token ids. `report` is called
         as generate calls it, and the fp32 logits each new token was chosen
         from are appended to `logits`, if given. How the turn ended is the
-        engine's `ending`."""
+        engine's `ending`. An empty prompt goes on with the last turn's
+        answer, from the token it chose last (#147)."""
         if self._ended is not None:
             raise RuntimeError(f"the conversation has ended: {self._ended}")
         engine = self._engine
-        ids = engine.encode(prompt) if isinstance(prompt, str) else engine._check_ids(prompt)
+        if isinstance(prompt, str):
+            ids = engine.encode(prompt)
+        elif len(prompt) == 0 and len(self._unfed):
+            ids = np.empty(0, dtype=np.int32)
+        else:
+            ids = engine._check_ids(prompt)
         if max_new_tokens < 1:
             raise ValueError(f"a turn decodes one token at least, got {max_new_tokens}")
         fed = np.concatenate([self._unfed, ids])
@@ -441,6 +447,24 @@ class Conversation:
         if source == "semantic" and self._cache.scores is None:
             raise ValueError("semantic scores need a cache that keeps them: kv_scoring=True")
         return engine._controlled_plan(self._cache, share, source, seed)
+
+    def tiers(self) -> np.ndarray:
+        """Each page's tier, (layers, pages), as an index into controller.TIERS,
+        -1 for a page the cache does not hold."""
+        if self._cache is None:
+            raise RuntimeError(f"the conversation has ended: {self._ended}")
+        return self._cache.pages.page_tiers()
+
+    def effective_bits(self) -> dict:
+        """The average effective bits per cached element the cache holds now:
+        `effective_bits` over every full page, and `candidate_effective_bits`
+        over those outside the recency floor, as a controlled plan's record
+        gives them (#142)."""
+        if self._cache is None:
+            raise RuntimeError(f"the conversation has ended: {self._ended}")
+        engine = self._engine
+        page_bytes = dict(zip(controller.TIERS, model.tier_page_bytes(engine.config)))
+        return engine._effective_bits(self._cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)
 
     @property
     def score_alpha(self) -> float | None:
