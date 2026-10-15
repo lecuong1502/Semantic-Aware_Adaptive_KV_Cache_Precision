@@ -100,6 +100,32 @@ class Downgrade:
     seconds: float
 
 
+@dataclass(frozen=True)
+class PlanOptions:
+    """Options of the planner for ADR-0018's ablations, recorded in every
+    plan (#144). The defaults are ADR-0016's policy.
+
+    - `lowest_tier`: the lowest tier a plan may move a page to.
+    - `importance_only`: a marginal cost of the page's score alone, the
+      tier's error and the bytes left out, so that pages go down in score
+      order, the least attended all the way first.
+    - `protect_first_page`: page 0 of every layer is never downgraded, as
+      though the recency floor held the attention sink too."""
+
+    lowest_tier: str = "INT2"
+    importance_only: bool = False
+    protect_first_page: bool = False
+
+    def __post_init__(self):
+        if self.lowest_tier not in TIERS[1:]:
+            raise ValueError(f"the lowest tier is a quantised tier, one of {TIERS[1:]}; got "
+                             f"{self.lowest_tier!r}")
+
+
+#: ADR-0016's policy.
+DEFAULT_OPTIONS = PlanOptions()
+
+
 @dataclass(frozen=True, eq=False)
 class Plan:
     """The downgrades, in the order they were chosen, and the batches they
@@ -126,6 +152,8 @@ class Plan:
     scores: np.ndarray
     seconds: np.ndarray
     budget_seconds: float
+    #: The planner's options the plan was made with (#144).
+    options: PlanOptions = DEFAULT_OPTIONS
 
     @functools.cached_property
     def batch_bounds(self) -> tuple[tuple[int, int], ...]:
@@ -158,11 +186,13 @@ class Plan:
                          float(self.scores[i]), float(self.seconds[i]))
 
 
-def _empty_plan(level: Level, recency_floor: int, budget_seconds: float) -> Plan:
+def _empty_plan(level: Level, recency_floor: int, budget_seconds: float,
+                options: PlanOptions = DEFAULT_OPTIONS) -> Plan:
     none, nothing = np.zeros(0, dtype=np.int64), np.zeros(0)
     return Plan(level=level, target_bytes=0, short=False, recency_floor=recency_floor,
                 layers=none, pages=none, current=none, lower=none, saved=none, costs=nothing,
-                scores=nothing, seconds=nothing, budget_seconds=budget_seconds)
+                scores=nothing, seconds=nothing, budget_seconds=budget_seconds,
+                options=options)
 
 
 def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, int], float],
@@ -197,7 +227,8 @@ def plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.ndarray,
                 move_seconds: dict[tuple[str, str], float], positions: int, page_tokens: int,
                 recency_floor: int = DEFAULT_RECENCY_FLOOR,
                 margin_bytes: int = DEFAULT_MARGIN_BYTES,
-                budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> Plan:
+                budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+                options: PlanOptions = DEFAULT_OPTIONS) -> Plan:
     """plan(), on arrays: `scores` and `tiers`, (layers, pages), page i of
     layer l at [l, i], a tier as its index into TIERS, -1 for a page the
     cache does not hold, NaN for a score not yet given.
@@ -216,11 +247,11 @@ def plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.ndarray,
     target_bytes = max(0, thresholds.yellow_below_bytes + margin_bytes - headroom_bytes)
     if level == GREEN:
         _check_plan_inputs(scores, tiers, positions, page_tokens, recency_floor)
-        return _empty_plan(level, recency_floor, budget_seconds)
+        return _empty_plan(level, recency_floor, budget_seconds, options)
     return target_plan_arrays(target_bytes, level, scores, tiers, page_bytes, errors,
                               move_seconds=move_seconds, positions=positions,
                               page_tokens=page_tokens, recency_floor=recency_floor,
-                              budget_seconds=budget_seconds)
+                              budget_seconds=budget_seconds, options=options)
 
 
 def share_target_bytes(share: float, tiers: np.ndarray, page_bytes: dict[str, int], *,
@@ -258,15 +289,19 @@ def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tier
                        page_bytes: dict[str, int], errors: dict[str, float], *,
                        move_seconds: dict[tuple[str, str], float], positions: int,
                        page_tokens: int, recency_floor: int = DEFAULT_RECENCY_FLOOR,
-                       budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> Plan:
+                       budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+                       options: PlanOptions = DEFAULT_OPTIONS) -> Plan:
     """The plan that reclaims `target_bytes`, by the greedy plan_arrays
     describes, whatever gives the target: a pressure event's headroom, or
     a controlled plan's share (#142). `level` is the plan's, which sets how
-    it is applied: at RED, at once."""
+    it is applied: at RED, at once. `options` vary the policy for
+    ADR-0018's ablations, and are recorded in the plan (#144)."""
     _check_plan_inputs(scores, tiers, positions, page_tokens, recency_floor)
     if target_bytes <= 0:
-        return _empty_plan(level, recency_floor, budget_seconds)
+        return _empty_plan(level, recency_floor, budget_seconds, options)
     candidate = candidates(tiers, positions, page_tokens, recency_floor)
+    if options.protect_first_page:
+        candidate[:, 0] = False
     scored = scores[candidate & ~np.isnan(scores)]
     neutral = float(scored.mean()) if scored.size else 1.0
     score = np.where(np.isnan(scores), neutral, scores)
@@ -277,10 +312,17 @@ def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tier
     saved = bytes_at[:-1] - bytes_at[1:]
     seconds = np.array([move_seconds[(TIERS[k], TIERS[k + 1])] for k in range(steps)])
     k = np.arange(steps)[None, None, :]
-    taken = k >= tiers[:, :, None]
-    # score x added error / bytes saved, rounded in that order, as the
-    # greedy's own arithmetic is.
-    cost = score[:, :, None] * (error_at[1:] - error_at[:-1])[None, None, :] / saved
+    # A step is still to take if the page is above it, and allowed if it
+    # goes no lower than the lowest tier.
+    taken = (k >= tiers[:, :, None]) & (k < TIERS.index(options.lowest_tier))
+    if options.importance_only:
+        # The page's score alone: a page goes all the way down, in score
+        # order, whatever each tier's error.
+        cost = np.broadcast_to(score[:, :, None], (*score.shape, steps)).astype(np.float64)
+    else:
+        # score x added error / bytes saved, rounded in that order, as the
+        # greedy's own arithmetic is.
+        cost = score[:, :, None] * (error_at[1:] - error_at[:-1])[None, None, :] / saved
     cost = np.maximum.accumulate(np.where(taken, cost, -np.inf), axis=2)
     li, pi, ki = np.nonzero(taken & candidate[:, :, None])
     costs, step_scores = cost[li, pi, ki], score[li, pi]
@@ -304,7 +346,7 @@ def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tier
                 recency_floor=recency_floor, layers=li[order].astype(np.int64),
                 pages=pi[order].astype(np.int64), current=steps_taken, lower=steps_taken + 1,
                 saved=saved[steps_taken], costs=costs[order], scores=step_scores[order],
-                seconds=seconds[steps_taken], budget_seconds=budget_seconds)
+                seconds=seconds[steps_taken], budget_seconds=budget_seconds, options=options)
 
 
 def _check_plan_inputs(scores: np.ndarray | None, tiers: np.ndarray, positions: int,
