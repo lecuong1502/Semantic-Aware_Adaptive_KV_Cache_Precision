@@ -11,13 +11,14 @@ logs the divergences.
 """
 
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from conftest import require_model
-from microinfer import Engine, benchlog, controller, monitor
+from microinfer import Engine, benchlog, controller, gate, monitor
 from microinfer.controller import PlanOptions
 
 REPO = Path(__file__).resolve().parent.parent
@@ -133,6 +134,19 @@ def test_one_layer_alone_at_int2():
     over a window of 3 pages."""
     assert sensitivity.one_layer_at(1, layers=3, pages=3) == [
         [], ["INT2", "INT2", "INT2"], []]
+
+
+def test_the_divergence_is_gate_s_kl_summed_over_rows():
+    """The reference's terms taken once give gate.kl_divergence's sum, over
+    more rows than one chunk holds, a last chunk short."""
+    rng = np.random.default_rng(1453)
+    reference = (4 * rng.standard_normal((300, 500))).astype(np.float32)
+    ours = (reference + 0.3 * rng.standard_normal(reference.shape)).astype(np.float32)
+    want = float(gate.kl_divergence(reference, ours).sum())
+    with ThreadPoolExecutor(4) as pool:
+        held = sensitivity.Reference(reference, pool)
+        assert held.summed_kl(ours) == pytest.approx(want, rel=1e-9)
+        assert held.summed_kl(reference) == pytest.approx(0, abs=1e-9)
 
 
 @pytest.mark.slow

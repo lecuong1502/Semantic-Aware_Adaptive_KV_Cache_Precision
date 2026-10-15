@@ -16,6 +16,7 @@ import argparse
 import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +27,7 @@ sys.path.insert(0, str(REPO / "tools"))
 
 from perplexity import ATTENTION, ROWS, SHA256, URL, held_out_text  # noqa: E402
 
-from microinfer import Engine, benchlog, gate, model  # noqa: E402
+from microinfer import Engine, benchlog, model  # noqa: E402
 
 
 def one_layer_at(layer: int, *, layers: int, pages: int, tier: str = "INT2") -> list[list[str]]:
@@ -35,11 +36,44 @@ def one_layer_at(layer: int, *, layers: int, pages: int, tier: str = "INT2") -> 
     return [[tier] * pages if row == layer else [] for row in range(layers)]
 
 
-def summed_kl(reference: np.ndarray, logits: np.ndarray) -> float:
-    """KL(reference || ours) summed over rows, `ROWS` rows at a time: a
-    2048-row window's logits in float64 at once would be 2.5 GB a copy."""
-    return sum(float(gate.kl_divergence(reference[r:r + ROWS], logits[r:r + ROWS]).sum())
-               for r in range(0, len(reference), ROWS))
+class Reference:
+    """FP16's next-token distributions over one window, to measure others'
+    KL divergence from, `ROWS` rows at a time.
+
+    KL(p || q) of a row is sum p log p - sum p z + log sum exp z, z being the
+    row's logits under q: what depends on the reference alone, p and the
+    first sum, is taken once a window rather than once a layer, which more
+    than halves the work. In float64, as gate.kl_divergence is; the window's
+    p take 2.5 GB at 2048 positions. Chunks are taken on threads, as NumPy
+    lets go of the GIL in its loops."""
+
+    def __init__(self, logits: np.ndarray, pool: ThreadPoolExecutor):
+        self.pool = pool
+        chunks = list(pool.map(self._reference, self._chunks(logits)))
+        self.p = [p for p, _ in chunks]
+        self.negentropy = sum(negentropy for _, negentropy in chunks)
+
+    @staticmethod
+    def _chunks(logits: np.ndarray) -> list[np.ndarray]:
+        return [logits[r:r + ROWS] for r in range(0, len(logits), ROWS)]
+
+    @staticmethod
+    def _reference(rows: np.ndarray) -> tuple[np.ndarray, float]:
+        z = rows.astype(np.float64)
+        z -= z.max(-1, keepdims=True)
+        log_p = z - np.log(np.exp(z).sum(-1, keepdims=True))
+        p = np.exp(log_p)
+        return p, float((p * log_p).sum())
+
+    def summed_kl(self, logits: np.ndarray) -> float:
+        """KL(reference || ours), summed over the window's rows."""
+        def cross(p: np.ndarray, rows: np.ndarray) -> float:
+            z = rows.astype(np.float64)
+            top = z.max(-1)
+            lse = top + np.log(np.exp(z - top[:, None]).sum(-1))
+            return float(lse.sum() - np.einsum("ij,ij->", p, z))
+
+        return self.negentropy + sum(self.pool.map(cross, self.p, self._chunks(logits)))
 
 
 def main(argv: list[str]) -> int:
@@ -66,16 +100,18 @@ def main(argv: list[str]) -> int:
     print(f"{layers} layers; {windows} windows of {args.window}")
 
     kl, scored, start = np.zeros(layers), 0, time.perf_counter()
+    pool = ThreadPoolExecutor(max_workers=8)
     for w in range(windows):
         window = ids[w * args.window:(w + 1) * args.window]
         engine.kv_tier_map = None
-        reference = engine.forward(window)[:-1]
+        reference = Reference(engine.forward(window)[:-1], pool)
         for layer in range(layers):
             engine.kv_tier_map = one_layer_at(layer, layers=layers, pages=pages)
-            kl[layer] += summed_kl(reference, engine.forward(window)[:-1])
+            kl[layer] += reference.summed_kl(engine.forward(window)[:-1])
         scored += len(window) - 1
         print(f"window {w + 1}/{windows}: {time.perf_counter() - start:.0f} s")
     engine.kv_tier_map = None
+    pool.shutdown()
     kl /= scored
     for layer, divergence in enumerate(kl):
         print(f"layer {layer:2d}: KL {divergence:.6f}")
