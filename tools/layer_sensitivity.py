@@ -8,6 +8,10 @@ the mean over every position but each window's last. One entry goes to the
 benchmark log, a divergence for each layer, in layer order; normalised,
 they are the weights controller.logged_layer_weights gives the planner.
 Refuses a dirty tree, as the checkpoint recorder does.
+
+A query reads its own page at FP16 (ADR-0011), so a window's first page
+sees no INT2 at all, and every position up to 31 neighbours at FP16. The
+bias is alike for every layer, and normalising leaves the weights' ratios.
 """
 
 from __future__ import annotations
@@ -30,6 +34,11 @@ from perplexity import ATTENTION, ROWS, SHA256, URL, held_out_text  # noqa: E402
 from microinfer import Engine, benchlog, model  # noqa: E402
 
 
+#: Threads the divergences are taken on: about 5 GB of temporaries at once,
+#: on top of the reference's p.
+WORKERS = 4
+
+
 def one_layer_at(layer: int, *, layers: int, pages: int, tier: str = "INT2") -> list[list[str]]:
     """The tier map that holds `layer` at `tier` over `pages` pages, and
     every other layer at the engine's kv_tier, FP16."""
@@ -45,7 +54,8 @@ class Reference:
     first sum, is taken once a window rather than once a layer, which more
     than halves the work. In float64, as gate.kl_divergence is; the window's
     p take 2.5 GB at 2048 positions. Chunks are taken on threads, as NumPy
-    lets go of the GIL in its loops."""
+    lets go of the GIL in its loops, each holding about four float64 copies
+    of its rows, 0.3 GB each on Qwen's vocabulary: WORKERS bounds that."""
 
     def __init__(self, logits: np.ndarray, pool: ThreadPoolExecutor):
         self.pool = pool
@@ -100,18 +110,18 @@ def main(argv: list[str]) -> int:
     print(f"{layers} layers; {windows} windows of {args.window}")
 
     kl, scored, start = np.zeros(layers), 0, time.perf_counter()
-    pool = ThreadPoolExecutor(max_workers=8)
-    for w in range(windows):
-        window = ids[w * args.window:(w + 1) * args.window]
-        engine.kv_tier_map = None
-        reference = Reference(engine.forward(window)[:-1], pool)
-        for layer in range(layers):
-            engine.kv_tier_map = one_layer_at(layer, layers=layers, pages=pages)
-            kl[layer] += reference.summed_kl(engine.forward(window)[:-1])
-        scored += len(window) - 1
-        print(f"window {w + 1}/{windows}: {time.perf_counter() - start:.0f} s")
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for w in range(windows):
+            window = ids[w * args.window:(w + 1) * args.window]
+            engine.kv_tier_map = None
+            reference = Reference(engine.forward(window)[:-1], pool)
+            for layer in range(layers):
+                engine.kv_tier_map = one_layer_at(layer, layers=layers, pages=pages)
+                kl[layer] += reference.summed_kl(engine.forward(window)[:-1])
+            del reference
+            scored += len(window) - 1
+            print(f"window {w + 1}/{windows}: {time.perf_counter() - start:.0f} s")
     engine.kv_tier_map = None
-    pool.shutdown()
     kl /= scored
     for layer, divergence in enumerate(kl):
         print(f"layer {layer:2d}: KL {divergence:.6f}")

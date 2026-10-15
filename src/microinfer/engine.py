@@ -742,8 +742,9 @@ class Engine:
     @property
     def kv_plan_options(self) -> controller.PlanOptions:
         """The planner's options for ADR-0018's ablations (#144), given to
-        every downgrade plan the engine makes, and recorded in every plan,
-        upgrades too: ADR-0016's policy by default."""
+        every plan the engine makes, downgrades and upgrades, and recorded in
+        each: ADR-0016's policy by default. Of them, only the layer weights
+        (#145) change upgrades; one for each of the model's layers."""
         return self._kv_plan_options
 
     @kv_plan_options.setter

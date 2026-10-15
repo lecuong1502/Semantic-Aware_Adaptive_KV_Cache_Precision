@@ -62,6 +62,14 @@ def test_a_page_s_score_is_multiplied_by_its_layer_s_weight_before_planning(targ
     assert weighted.options.layer_weights == weights
 
 
+def test_equal_weights_leave_a_plan_as_it_is():
+    """Weights all alike scale every cost alike: the plan is the plan
+    without weights, move for move."""
+    scores = np.random.default_rng(1454).random((3, 10))
+    assert moves(plan(9000, scores, PlanOptions(layer_weights=(2.0, 2.0, 2.0)))) == \
+        moves(plan(9000, scores))
+
+
 def test_a_sensitive_layer_is_spared():
     """Equal scores, and layer 1 ten times as sensitive: the six candidates
     of layer 0 all go to INT8 before any page of layer 1 is touched."""
