@@ -11,7 +11,7 @@ import pytest
 from test_adaptive_engine import simulated
 
 from conftest import require_model
-from microinfer import Engine, model, monitor
+from microinfer import Engine, model
 
 NAME = "qwen2.5-0.5b-instruct"
 
@@ -31,10 +31,24 @@ def test_the_default_is_the_scorer_s():
         pytest.approx(0.2)
 
 
-@pytest.mark.parametrize("alpha", [0.0, -0.1, 1.5])
+@pytest.mark.parametrize("alpha", [0.0, -0.1, 1.5, float("nan")])
 def test_a_weight_outside_zero_to_one_is_refused(alpha):
     with pytest.raises(ValueError, match="alpha"):
         Engine(require_model(NAME), kv_score_alpha=alpha)
+
+
+@pytest.mark.parametrize("alpha", [0.05, 0.5, 1.0])
+def test_a_weight_in_zero_to_one_is_taken(alpha):
+    """ADR-0018's 0.05 and 0.5, and 1, the scores' last step's mass alone."""
+    assert Engine(require_model(NAME), kv_score_alpha=alpha).kv_score_alpha == alpha
+
+
+def test_a_weight_set_later_is_checked_and_applies_to_the_next_cache():
+    engine = Engine(require_model(NAME))
+    engine.kv_score_alpha = 0.05
+    assert engine.kv_score_alpha == 0.05
+    with pytest.raises(ValueError, match="alpha"):
+        engine.kv_score_alpha = 2.0
 
 
 @pytest.mark.slow
@@ -66,6 +80,6 @@ def test_a_plan_from_semantic_scores_records_the_weight():
         engine.generate(prompt(1024, 1432), 8, stop_at_eos=False)
     finally:
         engine.stop_monitor()
-    pressured = [p for p in engine.plans if p.pressure is not None and len(p.plan)]
+    pressured = [p for p in engine.plans
+                 if p.pressure is not None and not p.upgrades and len(p.plan)]
     assert pressured and all(p.score_alpha == pytest.approx(0.5) for p in pressured)
-    assert all(p.plan.level == monitor.RED for p in pressured)

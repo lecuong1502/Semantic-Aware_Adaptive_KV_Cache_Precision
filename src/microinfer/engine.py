@@ -541,9 +541,6 @@ class Engine:
         self.kv_scoring = kv_scoring
         self.kv_score_every = (self.DEFAULT_SCORE_EVERY if kv_score_every is None
                                else kv_score_every)
-        if not 0 < kv_score_alpha <= 1:
-            raise ValueError(f"kv_score_alpha is an EWMA weight, in (0, 1]; got {kv_score_alpha}")
-        #: The weight the scorer folds each step's attention mass in with (#143).
         self.kv_score_alpha = kv_score_alpha
         if kv_score_source not in SOURCES:
             raise ValueError(f"kv_score_source is one of {SOURCES}, got {kv_score_source!r}")
@@ -725,6 +722,20 @@ class Engine:
             raise ValueError(f"kv_score_every is a count of decode steps, at least 1; "
                              f"got {every!r}")
         self._kv_score_every = every
+
+    @property
+    def kv_score_alpha(self) -> float:
+        """With kv_scoring, the EWMA weight the scores fold each step's
+        attention mass in with (#143), in (0, 1]: 0.2 by default (#99),
+        and ADR-0018's 0.05 and 0.5 its ablation. Setting it applies to the
+        next cache."""
+        return self._kv_score_alpha
+
+    @kv_score_alpha.setter
+    def kv_score_alpha(self, alpha: float) -> None:
+        if not 0 < alpha <= 1:  # NaN is refused too
+            raise ValueError(f"kv_score_alpha is an EWMA weight, in (0, 1]; got {alpha!r}")
+        self._kv_score_alpha = alpha
 
     @property
     def kv_tier_map(self) -> list[list[str]] | None:
