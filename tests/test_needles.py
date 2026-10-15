@@ -21,6 +21,7 @@ perplexity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(perplexity)
 
 NAME = "qwen2.5-1.5b-instruct"
+IM_END = 151645
 
 
 @pytest.fixture(scope="module")
@@ -118,3 +119,36 @@ def test_every_needle_lies_outside_the_recency_floor(built):
 
     for s in built:
         assert s.needle_positions[1] <= len(s.turn_1) - controller.DEFAULT_RECENCY_FLOOR
+
+
+def test_wikitext_2_s_test_split_holds_60_articles(text):
+    """A title is a line ' = Title = ' after a blank one: lines of a formula
+    such as ' = 1 henry and capacitance C = ' are not titles."""
+    found = needles.articles(text)
+    assert len(found) == 60
+    titles = [title for title, _ in found]
+    assert "Constant k filter" in titles and "2003 Pacific typhoon season" in titles
+    assert not any("henry" in title or "rad / s" in title for title in titles)
+
+
+def test_turn_two_after_a_turn_one_that_stopped_at_its_end_of_turn(engine, built):
+    """A turn 1 cut short at its 64 tokens needs its message closed; one that
+    stopped at <|im_end|> has fed it already, so turn 2 goes on after it."""
+    for s in built:
+        assert s.turn_2.tolist() == [IM_END] + s.turn_2_after_eos.tolist()
+    assert text_of(engine, built[0].turn_2_after_eos).startswith("\n<|im_start|>user\n")
+
+
+def test_the_samples_of_a_depth_have_their_own_haystacks(built):
+    for depth in needles.DEPTHS:
+        firsts = [s.first_article for s in built if s.depth == depth]
+        assert len(set(firsts)) == len(firsts)
+
+
+def test_more_samples_a_depth_leave_the_first_ones_as_they_are(engine, text, built):
+    """Screening replaces a sample FP16 answers wrongly (#148) with the next
+    of its depth: drawing more leaves the first five, byte for byte."""
+    more = needles.needle_set(text, engine.tokenizer, seed=146, samples_per_depth=7)
+    assert len(more) == 70
+    first_five = [s for s in more if int(s.sample_id.split("-")[1]) < 5]
+    assert needles.dumps(first_five) == needles.dumps(built)
