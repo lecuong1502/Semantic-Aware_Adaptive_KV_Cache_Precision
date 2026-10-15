@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import zlib
 from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 
-from . import controller, needles
+from . import benchlog, controller, needles
 
 EXPERIMENTS = ("question-blind", "question-aware")
 SUMMARY_TOKENS = 64
@@ -183,3 +185,42 @@ def config(sample: needles.Sample, cond: Condition, experiment: str, **more) -> 
             "summary_tokens": SUMMARY_TOKENS, "answer_tokens": ANSWER_TOKENS,
             "aware_tokens": AWARE_TOKENS if experiment == "question-aware" else None,
             **more}
+
+
+def screen(samples: Sequence, is_right: Callable[[needles.Sample], bool],
+           per_depth: int = needles.SAMPLES_PER_DEPTH) -> tuple[list, list]:
+    """ADR-0017's screening (#148): of `samples`, a set drawn with more than
+    `per_depth` a depth, in its order, keep for each depth the first
+    `per_depth` that FP16 answers correctly, `is_right`, and reject those
+    before them that it does not. A sample past a depth's last kept is not
+    run. The kept and the rejected, each in the set's order."""
+    kept, rejected = [], []
+    for depth in needles.DEPTHS:
+        held = 0
+        for sample in (s for s in samples if s.depth == depth):
+            if held == per_depth:
+                break
+            if is_right(sample):
+                kept.append(sample)
+                held += 1
+            else:
+                rejected.append(sample)
+        if held < per_depth:
+            raise ValueError(f"depth {round(depth * 100)}%: {held} of its samples drawn "
+                             f"answered correctly at FP16, {per_depth} needed; draw more")
+    return kept, rejected
+
+
+def screened(model: str, needle_seed: int,
+             log: str | Path = benchlog.DEFAULT_LOG) -> tuple[list[str], int]:
+    """The screened set's sample ids, for `model` and the set of
+    `needle_seed`, from the last needle-screening entry logged for them, and
+    the samples a depth it was drawn with, which gives those ids their
+    samples."""
+    entries = [e for e in benchlog.read(log) if e["kind"] == "needle-screening"
+               and e["model"] == model and e["config"]["needle_seed"] == needle_seed]
+    if not entries:
+        raise ValueError(f"no needle-screening logged for {model} at seed {needle_seed}; "
+                         f"run tools/screen_needles.py")
+    results = entries[-1]["results"]
+    return results["kept"], results["samples_per_depth"]

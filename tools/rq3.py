@@ -5,7 +5,8 @@ chosen: one entry in the benchmark log a run, naming the sample, the
 condition, the experiment and the code that produced it, with the plan, the
 average effective bits, the answer and whether it is correct (microinfer.rq3).
 By default, the whole needle set under every condition in the
-question-blind experiment. Refuses a dirty tree, as the checkpoint recorder
+question-blind experiment; with --screened, the set tools/screen_needles.py
+kept at FP16 (#148). Refuses a dirty tree, as the checkpoint recorder
 does.
 """
 
@@ -39,6 +40,9 @@ def main(argv: list[str]) -> int:
                         choices=rq3.EXPERIMENTS)
     parser.add_argument("--samples", nargs="+", default=None,
                         help="sample ids, such as d50-0 (default: the whole set)")
+    parser.add_argument("--screened", action="store_true",
+                        help="the screened set, from the last needle-screening logged for "
+                             "the model and seed")
     parser.add_argument("--samples-per-depth", type=int, default=needles.SAMPLES_PER_DEPTH,
                         help="draw more a depth, for screening's replacements")
     parser.add_argument("--needle-seed", type=int, default=NEEDLE_SEED)
@@ -52,10 +56,16 @@ def main(argv: list[str]) -> int:
         parser.error("tracked files have uncommitted changes; commit first, so that "
                      "each entry names the code that produced it")
 
+    per_depth = args.samples_per_depth
+    if args.screened:
+        if args.samples is not None:
+            parser.error("--screened chooses the samples; give one or the other")
+        args.samples, per_depth = rq3.screened(args.model, args.needle_seed, args.log)
+
     engine = Engine(REPO / "models" / args.model)
     engine.load_weights()
     every = needles.needle_set(held_out_text(), engine.tokenizer, seed=args.needle_seed,
-                               samples_per_depth=args.samples_per_depth,
+                               samples_per_depth=per_depth,
                                haystack_tokens=args.haystack_tokens)
     chosen = every if args.samples is None else [s for s in every if s.sample_id in args.samples]
     missing = set(args.samples or ()) - {s.sample_id for s in chosen}
