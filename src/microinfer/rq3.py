@@ -21,8 +21,9 @@ An **experiment** is when the plan is made:
 A turn stops at its end of turn. Turn 2 closes a turn 1 cut short at its
 tokens, or stopped at <|endoftext|>, and goes on after one that stopped at
 <|im_end|> (needles.Sample.turn_2). A question-aware run logs the answer's
-first tokens, and whether they open as the question asks: if not, the plan
-may have come after part of the code.
+first tokens, whether they open as the question asks, and whether the code
+comes after them, after the plan: Qwen2.5-1.5B opens "The access code for
+the ... archive is", which is not as asked, but holds no code yet.
 
 One engine serves every condition: a run sets the engine's tier, whether it
 adapts and scores, and its score source, which an emergency plan would use
@@ -88,6 +89,14 @@ def condition(name: str) -> Condition:
             return c
     raise ValueError(f"no condition {name!r}; ADR-0017's are {[c.name for c in CONDITIONS]}, "
                      f"and {NO_PLAN.name!r} the check")
+
+
+def code_after(opening: str, code: str) -> bool:
+    """Whether an answer's opening holds none of the code yet: neither the
+    code, nor, at its end, a start of it."""
+    opening = opening.rstrip()
+    return code not in opening and not any(opening.endswith(code[:k])
+                                           for k in range(1, len(code)))
 
 
 def sample_seed(sample_id: str, plan_seed: int) -> int:
@@ -156,6 +165,7 @@ def _run(engine, sample: needles.Sample, cond: Condition, experiment: str, seed:
         "summary_length": len(summary), "summary_stopped": stopped,
         "aware_opening": opening,
         "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
+        "code_after_plan": None if opening is None else code_after(opening, sample.code),
         "plan_positions": plan_positions, "plan": plan, "random_seed": seed,
         "effective_bits": bits["effective_bits"],
         "candidate_effective_bits": bits["candidate_effective_bits"],

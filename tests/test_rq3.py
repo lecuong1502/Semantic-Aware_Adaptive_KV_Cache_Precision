@@ -52,6 +52,17 @@ def test_the_answer_s_opening_is_the_tokens_decoded_before_a_question_aware_plan
     assert len(tokenizer.encode(rq3.AWARE_OPENING).ids) == rq3.AWARE_TOKENS
 
 
+@pytest.mark.parametrize("opening, after", [
+    ("The access code is", True),
+    ("The access code for the", True),
+    ("The access code is W", False),
+    ("The access code is WDM", False),
+    ("WDM-2615.", False),
+])
+def test_the_code_comes_after_an_opening_that_holds_none_of_it(opening, after):
+    assert rq3.code_after(opening, "WDM-2615") is after
+
+
 def test_each_sample_draws_its_own_random_scores():
     """One seed for every sample would rank the needle's page alike in the
     five of a depth, and pair their outcomes; each draws its own, logged."""
@@ -129,6 +140,7 @@ def test_question_aware_plans_after_the_answer_s_first_tokens(engine, samples):
     assert len(r["answer_tokens"]) <= rq3.ANSWER_TOKENS
     assert r["aware_opening"] == engine.decode(r["answer_tokens"][:rq3.AWARE_TOKENS])
     assert r["opened_as_asked"] == r["aware_opening"].startswith(rq3.AWARE_OPENING)
+    assert r["code_after_plan"] == rq3.code_after(r["aware_opening"], s.code)
 
 
 @pytest.mark.slow
