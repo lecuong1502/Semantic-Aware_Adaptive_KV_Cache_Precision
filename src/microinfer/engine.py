@@ -329,6 +329,9 @@ class PlanRecord:
     persisting: bool = False
     #: The OutOfMemory an emergency plan answers (#107); None for any other.
     emergency: str | None = None
+    #: The EWMA weight of the scores the plan came from, for a plan from
+    #: semantic scores (#143); None for one from another source.
+    score_alpha: float | None = None
     #: For a controlled plan (#142), made between turns for a share and a
     #: score source rather than on an event: the source and its seed, the
     #: share, the byte target and the bytes the plan reclaimed, whether it
@@ -343,6 +346,14 @@ class PlanRecord:
     @property
     def upgrades(self) -> bool:
         return isinstance(self.plan, controller.UpgradePlan)
+
+
+def _alpha_of(cache, source: str) -> float | None:
+    """The EWMA weight of the scores a plan from `source` reads: the cache's
+    scorer's, for semantic scores; None for any other source (#143)."""
+    if source != "semantic" or cache.scores is None:
+        return None
+    return cache.scores.alpha
 
 
 class Conversation:
@@ -431,6 +442,14 @@ class Conversation:
             raise ValueError("semantic scores need a cache that keeps them: kv_scoring=True")
         return engine._controlled_plan(self._cache, share, source, seed)
 
+    @property
+    def score_alpha(self) -> float | None:
+        """The EWMA weight the cache's scorer folds in with; None if it keeps
+        no scores."""
+        if self._cache is None or self._cache.scores is None:
+            return None
+        return self._cache.scores.alpha
+
     def scores(self) -> np.ndarray | None:
         """The importance scores the cache holds, (layers, pages), NaN for a
         page never observed; None if it keeps none."""
@@ -481,6 +500,10 @@ class Engine:
     #: than noise at 512 positions, and #88 makes every R-th its fallback.
     DEFAULT_SCORE_EVERY = 4
 
+    #: The importance scorer's EWMA weight by default (#99), the one #88
+    #: chose: a step's mass is folded in at 0.2.
+    DEFAULT_SCORE_ALPHA = model.device.ImportanceScores.default_alpha
+
     #: Which halves of a page a quantised tier quantises. "both" is the tier;
     #: "keys" and "values" are a diagnostic that splits its cost (kv_pages.h).
     KV_HALVES = ("both", "keys", "values")
@@ -488,7 +511,8 @@ class Engine:
     def __init__(self, model_dir: str | Path, *, verify: bool = True, kv_cache: str = "paged",
                  kv_tier: str = "FP16", kv_halves: str = "both",
                  kv_tier_map: list[list[str]] | None = None, kv_scoring: bool = False,
-                 kv_score_every: int | None = None, kv_adaptive: bool = False,
+                 kv_score_every: int | None = None,
+                 kv_score_alpha: float = DEFAULT_SCORE_ALPHA, kv_adaptive: bool = False,
                  kv_score_source: str = "semantic", kv_score_seed: int = 0,
                  kv_plan_budget_seconds: float = controller.DEFAULT_BUDGET_SECONDS,
                  kv_upgrade_cooldown_seconds: float = controller.DEFAULT_UPGRADE_COOLDOWN_SECONDS,
@@ -517,6 +541,7 @@ class Engine:
         self.kv_scoring = kv_scoring
         self.kv_score_every = (self.DEFAULT_SCORE_EVERY if kv_score_every is None
                                else kv_score_every)
+        self.kv_score_alpha = kv_score_alpha
         if kv_score_source not in SOURCES:
             raise ValueError(f"kv_score_source is one of {SOURCES}, got {kv_score_source!r}")
         if kv_adaptive and (kv_cache == "contiguous" or kv_halves != "both"):
@@ -697,6 +722,20 @@ class Engine:
             raise ValueError(f"kv_score_every is a count of decode steps, at least 1; "
                              f"got {every!r}")
         self._kv_score_every = every
+
+    @property
+    def kv_score_alpha(self) -> float:
+        """With kv_scoring, the EWMA weight the scores fold each step's
+        attention mass in with (#143), in (0, 1]: 0.2 by default (#99),
+        and ADR-0018's 0.05 and 0.5 its ablation. Setting it applies to the
+        next cache."""
+        return self._kv_score_alpha
+
+    @kv_score_alpha.setter
+    def kv_score_alpha(self, alpha: float) -> None:
+        if not 0 < alpha <= 1:  # NaN is refused too
+            raise ValueError(f"kv_score_alpha is an EWMA weight, in (0, 1]; got {alpha!r}")
+        self._kv_score_alpha = alpha
 
     @property
     def kv_tier_map(self) -> list[list[str]] | None:
@@ -1112,6 +1151,7 @@ class Engine:
         if len(plan) == 0:
             return None
         entry = PlanRecord(self._last_pressure, plan, time.perf_counter() - started, [],
+                           score_alpha=_alpha_of(cache, self.kv_score_source),
                            headroom_bytes=self._monitor.headroom_bytes)
         self.plans.append(entry)
         self._recent_moves.append(float(plan.seconds.max()))  # until one is timed
@@ -1134,7 +1174,8 @@ class Engine:
             target, RED, scores, tiers, page_bytes, errors, move_seconds=seconds,
             positions=cache.length, page_tokens=pages.page_tokens,
             budget_seconds=self.kv_plan_budget_seconds)
-        entry = PlanRecord(None, plan, time.perf_counter() - started, [])
+        entry = PlanRecord(None, plan, time.perf_counter() - started, [],
+                           score_alpha=_alpha_of(cache, source))
         self.plans.append(entry)
         if self._pending is not None:
             self._pending.ended = "replaced"
@@ -1205,6 +1246,7 @@ class Engine:
             move_seconds=seconds, positions=cache.length, page_tokens=pages.page_tokens,
             budget_seconds=self.kv_plan_budget_seconds)
         entry = PlanRecord(record, plan, time.perf_counter() - started, [],
+                           score_alpha=_alpha_of(cache, self.kv_score_source),
                            headroom_bytes=headroom, persisting=persisting, emergency=emergency)
         if len(plan) == 0 and persisting:
             return None
@@ -1372,6 +1414,7 @@ class Engine:
             scoring = self.kv_scoring or (self.kv_adaptive and self.kv_score_source == "semantic")
             cache = model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map),
                                      always_seal=self.kv_adaptive, scoring=scoring,
+                                     alpha=self.kv_score_alpha,
                                      score_every=self.kv_score_every)
             if self.kv_adaptive:
                 # A spare granule at each quantised tier (#107): a downgrade
@@ -1386,7 +1429,8 @@ class Engine:
             raise ValueError("kv_halves splits a quantised tier; FP16 has nothing to split")
         return model.PagedCache(self.config, tier,
                                 getattr(_microinfer.device.Halves, self.kv_halves.title()),
-                                scoring=self.kv_scoring, score_every=self.kv_score_every)
+                                scoring=self.kv_scoring, alpha=self.kv_score_alpha,
+                                score_every=self.kv_score_every)
 
     @contextmanager
     def _holding(self, cache, ws: model.Workspace):
