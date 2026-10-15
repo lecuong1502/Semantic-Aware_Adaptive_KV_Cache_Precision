@@ -156,7 +156,7 @@ def test_the_rq3_tool_runs_the_screened_set(tmp_path, monkeypatch):
                       "--haystack-tokens", "1024", "--log", str(log)]) == 0
     (run,) = [e for e in benchlog.read(log) if e["kind"] == "rq3-needle"]
     assert run["config"]["sample_id"] == "d50-6"
-    # the same command again, at the same commit, runs nothing it logged (#149)
+    # the same command again, at the same code, runs nothing it logged (#149)
     assert tool.main(["--issue", "148", "--model", name, "--screened", "--conditions", "fp16",
                       "--haystack-tokens", "1024", "--log", str(log)]) == 0
     assert len([e for e in benchlog.read(log) if e["kind"] == "rq3-needle"]) == 1

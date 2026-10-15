@@ -213,8 +213,28 @@ def test_the_runs_logged_at_a_commit_are_named_by_sample_experiment_and_conditio
     assert rq3.logged("m", 140, 1024, "another commit", log) == {}
 
 
+def test_a_run_logged_at_other_code_is_run_again_and_at_the_same_code_is_not(tmp_path,
+                                                                            monkeypatch):
+    """A commit that changed only the log holds the code of the runs before
+    it (benchlog.same_code): they are taken up; after a change to the code,
+    they run again. One git call a commit, not one an entry."""
+    log = tmp_path / "benchmark.jsonl"
+    logged_run(log, "d00-0", "semantic-70", True)
+    logged_run(log, "d00-1", "semantic-70", True)
+    commit = benchlog.read(log)[0]["git_commit"]
+    asked = []
+    monkeypatch.setattr(rq3.benchlog, "same_code",
+                        lambda a, b, log: asked.append(a) or (a, b) == (commit, "log only"))
+    assert set(rq3.logged("m", 140, 1024, "log only", log)) == {
+        ("d00-0", "question-blind", "semantic-70"), ("d00-1", "question-blind", "semantic-70")}
+    assert asked == [commit]
+    assert rq3.logged("m", 140, 1024, "code changed", log) == {}
+
+
 def test_question_blind_s_closing_run_is_every_source_at_both_levels():
     """#149: semantic, uniform and random at 70% and 80%; FP16 is
     screening's, and the static tiers are #151's."""
     assert tool.conditions_for(["sources"], screened=True) == [
         "semantic-70", "semantic-80", "uniform-70", "uniform-80", "random-70", "random-80"]
+    assert tool.conditions_for(["sources", "semantic-70", "fp16", "fp16"], screened=True) == [
+        *rq3.SOURCE_CONDITIONS, "fp16"]  # each once
