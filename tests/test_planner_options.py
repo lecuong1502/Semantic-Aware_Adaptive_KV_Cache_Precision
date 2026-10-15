@@ -42,15 +42,38 @@ def test_the_defaults_are_adr_0016_s_policy():
                                         protect_first_page=False)
 
 
+#: The plans the planner made before #144, on main at 4febdc2, for the scores
+#: of seed 144: (layer, page, step) in order, step 0 being FP16 to INT8.
+BEFORE = {
+    3000: [(0, 1, 0), (1, 3, 0), (0, 5, 0), (0, 3, 0), (1, 2, 0), (1, 5, 0), (1, 0, 0)],
+    9000: [(0, 1, 0), (1, 3, 0), (0, 5, 0), (0, 3, 0), (1, 2, 0), (1, 5, 0), (1, 0, 0),
+           (0, 4, 0), (0, 2, 0), (1, 1, 0), (0, 0, 0), (1, 4, 0),
+           (0, 1, 1), (1, 3, 1), (0, 5, 1), (0, 3, 1), (1, 2, 1), (1, 5, 1), (1, 0, 1),
+           (0, 4, 1), (0, 2, 1), (1, 1, 1), (0, 0, 1), (1, 4, 1),
+           (0, 1, 2), (1, 3, 2), (0, 5, 2), (0, 3, 2), (1, 2, 2)],
+}
+
+
 def test_defaults_leave_a_plan_unchanged_bit_for_bit():
-    """A plan with the default options given is the plan with none given,
-    move for move, cost for cost, and records them."""
+    """With no options, and with the defaults given, a plan is the one the
+    planner made before #144, move for move, and records the defaults."""
     scores = np.random.default_rng(144).random((2, 10))
-    for target in (3000, 9000, 9960):
-        a, b = plan(target, scores), plan(target, scores, PlanOptions())
-        assert steps(a) == steps(b)
-        np.testing.assert_array_equal(a.costs, b.costs)
-        assert a.short == b.short and b.options == PlanOptions()
+    for target, moves in BEFORE.items():
+        for p in (plan(target, scores), plan(target, scores, PlanOptions())):
+            assert list(zip(p.layers.tolist(), p.pages.tolist(), p.current.tolist())) == moves
+            assert not p.short and p.options == PlanOptions()
+    a, b = plan(9000, scores), plan(9000, scores, PlanOptions())
+    np.testing.assert_array_equal(a.costs, b.costs)
+
+
+def test_the_dict_planner_takes_the_options_too():
+    """plan(), keyed by (layer, page), threads the options as plan_arrays does."""
+    keys = [(layer, page) for layer in range(2) for page in range(10)]
+    p = controller.plan(monitor.DEFAULT.red_below_bytes - 1, monitor.DEFAULT,
+                        {k: 1.0 for k in keys}, {k: "FP16" for k in keys}, PAGE_BYTES, ERRORS,
+                        move_seconds=MOVES, positions=320, page_tokens=32,
+                        options=PlanOptions(protect_first_page=True))
+    assert p.options.protect_first_page and 0 not in p.pages.tolist()
 
 
 def test_with_int4_the_lowest_no_page_goes_to_int2():
@@ -97,6 +120,11 @@ def test_a_lowest_tier_is_a_quantised_tier():
 # -- the engine ---------------------------------------------------------------------------
 
 NAME = "qwen2.5-0.5b-instruct"
+
+
+def test_the_engine_takes_plan_options_only():
+    with pytest.raises(TypeError, match="PlanOptions"):
+        Engine(require_model(NAME), kv_plan_options={"lowest_tier": "INT4"})
 
 
 @pytest.mark.slow

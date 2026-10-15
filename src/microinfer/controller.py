@@ -107,10 +107,17 @@ class PlanOptions:
 
     - `lowest_tier`: the lowest tier a plan may move a page to.
     - `importance_only`: a marginal cost of the page's score alone, the
-      tier's error and the bytes left out, so that pages go down in score
-      order, the least attended all the way first.
+      tier's error left out, and with it the bytes it is weighed by, so
+      that pages go down in score order, the least attended all the way
+      first. The plan's `costs` are then those scores.
     - `protect_first_page`: page 0 of every layer is never downgraded, as
-      though the recency floor held the attention sink too."""
+      though the recency floor held the attention sink too. A page not yet
+      scored takes the mean of the pages a plan may choose, so page 0 is
+      left out of that mean as well.
+
+    A controlled plan's share is taken over the same pages whatever the
+    options (share_target_bytes), so that an ablation chases the full
+    policy's bytes; one that cannot reach them is recorded as short."""
 
     lowest_tier: str = "INT2"
     importance_only: bool = False
@@ -201,7 +208,8 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
          positions: int, page_tokens: int,
          recency_floor: int = DEFAULT_RECENCY_FLOOR,
          margin_bytes: int = DEFAULT_MARGIN_BYTES,
-         budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> Plan:
+         budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+         options: PlanOptions = DEFAULT_OPTIONS) -> Plan:
     """The plan for this headroom: `scores` and `tiers` by (layer, page),
     for the cache's pages; `page_bytes` and `errors` by tier; `move_seconds`
     by (current, target) tier. The cache holds `positions` positions, pages
@@ -219,7 +227,7 @@ def plan(headroom_bytes: int, thresholds: Thresholds, scores: dict[tuple[int, in
     return plan_arrays(headroom_bytes, thresholds, score_array, tier_index, page_bytes, errors,
                        move_seconds=move_seconds, positions=positions, page_tokens=page_tokens,
                        recency_floor=recency_floor, margin_bytes=margin_bytes,
-                       budget_seconds=budget_seconds)
+                       budget_seconds=budget_seconds, options=options)
 
 
 def plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.ndarray,

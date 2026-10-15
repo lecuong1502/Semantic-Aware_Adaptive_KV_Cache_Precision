@@ -552,8 +552,6 @@ class Engine:
         self.kv_adaptive = kv_adaptive
         #: Where a plan's scores come from (#104), and the random one's seed.
         self.kv_score_source, self.kv_score_seed = kv_score_source, kv_score_seed
-        #: The planner's options for ADR-0018's ablations (#144), given to every
-        #: downgrade plan the engine makes: ADR-0016's policy by default.
         self.kv_plan_options = kv_plan_options
         #: The time a YELLOW plan, or upgrades at GREEN, may take of one step,
         #: planning included.
@@ -740,6 +738,20 @@ class Engine:
         if not 0 < alpha <= 1:  # NaN is refused too
             raise ValueError(f"kv_score_alpha is an EWMA weight, in (0, 1]; got {alpha!r}")
         self._kv_score_alpha = alpha
+
+    @property
+    def kv_plan_options(self) -> controller.PlanOptions:
+        """The planner's options for ADR-0018's ablations (#144), given to
+        every downgrade plan the engine makes, and recorded in it: ADR-0016's
+        policy by default."""
+        return self._kv_plan_options
+
+    @kv_plan_options.setter
+    def kv_plan_options(self, options: controller.PlanOptions) -> None:
+        if not isinstance(options, controller.PlanOptions):
+            raise TypeError(f"kv_plan_options is a controller.PlanOptions; got "
+                            f"{type(options).__name__}")
+        self._kv_plan_options = options
 
     @property
     def kv_tier_map(self) -> list[list[str]] | None:
