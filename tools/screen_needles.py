@@ -37,16 +37,10 @@ EXPERIMENT = "question-blind"
 def logged_fp16(model: str, needle_seed: int, haystack_tokens: int, commit: str,
                 log: Path = benchlog.DEFAULT_LOG) -> dict[str, bool]:
     """Whether each sample was answered correctly, by sample id, from the
-    screening FP16 runs logged at `commit` for this model and set; none
-    before the log exists."""
-    if not Path(log).exists():
-        return {}
-    return {e["config"]["sample_id"]: e["results"]["correct"] for e in benchlog.read(log)
-            if e["kind"] == "rq3-needle" and e["git_commit"] == commit
-            and e["model"] == model and e["config"].get("screening")
-            and e["config"]["condition"]["name"] == FP16.name
-            and e["config"]["needle_seed"] == needle_seed
-            and e["config"]["haystack_tokens"] == haystack_tokens}
+    screening FP16 runs logged at `commit` for this model and set."""
+    runs = rq3.logged(model, needle_seed, haystack_tokens, commit, log, screening=True)
+    return {sample_id: correct for (sample_id, experiment, name), correct in runs.items()
+            if experiment == EXPERIMENT and name == FP16.name}
 
 
 def main(argv: list[str]) -> int:

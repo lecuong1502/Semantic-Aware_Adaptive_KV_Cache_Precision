@@ -87,6 +87,8 @@ CONDITIONS = (
     Condition("static-int2", tier="INT2"),
 )
 NO_PLAN = Condition("no-plan", adaptive=True)
+#: The conditions a source at a level holds, question-blind's closing run (#149).
+SOURCES = tuple(c.name for c in CONDITIONS if c.source is not None)
 
 
 def condition(name: str) -> Condition:
@@ -190,6 +192,27 @@ def config(sample: needles.Sample, cond: Condition, experiment: str, **more) -> 
             "summary_tokens": SUMMARY_TOKENS, "answer_tokens": ANSWER_TOKENS,
             "aware_tokens": AWARE_TOKENS if experiment == "question-aware" else None,
             **more}
+
+
+def logged(model: str, needle_seed: int, haystack_tokens: int, commit: str,
+           log: str | Path = benchlog.DEFAULT_LOG, *, screening: bool = False,
+           plan_seed: int = 0) -> dict[tuple[str, str, str], bool]:
+    """Whether each run logged at `commit` for `model`, the set of
+    `needle_seed` and `haystack_tokens`, and `plan_seed` was answered
+    correctly, by (sample id, experiment, condition): screening's runs, or
+    the others; none before the log exists. A run of hours stopped part way
+    is taken up again from them, at the same commit."""
+    if not Path(log).exists():
+        return {}
+    return {(e["config"]["sample_id"], e["config"]["experiment"],
+             e["config"]["condition"]["name"]): e["results"]["correct"]
+            for e in benchlog.read(log)
+            if e["kind"] == "rq3-needle" and e["git_commit"] == commit
+            and e["model"] == model
+            and bool(e["config"].get("screening")) == screening
+            and e["config"]["needle_seed"] == needle_seed
+            and e["config"]["haystack_tokens"] == haystack_tokens
+            and e["config"]["plan_seed"] == plan_seed}
 
 
 class ShortScreening(ValueError):
