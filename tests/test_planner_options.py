@@ -11,6 +11,7 @@ options to every plan it makes (Seam A).
 
 import numpy as np
 import pytest
+from test_upgrades_at_green import AMPLE_MIB, COOLDOWN, MIB, run
 
 from conftest import require_model
 from microinfer import Engine, controller, monitor
@@ -112,6 +113,25 @@ def test_a_protected_first_page_is_never_named():
     assert p.short and p.reclaimed_bytes == 8300
 
 
+def test_an_upgrade_plan_records_the_options_too():
+    """No option changes how pages move up, but a run's upgrade plans say
+    which options it ran with, as its downgrade plans do: one made, and one
+    the cooldown holds."""
+    options = PlanOptions(lowest_tier="INT4", importance_only=True)
+    tiers = np.full((2, 10), controller.TIERS.index("INT8"), dtype=np.int8)
+    shadowed = np.ones((2, 10), dtype=bool)
+    for last, held in ((0.0, False), (99.0, True)):
+        up = controller.upgrade_plan_arrays(
+            8000 * 2**20, monitor.DEFAULT, np.ones((2, 10)), tiers, shadowed, PAGE_BYTES,
+            ERRORS, move_seconds=MOVES, last_downgrade_seconds=last, now_seconds=100.0,
+            options=options)
+        assert up.options == options and bool(up.held_by) == held
+    assert controller.upgrade_plan_arrays(
+        8000 * 2**20, monitor.DEFAULT, np.ones((2, 10)), tiers, shadowed, PAGE_BYTES, ERRORS,
+        move_seconds=MOVES, last_downgrade_seconds=0.0, now_seconds=100.0).options == \
+        PlanOptions()
+
+
 def test_a_lowest_tier_is_a_quantised_tier():
     with pytest.raises(ValueError, match="lowest"):
         PlanOptions(lowest_tier="FP16")
@@ -143,3 +163,24 @@ def test_the_engine_s_options_reach_its_plans():
     assert record.plan.options == options
     assert record.plan.short and record.controlled["target_met"] is False
     assert INT2 not in record.plan.target.tolist() and 0 not in record.plan.pages.tolist()
+
+
+@pytest.mark.slow
+def test_the_engine_s_upgrade_plans_record_its_options():
+    """RED for a few decode steps, then ample: the engine's upgrade plan,
+    made at GREEN after the cooldown, records the options it runs with."""
+    options = PlanOptions(protect_first_page=True)
+    engine = Engine(require_model(NAME), kv_adaptive=True, prefill_chunk=None,
+                    kv_upgrade_cooldown_seconds=COOLDOWN, kv_plan_options=options)
+    engine.load_weights()
+    ids = np.random.default_rng(1442).integers(1000, 100_000, 2048).astype(np.int32)
+
+    def headroom(cache):
+        length = cache.length if cache is not None else 0
+        if len(ids) + 4 < length <= len(ids) + 8:
+            return 100 * MIB
+        return (AMPLE_MIB if length > len(ids) else 2000) * MIB
+
+    run(engine, ids, 160, headroom)
+    upgrades = [p for p in engine.plans if p.upgrades]
+    assert upgrades and all(p.plan.options == options for p in upgrades)

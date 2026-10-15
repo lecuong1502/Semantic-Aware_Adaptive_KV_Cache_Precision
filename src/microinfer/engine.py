@@ -742,8 +742,8 @@ class Engine:
     @property
     def kv_plan_options(self) -> controller.PlanOptions:
         """The planner's options for ADR-0018's ablations (#144), given to
-        every downgrade plan the engine makes, and recorded in it: ADR-0016's
-        policy by default."""
+        every downgrade plan the engine makes, and recorded in every plan,
+        upgrades too: ADR-0016's policy by default."""
         return self._kv_plan_options
 
     @kv_plan_options.setter
@@ -1163,7 +1163,7 @@ class Engine:
             page_bytes, errors, move_seconds=seconds,
             last_downgrade_seconds=cooldown_from,
             cooldown_seconds=self.kv_upgrade_cooldown_seconds,
-            budget_seconds=self.kv_plan_budget_seconds)
+            budget_seconds=self.kv_plan_budget_seconds, options=self.kv_plan_options)
         if len(plan) == 0:
             return None
         entry = PlanRecord(self._last_pressure, plan, time.perf_counter() - started, [],

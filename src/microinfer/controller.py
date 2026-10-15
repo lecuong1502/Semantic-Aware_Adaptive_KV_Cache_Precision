@@ -443,6 +443,10 @@ class UpgradePlan:
     scores: np.ndarray
     seconds: np.ndarray
     budget_seconds: float
+    #: The planner's options of the run the plan belongs to (#144). None of
+    #: them changes how pages move up; they are recorded so that every plan
+    #: of a run says which options it ran with.
+    options: PlanOptions = DEFAULT_OPTIONS
 
     @property
     def target(self) -> np.ndarray:
@@ -484,7 +488,8 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
                  now_seconds: float | None = None,
                  cooldown_seconds: float = DEFAULT_UPGRADE_COOLDOWN_SECONDS,
                  spike_bytes: int = DEFAULT_UPGRADE_SPIKE_BYTES,
-                 budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> UpgradePlan:
+                 budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+                 options: PlanOptions = DEFAULT_OPTIONS) -> UpgradePlan:
     """The upgrades for this headroom (#103), at GREEN only: at least
     `cooldown_seconds` after the last downgrade, and taking no more than the
     headroom above GREEN's threshold, T_high, plus `spike_bytes`, a P90
@@ -525,7 +530,7 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
         headroom_bytes, thresholds, score_array, tier_index, shadow_array, page_bytes, errors,
         move_seconds=move_seconds, last_downgrade_seconds=last_downgrade_seconds,
         now_seconds=now_seconds, cooldown_seconds=cooldown_seconds, spike_bytes=spike_bytes,
-        budget_seconds=budget_seconds)
+        budget_seconds=budget_seconds, options=options)
 
 
 def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.ndarray,
@@ -535,7 +540,8 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
                         now_seconds: float | None = None,
                         cooldown_seconds: float = DEFAULT_UPGRADE_COOLDOWN_SECONDS,
                         spike_bytes: int = DEFAULT_UPGRADE_SPIKE_BYTES,
-                        budget_seconds: float = DEFAULT_BUDGET_SECONDS) -> UpgradePlan:
+                        budget_seconds: float = DEFAULT_BUDGET_SECONDS,
+                        options: PlanOptions = DEFAULT_OPTIONS) -> UpgradePlan:
     """upgrade_plan(), on arrays: `scores`, `tiers` and `shadowed`,
     (layers, pages), page i of layer l at [l, i], a tier as its index into
     TIERS, -1 for a page the cache does not hold.
@@ -560,7 +566,7 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
         return UpgradePlan(level=level, available_bytes=max(0, available), held_by=reason,
                            layers=none, pages=none, current=none, higher=none, taken=none,
                            gains=nothing, scores=nothing, seconds=nothing,
-                           budget_seconds=budget_seconds)
+                           budget_seconds=budget_seconds, options=options)
 
     if level != GREEN:
         return held(f"the level is {level.value}; upgrades are made at GREEN only")
@@ -609,7 +615,8 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
                        layers=li[order].astype(np.int64), pages=pi[order].astype(np.int64),
                        current=leaving, higher=leaving - 1, taken=taken[order],
                        gains=own[li, pi, si][order], scores=step_scores[order],
-                       seconds=seconds_by[leaving - 1], budget_seconds=budget_seconds)
+                       seconds=seconds_by[leaving - 1], budget_seconds=budget_seconds,
+                       options=options)
 
 
 def logged_tier_errors(model: str, log: str | Path = benchlog.DEFAULT_LOG) -> dict[str, float]:
