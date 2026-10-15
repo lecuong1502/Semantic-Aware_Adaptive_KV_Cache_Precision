@@ -225,6 +225,21 @@ the upgrade takes: a downgrade's marginal cost, the other way. Upgrades
 come largest gain first, the reverse of downgrades (#103).
 _Avoid_: benefit, priority
 
+**Planner options**:
+The parts of ADR-0016's policy an ablation may vary, recorded in every
+plan (ADR-0018, #144, #145): the lowest tier a plan may use; a marginal
+cost of the score alone; a first page never downgraded; and layer weights.
+Their defaults are the policy itself.
+_Avoid_: flags, modes
+
+**Layer weight**:
+A layer's sensitivity, the KL divergence from FP16 of the next-token
+distribution with that layer alone at INT2, divided by the layers' mean.
+With weights, the planner multiplies each page's score by its layer's
+weight before planning, so marginal costs and gains are of weighted scores
+(#145). Without them, every layer counts alike.
+_Avoid_: layer importance (importance is a page's score)
+
 **Upgrade cooldown**:
 The time an upgrade waits after the last downgrade, 5 s by default, so
 that pages are not moved back as soon as they were moved down (#103). In

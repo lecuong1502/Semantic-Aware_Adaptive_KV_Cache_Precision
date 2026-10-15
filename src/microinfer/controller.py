@@ -114,6 +114,12 @@ class PlanOptions:
       though the recency floor held the attention sink too. A page not yet
       scored takes the mean of the pages a plan may choose, so page 0 is
       left out of that mean as well.
+    - `layer_weights`: one weight a layer, by which each page's score is
+      multiplied before planning, downgrades and upgrades alike (#145): the
+      layers' measured sensitivities, normalised (logged_layer_weights). A
+      page not yet scored takes the neutral score, weighted by its layer.
+      The plan's `scores` and costs are then the weighted ones. None, every
+      layer alike.
 
     A controlled plan's share is taken over the same pages whatever the
     options (share_target_bytes), so that an ablation chases the full
@@ -122,11 +128,28 @@ class PlanOptions:
     lowest_tier: str = "INT2"
     importance_only: bool = False
     protect_first_page: bool = False
+    layer_weights: tuple[float, ...] | None = None
 
     def __post_init__(self):
         if self.lowest_tier not in TIERS[1:]:
             raise ValueError(f"the lowest tier is a quantised tier, one of {TIERS[1:]}; got "
                              f"{self.lowest_tier!r}")
+        if self.layer_weights is not None:
+            weights = tuple(float(w) for w in self.layer_weights)
+            if not weights or not all(math.isfinite(w) and w > 0 for w in weights):
+                raise ValueError(f"a layer weight is positive and finite, one a layer; got "
+                                 f"{self.layer_weights!r}")
+            object.__setattr__(self, "layer_weights", weights)
+
+    def weighed(self, scores: np.ndarray) -> np.ndarray:
+        """`scores`, (layers, pages), each multiplied by its layer's weight;
+        the same scores without weights."""
+        if self.layer_weights is None:
+            return scores
+        if len(self.layer_weights) != scores.shape[0]:
+            raise ValueError(f"{len(self.layer_weights)} layer weights for a cache of "
+                             f"{scores.shape[0]} layers")
+        return scores * np.array(self.layer_weights)[:, None]
 
 
 #: ADR-0016's policy.
@@ -312,7 +335,7 @@ def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tier
         candidate[:, 0] = False
     scored = scores[candidate & ~np.isnan(scores)]
     neutral = float(scored.mean()) if scored.size else 1.0
-    score = np.where(np.isnan(scores), neutral, scores)
+    score = options.weighed(np.where(np.isnan(scores), neutral, scores))
 
     steps = len(TIERS) - 1  # step k takes a page from tier k to k + 1
     bytes_at = np.array([page_bytes[t] for t in TIERS], dtype=np.int64)
@@ -443,9 +466,9 @@ class UpgradePlan:
     scores: np.ndarray
     seconds: np.ndarray
     budget_seconds: float
-    #: The planner's options of the run the plan belongs to (#144). None of
-    #: them changes how pages move up; they are recorded so that every plan
-    #: of a run says which options it ran with.
+    #: The planner's options of the run the plan belongs to (#144): only the
+    #: layer weights change how pages move up (#145), but every plan of a run
+    #: says which options it ran with.
     options: PlanOptions = DEFAULT_OPTIONS
 
     @property
@@ -580,7 +603,7 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
     upgradable = (tiers > 0) & shadowed
     scored = scores[upgradable & ~np.isnan(scores)]
     neutral = float(scored.mean()) if scored.size else 1.0
-    score = np.where(np.isnan(scores), neutral, scores)
+    score = options.weighed(np.where(np.isnan(scores), neutral, scores))
 
     # Step k takes a page from tier k up to k - 1, for k from 3 down to 1.
     bytes_at = np.array([page_bytes[t] for t in TIERS], dtype=np.int64)
@@ -633,6 +656,21 @@ def logged_tier_errors(model: str, log: str | Path = benchlog.DEFAULT_LOG) -> di
     if missing:
         raise ValueError(f"no roundtrip logged for {model} at {sorted(missing)}")
     return errors
+
+
+def logged_layer_weights(model: str,
+                         log: str | Path = benchlog.DEFAULT_LOG) -> tuple[float, ...]:
+    """Each layer's weight, for `model`, from the last layer-sensitivity
+    entry logged for it (#145): the KL divergence from FP16 with that layer
+    alone at INT2, divided by the layers' mean, so that the weights average
+    1."""
+    entries = [e for e in benchlog.read(log)
+               if e["kind"] == "layer-sensitivity" and e["model"] == model]
+    if not entries:
+        raise ValueError(f"no layer-sensitivity logged for {model}; run "
+                         f"tools/layer_sensitivity.py")
+    kl = np.array(entries[-1]["results"]["kl"], dtype=np.float64)
+    return tuple((kl / kl.mean()).tolist())
 
 
 def logged_move_seconds(model: str | None,

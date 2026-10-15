@@ -742,8 +742,9 @@ class Engine:
     @property
     def kv_plan_options(self) -> controller.PlanOptions:
         """The planner's options for ADR-0018's ablations (#144), given to
-        every downgrade plan the engine makes, and recorded in every plan,
-        upgrades too: ADR-0016's policy by default."""
+        every plan the engine makes, downgrades and upgrades, and recorded in
+        each: ADR-0016's policy by default. Of them, only the layer weights
+        (#145) change upgrades; one for each of the model's layers."""
         return self._kv_plan_options
 
     @kv_plan_options.setter
@@ -751,6 +752,10 @@ class Engine:
         if not isinstance(options, controller.PlanOptions):
             raise TypeError(f"kv_plan_options is a controller.PlanOptions; got "
                             f"{type(options).__name__}")
+        layers = self.config.num_hidden_layers
+        if options.layer_weights is not None and len(options.layer_weights) != layers:
+            raise ValueError(f"{len(options.layer_weights)} layer weights for a model of "
+                             f"{layers} layers")
         self._kv_plan_options = options
 
     @property
