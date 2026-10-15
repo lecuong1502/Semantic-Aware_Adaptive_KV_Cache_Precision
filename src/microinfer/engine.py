@@ -513,6 +513,7 @@ class Engine:
                  kv_tier_map: list[list[str]] | None = None, kv_scoring: bool = False,
                  kv_score_every: int | None = None,
                  kv_score_alpha: float = DEFAULT_SCORE_ALPHA, kv_adaptive: bool = False,
+                 kv_plan_options: controller.PlanOptions = controller.DEFAULT_OPTIONS,
                  kv_score_source: str = "semantic", kv_score_seed: int = 0,
                  kv_plan_budget_seconds: float = controller.DEFAULT_BUDGET_SECONDS,
                  kv_upgrade_cooldown_seconds: float = controller.DEFAULT_UPGRADE_COOLDOWN_SECONDS,
@@ -551,6 +552,7 @@ class Engine:
         self.kv_adaptive = kv_adaptive
         #: Where a plan's scores come from (#104), and the random one's seed.
         self.kv_score_source, self.kv_score_seed = kv_score_source, kv_score_seed
+        self.kv_plan_options = kv_plan_options
         #: The time a YELLOW plan, or upgrades at GREEN, may take of one step,
         #: planning included.
         self.kv_plan_budget_seconds = kv_plan_budget_seconds
@@ -736,6 +738,20 @@ class Engine:
         if not 0 < alpha <= 1:  # NaN is refused too
             raise ValueError(f"kv_score_alpha is an EWMA weight, in (0, 1]; got {alpha!r}")
         self._kv_score_alpha = alpha
+
+    @property
+    def kv_plan_options(self) -> controller.PlanOptions:
+        """The planner's options for ADR-0018's ablations (#144), given to
+        every downgrade plan the engine makes, and recorded in every plan,
+        upgrades too: ADR-0016's policy by default."""
+        return self._kv_plan_options
+
+    @kv_plan_options.setter
+    def kv_plan_options(self, options: controller.PlanOptions) -> None:
+        if not isinstance(options, controller.PlanOptions):
+            raise TypeError(f"kv_plan_options is a controller.PlanOptions; got "
+                            f"{type(options).__name__}")
+        self._kv_plan_options = options
 
     @property
     def kv_tier_map(self) -> list[list[str]] | None:
@@ -1147,7 +1163,7 @@ class Engine:
             page_bytes, errors, move_seconds=seconds,
             last_downgrade_seconds=cooldown_from,
             cooldown_seconds=self.kv_upgrade_cooldown_seconds,
-            budget_seconds=self.kv_plan_budget_seconds)
+            budget_seconds=self.kv_plan_budget_seconds, options=self.kv_plan_options)
         if len(plan) == 0:
             return None
         entry = PlanRecord(self._last_pressure, plan, time.perf_counter() - started, [],
@@ -1173,7 +1189,7 @@ class Engine:
         plan = controller.target_plan_arrays(
             target, RED, scores, tiers, page_bytes, errors, move_seconds=seconds,
             positions=cache.length, page_tokens=pages.page_tokens,
-            budget_seconds=self.kv_plan_budget_seconds)
+            budget_seconds=self.kv_plan_budget_seconds, options=self.kv_plan_options)
         entry = PlanRecord(None, plan, time.perf_counter() - started, [],
                            score_alpha=_alpha_of(cache, source))
         self.plans.append(entry)
@@ -1244,7 +1260,7 @@ class Engine:
         plan = controller.plan_arrays(
             headroom, self._thresholds or DEFAULT_THRESHOLDS, scores, tiers, page_bytes, errors,
             move_seconds=seconds, positions=cache.length, page_tokens=pages.page_tokens,
-            budget_seconds=self.kv_plan_budget_seconds)
+            budget_seconds=self.kv_plan_budget_seconds, options=self.kv_plan_options)
         entry = PlanRecord(record, plan, time.perf_counter() - started, [],
                            score_alpha=_alpha_of(cache, self.kv_score_source),
                            headroom_bytes=headroom, persisting=persisting, emergency=emergency)
