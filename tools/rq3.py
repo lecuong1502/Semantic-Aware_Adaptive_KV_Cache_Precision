@@ -43,7 +43,7 @@ def main(argv: list[str]) -> int:
                         help="draw more a depth, for screening's replacements")
     parser.add_argument("--needle-seed", type=int, default=NEEDLE_SEED)
     parser.add_argument("--plan-seed", type=int, default=0,
-                        help="the random source's seed")
+                        help="the random source's seed, with each sample's id (rq3.sample_seed)")
     parser.add_argument("--haystack-tokens", type=int, default=needles.DEFAULT_HAYSTACK_TOKENS)
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
@@ -70,7 +70,7 @@ def main(argv: list[str]) -> int:
                 results = rq3.run(engine, sample, cond, experiment, plan_seed=args.plan_seed)
                 benchlog.append(
                     "rq3-needle", model=args.model, context_length=len(sample.turn_1),
-                    precision_tiers=None,
+                    precision_tiers=results["tier_shares"],
                     config=rq3.config(sample, cond, experiment, needle_seed=args.needle_seed,
                                       plan_seed=args.plan_seed,
                                       haystack_tokens=args.haystack_tokens, issue=args.issue),

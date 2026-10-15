@@ -377,6 +377,15 @@ prompt appended to what the cache holds, and the tokens decoded after it.
 RQ3's experiments compress the cache between two turns (ADR-0017).
 _Avoid_: round, message (a turn holds both sides of the exchange)
 
+**Condition**:
+How an RQ3 run holds its cache (ADR-0017, #147): FP16; a score source at a
+level, a controlled plan from semantic, uniform or random scores for 70% or
+80% of the FP16 bytes outside the recency floor; or a static tier, every
+page born at INT4 or INT2. RQ3's two experiments, question-blind and
+question-aware, are when a condition's plan is made; a survival experiment
+is another kind, under contention.
+_Avoid_: arm, treatment, setting
+
 **Controlled plan**:
 A requantisation plan the engine is asked for between two turns, for a byte
 target and a score source given by the experiment rather than by a

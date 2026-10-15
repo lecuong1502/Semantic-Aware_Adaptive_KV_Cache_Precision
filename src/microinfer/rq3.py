@@ -19,16 +19,25 @@ An **experiment** is when the plan is made:
   the answer, after them, in the same 32 tokens in all.
 
 A turn stops at its end of turn. Turn 2 closes a turn 1 cut short at its
-tokens, and goes on after one that stopped (needles.Sample.turn_2).
+tokens, or stopped at <|endoftext|>, and goes on after one that stopped at
+<|im_end|> (needles.Sample.turn_2). A question-aware run logs the answer's
+first tokens, and whether they open as the question asks: if not, the plan
+may have come after part of the code.
 
-One engine serves every condition: a run sets the engine's tier, and
-whether it adapts and scores, for its own conversation. NO_PLAN, the
+One engine serves every condition: a run sets the engine's tier, whether it
+adapts and scores, and its score source, which an emergency plan would use
+too, for its own conversation, and puts them back after. NO_PLAN, the
 adaptive, scoring engine with no plan applied, is a check rather than a
 condition: its answer is FP16's.
+
+The random source draws each sample's scores from a seed of its own,
+sample_seed, so that the samples of a depth do not rank the needle's page
+alike, and their outcomes stay unpaired but for the condition.
 """
 
 from __future__ import annotations
 
+import zlib
 from collections import Counter
 from dataclasses import asdict, dataclass
 
@@ -39,8 +48,11 @@ from . import controller, needles
 EXPERIMENTS = ("question-blind", "question-aware")
 SUMMARY_TOKENS = 64
 ANSWER_TOKENS = 32
-#: The answer's tokens the question-aware experiment decodes before its plan.
+#: The answer's tokens the question-aware experiment decodes before its plan,
+#: and what they are asked to be (needles.question_text).
 AWARE_TOKENS = 4
+AWARE_OPENING = "The access code is"
+END_OF_TURN = "<|im_end|>"
 
 
 @dataclass(frozen=True)
@@ -78,49 +90,76 @@ def condition(name: str) -> Condition:
                      f"and {NO_PLAN.name!r} the check")
 
 
+def sample_seed(sample_id: str, plan_seed: int) -> int:
+    """The random source's seed for one sample: `plan_seed` and the sample's
+    id, so that a sample draws the same scores whatever else is run."""
+    return zlib.crc32(f"{plan_seed}:{sample_id}".encode())
+
+
 def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
         plan_seed: int = 0) -> dict:
     """One sample through its turns: what a log entry's results hold. The
-    effective bits and the needle's pages' tiers are what the cache holds
-    when the question is answered from it, after any plan."""
+    effective bits, the tiers' shares and the needle's pages' tiers are what
+    the cache holds at the plan, or where it would be: the full pages before
+    the question's answer, which adds its own at FP16."""
     if experiment not in EXPERIMENTS:
         raise ValueError(f"an experiment is one of {EXPERIMENTS}; got {experiment!r}")
-    engine.kv_tier = cond.tier
-    engine.kv_adaptive = cond.adaptive
-    engine.kv_scoring = cond.adaptive
+    if engine.kv_cache != "paged" or engine.kv_halves != "both":
+        raise ValueError("a run holds its cache on pages, both halves at a page's tier")
+    held = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
+    engine.kv_tier, engine.kv_adaptive, engine.kv_scoring = cond.tier, cond.adaptive, cond.adaptive
+    engine.kv_score_source = cond.source or held[3]
+    try:
+        return _run(engine, sample, cond, experiment, sample_seed(sample.sample_id, plan_seed))
+    finally:
+        (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring,
+         engine.kv_score_source) = held
+
+
+def _run(engine, sample: needles.Sample, cond: Condition, experiment: str, seed: int) -> dict:
+    end_of_turn = engine.tokenizer.token_to_id(END_OF_TURN)
+    opening = None
     with engine.conversation() as chat:
         summary = chat.turn(sample.turn_1, SUMMARY_TOKENS)
-        stopped = int(summary[-1]) in engine.eos_token_ids
+        stopped = int(summary[-1]) == end_of_turn
         turn_2 = sample.turn_2_after_eos if stopped else sample.turn_2
         if experiment == "question-aware":
             answer = chat.turn(turn_2, AWARE_TOKENS)
             answered = int(answer[-1]) in engine.eos_token_ids
+            opening = engine.decode(answer)
         else:
             answer, answered = np.empty(0, dtype=np.int32), False
         plan_positions = chat.positions
         record = None
         if cond.source is not None:
-            record = chat.plan(cond.share, source=cond.source, seed=plan_seed)
+            record = chat.plan(cond.share, source=cond.source, seed=seed)
         bits = chat.effective_bits()
         tiers = chat.tiers()
-        first, last = sample.needle_pages
-        needle_tiers = Counter(controller.TIERS[t] for t in tiers[:, first:last + 1].ravel())
         if experiment == "question-blind":
             answer = chat.turn(turn_2, ANSWER_TOKENS)
         elif not answered:
             answer = np.concatenate([answer, chat.turn(np.empty(0, np.int32),
                                                        ANSWER_TOKENS - AWARE_TOKENS)])
+    first, last = sample.needle_pages
+    needle_tiers = Counter(controller.TIERS[t] for t in tiers[:, first:last + 1].ravel())
+    full = tiers[:, :plan_positions // sample.page_tokens]
+    shares = Counter(controller.TIERS[t] for t in full.ravel())
     text = engine.decode(answer)
+    plan = None
+    if record is not None:
+        plan = {k: v for k, v in record.controlled.items()
+                if k not in ("effective_bits", "candidate_effective_bits")}
+        plan.update(moves=len(record.plan), short=record.plan.short, ended=record.ended)
     return {
         "answer": text, "correct": needles.correct(text, sample.code),
         "answer_tokens": answer.tolist(), "summary": engine.decode(summary),
         "summary_length": len(summary), "summary_stopped": stopped,
-        "plan_positions": plan_positions,
-        "plan": None if record is None else {
-            **record.controlled, "moves": len(record.plan), "short": record.plan.short,
-            "ended": record.ended},
+        "aware_opening": opening,
+        "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
+        "plan_positions": plan_positions, "plan": plan, "random_seed": seed,
         "effective_bits": bits["effective_bits"],
         "candidate_effective_bits": bits["candidate_effective_bits"],
+        "tier_shares": {t: shares[t] / full.size for t in controller.TIERS if shares[t]},
         "needle_page_tiers": dict(sorted(needle_tiers.items())),
     }
 
