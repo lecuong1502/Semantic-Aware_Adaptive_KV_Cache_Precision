@@ -229,9 +229,9 @@ class PagedCache(_Cache):
         if scoring:
             self.scores = device.ImportanceScores(layers, pages_per_layer, alpha)
             self._mass = device.empty_f32(self.heads * pages_per_layer)
-        #: What each store wrote, (layer, start, keys, values) fp16 on the
-        #: host, in order, if the cache records them for a snapshot (#172).
-        self.recorded: list | None = None
+        #: Every layer's keys and values as stored, fp16 on the host, if the
+        #: cache keeps them for a snapshot (#172); None if not.
+        self.stored: list[list[np.ndarray]] | None = None
 
     @property
     def nbytes(self) -> int:
@@ -245,10 +245,29 @@ class PagedCache(_Cache):
 
     def store(self, layer: int, keys, values, start: int, n: int) -> None:
         self.pages.store(layer, keys, values, start, n)
-        if self.recorded is not None:
-            rows = n * self.kv_width
-            self.recorded.append((layer, start, keys.to_numpy()[:rows].astype(np.float16),
-                                  values.to_numpy()[:rows].astype(np.float16)))
+        if self.stored is not None:
+            held = self.stored[layer]
+            if len(held[0]) < start + n:  # room for a page's worth more at a time
+                rows = -(-(start + n) // device.page_tokens) * device.page_tokens
+                for i, old in enumerate(held):
+                    held[i] = np.zeros((rows, self.kv_width), np.float16)
+                    held[i][:len(old)] = old
+            width = n * self.kv_width
+            for half, tensor in zip(held, (keys, values)):
+                half[start:start + n] = tensor.to_numpy()[:width].reshape(n, self.kv_width)
+
+    def keep_stored(self) -> None:
+        """Copy to the host, from now on, the keys and values each store
+        writes: what a snapshot of the cache holds (#172)."""
+        empty = np.zeros((0, self.kv_width), np.float16)
+        self.stored = [[empty, empty] for _ in range(self.pages.layers)]
+
+    def take_stored(self) -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
+        """Every layer's keys and values kept, over the positions the cache
+        holds, and stop keeping them: the host holds them once."""
+        stored, self.stored = self.stored, None
+        return (tuple(k[:self.length] for k, _ in stored),
+                tuple(v[:self.length] for _, v in stored))
 
     def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int,
                keys=None, values=None) -> None:

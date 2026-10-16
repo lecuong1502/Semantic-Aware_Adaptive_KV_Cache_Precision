@@ -383,8 +383,8 @@ layer's keys and values as they were stored, at FP16, the importance
 scores, and the token not yet fed (#172). A conversation started from it
 goes on as the one it was taken from would have, to the bit, so the
 conditions of a needle sample that hold turn 1 alike run it once. Only a
-conversation that records what it stores can take one, and only while
-every page is at FP16.
+conversation made for one, which keeps on the host what its cache stores,
+can take one, once, and only while every page is at FP16.
 _Avoid_: fork, clone (the two conversations share nothing), checkpoint
 
 **Condition**:

@@ -10,7 +10,7 @@ kept at FP16 (#148). A run already logged at the same code, for the
 model, set and plan seed, is not run again, whatever its issue, so that a
 run of hours stopped part way, its log committed or not, is taken up by the
 same command (rq3.logged). A sample's conditions that hold turn 1 alike
-run it once (rq3.runs, #172). Refuses a dirty tree, as the checkpoint
+run it once (rq3.runs, #172), before the others of the sample. Refuses a dirty tree, as the checkpoint
 recorder does.
 """
 
@@ -104,7 +104,8 @@ def main(argv: list[str]) -> int:
     engine.load_weights()
     start = time.perf_counter()
     # A sample's conditions in one experiment share turn 1 where they hold
-    # it alike (rq3.runs, #172); each run is logged as it ends.
+    # it alike (rq3.runs, #172), and run in its order, the sharing ones
+    # first; each run is logged as it ends.
     together: dict[tuple, list[str]] = {}
     for sample, experiment, name in todo:
         together.setdefault((sample.sample_id, experiment), []).append(name)

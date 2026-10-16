@@ -574,17 +574,16 @@ void bind_device(py::module_ &parent)
           [](ImportanceScores &s,
              py::array_t<float, py::array::c_style | py::array::forcecast> host)
           {
-            if (host.ndim() != 2 || host.shape(0) != s.layers() ||
-                host.shape(1) != s.max_pages())
+            if (host.ndim() != 2)
             {
               throw std::invalid_argument(
-                  "scores to put back are (layers, max_pages), (" +
-                  std::to_string(s.layers()) + ", " +
-                  std::to_string(s.max_pages()) + ")");
+                  "scores to put back are (layers, max_pages); got " +
+                  std::to_string(host.ndim()) + " dimensions");
             }
-            std::vector<float> values(host.data(), host.data() + host.size());
+            const int layers = static_cast<int>(host.shape(0));
+            const int pages = static_cast<int>(host.shape(1));
             py::gil_scoped_release release;
-            s.upload(values);
+            s.upload(host.data(), layers, pages);
           },
           py::arg("host"),
           "Put back scores download() gave, (layers, max_pages) float32: a "

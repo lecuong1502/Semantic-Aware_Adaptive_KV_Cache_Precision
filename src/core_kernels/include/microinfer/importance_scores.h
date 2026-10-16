@@ -44,10 +44,10 @@ namespace microinfer
     // been observed: the one copy to the host.
     std::vector<float> download();
 
-    // Puts back scores `download` gave, (layers, max_pages): a conversation
-    // started from a snapshot folds into what the one it was taken from
-    // held (#172).
-    void upload(const std::vector<float> &host);
+    // Puts back scores `download` gave, `host` (layers, max_pages) row-major:
+    // a conversation started from a snapshot folds into what the one it was
+    // taken from held (#172). Throws std::invalid_argument on other shapes.
+    void upload(const float *host, int layers, int max_pages);
 
     int layers() const { return layers_; }
     int max_pages() const { return max_pages_; }
