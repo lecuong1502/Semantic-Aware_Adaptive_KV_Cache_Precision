@@ -107,6 +107,23 @@ namespace microinfer
     return host;
   }
 
+  void ImportanceScores::upload(const float *host, int layers, int max_pages)
+  {
+    if (layers != layers_ || max_pages != max_pages_)
+    {
+      throw std::invalid_argument(
+          "scores to put back are (layers, max_pages), (" +
+          std::to_string(layers_) + ", " + std::to_string(max_pages_) +
+          "); got (" + std::to_string(layers) + ", " +
+          std::to_string(max_pages) + ")");
+    }
+    cuda_check(
+        cudaMemcpy(scores_->raw(), host,
+                   static_cast<size_t>(layers_) * max_pages_ * sizeof(float),
+                   cudaMemcpyHostToDevice),
+        "cudaMemcpy importance scores host-to-device");
+  }
+
   std::size_t ImportanceScores::nbytes() const
   {
     return static_cast<size_t>(layers_) * max_pages_ * sizeof(float);

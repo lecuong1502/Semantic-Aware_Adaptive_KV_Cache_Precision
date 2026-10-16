@@ -18,6 +18,7 @@ import pytest
 
 from conftest import require_model
 from microinfer import Engine, benchlog, needles, rq3
+from microinfer.engine import Conversation
 
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("rq3_tool", REPO / "tools" / "rq3.py")
@@ -151,6 +152,53 @@ def test_a_run_leaves_the_engine_as_it_found_it(engine, samples):
     rq3.run(engine, samples[9], rq3.condition("static-int2"), "question-blind")
     assert (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring,
             engine.kv_score_source) == before
+
+
+@pytest.fixture(scope="module")
+def chunked(engine):
+    """The engine prefilling in chunks, as the RQ3 tool's does."""
+    held = engine.prefill_chunk
+    engine.prefill_chunk = 256
+    yield engine
+    engine.prefill_chunk = held
+
+
+def test_only_the_conditions_at_fp16_and_adaptive_share_turn_one():
+    shared = [c.name for c in (*rq3.CONDITIONS, rq3.NO_PLAN) if rq3.shares_turn_1(c)]
+    assert shared == [*rq3.SOURCE_CONDITIONS, "no-plan"]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("experiment", rq3.EXPERIMENTS)
+def test_conditions_that_share_turn_one_give_what_each_gives_alone(chunked, samples, experiment):
+    """#172: the source conditions run turn 1 once, and each starts from its
+    snapshot; FP16 and the static tiers, each holding turn 1 as no other
+    does, run alone after them. Every result is the one the condition gives
+    run alone."""
+    s = samples[11]
+    names = ["semantic-80", "fp16", "static-int2", "uniform-70", "static-int4", "random-80"]
+    shared = list(rq3.runs(chunked, s, [rq3.condition(n) for n in names], experiment))
+    assert [c.name for c, _ in shared] == ["semantic-80", "uniform-70", "random-80", "fp16",
+                                           "static-int2", "static-int4"]
+    for cond, results in shared:
+        assert results == rq3.run(chunked, s, cond, experiment), cond.name
+
+
+@pytest.mark.slow
+def test_a_snapshot_refused_runs_each_condition_alone(chunked, samples, monkeypatch):
+    """A page gone below FP16 in turn 1, an emergency, refuses the
+    snapshot: the conditions run alone, and give what they give alone."""
+    s = samples[12]
+
+    def refused(chat):
+        raise ValueError("a page of this cache is below it now")
+
+    monkeypatch.setattr(Conversation, "snapshot", refused)
+    conds = [rq3.condition("semantic-70"), rq3.condition("random-80")]
+    got = list(rq3.runs(chunked, s, conds, "question-blind"))
+    assert [c for c, _ in got] == conds
+    for cond, results in got:
+        assert results == rq3.run(chunked, s, cond, "question-blind")
 
 
 @pytest.mark.slow

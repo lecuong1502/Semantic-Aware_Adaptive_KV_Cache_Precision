@@ -356,6 +356,45 @@ def _alpha_of(cache, source: str) -> float | None:
     return cache.scores.alpha
 
 
+@dataclass(frozen=True)
+class CacheOptions:
+    """What decides how a conversation's cache is made and what it keeps,
+    and the model's shape it is made for: two engines alike in these make
+    caches alike (Engine._new_cache)."""
+
+    kv_cache: str
+    kv_tier: str
+    kv_halves: str
+    kv_tier_map: list | None
+    kv_adaptive: bool
+    #: Whether the cache keeps importance scores.
+    scoring: bool
+    kv_score_alpha: float
+    kv_score_every: int
+    layers: int
+    kv_width: int
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """What a conversation's cache held after its turns, on the host (#172):
+    every layer's keys and values as they were stored, (length, kv_width)
+    fp16, the importance scores, if it kept them, and the token the last
+    turn chose, not yet fed. A conversation started from it holds the same,
+    on an engine whose cache is made as it was (`options`), and goes on as
+    the one it was taken from would have, to the bit."""
+
+    keys: tuple[np.ndarray, ...]
+    values: tuple[np.ndarray, ...]
+    scores: np.ndarray | None
+    unfed: np.ndarray
+    options: CacheOptions
+
+    @property
+    def length(self) -> int:
+        return len(self.keys[0])
+
+
 class Conversation:
     """Turns over one paged cache (#141), from Engine.conversation.
 
@@ -366,15 +405,68 @@ class Conversation:
     live with the cache, so each turn starts from the last one's. The cache
     is released when the conversation ends, by `close` or by leaving the
     `with` block, or when a turn ends exhausted or raises, since a turn that
-    raises leaves the cache half written; a turn after that is refused."""
+    raises leaves the cache half written; a turn after that is refused.
 
-    def __init__(self, engine: Engine):
+    A conversation made for a snapshot copies to the host what its cache
+    stores, and can take one `snapshot` after its turns; one started from a
+    snapshot holds what that cache held, and goes on from there (#172): a
+    needle sample's conditions that hold turn 1 alike run it once."""
+
+    def __init__(self, engine: Engine, *, for_snapshot: bool = False,
+                 start: Snapshot | None = None):
+        if for_snapshot and start is not None:
+            raise ValueError("a conversation started from a snapshot is not made for one: "
+                             "what it holds was not stored by it")
+        if start is not None and start.options != engine._cache_options():
+            raise ValueError(f"a snapshot starts a conversation on an engine whose cache is "
+                             f"made as its was, {start.options}; this engine's is "
+                             f"{engine._cache_options()}")
         self._engine = engine
         self._cache = engine._new_cache(capacity=engine.config.max_position_embeddings)
         engine._conversations.add(self)
         #: The last token the last turn chose, not yet in the cache.
         self._unfed = np.empty(0, dtype=np.int32)
         self._ended: str | None = None
+        if for_snapshot:
+            self._cache.keep_stored()
+        if start is not None:
+            self._restore(start)
+
+    def _restore(self, snapshot: Snapshot) -> None:
+        """Store a snapshot's keys and values, whole, and put its scores back."""
+        cache, length = self._cache, snapshot.length
+        shape = (length, cache.kv_width)
+        if (len(snapshot.keys) != self._engine.config.num_hidden_layers
+                or any(a.shape != shape for a in (*snapshot.keys, *snapshot.values))):
+            raise ValueError(f"a snapshot holds every layer's keys and values, {shape} each")
+        cache.reserve(length)
+        for layer, (keys, values) in enumerate(zip(snapshot.keys, snapshot.values)):
+            cache.store(layer, _microinfer.upload_fp16(keys.astype(np.float32).ravel()),
+                        _microinfer.upload_fp16(values.astype(np.float32).ravel()), 0, length)
+        cache.length = length
+        if snapshot.scores is not None:
+            cache.scores.upload(snapshot.scores)
+        self._unfed = snapshot.unfed.copy()
+
+    def snapshot(self) -> Snapshot:
+        """What the cache holds now, for a conversation to start from: once,
+        from a conversation made for one, while every page is at FP16, since
+        what was stored is then what the cache holds. The cache's copy of
+        what it stored becomes the snapshot's, so that the host holds it
+        once; the turns after it are not copied."""
+        if self._ended is not None:
+            raise RuntimeError(f"the conversation has ended: {self._ended}")
+        cache = self._cache
+        if cache.stored is None:
+            raise ValueError("a snapshot is of a conversation made for one, once: "
+                             "Engine.conversation(for_snapshot=True)")
+        tiers = cache.pages.page_tiers()
+        if (tiers[tiers >= 0] != controller.TIERS.index("FP16")).any():
+            raise ValueError("a snapshot holds what was stored, at FP16; a page of this "
+                             "cache is below it now")
+        keys, values = cache.take_stored()
+        return Snapshot(keys, values, None if cache.scores is None else cache.scores.download(),
+                        self._unfed.copy(), self._engine._cache_options())
 
     def __enter__(self) -> Conversation:
         return self
@@ -899,13 +991,26 @@ class Engine:
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
         return self._end(self._turn(cache, ids, max_new_tokens, stop_at_eos, report))
 
-    def conversation(self) -> Conversation:
+    def conversation(self, *, for_snapshot: bool = False,
+                     start: Snapshot | None = None) -> Conversation:
         """A conversation of turns over one paged cache (#141), released when
-        the conversation ends; use it as a context manager. See Conversation."""
+        the conversation ends; use it as a context manager. One made
+        `for_snapshot` can take a snapshot, and one can `start` from a
+        snapshot (#172). See Conversation."""
         if self.kv_cache != "paged":
             raise ValueError("a conversation keeps a paged cache; this engine's is "
                              f"{self.kv_cache!r}")
-        return Conversation(self)
+        return Conversation(self, for_snapshot=for_snapshot, start=start)
+
+    def _cache_options(self) -> CacheOptions:
+        """What the caches this engine makes now are made with (_new_cache)."""
+        return CacheOptions(
+            kv_cache=self.kv_cache, kv_tier=self.kv_tier, kv_halves=self.kv_halves,
+            kv_tier_map=self.kv_tier_map, kv_adaptive=self.kv_adaptive,
+            scoring=self.kv_scoring or (self.kv_adaptive and self.kv_score_source == "semantic"),
+            kv_score_alpha=self.kv_score_alpha, kv_score_every=self.kv_score_every,
+            layers=self.config.num_hidden_layers,
+            kv_width=self.config.num_key_value_heads * self.config.head_dim)
 
     def _turn(self, cache, ids: np.ndarray, max_new_tokens: int, stop_at_eos: bool,
               report: Callable[[str, int, int | None], None],
@@ -1456,7 +1561,7 @@ class Engine:
         if self.kv_halves == "both":
             # An adaptive cache seals, so that any page can be downgraded, and
             # scores its pages when a plan reads the scorer's scores.
-            scoring = self.kv_scoring or (self.kv_adaptive and self.kv_score_source == "semantic")
+            scoring = self._cache_options().scoring
             cache = model.PagedCache(self.config, tier, tier_map=tier_map_of(self.kv_tier_map),
                                      always_seal=self.kv_adaptive, scoring=scoring,
                                      alpha=self.kv_score_alpha,

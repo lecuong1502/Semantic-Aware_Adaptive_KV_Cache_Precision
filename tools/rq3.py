@@ -9,8 +9,9 @@ question-blind experiment; with --screened, the set tools/screen_needles.py
 kept at FP16 (#148). A run already logged at the same code, for the
 model, set and plan seed, is not run again, whatever its issue, so that a
 run of hours stopped part way, its log committed or not, is taken up by the
-same command (rq3.logged). Refuses a dirty tree, as the
-checkpoint recorder does.
+same command (rq3.logged). A sample's conditions that hold turn 1 alike
+run it once (rq3.runs, #172), before the others of the sample. Refuses a dirty tree, as the checkpoint
+recorder does.
 """
 
 from __future__ import annotations
@@ -102,20 +103,30 @@ def main(argv: list[str]) -> int:
 
     engine.load_weights()
     start = time.perf_counter()
-    for i, (sample, experiment, name) in enumerate(todo):
-        cond = rq3.condition(name)
-        results = rq3.run(engine, sample, cond, experiment, plan_seed=args.plan_seed)
-        benchlog.append(
-            "rq3-needle", model=args.model, context_length=len(sample.turn_1),
-            precision_tiers=results["tier_shares"],
-            config=rq3.config(sample, cond, experiment, needle_seed=args.needle_seed,
-                              plan_seed=args.plan_seed,
-                              haystack_tokens=args.haystack_tokens, issue=args.issue),
-            results=results, log=args.log)
-        print(f"{i + 1}/{len(todo)} {sample.sample_id} {experiment} {name}: "
-              f"{'right' if results['correct'] else 'WRONG'} "
-              f"{results['effective_bits']:.2f} bits  {results['answer']!r}  "
-              f"({time.perf_counter() - start:.0f} s)", flush=True)
+    # A sample's conditions in one experiment share turn 1 where they hold
+    # it alike (rq3.runs, #172), and run in its order, the sharing ones
+    # first; each run is logged as it ends.
+    together: dict[tuple, list[str]] = {}
+    for sample, experiment, name in todo:
+        together.setdefault((sample.sample_id, experiment), []).append(name)
+    by_id = {s.sample_id: s for s in chosen}
+    ran = 0
+    for (sample_id, experiment), names in together.items():
+        sample = by_id[sample_id]
+        for cond, results in rq3.runs(engine, sample, [rq3.condition(n) for n in names],
+                                      experiment, plan_seed=args.plan_seed):
+            benchlog.append(
+                "rq3-needle", model=args.model, context_length=len(sample.turn_1),
+                precision_tiers=results["tier_shares"],
+                config=rq3.config(sample, cond, experiment, needle_seed=args.needle_seed,
+                                  plan_seed=args.plan_seed,
+                                  haystack_tokens=args.haystack_tokens, issue=args.issue),
+                results=results, log=args.log)
+            ran += 1
+            print(f"{ran}/{len(todo)} {sample_id} {experiment} {cond.name}: "
+                  f"{'right' if results['correct'] else 'WRONG'} "
+                  f"{results['effective_bits']:.2f} bits  {results['answer']!r}  "
+                  f"({time.perf_counter() - start:.0f} s)", flush=True)
     return 0
 
 

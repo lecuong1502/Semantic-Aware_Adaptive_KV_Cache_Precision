@@ -569,6 +569,25 @@ void bind_device(py::module_ &parent)
           },
           "Every layer's scores, (layers, max_pages): the one copy to the "
           "host.")
+      .def(
+          "upload",
+          [](ImportanceScores &s,
+             py::array_t<float, py::array::c_style | py::array::forcecast> host)
+          {
+            if (host.ndim() != 2)
+            {
+              throw std::invalid_argument(
+                  "scores to put back are (layers, max_pages); got " +
+                  std::to_string(host.ndim()) + " dimensions");
+            }
+            const int layers = static_cast<int>(host.shape(0));
+            const int pages = static_cast<int>(host.shape(1));
+            py::gil_scoped_release release;
+            s.upload(host.data(), layers, pages);
+          },
+          py::arg("host"),
+          "Put back scores download() gave, (layers, max_pages) float32: a "
+          "conversation started from a snapshot (#172).")
       .def_property_readonly("alpha", &ImportanceScores::alpha)
       .def_property_readonly("layers", &ImportanceScores::layers)
       .def_property_readonly("max_pages", &ImportanceScores::max_pages)
