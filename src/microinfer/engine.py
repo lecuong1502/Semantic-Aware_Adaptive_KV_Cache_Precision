@@ -356,6 +356,37 @@ def _alpha_of(cache, source: str) -> float | None:
     return cache.scores.alpha
 
 
+@dataclass(frozen=True)
+class Snapshot:
+    """What a conversation's cache held after its turns, on the host (#172):
+    every layer's keys and values as they were stored, (length, kv_width)
+    fp16, the importance scores, if it kept them, and the token the last
+    turn chose, not yet fed. A conversation started from it holds the same,
+    on an engine whose cache is made as it was (`settings`), and goes on
+    as the one it was taken from would have, to the bit."""
+
+    keys: tuple[np.ndarray, ...]
+    values: tuple[np.ndarray, ...]
+    scores: np.ndarray | None
+    unfed: np.ndarray
+    settings: dict
+
+    @property
+    def length(self) -> int:
+        return len(self.keys[0])
+
+
+def _cache_settings(engine: Engine) -> dict:
+    """What decides how a conversation's cache is made and what it keeps:
+    two engines alike in these make caches alike (Engine._new_cache)."""
+    return {"kv_cache": engine.kv_cache, "kv_tier": engine.kv_tier,
+            "kv_halves": engine.kv_halves, "kv_tier_map": engine.kv_tier_map,
+            "kv_adaptive": engine.kv_adaptive,
+            "scoring": engine.kv_scoring or (engine.kv_adaptive
+                                             and engine.kv_score_source == "semantic"),
+            "kv_score_alpha": engine.kv_score_alpha, "kv_score_every": engine.kv_score_every}
+
+
 class Conversation:
     """Turns over one paged cache (#141), from Engine.conversation.
 
@@ -366,15 +397,70 @@ class Conversation:
     live with the cache, so each turn starts from the last one's. The cache
     is released when the conversation ends, by `close` or by leaving the
     `with` block, or when a turn ends exhausted or raises, since a turn that
-    raises leaves the cache half written; a turn after that is refused."""
+    raises leaves the cache half written; a turn after that is refused.
 
-    def __init__(self, engine: Engine):
+    A conversation that records what its cache stores can take a `snapshot`
+    after its turns, and one started from a snapshot holds what its cache
+    held, and goes on from there (#172): a needle sample's conditions that
+    hold turn 1 alike run it once."""
+
+    def __init__(self, engine: Engine, *, record: bool = False, start: Snapshot | None = None):
+        if record and start is not None:
+            raise ValueError("a conversation started from a snapshot does not record: what "
+                             "it holds was not stored by it")
+        if start is not None and start.settings != _cache_settings(engine):
+            raise ValueError(f"a snapshot starts a conversation on an engine whose cache is "
+                             f"made as its was, {start.settings}; this engine's is "
+                             f"{_cache_settings(engine)}")
         self._engine = engine
         self._cache = engine._new_cache(capacity=engine.config.max_position_embeddings)
         engine._conversations.add(self)
         #: The last token the last turn chose, not yet in the cache.
         self._unfed = np.empty(0, dtype=np.int32)
         self._ended: str | None = None
+        if record:
+            self._cache.recorded = []
+        if start is not None:
+            self._hold(start)
+
+    def _hold(self, snapshot: Snapshot) -> None:
+        """Store a snapshot's keys and values, whole, and put its scores back."""
+        cache, length = self._cache, snapshot.length
+        cache.reserve(length)
+        for layer, (keys, values) in enumerate(zip(snapshot.keys, snapshot.values)):
+            cache.store(layer, _microinfer.upload_fp16(keys.astype(np.float32).ravel()),
+                        _microinfer.upload_fp16(values.astype(np.float32).ravel()), 0, length)
+        cache.length = length
+        if snapshot.scores is not None:
+            cache.scores.upload(snapshot.scores)
+        self._unfed = snapshot.unfed.copy()
+
+    def snapshot(self) -> Snapshot:
+        """What the cache holds now, for a conversation to start from: only
+        from one that records, while every page is at FP16, since what was
+        stored is then what the cache holds."""
+        if self._ended is not None:
+            raise RuntimeError(f"the conversation has ended: {self._ended}")
+        cache = self._cache
+        if cache.recorded is None:
+            raise ValueError("a snapshot is of a conversation that records what its cache "
+                             "stores: Engine.conversation(record=True)")
+        tiers = cache.pages.page_tiers()
+        if (tiers[tiers >= 0] != controller.TIERS.index("FP16")).any():
+            raise ValueError("a snapshot holds what was stored, at FP16; a page of this "
+                             "cache is below it now")
+        length, width = cache.length, cache.kv_width
+        layers = self._engine.config.num_hidden_layers
+        keys = [np.zeros((length, width), np.float16) for _ in range(layers)]
+        values = [np.zeros((length, width), np.float16) for _ in range(layers)]
+        for layer, start, k, v in cache.recorded:  # in order: a later store overwrites
+            n = min(len(k) // width, length - start)
+            if n > 0:
+                keys[layer][start:start + n] = k[:n * width].reshape(-1, width)
+                values[layer][start:start + n] = v[:n * width].reshape(-1, width)
+        return Snapshot(tuple(keys), tuple(values),
+                        None if cache.scores is None else cache.scores.download(),
+                        self._unfed.copy(), _cache_settings(self._engine))
 
     def __enter__(self) -> Conversation:
         return self
@@ -899,13 +985,16 @@ class Engine:
         cache = self._new_cache(capacity=len(ids) + max_new_tokens - 1)
         return self._end(self._turn(cache, ids, max_new_tokens, stop_at_eos, report))
 
-    def conversation(self) -> Conversation:
+    def conversation(self, *, record: bool = False,
+                     start: Snapshot | None = None) -> Conversation:
         """A conversation of turns over one paged cache (#141), released when
-        the conversation ends; use it as a context manager. See Conversation."""
+        the conversation ends; use it as a context manager. One that
+        records can take a snapshot, and one can start from a snapshot
+        (#172). See Conversation."""
         if self.kv_cache != "paged":
             raise ValueError("a conversation keeps a paged cache; this engine's is "
                              f"{self.kv_cache!r}")
-        return Conversation(self)
+        return Conversation(self, record=record, start=start)
 
     def _turn(self, cache, ids: np.ndarray, max_new_tokens: int, stop_at_eos: bool,
               report: Callable[[str, int, int | None], None],

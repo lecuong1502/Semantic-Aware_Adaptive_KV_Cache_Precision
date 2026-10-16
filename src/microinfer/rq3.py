@@ -35,6 +35,12 @@ Screening's FP16 runs (#148) are logged as RQ3's are, with screening true
 in their config: they are the fp16 condition of the screened set, and an
 analysis that pairs runs tells them apart by it.
 
+A sample's conditions that hold turn 1 alike, every source condition, at
+FP16 and adaptive, run it once (`runs`, #172): until the plan nothing
+differs between them, since the score source is read only by a plan. Turn
+1, and question-aware the answer's first tokens, are recorded, and each
+condition starts from their snapshot, which gives what it gives alone.
+
 The random source draws each sample's scores from a seed of its own,
 sample_seed, so that the samples of a depth do not rank the needle's page
 alike, and their outcomes stay unpaired but for the condition.
@@ -44,7 +50,8 @@ from __future__ import annotations
 
 import zlib
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -113,50 +120,105 @@ def sample_seed(sample_id: str, plan_seed: int) -> int:
     return zlib.crc32(f"{plan_seed}:{sample_id}".encode())
 
 
-def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
-        plan_seed: int = 0) -> dict:
-    """One sample through its turns: what a log entry's results hold. The
-    effective bits, the tiers' shares and the needle's pages' tiers are what
-    the cache holds at the plan, or where it would be: the full pages before
-    the question's answer, which adds its own at FP16."""
-    if experiment not in EXPERIMENTS:
-        raise ValueError(f"an experiment is one of {EXPERIMENTS}; got {experiment!r}")
+@contextmanager
+def _held_as(engine, cond: Condition):
+    """The engine set for `cond`: its tier, whether it adapts and scores, and
+    its score source, put back after."""
     if engine.kv_cache != "paged" or engine.kv_halves != "both":
         raise ValueError("a run holds its cache on pages, both halves at a page's tier")
     held = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
     engine.kv_tier, engine.kv_adaptive, engine.kv_scoring = cond.tier, cond.adaptive, cond.adaptive
     engine.kv_score_source = cond.source or held[3]
     try:
-        return _run(engine, sample, cond, experiment, sample_seed(sample.sample_id, plan_seed))
+        yield
     finally:
         (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring,
          engine.kv_score_source) = held
 
 
-def _run(engine, sample: needles.Sample, cond: Condition, experiment: str, seed: int) -> dict:
+def _experiment(experiment: str) -> None:
+    if experiment not in EXPERIMENTS:
+        raise ValueError(f"an experiment is one of {EXPERIMENTS}; got {experiment!r}")
+
+
+def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
+        plan_seed: int = 0) -> dict:
+    """One sample through its turns: what a log entry's results hold. The
+    effective bits, the tiers' shares and the needle's pages' tiers are what
+    the cache holds at the plan, or where it would be: the full pages before
+    the question's answer, which adds its own at FP16."""
+    _experiment(experiment)
+    with _held_as(engine, cond), engine.conversation() as chat:
+        opened = _open(engine, chat, sample, experiment)
+        return _close(engine, chat, sample, cond, experiment,
+                      sample_seed(sample.sample_id, plan_seed), opened)
+
+
+def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment: str, *,
+         plan_seed: int = 0) -> Iterator[tuple[Condition, dict]]:
+    """Each of `conds` on one sample, as `run` gives it, in their order; those
+    that hold turn 1 alike, at one tier and as adaptive, run it once (#172).
+    Until the plan, nothing differs between them: the score source is read
+    only by a plan. Turn 1, and question-aware the answer's first tokens,
+    are run once, recorded; each condition starts from their snapshot."""
+    _experiment(experiment)
+    alike: dict[tuple, list[Condition]] = {}
+    for cond in conds:
+        alike.setdefault((cond.tier, cond.adaptive), []).append(cond)
+    for group in alike.values():
+        if len(group) == 1:
+            yield group[0], run(engine, sample, group[0], experiment, plan_seed=plan_seed)
+            continue
+        with _held_as(engine, group[0]), engine.conversation(record=True) as chat:
+            opened = _open(engine, chat, sample, experiment)
+            snapshot = chat.snapshot()
+        for cond in group:
+            with _held_as(engine, cond), engine.conversation(start=snapshot) as chat:
+                results = _close(engine, chat, sample, cond, experiment,
+                                 sample_seed(sample.sample_id, plan_seed), opened)
+            yield cond, results
+
+
+@dataclass(frozen=True)
+class _Opened:
+    """What a run holds before its plan: turn 1's summary, whether it stopped
+    at its end of turn, turn 2's prompt, and, question-aware, the answer's
+    first tokens and whether they ended it."""
+
+    summary: np.ndarray
+    stopped: bool
+    turn_2: np.ndarray
+    answer: np.ndarray
+    answered: bool
+    opening: str | None
+
+
+def _open(engine, chat, sample: needles.Sample, experiment: str) -> _Opened:
     end_of_turn = engine.tokenizer.token_to_id(END_OF_TURN)
-    opening = None
-    with engine.conversation() as chat:
-        summary = chat.turn(sample.turn_1, SUMMARY_TOKENS)
-        stopped = int(summary[-1]) == end_of_turn
-        turn_2 = sample.turn_2_after_eos if stopped else sample.turn_2
-        if experiment == "question-aware":
-            answer = chat.turn(turn_2, AWARE_TOKENS)
-            answered = int(answer[-1]) in engine.eos_token_ids
-            opening = engine.decode(answer)
-        else:
-            answer, answered = np.empty(0, dtype=np.int32), False
-        plan_positions = chat.positions
-        record = None
-        if cond.source is not None:
-            record = chat.plan(cond.share, source=cond.source, seed=seed)
-        bits = chat.effective_bits()
-        tiers = chat.tiers()
-        if experiment == "question-blind":
-            answer = chat.turn(turn_2, ANSWER_TOKENS)
-        elif not answered:
-            answer = np.concatenate([answer, chat.turn(np.empty(0, np.int32),
-                                                       ANSWER_TOKENS - AWARE_TOKENS)])
+    summary = chat.turn(sample.turn_1, SUMMARY_TOKENS)
+    stopped = int(summary[-1]) == end_of_turn
+    turn_2 = sample.turn_2_after_eos if stopped else sample.turn_2
+    if experiment == "question-aware":
+        answer = chat.turn(turn_2, AWARE_TOKENS)
+        return _Opened(summary, stopped, turn_2, answer,
+                       int(answer[-1]) in engine.eos_token_ids, engine.decode(answer))
+    return _Opened(summary, stopped, turn_2, np.empty(0, dtype=np.int32), False, None)
+
+
+def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: str, seed: int,
+           opened: _Opened) -> dict:
+    opening, answer = opened.opening, opened.answer
+    plan_positions = chat.positions
+    record = None
+    if cond.source is not None:
+        record = chat.plan(cond.share, source=cond.source, seed=seed)
+    bits = chat.effective_bits()
+    tiers = chat.tiers()
+    if experiment == "question-blind":
+        answer = chat.turn(opened.turn_2, ANSWER_TOKENS)
+    elif not opened.answered:
+        answer = np.concatenate([answer, chat.turn(np.empty(0, np.int32),
+                                                   ANSWER_TOKENS - AWARE_TOKENS)])
     first, last = sample.needle_pages
     needle_tiers = Counter(controller.TIERS[t] for t in tiers[:, first:last + 1].ravel())
     full = tiers[:, :plan_positions // sample.page_tokens]
@@ -169,8 +231,8 @@ def _run(engine, sample: needles.Sample, cond: Condition, experiment: str, seed:
         plan.update(moves=len(record.plan), short=record.plan.short, ended=record.ended)
     return {
         "answer": text, "correct": needles.correct(text, sample.code),
-        "answer_tokens": answer.tolist(), "summary": engine.decode(summary),
-        "summary_length": len(summary), "summary_stopped": stopped,
+        "answer_tokens": answer.tolist(), "summary": engine.decode(opened.summary),
+        "summary_length": len(opened.summary), "summary_stopped": opened.stopped,
         "aware_opening": opening,
         "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
         "code_after_plan": None if opening is None else code_after(opening, sample.code),

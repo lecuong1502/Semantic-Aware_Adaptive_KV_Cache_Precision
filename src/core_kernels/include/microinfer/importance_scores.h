@@ -44,6 +44,11 @@ namespace microinfer
     // been observed: the one copy to the host.
     std::vector<float> download();
 
+    // Puts back scores `download` gave, (layers, max_pages): a conversation
+    // started from a snapshot folds into what the one it was taken from
+    // held (#172).
+    void upload(const std::vector<float> &host);
+
     int layers() const { return layers_; }
     int max_pages() const { return max_pages_; }
     float alpha() const { return alpha_; }

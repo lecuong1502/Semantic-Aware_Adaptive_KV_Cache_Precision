@@ -154,6 +154,21 @@ def test_a_run_leaves_the_engine_as_it_found_it(engine, samples):
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("experiment", rq3.EXPERIMENTS)
+def test_conditions_that_share_turn_one_give_what_each_gives_alone(engine, samples, experiment):
+    """#172: the source conditions run turn 1 once, and each starts from its
+    snapshot; FP16 and a static tier, alone in holding turn 1 as they do,
+    run as ever. Every result is the one the condition gives run alone."""
+    s = samples[11]
+    names = ["semantic-80", "fp16", "uniform-70", "static-int4", "random-80"]
+    shared = list(rq3.runs(engine, s, [rq3.condition(n) for n in names], experiment))
+    assert [c.name for c, _ in shared] == ["semantic-80", "uniform-70", "random-80", "fp16",
+                                           "static-int4"]
+    for cond, results in shared:
+        assert results == rq3.run(engine, s, cond, experiment), cond.name
+
+
+@pytest.mark.slow
 def test_every_condition_runs_from_one_command(tmp_path, monkeypatch):
     """One sample, both experiments, every condition: an entry for each,
     naming the sample, the condition, the experiment and the code."""

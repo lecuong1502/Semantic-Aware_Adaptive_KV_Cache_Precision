@@ -229,6 +229,9 @@ class PagedCache(_Cache):
         if scoring:
             self.scores = device.ImportanceScores(layers, pages_per_layer, alpha)
             self._mass = device.empty_f32(self.heads * pages_per_layer)
+        #: What each store wrote, (layer, start, keys, values) fp16 on the
+        #: host, in order, if the cache records them for a snapshot (#172).
+        self.recorded: list | None = None
 
     @property
     def nbytes(self) -> int:
@@ -242,6 +245,10 @@ class PagedCache(_Cache):
 
     def store(self, layer: int, keys, values, start: int, n: int) -> None:
         self.pages.store(layer, keys, values, start, n)
+        if self.recorded is not None:
+            rows = n * self.kv_width
+            self.recorded.append((layer, start, keys.to_numpy()[:rows].astype(np.float16),
+                                  values.to_numpy()[:rows].astype(np.float16)))
 
     def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int,
                keys=None, values=None) -> None:

@@ -377,6 +377,16 @@ prompt appended to what the cache holds, and the tokens decoded after it.
 RQ3's experiments compress the cache between two turns (ADR-0017).
 _Avoid_: round, message (a turn holds both sides of the exchange)
 
+**Snapshot**:
+What a conversation's cache held after its turns, copied to the host: every
+layer's keys and values as they were stored, at FP16, the importance
+scores, and the token not yet fed (#172). A conversation started from it
+goes on as the one it was taken from would have, to the bit, so the
+conditions of a needle sample that hold turn 1 alike run it once. Only a
+conversation that records what it stores can take one, and only while
+every page is at FP16.
+_Avoid_: fork, clone (the two conversations share nothing), checkpoint
+
 **Condition**:
 How an RQ3 run holds its cache (ADR-0017, #147): FP16; a score source at a
 level, a controlled plan from semantic, uniform or random scores for 70% or

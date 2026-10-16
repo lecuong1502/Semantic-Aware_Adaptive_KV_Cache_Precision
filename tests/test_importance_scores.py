@@ -127,6 +127,23 @@ def test_no_copy_to_the_host_without_a_request():
     assert scores.downloads == 1
 
 
+def test_scores_put_back_are_folded_into_as_the_ones_downloaded():
+    """A conversation started from a snapshot (#172) puts its scores back:
+    the scores after it and one more fold are those of the scorer it was
+    taken from, bit for bit, NaN where a page was never observed."""
+    rng = np.random.default_rng(5)
+    source = device.ImportanceScores(2, 16)
+    fold_all(source, random_masses(rng, 2, 4, 6, 2))
+    copy = device.ImportanceScores(2, 16)
+    copy.upload(source.download())
+    step = random_masses(rng, 2, 4, 1, 2)
+    fold_all(source, step)
+    fold_all(copy, step)
+    np.testing.assert_array_equal(copy.download(), source.download())
+    with pytest.raises(ValueError, match="layers, max_pages"):
+        copy.upload(np.zeros((2, 15), f32))
+
+
 def test_what_the_scores_refuse():
     with pytest.raises(ValueError, match="alpha"):
         device.ImportanceScores(2, 8, 0.0)
