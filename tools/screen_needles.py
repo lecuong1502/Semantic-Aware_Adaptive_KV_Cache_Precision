@@ -9,7 +9,7 @@ the replacements are the next of the seed. Each FP16 run is an rq3-needle
 entry, and the screened set and its replacements one needle-screening
 entry, which tools/rq3.py --screened reads. A depth short of five after
 --draws is reported with every other short one once all are screened, and
-logged as a screening not complete; a rerun at the same commit, with more
+logged as a screening not complete; a rerun at the same code, with more
 draws, takes the FP16 runs already logged rather than run them again.
 Refuses a dirty tree, as the checkpoint recorder does.
 """
@@ -37,16 +37,10 @@ EXPERIMENT = "question-blind"
 def logged_fp16(model: str, needle_seed: int, haystack_tokens: int, commit: str,
                 log: Path = benchlog.DEFAULT_LOG) -> dict[str, bool]:
     """Whether each sample was answered correctly, by sample id, from the
-    screening FP16 runs logged at `commit` for this model and set; none
-    before the log exists."""
-    if not Path(log).exists():
-        return {}
-    return {e["config"]["sample_id"]: e["results"]["correct"] for e in benchlog.read(log)
-            if e["kind"] == "rq3-needle" and e["git_commit"] == commit
-            and e["model"] == model and e["config"].get("screening")
-            and e["config"]["condition"]["name"] == FP16.name
-            and e["config"]["needle_seed"] == needle_seed
-            and e["config"]["haystack_tokens"] == haystack_tokens}
+    screening FP16 runs logged at the code of `commit` for this model and set."""
+    runs = rq3.logged(model, needle_seed, haystack_tokens, commit, log, screening=True)
+    return {sample_id: correct for (sample_id, experiment, name), correct in runs.items()
+            if experiment == EXPERIMENT and name == FP16.name}
 
 
 def main(argv: list[str]) -> int:
@@ -80,7 +74,7 @@ def main(argv: list[str]) -> int:
 
     def is_right(sample: needles.Sample) -> bool:
         if sample.sample_id in done:
-            print(f"{sample.sample_id}: logged at this commit", flush=True)
+            print(f"{sample.sample_id}: logged at this code", flush=True)
             return done[sample.sample_id]
         results = rq3.run(engine, sample, FP16, EXPERIMENT)
         benchlog.append(

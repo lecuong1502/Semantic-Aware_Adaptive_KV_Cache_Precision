@@ -87,6 +87,8 @@ CONDITIONS = (
     Condition("static-int2", tier="INT2"),
 )
 NO_PLAN = Condition("no-plan", adaptive=True)
+#: The conditions of a score source at a level, question-blind's closing run (#149).
+SOURCE_CONDITIONS = tuple(c.name for c in CONDITIONS if c.source is not None)
 
 
 def condition(name: str) -> Condition:
@@ -190,6 +192,38 @@ def config(sample: needles.Sample, cond: Condition, experiment: str, **more) -> 
             "summary_tokens": SUMMARY_TOKENS, "answer_tokens": ANSWER_TOKENS,
             "aware_tokens": AWARE_TOKENS if experiment == "question-aware" else None,
             **more}
+
+
+def logged(model: str, needle_seed: int, haystack_tokens: int, commit: str,
+           log: str | Path = benchlog.DEFAULT_LOG, *, screening: bool = False,
+           plan_seed: int = 0) -> dict[tuple[str, str, str], bool]:
+    """The rq3-needle runs already logged, by (sample id, experiment,
+    condition), each with whether it was answered correctly; none before
+    the log exists. A run counts when:
+    - its commit holds the code of `commit`, though the log may differ
+      (benchlog.same_code), so that a log committed part way through does
+      not start the run again;
+    - its model, needle seed, haystack length and plan seed are these;
+    - it is screening's when `screening`, and not otherwise.
+    The issue is not matched: the same run made for another ticket is the
+    same run. A run of hours stopped part way is taken up again from them."""
+    if not Path(log).exists():
+        return {}
+    same: dict[str, bool] = {}
+
+    def held(other: str) -> bool:
+        if other not in same:
+            same[other] = benchlog.same_code(other, commit, log)
+        return same[other]
+
+    return {(e["config"]["sample_id"], e["config"]["experiment"],
+             e["config"]["condition"]["name"]): e["results"]["correct"]
+            for e in benchlog.read(log)
+            if e["kind"] == "rq3-needle" and e["model"] == model and held(e["git_commit"])
+            and bool(e["config"].get("screening")) == screening
+            and e["config"]["needle_seed"] == needle_seed
+            and e["config"]["haystack_tokens"] == haystack_tokens
+            and e["config"]["plan_seed"] == plan_seed}
 
 
 class ShortScreening(ValueError):

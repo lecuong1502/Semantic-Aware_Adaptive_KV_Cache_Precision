@@ -210,6 +210,36 @@ def git(*args: str) -> str:
                           check=True).stdout
 
 
+def test_two_commits_that_differ_only_in_the_log_hold_the_same_code(tmp_path, monkeypatch):
+    """A run of hours stopped part way, its log committed, and taken up
+    again: the commit is new, the code that produced the entries is not."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run = lambda *a: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)  # noqa: E731
+    head = lambda: subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,  # noqa: E731
+                                  capture_output=True, text=True).stdout.strip()
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    log = repo / "logs" / "benchmark.jsonl"
+    (repo / "code.py").write_text("x = 1\n")
+    monkeypatch.setattr(benchlog, "REPO", repo)
+    entry(log)
+    run("add", "-A")
+    run("commit", "-q", "-m", "start")
+    start = head()
+    entry(log)
+    run("commit", "-qam", "log")
+    logged = head()
+    (repo / "code.py").write_text("x = 2\n")
+    run("commit", "-qam", "code")
+
+    assert benchlog.same_code(start, logged, log)
+    assert not benchlog.same_code(logged, head(), log)
+    assert not benchlog.same_code(start, logged, repo / "logs" / "other.jsonl")
+    assert not benchlog.same_code(start, "no such commit", log)
+
+
 def test_the_repository_log_has_only_ever_grown():
     """Every committed version of experiments/logs/benchmark.jsonl is a prefix
     of the next, and the working copy extends the newest. History is the one

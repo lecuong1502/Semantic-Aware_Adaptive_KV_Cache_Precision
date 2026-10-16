@@ -100,6 +100,7 @@ def fp16_entry(log, sample_id, correct, *, screening=True, seed=140, haystack=10
     benchlog.append("rq3-needle", model="m", context_length=1100,
                     precision_tiers={"FP16": 1.0},
                     config={"sample_id": sample_id, "condition": {"name": "fp16"},
+                            "experiment": "question-blind", "plan_seed": 0,
                             "needle_seed": seed, "haystack_tokens": haystack,
                             "screening": screening},
                     results={"correct": correct}, log=log)
@@ -155,6 +156,10 @@ def test_the_rq3_tool_runs_the_screened_set(tmp_path, monkeypatch):
                       "--haystack-tokens", "1024", "--log", str(log)]) == 0
     (run,) = [e for e in benchlog.read(log) if e["kind"] == "rq3-needle"]
     assert run["config"]["sample_id"] == "d50-6"
+    # the same command again, at the same code, runs nothing it logged (#149)
+    assert tool.main(["--issue", "148", "--model", name, "--screened", "--conditions", "fp16",
+                      "--haystack-tokens", "1024", "--log", str(log)]) == 0
+    assert len([e for e in benchlog.read(log) if e["kind"] == "rq3-needle"]) == 1
     for clash in (["--samples", "d50-0"], ["--samples-per-depth", "9"]):
         with pytest.raises(SystemExit):
             tool.main(["--issue", "148", "--screened", *clash, "--log", str(log)])

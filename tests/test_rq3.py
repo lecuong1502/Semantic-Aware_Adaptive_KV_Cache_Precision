@@ -173,3 +173,68 @@ def test_every_condition_runs_from_one_command(tmp_path, monkeypatch):
         assert e["config"]["sample_id"] == "d50-0" and e["git_commit"]
         assert isinstance(e["results"]["correct"], bool)
         assert e["precision_tiers"] == e["results"]["tier_shares"]
+
+
+# -- a run of hours, taken up again --------------------------------------------------------
+
+def logged_run(log, sample_id, name, correct, *, experiment="question-blind", plan_seed=0,
+               screening=False, seed=140, haystack=1024, model="m"):
+    config = {"sample_id": sample_id, "condition": {"name": name}, "experiment": experiment,
+              "needle_seed": seed, "plan_seed": plan_seed, "haystack_tokens": haystack}
+    if screening:
+        config["screening"] = True
+    benchlog.append("rq3-needle", model=model, context_length=1100,
+                    precision_tiers={"FP16": 1.0}, config=config,
+                    results={"correct": correct}, log=log)
+
+
+def test_the_runs_logged_at_a_commit_are_named_by_sample_experiment_and_condition(tmp_path):
+    """A run of hours stopped part way is taken up again at the same commit:
+    what it logged, for this model, set and plan seed, is not run again."""
+    log = tmp_path / "benchmark.jsonl"
+    assert rq3.logged("m", 140, 1024, "any", log) == {}  # no log yet
+    logged_run(log, "d00-0", "semantic-70", True)
+    logged_run(log, "d00-0", "uniform-80", False)
+    logged_run(log, "d00-1", "semantic-70", True, experiment="question-aware")
+    logged_run(log, "d00-2", "fp16", True, screening=True)
+    logged_run(log, "d00-3", "random-70", True, plan_seed=1)
+    logged_run(log, "d00-4", "semantic-70", True, seed=141)
+    logged_run(log, "d00-5", "semantic-70", True, haystack=7936)
+    logged_run(log, "d00-6", "semantic-70", True, model="other")
+    commit = benchlog.read(log)[0]["git_commit"]
+    assert rq3.logged("m", 140, 1024, commit, log) == {
+        ("d00-0", "question-blind", "semantic-70"): True,
+        ("d00-0", "question-blind", "uniform-80"): False,
+        ("d00-1", "question-aware", "semantic-70"): True}
+    assert rq3.logged("m", 140, 1024, commit, log, screening=True) == {
+        ("d00-2", "question-blind", "fp16"): True}
+    assert rq3.logged("m", 140, 1024, commit, log, plan_seed=1) == {
+        ("d00-3", "question-blind", "random-70"): True}
+    assert rq3.logged("m", 140, 1024, "another commit", log) == {}
+
+
+def test_a_run_logged_at_other_code_is_run_again_and_at_the_same_code_is_not(tmp_path,
+                                                                            monkeypatch):
+    """A commit that changed only the log holds the code of the runs before
+    it (benchlog.same_code): they are taken up; after a change to the code,
+    they run again. One git call a commit, not one an entry."""
+    log = tmp_path / "benchmark.jsonl"
+    logged_run(log, "d00-0", "semantic-70", True)
+    logged_run(log, "d00-1", "semantic-70", True)
+    commit = benchlog.read(log)[0]["git_commit"]
+    asked = []
+    monkeypatch.setattr(rq3.benchlog, "same_code",
+                        lambda a, b, log: asked.append(a) or (a, b) == (commit, "log only"))
+    assert set(rq3.logged("m", 140, 1024, "log only", log)) == {
+        ("d00-0", "question-blind", "semantic-70"), ("d00-1", "question-blind", "semantic-70")}
+    assert asked == [commit]
+    assert rq3.logged("m", 140, 1024, "code changed", log) == {}
+
+
+def test_question_blind_s_closing_run_is_every_source_at_both_levels():
+    """#149: semantic, uniform and random at 70% and 80%; FP16 is
+    screening's, and the static tiers are #151's."""
+    assert tool.conditions_for(["sources"], screened=True) == [
+        "semantic-70", "semantic-80", "uniform-70", "uniform-80", "random-70", "random-80"]
+    assert tool.conditions_for(["sources", "semantic-70", "fp16", "fp16"], screened=True) == [
+        *rq3.SOURCE_CONDITIONS, "fp16"]  # each once

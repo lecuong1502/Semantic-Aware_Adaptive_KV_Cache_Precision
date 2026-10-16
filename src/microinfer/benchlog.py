@@ -118,6 +118,19 @@ def environment(log: str | Path = DEFAULT_LOG) -> dict[str, Any]:
     }
 
 
+def same_code(a: str, b: str, log: str | Path = DEFAULT_LOG) -> bool:
+    """Whether commits `a` and `b` hold the same tracked files but for `log`,
+    as `git_dirty` counts a change: a log committed between two parts of
+    one run leaves the code that produced its entries as it was."""
+    if a == b:
+        return True
+    try:
+        return subprocess.run(["git", "diff", "--quiet", a, b, "--", ".", *_exclude(Path(log))],
+                              cwd=REPO, capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
 def _exclude(log: Path) -> list[str]:
     """A git pathspec excluding the log, when it lies inside the repository."""
     try:
