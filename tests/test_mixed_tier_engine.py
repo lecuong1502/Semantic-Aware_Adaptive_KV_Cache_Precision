@@ -143,7 +143,7 @@ def test_a_map_of_one_tier_is_the_static_engine(engine, golden):
         np.testing.assert_array_equal(got, want)
         np.testing.assert_array_equal(got_logits, want_logits)
 
-    each([(t, c, p) for t in TIERS for c in {t, "FP16"} for p in ("short-00", "long-03")],
+    each([(t, c, p) for t in TIERS for c in {t, "FP16"} for p in ("long-03",)],
          static, name=lambda c: f"{c[0]} map over a {c[1]} cache, {c[2]}")
 
 

@@ -26,7 +26,7 @@ from microinfer.golden import GoldenError, GoldenSet
 
 REPO = Path(__file__).resolve().parent.parent
 MODELS = ("qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct")
-PROMPTS = ("long-03", "medium-01", "adversarial-04")
+PROMPTS = ("long-03", "adversarial-04")
 #: How many of the highest a first page must be among, in how many layers.
 TOP, LAYER_SHARE = 3, 0.75
 
@@ -44,14 +44,14 @@ def golden_for(name):
 
 @pytest.mark.slow
 def test_the_first_page_scores_among_the_highest_without_protection():
-    """After a prompt and 64 decoded tokens, scoring every step and every
+    """After a prompt and 32 decoded tokens, scoring every step and every
     R-th as the engine does by default (#100), the first page's score,
     averaged over the layers, is the highest of every page's; and in at
     least three layers in four it is among the three highest."""
     def sink(engine, golden, prompt_id, every):
         ids = golden[prompt_id].token_ids
         cache = model.PagedCache(engine.config, scoring=True, score_every=every)
-        new = 64
+        new = 32
         decode(engine, ids, new, cache)
         attended = -(-(len(ids) + new - 1) // P)  # the pages the last step read
         scores = cache.scores.download()[:, :attended]

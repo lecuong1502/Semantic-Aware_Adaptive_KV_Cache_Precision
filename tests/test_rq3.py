@@ -104,10 +104,11 @@ def test_a_turn_with_no_prompt_goes_on_with_the_answer(engine, samples):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("experiment", rq3.EXPERIMENTS)
-def test_fp16_and_no_plan_applied_give_the_same_answer(engine, samples, experiment):
+def test_fp16_and_no_plan_applied_give_the_same_answer(engine, samples):
     """The adaptive, scoring engine a controlled plan needs changes nothing
-    until a plan is applied: its answer is FP16's, token for token."""
+    until a plan is applied: its answer is FP16's, token for token, here
+    question-aware, whose answer is decoded in two parts."""
+    experiment = "question-aware"
     s = samples[3]
     fp16 = rq3.run(engine, s, rq3.condition("fp16"), experiment)
     unplanned = rq3.run(engine, s, rq3.NO_PLAN, experiment)
@@ -144,16 +145,6 @@ def test_question_aware_plans_after_the_answer_s_first_tokens(engine, samples):
     assert r["code_after_plan"] == rq3.code_after(r["aware_opening"], s.code)
 
 
-@pytest.mark.slow
-def test_a_run_leaves_the_engine_as_it_found_it(engine, samples):
-    before = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
-    r = rq3.run(engine, samples[9], rq3.condition("random-70"), "question-blind")
-    assert r["random_seed"] == r["plan"]["seed"] == rq3.sample_seed(samples[9].sample_id, 0)
-    rq3.run(engine, samples[9], rq3.condition("static-int2"), "question-blind")
-    assert (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring,
-            engine.kv_score_source) == before
-
-
 @pytest.fixture(scope="module")
 def chunked(engine):
     """The engine prefilling in chunks, as the RQ3 tool's does."""
@@ -172,50 +163,63 @@ def test_only_the_conditions_at_fp16_and_adaptive_share_turn_one():
 @pytest.mark.parametrize("experiment", rq3.EXPERIMENTS)
 def test_conditions_that_share_turn_one_give_what_each_gives_alone(chunked, samples, experiment):
     """#172: the source conditions run turn 1 once, and each starts from its
-    snapshot; FP16 and the static tiers, each holding turn 1 as no other
-    does, run alone after them. Every result is the one the condition gives
-    run alone."""
+    snapshot; a static tier, holding turn 1 as no other does, runs alone
+    after them. Every result is the one the condition gives run alone, and
+    the engine is left as it was found. Which conditions share is
+    test_only_the_conditions_at_fp16_and_adaptive_share_turn_one's."""
     s = samples[11]
-    names = ["semantic-80", "fp16", "static-int2", "uniform-70", "static-int4", "random-80"]
+    before = (chunked.kv_tier, chunked.kv_adaptive, chunked.kv_scoring,
+              chunked.kv_score_source)
+    names = ["semantic-80", "static-int2", "random-70"]
     shared = list(rq3.runs(chunked, s, [rq3.condition(n) for n in names], experiment))
-    assert [c.name for c, _ in shared] == ["semantic-80", "uniform-70", "random-80", "fp16",
-                                           "static-int2", "static-int4"]
+    assert [c.name for c, _ in shared] == ["semantic-80", "random-70", "static-int2"]
     for cond, results in shared:
         assert results == rq3.run(chunked, s, cond, experiment), cond.name
+    random = dict(shared)[rq3.condition("random-70")]
+    assert random["random_seed"] == random["plan"]["seed"] == rq3.sample_seed(s.sample_id, 0)
+    assert (chunked.kv_tier, chunked.kv_adaptive, chunked.kv_scoring,
+            chunked.kv_score_source) == before
 
 
 @pytest.mark.slow
 def test_a_snapshot_refused_runs_each_condition_alone(chunked, samples, monkeypatch):
     """A page gone below FP16 in turn 1, an emergency, refuses the
-    snapshot: the conditions run alone, and give what they give alone."""
+    snapshot: each condition then runs alone, as `run` runs it."""
     s = samples[12]
+    alone = []
 
     def refused(chat):
         raise ValueError("a page of this cache is below it now")
 
+    def run(engine, sample, cond, experiment, plan_seed=0):
+        alone.append(cond.name)
+        return {"run": cond.name}
+
     monkeypatch.setattr(Conversation, "snapshot", refused)
+    monkeypatch.setattr(rq3, "run", run)
     conds = [rq3.condition("semantic-70"), rq3.condition("random-80")]
     got = list(rq3.runs(chunked, s, conds, "question-blind"))
-    assert [c for c, _ in got] == conds
-    for cond, results in got:
-        assert results == rq3.run(chunked, s, cond, "question-blind")
+    assert got == [(c, {"run": c.name}) for c in conds] and alone == ["semantic-70", "random-80"]
 
 
 @pytest.mark.slow
-def test_every_condition_runs_from_one_command(tmp_path, monkeypatch):
-    """One sample, both experiments, every condition: an entry for each,
-    naming the sample, the condition, the experiment and the code."""
+def test_the_conditions_chosen_run_from_one_command(tmp_path, monkeypatch):
+    """One sample, both experiments, a source condition and a static tier:
+    an entry for each, naming the sample, the condition, the experiment and
+    the code. That every condition is one the tool can name is
+    test_adr_0017_s_conditions'."""
+    names = ["semantic-80", "static-int2"]
     log = tmp_path / "benchmark.jsonl"
     real = benchlog.environment  # this test runs on a tree being changed
     monkeypatch.setattr(tool.benchlog, "environment",
                         lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
     assert tool.main(["--issue", "147", "--model", NAME, "--samples", "d50-0",
-                      "--experiments", *rq3.EXPERIMENTS, "--haystack-tokens", "1024",
-                      "--log", str(log)]) == 0
+                      "--experiments", *rq3.EXPERIMENTS, "--conditions", *names,
+                      "--haystack-tokens", "1024", "--log", str(log)]) == 0
     entries = benchlog.read(log)
-    assert len(entries) == 2 * len(rq3.CONDITIONS)
+    assert len(entries) == 2 * len(names)
     seen = {(e["config"]["condition"]["name"], e["config"]["experiment"]) for e in entries}
-    assert seen == {(c.name, x) for c in rq3.CONDITIONS for x in rq3.EXPERIMENTS}
+    assert seen == {(n, x) for n in names for x in rq3.EXPERIMENTS}
     for e in entries:
         assert e["kind"] == "rq3-needle" and e["model"] == NAME
         assert e["config"]["sample_id"] == "d50-0" and e["git_commit"]

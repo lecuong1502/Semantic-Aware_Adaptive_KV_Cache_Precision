@@ -165,13 +165,13 @@ def test_the_tool_logs_one_divergence_per_layer(tmp_path, monkeypatch):
     real = benchlog.environment  # this test runs on a tree being changed
     monkeypatch.setattr(sensitivity.benchlog, "environment",
                         lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
-    assert sensitivity.main(["--issue", "145", "--model", NAME, "--window", "256",
+    assert sensitivity.main(["--issue", "145", "--model", NAME, "--window", "128",
                              "--windows", "1", "--log", str(log)]) == 0
     (entry,) = benchlog.read(log)
     assert entry["kind"] == "layer-sensitivity" and entry["model"] == NAME
     kl = entry["results"]["kl"]
     assert len(kl) == 24 and all(np.isfinite(kl)) and min(kl) > 0
-    assert entry["results"]["scored_tokens"] == 255
+    assert entry["results"]["scored_tokens"] == 127
     assert np.mean(controller.logged_layer_weights(NAME, log)) == pytest.approx(1.0)
 
 

@@ -74,15 +74,18 @@ def test_the_tier_is_chosen_by_configuration():
 
 @pytest.mark.slow
 def test_every_tier_runs_and_each_narrower_one_costs_more(engine, golden):
-    """The gate, run at every tier. FP16 passes it, as ADR-0006 requires. The
-    others are not held to it, since quantisation is meant to cost something;
-    what must hold is that it costs more the narrower the tier: KL against the
-    reference rises strictly from FP16 through INT8 and INT4 to INT2, and top-1
-    agreement never rises."""
+    """The gate, run at every tier over two prompts of each kind. FP16
+    passes it, as ADR-0006 requires; over every prompt it is
+    tests/test_inference.py's. The others are not held to it, since
+    quantisation is meant to cost something; what must hold is that it costs
+    more the narrower the tier: KL against the reference rises strictly from
+    FP16 through INT8 and INT4 to INT2, and top-1 agreement never rises."""
+    some = [golden[p] for p in ("short-00", "short-03", "medium-01", "medium-06",
+                                "adversarial-00", "adversarial-04", "long-00", "long-03")]
     reports = {}
     for tier in TIERS:
         with at_tier(engine, tier):
-            reports[tier] = run_gate(engine, golden)
+            reports[tier] = run_gate(engine, some)
     print("\n" + "\n".join(f"  {t:<5} top-1 {r.top1:.4f}  mean KL {r.kl_mean:.3e}"
                            for t, r in reports.items()))
     fp16 = reports["FP16"]
