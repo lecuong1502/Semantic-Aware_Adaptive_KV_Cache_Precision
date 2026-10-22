@@ -159,7 +159,7 @@ def test_only_the_conditions_at_fp16_and_adaptive_share_turn_one():
     assert shared == [*rq3.SOURCE_CONDITIONS, "no-plan"]
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 @pytest.mark.parametrize("experiment", rq3.EXPERIMENTS)
 def test_conditions_that_share_turn_one_give_what_each_gives_alone(chunked, samples, experiment):
     """#172: the source conditions run turn 1 once, and each starts from its
@@ -202,7 +202,7 @@ def test_a_snapshot_refused_runs_each_condition_alone(chunked, samples, monkeypa
     assert got == [(c, {"run": c.name}) for c in conds] and alone == ["semantic-70", "random-80"]
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_the_conditions_chosen_run_from_one_command(tmp_path, monkeypatch):
     """One sample, both experiments, a source condition and a static tier:
     an entry for each, naming the sample, the condition, the experiment and

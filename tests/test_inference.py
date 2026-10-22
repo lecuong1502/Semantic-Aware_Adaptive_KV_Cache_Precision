@@ -66,7 +66,7 @@ def test_the_gate(engine, golden):
     assert report.kl_mean < KL_MAX, report.render()
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_the_kl_sample_does_not_decide_the_gate(engine, golden):
     """The gate's KL term is a sample of 16 positions per prompt (ADR-0006). The
     reference keeps every position for two prompts, and the sample errs on

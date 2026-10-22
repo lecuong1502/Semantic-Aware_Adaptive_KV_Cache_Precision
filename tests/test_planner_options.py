@@ -165,7 +165,7 @@ def test_the_engine_s_options_reach_its_plans():
     assert INT2 not in record.plan.target.tolist() and 0 not in record.plan.pages.tolist()
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_the_engine_s_upgrade_plans_record_its_options():
     """RED for a few decode steps, then ample: the engine's upgrade plan,
     made at GREEN after the cooldown, records the options it runs with."""

@@ -42,7 +42,7 @@ def golden_for(name):
         pytest.skip(str(exc))
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_the_first_page_scores_among_the_highest_without_protection():
     """After a prompt and 32 decoded tokens, scoring every step and every
     R-th as the engine does by default (#100), the first page's score,

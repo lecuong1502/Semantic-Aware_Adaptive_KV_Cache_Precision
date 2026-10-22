@@ -62,7 +62,7 @@ def assert_restored(cache):
     assert (tiers[shadowed] == fp16).all(), np.unique(tiers[shadowed], return_counts=True)
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_after_contention_passes_pages_return_to_fp16_in_the_policy_s_order():
     """A RED mid-decode downgrades pages; once headroom is ample again and
     the cooldown has passed, an upgrade plan restores every page with a
@@ -121,7 +121,7 @@ def test_after_contention_passes_pages_return_to_fp16_in_the_policy_s_order():
     assert_restored(cache)
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_a_pulse_train_makes_no_downgrade_upgrade_thrash():
     """RED pulses of 40 ms every 150 ms, for a second, closer together than
     the cooldown: the engine downgrades on the first and makes no upgrade
@@ -157,7 +157,7 @@ def test_a_pulse_train_makes_no_downgrade_upgrade_thrash():
     assert_restored(cache)
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_a_blip_of_pressure_while_upgrading_cancels_the_upgrades_left():
     """A RED that rises and falls within a step or two, while upgrades are
     under way, cancels those not yet made, though the latest event the step

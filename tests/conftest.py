@@ -20,17 +20,23 @@ MODELS = Path(__file__).resolve().parent.parent / "models"
 def pytest_addoption(parser):
     parser.addoption("--runslow", action="store_true",
                      help="also run the tests marked slow, as before pushing")
+    parser.addoption("--runslowest", action="store_true",
+                     help="also run the tests marked slow and those marked slowest, as "
+                          "before closing a milestone")
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip the slow tests unless --runslow: a run while working takes a
-    third of the time, and the run before pushing takes them all."""
-    if config.getoption("--runslow"):
-        return
-    skip = pytest.mark.skip(reason="slow: run with --runslow")
+    """Skip the slow tests unless --runslow, and the slowest unless
+    --runslowest, which runs the slow ones too: a run while working takes a
+    fraction of the time, the run before pushing a few minutes more, and the
+    run before closing a milestone takes them all."""
+    slowest = config.getoption("--runslowest")
+    slow = slowest or config.getoption("--runslow")
     for item in items:
-        if "slow" in item.keywords:
-            item.add_marker(skip)
+        if "slowest" in item.keywords and not slowest:
+            item.add_marker(pytest.mark.skip(reason="slowest: run with --runslowest"))
+        elif "slow" in item.keywords and not slow:
+            item.add_marker(pytest.mark.skip(reason="slow: run with --runslow"))
 
 
 def load_tool(name: str):

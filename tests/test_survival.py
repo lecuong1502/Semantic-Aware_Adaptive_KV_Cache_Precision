@@ -197,7 +197,7 @@ def test_no_pressure_has_no_spread():
 
 # -- the run, small -----------------------------------------------------------------------
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_the_static_engine_runs_out_where_the_adaptive_one_survives(tmp_path):
     """The experiment at a small scale: Qwen2.5-0.5B prefills 4096 positions
     and decodes 16 tokens; at 2048 positions the simulator, a process of its

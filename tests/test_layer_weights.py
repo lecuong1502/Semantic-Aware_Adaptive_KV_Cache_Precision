@@ -157,7 +157,7 @@ def test_the_divergence_is_gate_s_kl_summed_over_rows():
         assert held.summed_kl(reference) == pytest.approx(0, abs=1e-9)
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_the_tool_logs_one_divergence_per_layer(tmp_path, monkeypatch):
     """One short window on Qwen2.5-0.5B: a divergence for each of its 24
     layers, each above 0, and weights from them with a mean of 1."""
