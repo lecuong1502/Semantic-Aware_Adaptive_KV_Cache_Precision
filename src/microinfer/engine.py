@@ -519,6 +519,41 @@ class Conversation:
             self._unfed = ending.tokens[-1:]
         return engine._end(ending)
 
+    def force(self, ids, *, one_by_one: bool = False, logits: bool = False) -> np.ndarray | None:
+        """Teacher-force `ids`, token ids, into the cache (#153): the tokens
+        given, not those the model would choose, after what it holds. At
+        once, in prefill chunks, or `one_by_one`, a position a step as a
+        decoded token is fed, so that the scorer folds each in. With
+        `logits`, the fp32 logits after each position, (len(ids), vocab);
+        else None. Refused after a turn, whose last chosen token waits to be
+        fed first; a turn after forcing appends its prompt to what was
+        forced."""
+        if self._ended is not None:
+            raise RuntimeError(f"the conversation has ended: {self._ended}")
+        if len(self._unfed):
+            raise RuntimeError("forcing feeds only the tokens it is given; after a turn, the "
+                               "token the turn chose last waits to be fed first")
+        engine = self._engine
+        ids = engine._check_ids(ids)
+        engine._check_window(self._cache.length + len(ids))
+        out = [] if logits else None
+        try:
+            if one_by_one:
+                ws = model.Workspace(engine.config, rows=1)
+                with engine._holding(self._cache, ws):
+                    for i in range(len(ids)):
+                        engine._run(ws, self._cache, ids[i:i + 1])
+                        if out is not None:
+                            out.append(engine._model.logits(ws, 1))
+            else:
+                for chunk, ws, _, _ in engine._prefill(self._cache, ids):
+                    if out is not None:
+                        out.append(engine._model.logits(ws, len(chunk)))
+        except BaseException as exc:
+            self.close(f"forcing raised {type(exc).__name__}")
+            raise
+        return None if out is None else np.concatenate(out)
+
     def plan(self, share: float, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
         """Apply a controlled plan between turns (#142, ADR-0017): reclaim
         `share` of the FP16 bytes of the pages outside the recency floor,

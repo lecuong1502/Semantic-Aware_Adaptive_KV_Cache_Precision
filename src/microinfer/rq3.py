@@ -129,7 +129,7 @@ def _check(engine, experiment: str) -> None:
 
 
 @contextmanager
-def _set_for(engine, cond: Condition):
+def set_for(engine, cond: Condition):
     """The engine set for `cond`: its tier, whether it adapts and scores, and
     its score source, put back after."""
     kept = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
@@ -156,7 +156,7 @@ def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
     the cache holds at the plan, or where it would be: the full pages before
     the question's answer, which adds its own at FP16."""
     _check(engine, experiment)
-    with _set_for(engine, cond), engine.conversation() as chat:
+    with set_for(engine, cond), engine.conversation() as chat:
         opened = _open(engine, chat, sample, experiment)
         return _close(engine, chat, sample, cond, experiment,
                       sample_seed(sample.sample_id, plan_seed), opened)
@@ -176,7 +176,7 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     alone = [c for c in conds if not shares_turn_1(c)]
     snapshot = None
     if len(shared) > 1:
-        with _set_for(engine, shared[0]), engine.conversation(for_snapshot=True) as chat:
+        with set_for(engine, shared[0]), engine.conversation(for_snapshot=True) as chat:
             opened = _open(engine, chat, sample, experiment)
             try:
                 snapshot = chat.snapshot()
@@ -185,7 +185,7 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     if snapshot is None:
         alone, shared = [*shared, *alone], []
     for cond in shared:
-        with _set_for(engine, cond), engine.conversation(start=snapshot) as chat:
+        with set_for(engine, cond), engine.conversation(start=snapshot) as chat:
             results = _close(engine, chat, sample, cond, experiment, seed, opened)
         yield cond, results
     for cond in alone:

@@ -174,3 +174,56 @@ def test_between_turns_the_footprint_counts_the_conversation_s_cache(fp16):
         between = fp16.footprint()
         assert between.kv_cache == chat.nbytes > 0
     assert fp16.footprint().kv_cache == 0
+
+
+# -- teacher forcing (#153) ----------------------------------------------------------------
+
+def forced_by_hand(engine, cache, prefix, steps):
+    """`prefix` prefilled into `cache` at once, then `steps` fed one position
+    at a time: the logits after each of them."""
+    m = engine._model
+    m.run(model.Workspace(engine.config, rows=len(prefix)), cache, prefix)
+    one, logits = model.Workspace(engine.config, rows=1), []
+    for token in steps:
+        m.run(one, cache, np.array([token], np.int32))
+        logits.append(m.last_logits(one, 1))
+    return np.stack(logits)
+
+
+@pytest.mark.slow
+def test_forcing_feeds_the_tokens_given_and_gives_the_logits_after_each():
+    """Continuation fidelity teacher-forces a passage (#153): its tokens, not
+    the ones the model would choose, go into the cache, one position a step,
+    so the scorer folds in each as it does a decoded one. The logits after
+    each and the scores are those of the same tokens run by hand, to the bit;
+    a prefill forced at once gives no logits, and is the prompt of a turn."""
+    engine = loaded(kv_scoring=True, kv_score_every=1)
+    prefix, steps = prompt(300, 153), prompt(24, 1530)
+    with engine.conversation() as chat:
+        assert chat.force(prefix) is None
+        logits = chat.force(steps, one_by_one=True, logits=True)
+        assert chat.positions == len(prefix) + len(steps)
+        scores = chat.scores()
+    cache = model.PagedCache(engine.config, Tier.FP16, scoring=True, score_every=1)
+    assert np.array_equal(logits, forced_by_hand(engine, cache, prefix, steps))
+    assert np.array_equal(scores, cache.scores.download(), equal_nan=True)
+
+
+@pytest.mark.slow
+def test_forcing_goes_on_from_forcing_and_not_from_a_turn(fp16):
+    """A turn leaves the token it chose last to be fed first; forcing feeds
+    only the tokens it is given, so it is refused after a turn. A turn after
+    forcing appends its prompt to the tokens forced, as a turn after a turn
+    does, and decodes what the same tokens run by hand decode."""
+    with fp16.conversation() as chat:
+        chat.turn(prompt(40, 1531), 2)
+        with pytest.raises(RuntimeError, match="turn"):
+            chat.force(prompt(4, 1532))
+    forced, second = prompt(40, 1533), prompt(8, 1534)
+    with fp16.conversation() as chat:
+        chat.force(forced)
+        out = chat.turn(second, 4, stop_at_eos=False)
+    cache = model.PagedCache(fp16.config, Tier.FP16)
+    fp16._model.run(model.Workspace(fp16.config, rows=len(forced)), cache, forced)
+    _, tokens = by_hand(fp16, cache, [(second, 4)])
+    assert out.tolist() == tokens[0]
