@@ -27,12 +27,9 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "tools"))
 
 from perplexity import held_out_text  # noqa: E402
+from summarise_rq3 import interval  # noqa: E402
 
 from microinfer import Engine, benchlog, continuation, rq3  # noqa: E402
-
-
-def interval(pair: list[float], digits: int = 4) -> str:
-    return f"[{pair[0]:.{digits}f}, {pair[1]:.{digits}f}]"
 
 
 def main(argv: list[str]) -> int:
@@ -54,15 +51,14 @@ def main(argv: list[str]) -> int:
     if environment["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first, so that "
                      "each entry names the code that produced it")
-    shape = (args.prefix_tokens, args.warm_tokens, args.measured_tokens, args.plan_seed)
+    shape = continuation.Shape(args.prefix_tokens, args.warm_tokens, args.measured_tokens,
+                               args.plan_seed)
     if args.summarise:
         return summarise(parser, args, shape)
 
     done = continuation.logged(args.model, shape, environment["git_commit"], args.log)
     engine = Engine(REPO / "models" / args.model)
-    chosen = continuation.passages(engine.encode(held_out_text()), args.passages,
-                                   prefix=args.prefix_tokens, warm=args.warm_tokens,
-                                   measured=args.measured_tokens)
+    chosen = continuation.passages(engine.encode(held_out_text()), args.passages, shape)
     todo = [(p, [rq3.condition(n) for n in args.conditions if (p.passage_id, n) not in done])
             for p in chosen]
     todo = [(p, conds) for p, conds in todo if conds]
@@ -94,7 +90,7 @@ def summarise(parser, args, shape) -> int:
     benchlog.verify(args.log)
     try:
         summary = continuation.summarise(benchlog.read(args.log), args.model, shape,
-                                         args.conditions)
+                                         args.passages, args.conditions)
     except ValueError as exc:
         parser.error(str(exc))
     benchlog.append("continuation-summary", model=args.model,
@@ -105,22 +101,23 @@ def summarise(parser, args, shape) -> int:
                     results=summary, log=args.log)
     print(f"\n{summary['passages']} passages of {args.prefix_tokens} + {args.warm_tokens} + "
           f"{args.measured_tokens} tokens\n")
-    print("| Condition | Top-1 agreement | Bootstrap 95% | Mean KL | Bootstrap 95% | Bits |")
-    print("|---|---|---|---|---|---|")
+    print("| Condition | Top-1 agreement | Bootstrap 95% | Mean KL | Bootstrap 95% | Bits "
+          "| Plans short |")
+    print("|---|---|---|---|---|---|---|")
     for name, c in summary["by_condition"].items():
-        print(f"| {name} | {c['top1']:.4f} | {interval(c['top1_bootstrap_95'])} "
-              f"| {c['kl_mean']:.4f} | {interval(c['kl_bootstrap_95'])} "
-              f"| {c['effective_bits']:.2f} |")
+        print(f"| {name} | {c['top1']:.4f} | {interval(c['top1_bootstrap_95'], 4)} "
+              f"| {c['kl_mean']:.4f} | {interval(c['kl_bootstrap_95'], 4)} "
+              f"| {c['effective_bits']:.2f} | {c['plans_short_of_target']} |")
     print("\n| Level | Pair | KL difference | Bootstrap 95% | Passages semantic lower "
           "| Top-1 difference | Bootstrap 95% |")
     print("|---|---|---|---|---|---|---|")
     for level, pairs in summary["paired"].items():
         for pair, p in pairs.items():
             print(f"| {level} | {pair} | {p['kl_difference']:+.4f} "
-                  f"| {interval(p['kl_difference_bootstrap_95'])} "
+                  f"| {interval(p['kl_difference_bootstrap_95'], 4)} "
                   f"| {p['semantic_lower_kl']}/{summary['passages']} "
                   f"| {p['top1_difference']:+.4f} "
-                  f"| {interval(p['top1_difference_bootstrap_95'])} |")
+                  f"| {interval(p['top1_difference_bootstrap_95'], 4)} |")
     return 0
 
 

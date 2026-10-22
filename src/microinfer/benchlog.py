@@ -131,6 +131,19 @@ def same_code(a: str, b: str, log: str | Path = DEFAULT_LOG) -> bool:
         return False
 
 
+def same_code_as(commit: str, log: str | Path = DEFAULT_LOG):
+    """A predicate on commits, whether one holds the code of `commit`
+    (same_code), with one git call a commit however many entries ask."""
+    known: dict[str, bool] = {}
+
+    def holds(other: str) -> bool:
+        if other not in known:
+            known[other] = same_code(other, commit, log)
+        return known[other]
+
+    return holds
+
+
 def _exclude(log: Path) -> list[str]:
     """A git pathspec excluding the log, when it lies inside the repository."""
     try:

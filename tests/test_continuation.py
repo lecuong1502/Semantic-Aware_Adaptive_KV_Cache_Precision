@@ -22,13 +22,13 @@ NAME = "qwen2.5-0.5b-instruct"
 
 def test_passages_are_consecutive_and_do_not_overlap():
     tokens = np.arange(1000, dtype=np.int32)
-    ps = continuation.passages(tokens, 3, prefix=200, warm=30, measured=70)
+    ps = continuation.passages(tokens, 3, continuation.Shape(200, 30, 70))
     assert [p.passage_id for p in ps] == ["p00", "p01", "p02"]
     assert [p.start for p in ps] == [0, 300, 600]
     assert ps[1].prefix[0] == 300 and ps[1].warm[0] == 500 and ps[1].measured[-1] == 599
     assert (len(ps[2].prefix), len(ps[2].warm), len(ps[2].measured)) == (200, 30, 70)
     with pytest.raises(ValueError, match="split holds 1000"):
-        continuation.passages(tokens, 4, prefix=200, warm=30, measured=70)
+        continuation.passages(tokens, 4, continuation.Shape(200, 30, 70))
 
 
 def test_top_1_agreement_and_kl_from_fp16_at_each_position():
@@ -43,7 +43,7 @@ def test_top_1_agreement_and_kl_from_fp16_at_each_position():
         continuation.measures(reference, logits[:1])
 
 
-SHAPE = (2048, 64, 128, 0)
+SHAPE = continuation.Shape()
 
 
 def entry(log, passage, name, top1, kl, *, shape=SHAPE):
@@ -53,7 +53,8 @@ def entry(log, passage, name, top1, kl, *, shape=SHAPE):
                     config={"passage_id": passage, "condition": {"name": name},
                             "prefix_tokens": prefix, "warm_tokens": warm,
                             "measured_tokens": measured, "plan_seed": plan_seed},
-                    results={"top1": top1, "kl_mean": kl, "effective_bits": 3.4}, log=log)
+                    results={"top1": top1, "kl_mean": kl, "effective_bits": 3.4,
+                             "plan": {"target_met": passage != "p01"}}, log=log)
 
 
 def test_the_summary_pairs_semantic_against_uniform_and_random_by_passage(tmp_path):
@@ -64,10 +65,12 @@ def test_the_summary_pairs_semantic_against_uniform_and_random_by_passage(tmp_pa
         entry(log, p, "uniform-80", 0.8, 0.20 + i * 0.01)
         entry(log, p, "random-80", 0.8, 0.10 + i * 0.01 + (0.01 if i < 3 else -0.01))
     entry(log, "p00", "semantic-80", 0.9, 0.10)  # a repeat stands for the run before it
-    entry(log, "p00", "uniform-80", 0.0, 9.0, shape=(1024, 64, 128, 0))  # another shape
+    entry(log, "p00", "uniform-80", 0.0, 9.0, shape=continuation.Shape(1024))  # another shape
     conds = ["semantic-80", "uniform-80", "random-80"]
-    s = continuation.summarise(benchlog.read(log), "m", SHAPE, conds)
+    s = continuation.summarise(benchlog.read(log), "m", SHAPE, 10, conds)
     assert s["passages"] == 10 and len(s["entries"]) == 30
+    assert s["by_condition"]["semantic-80"]["plans_short_of_target"] == 1
+    assert len(s["commits"]) == 1
     assert s["by_condition"]["uniform-80"]["kl_mean"] == pytest.approx(0.245)
     low, high = s["by_condition"]["uniform-80"]["kl_bootstrap_95"]
     assert low < 0.245 < high
@@ -79,18 +82,21 @@ def test_the_summary_pairs_semantic_against_uniform_and_random_by_passage(tmp_pa
     assert random["semantic_lower_kl"] == 3
     lo, hi = random["kl_difference_bootstrap_95"]
     assert lo < random["kl_difference"] < hi
-    del_one = [e for e in benchlog.read(log)
+    without_one = [e for e in benchlog.read(log)
                if not (e["config"]["passage_id"] == "p05"
                        and e["config"]["condition"]["name"] == "random-80")]
     with pytest.raises(ValueError, match="p05"):
-        continuation.summarise(del_one, "m", SHAPE, conds)
+        continuation.summarise(without_one, "m", SHAPE, 10, conds)
+    # a run stopped part way, its passages after the tenth not run, is not pooled as whole
+    with pytest.raises(ValueError, match="of the 50 passages"):
+        continuation.summarise(benchlog.read(log), "m", SHAPE, 50, conds)
 
 
 def test_the_runs_logged_at_the_same_code_are_taken_up(tmp_path):
     log = tmp_path / "benchmark.jsonl"
     assert continuation.logged("m", SHAPE, "any", log) == set()
     entry(log, "p00", "semantic-80", 0.9, 0.1)
-    entry(log, "p01", "semantic-80", 0.9, 0.1, shape=(1024, 64, 128, 0))
+    entry(log, "p01", "semantic-80", 0.9, 0.1, shape=continuation.Shape(1024))
     commit = benchlog.read(log)[0]["git_commit"]
     assert continuation.logged("m", SHAPE, commit, log) == {("p00", "semantic-80")}
     assert continuation.logged("m", SHAPE, "another commit", log) == set()
@@ -110,7 +116,7 @@ def test_a_passage_under_no_plan_is_its_reference_and_under_a_plan_departs_from_
     """No plan applied, the logits are FP16's: agreement 1 and KL 0, to the
     bit. Under a plan at 80%, its bytes reclaimed, the logits depart."""
     tokens = np.random.default_rng(153).integers(1000, 100_000, 400).astype(np.int32)
-    (passage,) = continuation.passages(tokens, 1, prefix=320, warm=16, measured=24)
+    (passage,) = continuation.passages(tokens, 1, continuation.Shape(320, 16, 24))
     conds = [rq3.NO_PLAN, rq3.condition("uniform-80"), rq3.condition("random-80")]
     got = dict(continuation.runs(engine, passage, conds))
     none = got[rq3.NO_PLAN]

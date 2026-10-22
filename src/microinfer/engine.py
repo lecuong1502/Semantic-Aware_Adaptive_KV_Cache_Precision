@@ -191,6 +191,12 @@ class Ending:
     reason: str = ""
 
 
+class ForcingExhausted(RuntimeError):
+    """Teacher forcing ran out of device memory, again after an emergency
+    plan, or with nothing to downgrade (Conversation.force): a turn would
+    end exhausted; forcing has no tokens to end with, and raises this."""
+
+
 class _Exhausted(Exception):
     """A step's allocation failed and an emergency plan did not answer it."""
 
@@ -522,14 +528,22 @@ class Conversation:
     def force(self, ids, *, one_by_one: bool = False, logits: bool = False) -> np.ndarray | None:
         """Teacher-force `ids`, token ids, into the cache (#153): the tokens
         given, not those the model would choose, after what it holds. At
-        once, in prefill chunks, or `one_by_one`, a position a step as a
-        decoded token is fed, so that the scorer folds each in. With
+        once, in prefill chunks, or `one_by_one`, a position a step, so
+        that the scorer folds each in as it does a decoded token. With
         `logits`, the fp32 logits after each position, (len(ids), vocab);
         else None. Refused after a turn, whose last chosen token waits to be
         fed first; a turn after forcing appends its prompt to what was
-        forced."""
+        forced. Each step allocates as a decode step does, an adaptive
+        engine answering a failure with an emergency plan; one that still
+        fails ends the conversation and raises ForcingExhausted. No monitor
+        is drained meanwhile, so forcing is refused while one runs. Logits
+        are (n, vocab) fp32 on the host: a long prefill forced with them
+        holds as many."""
         if self._ended is not None:
             raise RuntimeError(f"the conversation has ended: {self._ended}")
+        if self._engine._monitor is not None:
+            raise ValueError("forcing drains no monitor's events: one running would go "
+                             "unheard, or plan against the tokens being forced")
         if len(self._unfed):
             raise RuntimeError("forcing feeds only the tokens it is given; after a turn, the "
                                "token the turn chose last waits to be fed first")
@@ -549,6 +563,9 @@ class Conversation:
                 for chunk, ws, _, _ in engine._prefill(self._cache, ids):
                     if out is not None:
                         out.append(engine._model.logits(ws, len(chunk)))
+        except _Exhausted as exc:
+            self.close(f"forcing ended exhausted: {exc}")
+            raise ForcingExhausted(str(exc)) from exc
         except BaseException as exc:
             self.close(f"forcing raised {type(exc).__name__}")
             raise

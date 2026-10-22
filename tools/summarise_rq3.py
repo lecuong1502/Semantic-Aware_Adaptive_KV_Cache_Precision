@@ -27,8 +27,8 @@ from rq3 import NEEDLE_SEED  # noqa: E402
 from microinfer import benchlog, needles, rq3, rq3_summary  # noqa: E402
 
 
-def interval(pair: list[float]) -> str:
-    return f"[{pair[0]:.2f}, {pair[1]:.2f}]"
+def interval(pair: list[float], digits: int = 2) -> str:
+    return f"[{pair[0]:.{digits}f}, {pair[1]:.{digits}f}]"
 
 
 def main(argv: list[str]) -> int:

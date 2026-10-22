@@ -426,11 +426,12 @@ _Avoid_: offline, online (both are mid-session)
 
 **Continuation fidelity** / **Passage**:
 RQ3's secondary task (ADR-0017, #153): a passage of WikiText-2's test
-split, its prefix prefilled and a few tokens after it forced a position a
-step so the scorer has scores, is compressed by a controlled plan, and the
-rest is **teacher-forced**, fed the passage's own tokens rather than the
-model's choices. Its measures are top-1 agreement with FP16 and the KL
-divergence from FP16's logits, position by position.
+split, its prefix prefilled and its **warm** tokens forced a position a step
+so the scorer has scores, is compressed by a controlled plan, and its
+**measured** tokens are **teacher-forced**, fed the passage's own tokens
+rather than the model's choices. Its measures are top-1 agreement with the
+**reference**, the same passage with no plan applied, which is FP16's, and
+the KL divergence from the reference's logits, position by position.
 _Avoid_: perplexity (that is ADR-0011's measure of a whole tier), free
 generation (nothing is generated)
 

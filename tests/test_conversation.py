@@ -227,3 +227,22 @@ def test_forcing_goes_on_from_forcing_and_not_from_a_turn(fp16):
     fp16._model.run(model.Workspace(fp16.config, rows=len(forced)), cache, forced)
     _, tokens = by_hand(fp16, cache, [(second, 4)])
     assert out.tolist() == tokens[0]
+
+
+@pytest.mark.slow
+def test_forcing_that_runs_out_ends_the_conversation_and_says_so(fp16, monkeypatch):
+    """A step that fails again after an emergency plan, or has nothing to
+    downgrade, ends forcing as it would end a turn exhausted; forcing has no
+    tokens to end with, so it raises the engine's ForcingExhausted."""
+    from microinfer.engine import ForcingExhausted, _Exhausted
+
+    def exhausted(*args, **kwargs):
+        raise _Exhausted("out of memory; nothing to downgrade")
+
+    with fp16.conversation() as chat:
+        chat.force(prompt(40, 1535))
+        monkeypatch.setattr(fp16, "_run", exhausted)
+        with pytest.raises(ForcingExhausted, match="nothing to downgrade"):
+            chat.force(prompt(4, 1536), one_by_one=True)
+        with pytest.raises(RuntimeError, match="ended exhausted"):
+            chat.force(prompt(4, 1536))
