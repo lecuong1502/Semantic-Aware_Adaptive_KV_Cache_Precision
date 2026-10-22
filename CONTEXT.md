@@ -424,6 +424,15 @@ attention of an earlier turn (question-blind, RQ3's primary experiment), or
 after the first tokens of an answer to it (question-aware, an upper bound).
 _Avoid_: offline, online (both are mid-session)
 
+**Closing question**:
+The one test Milestone 3 is closed on (ADR-0017, #152): whether semantic
+allocation answers more needle samples than uniform at 80% of the FP16
+bytes reclaimed, question-blind, by McNemar's exact test on the samples
+only one of them answered, at alpha 0.05. Its answer, yes or no, is
+reported whatever it is; every other comparison of the RQ3 summary is
+descriptive beside it.
+_Avoid_: hypothesis, headline result (it is fixed before the result is read)
+
 **Shortfall**:
 The device memory a survival experiment's contention leaves an engine short
 of its full FP16 cache: the simulator takes the headroom, less its own
