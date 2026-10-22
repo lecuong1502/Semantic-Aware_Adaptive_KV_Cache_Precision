@@ -129,7 +129,7 @@ def _check(engine, experiment: str) -> None:
 
 
 @contextmanager
-def _set_for(engine, cond: Condition):
+def set_for(engine, cond: Condition):
     """The engine set for `cond`: its tier, whether it adapts and scores, and
     its score source, put back after."""
     kept = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
@@ -156,7 +156,7 @@ def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
     the cache holds at the plan, or where it would be: the full pages before
     the question's answer, which adds its own at FP16."""
     _check(engine, experiment)
-    with _set_for(engine, cond), engine.conversation() as chat:
+    with set_for(engine, cond), engine.conversation() as chat:
         opened = _open(engine, chat, sample, experiment)
         return _close(engine, chat, sample, cond, experiment,
                       sample_seed(sample.sample_id, plan_seed), opened)
@@ -176,7 +176,7 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     alone = [c for c in conds if not shares_turn_1(c)]
     snapshot = None
     if len(shared) > 1:
-        with _set_for(engine, shared[0]), engine.conversation(for_snapshot=True) as chat:
+        with set_for(engine, shared[0]), engine.conversation(for_snapshot=True) as chat:
             opened = _open(engine, chat, sample, experiment)
             try:
                 snapshot = chat.snapshot()
@@ -185,7 +185,7 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     if snapshot is None:
         alone, shared = [*shared, *alone], []
     for cond in shared:
-        with _set_for(engine, cond), engine.conversation(start=snapshot) as chat:
+        with set_for(engine, cond), engine.conversation(start=snapshot) as chat:
             results = _close(engine, chat, sample, cond, experiment, seed, opened)
         yield cond, results
     for cond in alone:
@@ -234,14 +234,7 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
                                                    ANSWER_TOKENS - AWARE_TOKENS)])
     first, last = sample.needle_pages
     needle_tiers = Counter(controller.TIERS[t] for t in tiers[:, first:last + 1].ravel())
-    full = tiers[:, :plan_positions // sample.page_tokens]
-    shares = Counter(controller.TIERS[t] for t in full.ravel())
     text = engine.decode(answer)
-    plan = None
-    if record is not None:
-        plan = {k: v for k, v in record.controlled.items()
-                if k not in ("effective_bits", "candidate_effective_bits")}
-        plan.update(moves=len(record.plan), short=record.plan.short, ended=record.ended)
     return {
         "answer": text, "correct": needles.correct(text, sample.code),
         "answer_tokens": answer.tolist(), "summary": engine.decode(opened.summary),
@@ -249,13 +242,31 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         "aware_opening": opening,
         "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
         "code_after_plan": None if opening is None else code_after(opening, sample.code),
-        "plan_positions": plan_positions, "plan": plan,
+        "plan_positions": plan_positions, "plan": plan_summary(record),
         "random_seed": seed if cond.source == "random" else None,
         "effective_bits": bits["effective_bits"],
         "candidate_effective_bits": bits["candidate_effective_bits"],
-        "tier_shares": {t: shares[t] / full.size for t in controller.TIERS if shares[t]},
+        "tier_shares": tier_shares(tiers[:, :plan_positions // sample.page_tokens]),
         "needle_page_tiers": dict(sorted(needle_tiers.items())),
     }
+
+
+def plan_summary(record) -> dict | None:
+    """What a log entry's results hold of a controlled plan's record: its
+    controlled fields but the effective bits, given beside it, and its
+    moves, whether it fell short, and how it ended; None for no plan."""
+    if record is None:
+        return None
+    plan = {k: v for k, v in record.controlled.items()
+            if k not in ("effective_bits", "candidate_effective_bits")}
+    plan.update(moves=len(record.plan), short=record.plan.short, ended=record.ended)
+    return plan
+
+
+def tier_shares(tiers: np.ndarray) -> dict[str, float]:
+    """Each tier's share of `tiers`, indices into controller.TIERS."""
+    counts = Counter(controller.TIERS[t] for t in tiers.ravel())
+    return {t: counts[t] / tiers.size for t in controller.TIERS if counts[t]}
 
 
 def config(sample: needles.Sample, cond: Condition, experiment: str, **more) -> dict:
@@ -284,13 +295,7 @@ def logged(model: str, needle_seed: int, haystack_tokens: int, commit: str,
     same run. A run of hours stopped part way is taken up again from them."""
     if not Path(log).exists():
         return {}
-    same: dict[str, bool] = {}
-
-    def held(other: str) -> bool:
-        if other not in same:
-            same[other] = benchlog.same_code(other, commit, log)
-        return same[other]
-
+    held = benchlog.same_code_as(commit, log)
     return {(e["config"]["sample_id"], e["config"]["experiment"],
              e["config"]["condition"]["name"]): e["results"]["correct"]
             for e in benchlog.read(log)

@@ -424,6 +424,17 @@ attention of an earlier turn (question-blind, RQ3's primary experiment), or
 after the first tokens of an answer to it (question-aware, an upper bound).
 _Avoid_: offline, online (both are mid-session)
 
+**Continuation fidelity** / **Passage**:
+RQ3's secondary task (ADR-0017, #153): a passage of WikiText-2's test
+split, its prefix prefilled and its **warm** tokens forced a position a step
+so the scorer has scores, is compressed by a controlled plan, and its
+**measured** tokens are **teacher-forced**, fed the passage's own tokens
+rather than the model's choices. Its measures are top-1 agreement with the
+**reference**, the same passage with no plan applied, which is FP16's, and
+the KL divergence from the reference's logits, position by position.
+_Avoid_: perplexity (that is ADR-0011's measure of a whole tier), free
+generation (nothing is generated)
+
 **Closing question**:
 The one test Milestone 3 is closed on: whether the semantic source answers
 more needle samples than uniform at 80% of the FP16 bytes outside the
