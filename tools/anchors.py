@@ -7,7 +7,7 @@ Three steps, each a command (microinfer.anchors):
    screened set an anchor-screening entry; a gap short after --draws is
    logged as a screening not complete.
 2. By default: the screened set under each condition chosen, every score
-   source at each level unless --conditions names others; one rq3-anchor
+   source at each level, or those --conditions names; one rq3-anchor
    entry a run. A dialogue's source conditions run its turns once
    (anchors.runs).
 3. `--summarise`: the anchor-summary entry, recall per condition by gap and
@@ -46,8 +46,7 @@ def main(argv: list[str]) -> int:
     step.add_argument("--summarise", action="store_true",
                       help="log the summary of the screened set's runs")
     parser.add_argument("--conditions", nargs="+", default=list(rq3.SOURCE_CONDITIONS),
-                        choices=[c.name for c in (*rq3.CONDITIONS, rq3.NO_PLAN)
-                                 if c.name != FP16.name],
+                        choices=rq3.SOURCE_CONDITIONS,
                         help="default: every score source at each level; fp16's runs are "
                              "screening's")
     parser.add_argument("--per-gap", type=int, default=anchors.SAMPLES_PER_GAP)
@@ -60,19 +59,17 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--passage-tokens", type=int, default=anchors.PASSAGE_TOKENS)
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
-    shape = {"turns": args.turns, "passage_tokens": args.passage_tokens}
+    of = anchors.AnchorSet(args.model, args.anchor_seed, args.turns, args.passage_tokens)
 
     if args.summarise:
         benchlog.verify(args.log)
         names = list(dict.fromkeys(args.conditions))
-        summary = anchors.summarise(benchlog.read(args.log), args.model, args.anchor_seed,
-                                    plan_seed=args.plan_seed, conditions=["fp16", *names],
-                                    **shape)
+        summary = anchors.summarise(benchlog.read(args.log), of, plan_seed=args.plan_seed,
+                                    conditions=[FP16.name, *names])
         entry = benchlog.append(
             "anchor-summary", model=args.model, context_length=None,
             precision_tiers=None,
-            config={"anchor_seed": args.anchor_seed, "plan_seed": args.plan_seed,
-                    "issue": args.issue, **shape},
+            config={**of.config(), "plan_seed": args.plan_seed, "issue": args.issue},
             results=summary, log=args.log)
         print(tables(summary))
         print(f"\nlogged {entry['sha256'][:12]}")
@@ -85,23 +82,21 @@ def main(argv: list[str]) -> int:
     commit = environment["git_commit"]
     engine = Engine(REPO / "models" / args.model)
     text = held_out_text()
-    common = {"anchor_seed": args.anchor_seed, "issue": args.issue}
 
     def log_run(dialogue, cond, results, **more):
         benchlog.append(
             anchors.KIND, model=args.model,
             context_length=results["plan_positions"] + 1,
             precision_tiers=results["tier_shares"],
-            config=anchors.config(dialogue, cond, **common, **more), results=results,
+            config=anchors.config(dialogue, cond, anchor_seed=of.seed, issue=args.issue, **more),
+            results=results,
             log=args.log)
 
     start = time.perf_counter()
     if args.screen:
         done = {s: right for (s, name), right in anchors.logged(
-            args.model, args.anchor_seed, commit, args.log, screening=True, **shape).items()
-            if name == FP16.name}
-        drawn = anchors.dialogue_set(text, engine.tokenizer, seed=args.anchor_seed,
-                                     samples_per_gap=args.draws, **shape)
+            of, commit, args.log, screening=True).items() if name == FP16.name}
+        drawn = of.dialogues(text, engine.tokenizer, args.draws)
         engine.load_weights()
 
         def is_right(dialogue) -> bool:
@@ -115,18 +110,17 @@ def main(argv: list[str]) -> int:
             return results["correct"]
 
         try:
-            kept, rejected = rq3.screen(drawn, is_right, per_depth=args.per_gap,
-                                        groups=anchors.gaps(args.turns),
-                                        group=lambda d: d.gap, label=anchors.gap_name,
-                                        named="gaps")
+            kept, rejected = rq3.screen(drawn, is_right, args.per_gap,
+                                        anchors.by_gap(args.turns))
             short = None
         except rq3.ShortScreening as failed:
             kept, rejected, short = failed.kept, failed.rejected, failed
         benchlog.append(
             anchors.SCREENING_KIND, model=args.model, context_length=None,
             precision_tiers={"FP16": 1.0},
-            config={**common, "per_gap": args.per_gap, "draws": args.draws,
-                    "condition": FP16.name, "experiment": anchors.EXPERIMENT, **shape},
+            config={**of.config(), "per_gap": args.per_gap, "draws": args.draws,
+                    "condition": FP16.name, "experiment": anchors.EXPERIMENT,
+                    "issue": args.issue},
             results={"kept": [d.sample_id for d in kept],
                      "rejected": [d.sample_id for d in rejected], "complete": short is None,
                      "short": None if short is None else {
@@ -139,15 +133,12 @@ def main(argv: list[str]) -> int:
         print(f"kept {len(kept)}; replaced {len(rejected)}: {[d.sample_id for d in rejected]}")
         return 0
 
-    screening = anchors.last_screening(benchlog.read(args.log), args.model, args.anchor_seed,
-                                       **shape)
+    screening = anchors.last_screening(benchlog.read(args.log), of)
     kept = screening["results"]["kept"]
-    every = anchors.dialogue_set(text, engine.tokenizer, seed=args.anchor_seed,
-                                 samples_per_gap=screening["config"]["draws"], **shape)
+    every = of.dialogues(text, engine.tokenizer, screening["config"]["draws"])
     by_id = {d.sample_id: d for d in every}
     names = list(dict.fromkeys(args.conditions))
-    done = anchors.logged(args.model, args.anchor_seed, commit, args.log,
-                          plan_seed=args.plan_seed, **shape)
+    done = anchors.logged(of, commit, args.log, plan_seed=args.plan_seed)
     todo = {s: [n for n in names if (s, n) not in done] for s in kept}
     count = sum(len(v) for v in todo.values())
     print(f"{len(kept) * len(names) - count} of {len(kept) * len(names)} runs logged at this "

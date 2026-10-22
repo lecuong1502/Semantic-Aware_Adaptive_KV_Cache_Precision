@@ -55,6 +55,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -124,6 +125,11 @@ def sample_seed(sample_id: str, plan_seed: int) -> int:
 def _check(engine, experiment: str) -> None:
     if experiment not in EXPERIMENTS:
         raise ValueError(f"an experiment is one of {EXPERIMENTS}; got {experiment!r}")
+    check_engine(engine)
+
+
+def check_engine(engine) -> None:
+    """Refuse an engine a run cannot hold its cache on."""
     if engine.kv_cache != "paged" or engine.kv_halves != "both":
         raise ValueError("a run holds its cache on pages, both halves at a page's tier")
 
@@ -237,19 +243,12 @@ def _open(engine, chat, sample: needles.Sample, experiment: str) -> _Opened:
 def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: str, seed: int,
            opened: _Opened) -> dict:
     opening, answer = opened.opening, opened.answer
-    plan_positions = chat.positions
-    record = None
-    if cond.source is not None:
-        record = chat.plan(cond.share, source=cond.source, seed=seed)
-    bits = chat.effective_bits()
-    tiers = chat.tiers()
+    planned = plan_at(chat, cond, seed)
     if experiment == "question-blind":
         answer = chat.turn(opened.turn_2, ANSWER_TOKENS)
     elif not opened.answered:
         answer = np.concatenate([answer, chat.turn(np.empty(0, np.int32),
                                                    ANSWER_TOKENS - AWARE_TOKENS)])
-    first, last = sample.needle_pages
-    needle_tiers = Counter(controller.TIERS[t] for t in tiers[:, first:last + 1].ravel())
     text = engine.decode(answer)
     return {
         "answer": text, "correct": needles.correct(text, sample.code),
@@ -258,13 +257,46 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         "aware_opening": opening,
         "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
         "code_after_plan": None if opening is None else code_after(opening, sample.code),
-        "plan_positions": plan_positions, "plan": plan_summary(record),
-        "random_seed": seed if cond.source == "random" else None,
-        "effective_bits": bits["effective_bits"],
-        "candidate_effective_bits": bits["candidate_effective_bits"],
-        "tier_shares": tier_shares(tiers[:, :plan_positions // sample.page_tokens]),
-        "needle_page_tiers": dict(sorted(needle_tiers.items())),
+        **planned.results(cond, seed, sample.page_tokens),
+        "needle_page_tiers": planned.page_tiers(sample.needle_pages),
     }
+
+
+@dataclass(frozen=True)
+class Planned:
+    """What a run's cache holds at its plan, or where it would be: the
+    positions it holds, the plan's record, if one was applied, its
+    effective bits and its pages' tiers."""
+
+    positions: int
+    record: Any
+    bits: dict
+    tiers: np.ndarray
+
+    def results(self, cond: Condition, seed: int, page_tokens: int) -> dict:
+        """What a log entry's results hold of it: the tiers' shares over the
+        full pages, the plan's summary, and the random source's seed."""
+        return {"plan_positions": self.positions, "plan": plan_summary(self.record),
+                "random_seed": seed if cond.source == "random" else None,
+                "effective_bits": self.bits["effective_bits"],
+                "candidate_effective_bits": self.bits["candidate_effective_bits"],
+                "tier_shares": tier_shares(self.tiers[:, :self.positions // page_tokens])}
+
+    def page_tiers(self, pages: tuple[int, int]) -> dict[str, int]:
+        """The tiers of every (layer, page) of `pages`, first and last, by count."""
+        first, last = pages
+        counts = Counter(controller.TIERS[t] for t in self.tiers[:, first:last + 1].ravel())
+        return dict(sorted(counts.items()))
+
+
+def plan_at(chat, cond: Condition, seed: int) -> Planned:
+    """`cond`'s controlled plan applied, if it makes one, and what the cache
+    then holds."""
+    positions = chat.positions
+    record = None
+    if cond.source is not None:
+        record = chat.plan(cond.share, source=cond.source, seed=seed)
+    return Planned(positions, record, chat.effective_bits(), chat.tiers())
 
 
 def plan_summary(record) -> dict | None:
@@ -322,47 +354,59 @@ def logged(model: str, needle_seed: int, haystack_tokens: int, commit: str,
             and e["config"]["plan_seed"] == plan_seed}
 
 
+@dataclass(frozen=True)
+class Grouping:
+    """What a set is screened by: the value `of` each sample that groups
+    it, the `groups` in their order, each shown by its `label`, and what
+    the groups are `named` together."""
+
+    groups: tuple
+    of: Callable[[Any], Any]
+    label: Callable[[Any], str]
+    named: str
+
+
+#: The needle set's grouping, by depth (#148).
+BY_DEPTH = Grouping(needles.DEPTHS, lambda s: s.depth, lambda d: f"{round(d * 100)}%", "depths")
+
+
 class ShortScreening(ValueError):
-    """A screening with a depth short of right answers: what it kept and
-    rejected, and each short depth's count of right ones."""
+    """A screening with a group short of right answers: what it kept and
+    rejected, and each short group's count of right ones."""
 
-    def __init__(self, kept: list, rejected: list, short: dict, per_depth: int,
-                 label: Callable = lambda d: f"{round(d * 100)}%", groups: str = "depths"):
+    def __init__(self, kept: list, rejected: list, short: dict, per_group: int,
+                 grouping: Grouping = BY_DEPTH):
         self.kept, self.rejected, self.short = kept, rejected, short
-        named = ", ".join(f"{label(d)}: {n}" for d, n in short.items())
-        super().__init__(f"{groups} short of {per_depth} answered correctly at FP16 ({named}); "
-                         f"draw more")
+        shown = ", ".join(f"{grouping.label(g)}: {n}" for g, n in short.items())
+        super().__init__(f"{grouping.named} short of {per_group} answered correctly at FP16 "
+                         f"({shown}); draw more")
 
 
-def screen(samples: Sequence, is_right: Callable[[needles.Sample], bool],
-           per_depth: int = needles.SAMPLES_PER_DEPTH, *, groups: Sequence = needles.DEPTHS,
-           group: Callable = lambda s: s.depth, label: Callable | None = None,
-           named: str = "depths") -> tuple[list, list]:
+def screen(samples: Sequence, is_right: Callable[[Any], bool],
+           per_group: int = needles.SAMPLES_PER_DEPTH,
+           grouping: Grouping = BY_DEPTH) -> tuple[list, list]:
     """ADR-0017's screening (#148): of `samples`, a set drawn with more than
-    `per_depth` a depth, in its order, keep for each depth the first
-    `per_depth` that FP16 answers correctly, `is_right`, and reject those
-    before them that it does not. A sample past a depth's last kept is not
-    run. The kept and the rejected, each in the set's order; every depth is
-    screened before a ShortScreening names those short of `per_depth`.
-    Another set screens by `group` of its samples rather than depth, over
-    `groups`, a ShortScreening naming them `named`, each by its `label`
-    (the anchor-fact set by its gap, #154)."""
+    `per_group` a group, a depth by default, in its order, keep for each
+    group the first `per_group` that FP16 answers correctly, `is_right`,
+    and reject those before them that it does not. A sample past a group's
+    last kept is not run. The kept and the rejected, each in the set's
+    order; every group is screened before a ShortScreening names those
+    short of `per_group`. The anchor-fact set is grouped by gap (#154)."""
     kept, rejected, short = [], [], {}
-    for depth in groups:
+    for g in grouping.groups:
         held = 0
-        for sample in (s for s in samples if group(s) == depth):
-            if held == per_depth:
+        for sample in (s for s in samples if grouping.of(s) == g):
+            if held == per_group:
                 break
             if is_right(sample):
                 kept.append(sample)
                 held += 1
             else:
                 rejected.append(sample)
-        if held < per_depth:
-            short[depth] = held
+        if held < per_group:
+            short[g] = held
     if short:
-        raise ShortScreening(kept, rejected, short, per_depth,
-                             *(() if label is None else (label,)), groups=named)
+        raise ShortScreening(kept, rejected, short, per_group, grouping)
     return kept, rejected
 
 

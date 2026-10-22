@@ -145,16 +145,22 @@ def _accuracy(runs: list[dict], right: np.ndarray, interval: np.ndarray,
             "accuracy": float(at.mean()),
             "bootstrap_95": [float(v) for v in bootstrap(at[None, :], rng)[0]],
             "wilson_95": list(wilson(int(at.sum()), len(at)))}
-    tiers = Counter()
-    for e in runs:
-        tiers.update(e["results"]["needle_page_tiers"])
-    held = sum(tiers.values())
     correct = int(right.sum())
     return {"correct": correct, "n": len(right), "accuracy": correct / len(right),
             "bootstrap_95": [float(v) for v in interval],
             "wilson_95": list(wilson(correct, len(right))), "by_depth": by_depth,
             "effective_bits": float(np.mean([e["results"]["effective_bits"] for e in runs])),
-            "needle_page_tiers": {t: n / held for t, n in sorted(tiers.items())}}
+            "needle_page_tiers": pooled_tiers(runs, "needle_page_tiers")}
+
+
+def pooled_tiers(runs: list[dict], key: str) -> dict[str, float]:
+    """Each tier's share of every (layer, page) the runs' `key`, tier
+    counts, hold together."""
+    tiers = Counter()
+    for e in runs:
+        tiers.update(e["results"][key])
+    held = sum(tiers.values())
+    return {t: n / held for t, n in sorted(tiers.items())}
 
 
 def paired(semantic: np.ndarray, other: np.ndarray, rng: np.random.Generator) -> dict:

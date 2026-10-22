@@ -44,14 +44,14 @@ uniform and random by McNemar's exact test, as the needle's summary does.
 from __future__ import annotations
 
 import json
-from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
-from . import benchlog, controller, needles, rq3, rq3_summary
+from . import benchlog, needles, rq3, rq3_summary
 
 TURNS = 10
 PASSAGE_TOKENS = 720
@@ -188,10 +188,12 @@ def _passages(haystacks: needles.Haystacks, article: int, turns: int,
 
 @dataclass(frozen=True)
 class _Opened:
-    """What a run holds before its plan: each turn's reply, the fact's
-    positions, and the question's prompt."""
+    """What a run holds before its plan: each turn's reply and whether it
+    stopped at its end of turn, the fact's positions, and the question's
+    prompt."""
 
     replies: tuple[np.ndarray, ...]
+    stopped: tuple[bool, ...]
     fact_positions: tuple[int, int]
     question: np.ndarray
 
@@ -201,74 +203,61 @@ def _open(engine, chat, dialogue: Dialogue) -> _Opened:
     the last one's tokens and reply end: the reply's last token, not yet
     fed, takes the position before it."""
     end_of_turn = engine.tokenizer.token_to_id(rq3.END_OF_TURN)
-    replies, position, cut, fact = [], 0, False, None
+    replies, stopped, position, fact = [], [], 0, None
+
+    def after_last(body: np.ndarray) -> np.ndarray:
+        if not stopped or stopped[-1]:
+            return body
+        return np.concatenate([[end_of_turn], body]).astype(np.int32)
+
     for i, body in enumerate(dialogue.turns):
-        prompt = np.concatenate([[end_of_turn], body]).astype(np.int32) if cut else body
+        prompt = after_last(body)
         if i == dialogue.fact_turn:
             first = position + len(prompt) - len(body)
             fact = (first + dialogue.fact_offsets[0], first + dialogue.fact_offsets[1])
         reply = chat.turn(prompt, REPLY_TOKENS)
         position += len(prompt) + len(reply)
-        cut = int(reply[-1]) != end_of_turn
         replies.append(reply)
-    question = dialogue.question_turn
-    if cut:
-        question = np.concatenate([[end_of_turn], question]).astype(np.int32)
-    return _Opened(tuple(replies), fact, question)
+        stopped.append(int(reply[-1]) == end_of_turn)
+    return _Opened(tuple(replies), tuple(stopped), fact, after_last(dialogue.question_turn))
 
 
 def _close(engine, chat, dialogue: Dialogue, cond: rq3.Condition, seed: int,
            opened: _Opened) -> dict:
-    plan_positions = chat.positions
-    record = None
-    if cond.source is not None:
-        record = chat.plan(cond.share, source=cond.source, seed=seed)
-    bits = chat.effective_bits()
-    tiers = chat.tiers()
+    planned = rq3.plan_at(chat, cond, seed)
     answer = chat.turn(opened.question, rq3.ANSWER_TOKENS)
-    start, end = opened.fact_positions
-    pages = (start // dialogue.page_tokens, (end - 1) // dialogue.page_tokens)
-    fact_tiers = Counter(controller.TIERS[t] for t in tiers[:, pages[0]:pages[1] + 1].ravel())
+    pages = needles.pages_holding(opened.fact_positions, dialogue.page_tokens)
     replies = [engine.decode(r) for r in opened.replies]
-    end_of_turn = engine.tokenizer.token_to_id(rq3.END_OF_TURN)
     text = engine.decode(answer)
     return {
         "answer": text, "correct": needles.correct(text, dialogue.code),
         "answer_tokens": answer.tolist(), "replies": replies,
         "reply_tokens": [r.tolist() for r in opened.replies],
-        "replies_stopped": [int(r[-1]) == end_of_turn for r in opened.replies],
+        "replies_stopped": list(opened.stopped),
         # a reply that repeats the code holds it at a second place
         "code_echoed": [i for i, r in enumerate(replies) if dialogue.code in r],
         "fact_positions": list(opened.fact_positions), "fact_pages": list(pages),
-        "plan_positions": plan_positions, "plan": rq3.plan_summary(record),
-        "random_seed": seed if cond.source == "random" else None,
-        "effective_bits": bits["effective_bits"],
-        "candidate_effective_bits": bits["candidate_effective_bits"],
-        "tier_shares": rq3.tier_shares(tiers[:, :plan_positions // dialogue.page_tokens]),
-        "fact_page_tiers": dict(sorted(fact_tiers.items())),
+        **planned.results(cond, seed, dialogue.page_tokens),
+        "fact_page_tiers": planned.page_tiers(pages),
     }
-
-
-def _check(engine) -> None:
-    if engine.kv_cache != "paged" or engine.kv_halves != "both":
-        raise ValueError("a run holds its cache on pages, both halves at a page's tier")
 
 
 def run(engine, dialogue: Dialogue, cond: rq3.Condition, *, plan_seed: int = 0) -> dict:
     """One dialogue through its turns, the plan and the question under one
     condition: what a log entry's results hold. The effective bits and the
     tiers are the cache's at the plan."""
-    _check(engine)
+    rq3.check_engine(engine)
     with rq3.set_for(engine, cond), engine.conversation() as chat:
-        return _close(engine, chat, dialogue, cond,
-                      rq3.sample_seed(dialogue.sample_id, plan_seed), _open(engine, chat, dialogue))
+        seed = rq3.sample_seed(dialogue.sample_id, plan_seed)
+        return _close(engine, chat, dialogue, cond, seed, _open(engine, chat, dialogue))
 
 
 def runs(engine, dialogue: Dialogue, conds: Sequence[rq3.Condition], *,
          plan_seed: int = 0) -> Iterator[tuple[rq3.Condition, dict]]:
     """Each of `conds` on one dialogue, with what `run` gives it, those that
-    hold the turns alike from one run of them (rq3.from_one_opening)."""
-    _check(engine)
+    hold the turns alike from one run of them (rq3.from_one_opening): their
+    replies, and so `code_echoed`, are alike too."""
+    rq3.check_engine(engine)
     seed = rq3.sample_seed(dialogue.sample_id, plan_seed)
     yield from rq3.from_one_opening(
         engine, conds, lambda chat: _open(engine, chat, dialogue),
@@ -285,39 +274,56 @@ def config(dialogue: Dialogue, cond: rq3.Condition, **more) -> dict:
             "condition": asdict(cond), "experiment": EXPERIMENT, **more}
 
 
-def _matches(e: dict, model: str, anchor_seed: int, turns: int, passage_tokens: int) -> bool:
-    c = e["config"]
-    return (e["model"] == model and c["anchor_seed"] == anchor_seed and c["turns"] == turns
-            and c["passage_tokens"] == passage_tokens)
+class AnchorSet(NamedTuple):
+    """What names one anchor-fact set's runs: the model, the set's seed, and
+    its dialogues' turns and passage length."""
+
+    model: str
+    seed: int = ANCHOR_SEED
+    turns: int = TURNS
+    passage_tokens: int = PASSAGE_TOKENS
+
+    def holds(self, entry: dict) -> bool:
+        """Whether a log entry is of this set."""
+        c = entry["config"]
+        return (entry["model"] == self.model and c["anchor_seed"] == self.seed
+                and c["turns"] == self.turns and c["passage_tokens"] == self.passage_tokens)
+
+    def dialogues(self, text: str, tokenizer, samples_per_gap: int) -> list[Dialogue]:
+        """The set's dialogues, `samples_per_gap` a gap (dialogue_set)."""
+        return dialogue_set(text, tokenizer, seed=self.seed, samples_per_gap=samples_per_gap,
+                            turns=self.turns, passage_tokens=self.passage_tokens)
+
+    def config(self) -> dict:
+        """What a log entry's config names of the set, but its model."""
+        return {"anchor_seed": self.seed, "turns": self.turns,
+                "passage_tokens": self.passage_tokens}
 
 
-def logged(model: str, anchor_seed: int, commit: str, log: str | Path = benchlog.DEFAULT_LOG,
-           *, screening: bool = False, plan_seed: int = 0, turns: int = TURNS,
-           passage_tokens: int = PASSAGE_TOKENS) -> dict[tuple[str, str], bool]:
-    """The runs already logged, by (sample id, condition), each with whether
-    it was answered rightly: those at the code of `commit`
-    (benchlog.same_code), for this model, set and plan seed, screening's
-    when `screening` and not otherwise, as rq3.logged counts a needle run."""
+def logged(of: AnchorSet, commit: str, log: str | Path = benchlog.DEFAULT_LOG, *,
+           screening: bool = False, plan_seed: int = 0) -> dict[tuple[str, str], bool]:
+    """The runs of the set already logged, by (sample id, condition), each
+    with whether it was answered rightly: those at the code of `commit`
+    (benchlog.same_code), at this plan seed, screening's when `screening`
+    and not otherwise, as rq3.logged counts a needle run."""
     if not Path(log).exists():
         return {}
-    held = benchlog.same_code_as(commit, log)
+    same_code = benchlog.same_code_as(commit, log)
     return {(e["config"]["sample_id"], e["config"]["condition"]["name"]): e["results"]["correct"]
             for e in benchlog.read(log)
-            if e["kind"] == KIND and _matches(e, model, anchor_seed, turns, passage_tokens)
+            if e["kind"] == KIND and of.holds(e)
             and bool(e["config"].get("screening")) == screening
-            and e["config"]["plan_seed"] == plan_seed and held(e["git_commit"])}
+            and e["config"]["plan_seed"] == plan_seed and same_code(e["git_commit"])}
 
 
-def last_screening(entries: Sequence[dict], model: str, anchor_seed: int, *,
-                   turns: int = TURNS, passage_tokens: int = PASSAGE_TOKENS) -> dict:
-    """The last complete anchor-screening entry for `model` and the set; a
-    ValueError if there is none."""
-    found = [e for e in entries if e["kind"] == SCREENING_KIND
-             and _matches(e, model, anchor_seed, turns, passage_tokens)
+def last_screening(entries: Sequence[dict], of: AnchorSet) -> dict:
+    """The last complete anchor-screening entry of the set; a ValueError if
+    there is none."""
+    found = [e for e in entries if e["kind"] == SCREENING_KIND and of.holds(e)
              and e["results"]["complete"]]
     if not found:
-        raise ValueError(f"no complete {SCREENING_KIND} logged for {model} at seed "
-                         f"{anchor_seed}; run tools/anchors.py --screen")
+        raise ValueError(f"no complete {SCREENING_KIND} logged for {of.model} at seed "
+                         f"{of.seed}; run tools/anchors.py --screen")
     return found[-1]
 
 
@@ -325,65 +331,71 @@ def gap_name(gap: int) -> str:
     return f"{gap} turns"
 
 
-def summarise(entries: Sequence[dict], model: str, anchor_seed: int, *, plan_seed: int = 0,
-              turns: int = TURNS, passage_tokens: int = PASSAGE_TOKENS,
+def by_gap(turns: int = TURNS) -> rq3.Grouping:
+    """The grouping a set of dialogues of `turns` is screened by, its gaps."""
+    return rq3.Grouping(gaps(turns), lambda d: d.gap, gap_name, "gaps")
+
+
+def summarise(entries: Sequence[dict], of: AnchorSet, *, plan_seed: int = 0,
               conditions: Sequence[str] = ("fp16", *rq3.SOURCE_CONDITIONS)) -> dict:
     """The anchor-fact summary of the screened set's runs in `entries`, the
-    latest of each dialogue under each of `conditions`, fp16's screening's,
-    as the module describes; a ValueError naming what is missing."""
-    screening = last_screening(entries, model, anchor_seed, turns=turns,
-                               passage_tokens=passage_tokens)
+    latest of each dialogue under each of `conditions`, as the module
+    describes: fp16's are screening's, which make no plan and so are of
+    any plan seed, and the others' at `plan_seed`. A ValueError naming what
+    is missing."""
+    screening = last_screening(entries, of)
     kept = screening["results"]["kept"]
     latest = {}
     for e in entries:
+        if e["kind"] != KIND or not of.holds(e):
+            continue
         c = e["config"]
-        if (e["kind"] == KIND and _matches(e, model, anchor_seed, turns, passage_tokens)
-                and c["plan_seed"] == plan_seed
-                and bool(c.get("screening")) == (c["condition"]["name"] == "fp16")):
+        fp16 = c["condition"]["name"] == "fp16"
+        if bool(c.get("screening")) == fp16 and (fp16 or c["plan_seed"] == plan_seed):
             latest[(c["sample_id"], c["condition"]["name"])] = e
-    missing = [(s, n) for n in conditions for s in kept if (s, n) not in latest]
+    missing = [(s, name) for name in conditions for s in kept if (s, name) not in latest]
     if missing:
         raise ValueError(f"no run of {len(missing)} dialogues' conditions, such as "
                          f"{missing[:3]}; run tools/anchors.py for them")
     rng = np.random.default_rng(SEED)
-    runs_of = {n: [latest[(s, n)] for s in kept] for n in conditions}
-    right = {n: np.array([e["results"]["correct"] for e in runs_of[n]]) for n in conditions}
+    runs_of = {name: [latest[(s, name)] for s in kept] for name in conditions}
+    right = {name: np.array([e["results"]["correct"] for e in runs_of[name]])
+             for name in conditions}
     gap_of = np.array([latest[(s, conditions[0])]["config"]["gap"] for s in kept])
     recall = {}
-    for n in conditions:
-        r, entries_n = right[n], runs_of[n]
+    for name in conditions:
+        answered, condition_runs = right[name], runs_of[name]
         by_gap = {}
-        for gap in gaps(turns):
-            at = r[gap_of == gap]
+        for gap in gaps(of.turns):
+            at = answered[gap_of == gap]
             if len(at):
                 by_gap[gap_name(gap)] = {"correct": int(at.sum()), "n": len(at),
                                          "recall": float(at.mean()),
                                          "wilson_95": list(rq3_summary.wilson(int(at.sum()),
                                                                               len(at)))}
-        tiers = Counter()
-        for e in entries_n:
-            tiers.update(e["results"]["fact_page_tiers"])
-        held = sum(tiers.values())
-        recall[n] = {
-            "correct": int(r.sum()), "n": len(r), "recall": float(r.mean()),
-            "bootstrap_95": [float(v) for v in rq3_summary.bootstrap(r[None, :], rng)[0]],
-            "wilson_95": list(rq3_summary.wilson(int(r.sum()), len(r))), "by_gap": by_gap,
+        recall[name] = {
+            "correct": int(answered.sum()), "n": len(answered),
+            "recall": float(answered.mean()),
+            "bootstrap_95": [float(v)
+                             for v in rq3_summary.bootstrap(answered[None, :], rng)[0]],
+            "wilson_95": list(rq3_summary.wilson(int(answered.sum()), len(answered))),
+            "by_gap": by_gap,
             "effective_bits": float(np.mean([e["results"]["effective_bits"]
-                                             for e in entries_n])),
-            "fact_page_tiers": {t: k / held for t, k in sorted(tiers.items())},
-            "code_echoed": sum(1 for e in entries_n if e["results"]["code_echoed"])}
-    paired = {}
+                                             for e in condition_runs])),
+            "fact_page_tiers": rq3_summary.pooled_tiers(condition_runs, "fact_page_tiers"),
+            "code_echoed": sum(1 for e in condition_runs if e["results"]["code_echoed"])}
+    pairs = {}
     for share in rq3_summary.LEVELS:
         names = {c.source: c.name for c in rq3.CONDITIONS if c.share == share}
         if names["semantic"] not in conditions:
             continue
-        paired[rq3_summary.level_name(share)] = {
+        pairs[rq3_summary.level_name(share)] = {
             f"semantic-{other}": rq3_summary.paired(right[names["semantic"]],
                                                     right[names[other]], rng)
             for other in rq3_summary.OTHER_SOURCES if names[other] in conditions}
-    return {"model": model, "anchor_seed": anchor_seed, "plan_seed": plan_seed,
-            "turns": turns, "passage_tokens": passage_tokens, "dialogues": len(kept),
+    return {"model": of.model, **of.config(), "plan_seed": plan_seed,
+            "dialogues": len(kept),
             "bootstrap": {"resamples": rq3_summary.RESAMPLES, "seed": SEED},
-            "recall": recall, "paired": paired, "screening": screening["sha256"],
-            "commits": sorted({e["git_commit"] for n in conditions for e in runs_of[n]}),
-            "entries": [e["sha256"] for n in conditions for e in runs_of[n]]}
+            "recall": recall, "paired": pairs, "screening": screening["sha256"],
+            "commits": sorted({e["git_commit"] for name in conditions for e in runs_of[name]}),
+            "entries": [e["sha256"] for name in conditions for e in runs_of[name]]}

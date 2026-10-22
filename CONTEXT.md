@@ -442,7 +442,9 @@ turn opens with a **fact**, a needle stated as "Note for later: ...". After
 the last turn a controlled plan is applied, and the question asks for the
 fact back, scored as a needle answer is. Its **gap** is the turns between
 the fact's turn and the question, 0 to 9. The fact's positions depend on
-the replies before it, so a run records them.
+the replies before it, so a run records them. Its **recall** is the share
+of dialogues whose answer holds the fact's code, what a needle's accuracy
+is; #154 names it so.
 _Avoid_: depth (that is a needle's place in one document), distance (it
 reads as positions, not turns)
 

@@ -106,6 +106,9 @@ def test_the_dialogue_is_about_8k_positions_and_the_fact_outside_the_recency_flo
 
 # -- the log -------------------------------------------------------------------------------
 
+SET = anchors.AnchorSet("m")
+
+
 def entry(log, sample_id, name, correct, *, gap=0, screening=False, seed=154, plan_seed=0,
           turns=10, tiers=None, echoed=()):
     config = {"sample_id": sample_id, "gap": gap, "condition": {"name": name},
@@ -130,27 +133,27 @@ def screening(log, kept, *, complete=True, seed=154):
 
 def test_the_runs_logged_at_the_same_code_are_taken_up(tmp_path):
     log = tmp_path / "benchmark.jsonl"
-    assert anchors.logged("m", 154, "any", log) == {}
+    assert anchors.logged(SET, "any", log) == {}
     entry(log, "g0-0", "fp16", True, screening=True)
     entry(log, "g0-0", "semantic-80", False)
     entry(log, "g0-1", "semantic-80", True, seed=155)
     entry(log, "g0-2", "semantic-80", True, turns=3)
     entry(log, "g0-3", "semantic-80", True, plan_seed=1)
     commit = benchlog.read(log)[0]["git_commit"]
-    assert anchors.logged("m", 154, commit, log) == {("g0-0", "semantic-80"): False}
-    assert anchors.logged("m", 154, commit, log, screening=True) == {("g0-0", "fp16"): True}
-    assert anchors.logged("m", 154, "another commit", log) == {}
+    assert anchors.logged(SET, commit, log) == {("g0-0", "semantic-80"): False}
+    assert anchors.logged(SET, commit, log, screening=True) == {("g0-0", "fp16"): True}
+    assert anchors.logged(SET, "another commit", log) == {}
 
 
 def test_the_screened_set_is_the_last_complete_screening_s(tmp_path):
     log = tmp_path / "benchmark.jsonl"
     with pytest.raises(ValueError, match="anchor-screening"):
-        anchors.last_screening([], "m", 154)
+        anchors.last_screening([], SET)
     screening(log, ["g0-0"])
     screening(log, ["g0-1"])
     screening(log, ["g0-2"], complete=False)
     screening(log, ["g0-3"], seed=155)
-    assert anchors.last_screening(benchlog.read(log), "m", 154)["results"]["kept"] == ["g0-1"]
+    assert anchors.last_screening(benchlog.read(log), SET)["results"]["kept"] == ["g0-1"]
 
 
 def test_the_screening_screens_by_gap():
@@ -159,13 +162,13 @@ def test_the_screening_screens_by_gap():
             self.gap, self.sample_id = gap, f"g{gap}-{k}"
 
     drawn = [Fake(g, k) for g in range(10) for k in range(7)]
-    kept, rejected = rq3.screen(drawn, lambda d: d.sample_id != "g3-1", groups=anchors.gaps(),
-                                group=lambda d: d.gap)
+    kept, rejected = rq3.screen(drawn, lambda d: d.sample_id != "g3-1",
+                                grouping=anchors.by_gap())
     assert [d.sample_id for d in kept if d.gap == 3] == ["g3-0", "g3-2", "g3-3", "g3-4", "g3-5"]
     assert [d.sample_id for d in rejected] == ["g3-1"]
     with pytest.raises(rq3.ShortScreening, match=r"gaps short .*\(4 turns: 2\)"):
-        rq3.screen(drawn, lambda d: d.gap != 4 or d.sample_id < "g4-2", groups=anchors.gaps(),
-                   group=lambda d: d.gap, label=anchors.gap_name, named="gaps")
+        rq3.screen(drawn, lambda d: d.gap != 4 or d.sample_id < "g4-2",
+                   grouping=anchors.by_gap())
 
 
 def test_the_summary_gives_recall_by_gap_and_pairs_semantic_by_dialogue(tmp_path):
@@ -179,7 +182,7 @@ def test_the_summary_gives_recall_by_gap_and_pairs_semantic_by_dialogue(tmp_path
         entry(log, s, "uniform-80", gap < 2, gap=gap, tiers={"INT2": 28})
     entry(log, "g9-0", "uniform-80", True, gap=9, screening=True)  # screening's is not pooled
     conds = ["fp16", "semantic-80", "uniform-80"]
-    s = anchors.summarise(benchlog.read(log), "m", 154, conditions=conds)
+    s = anchors.summarise(benchlog.read(log), SET, conditions=conds)
     assert s["dialogues"] == 50 and len(s["entries"]) == 150
     semantic = s["recall"]["semantic-80"]
     assert (semantic["correct"], semantic["n"]) == (40, 50) and semantic["code_echoed"] == 1
@@ -189,8 +192,14 @@ def test_the_summary_gives_recall_by_gap_and_pairs_semantic_by_dialogue(tmp_path
     pair = s["paired"]["80%"]["semantic-uniform"]
     assert (pair["semantic_only"], pair["other_only"]) == (30, 0) and pair["mcnemar_p"] < 1e-6
     assert "semantic-random" not in s["paired"]["80%"] and "70%" not in s["paired"]
+    # screening's fp16 runs make no plan: they stand at any plan seed
+    for name in ("semantic-80", "uniform-80"):
+        for d in kept:
+            entry(log, d, name, True, gap=int(d[1]), plan_seed=1)
+    again = anchors.summarise(benchlog.read(log), SET, plan_seed=1, conditions=conds)
+    assert again["recall"]["fp16"]["correct"] == again["recall"]["uniform-80"]["correct"] == 50
     with pytest.raises(ValueError, match="random-80"):
-        anchors.summarise(benchlog.read(log), "m", 154, conditions=[*conds, "random-80"])
+        anchors.summarise(benchlog.read(log), SET, conditions=[*conds, "random-80"])
 
 
 # -- through the engine --------------------------------------------------------------------

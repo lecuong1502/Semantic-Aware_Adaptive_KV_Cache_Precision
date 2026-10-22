@@ -89,7 +89,7 @@ def main(argv: list[str]) -> int:
         return results["correct"]
 
     try:
-        kept, rejected = rq3.screen(drawn, is_right, per_depth=args.per_depth)
+        kept, rejected = rq3.screen(drawn, is_right, per_group=args.per_depth)
         short = None
     except rq3.ShortScreening as failed:
         kept, rejected, short = failed.kept, failed.rejected, failed
