@@ -208,8 +208,12 @@ enough that nobody is tempted to skip it.
 
 While working, `pytest` skips the tests marked `slow`: those that decode a
 real model or time real work, 5 s or more each, among them the correctness
-gate (ADR-0006). Run `pytest --runslow` before pushing, which runs them all.
-Mark a new test `@pytest.mark.slow` if it takes 5 s or more.
+gate (ADR-0006). Run `pytest --runslow` before pushing, which runs them,
+about seven minutes in all. Mark a new test `@pytest.mark.slow` if it takes
+5 s or more, and `@pytest.mark.slowest` instead if it takes 10 s or more:
+`pytest --runslowest` runs those too, every test, before a milestone is
+closed and after a change to what they cover, the engine's adaptation
+under pressure, its upgrades and emergencies above all.
 
 ### The two guards
 

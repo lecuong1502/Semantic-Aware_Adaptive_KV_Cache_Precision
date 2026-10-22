@@ -338,18 +338,27 @@ def screen(samples: Sequence, is_right: Callable[[needles.Sample], bool],
     return kept, rejected
 
 
+def last_screening(entries: Sequence[dict], model: str, needle_seed: int,
+                   haystack_tokens: int) -> dict:
+    """The last complete needle-screening entry in `entries` for `model` and
+    the set of `needle_seed` and `haystack_tokens`; a ValueError if there is
+    none."""
+    found = [e for e in entries if e["kind"] == "needle-screening"
+             and e["model"] == model and e["config"]["needle_seed"] == needle_seed
+             and e["config"]["haystack_tokens"] == haystack_tokens
+             and e["results"].get("complete", True)]
+    if not found:
+        raise ValueError(f"no complete needle-screening logged for {model} at seed "
+                         f"{needle_seed} over haystacks of {haystack_tokens} tokens; run "
+                         f"tools/screen_needles.py")
+    return found[-1]
+
+
 def screened(model: str, needle_seed: int, haystack_tokens: int,
              log: str | Path = benchlog.DEFAULT_LOG) -> tuple[list[str], int]:
     """The screened set's sample ids, for `model` and the set of
     `needle_seed` and `haystack_tokens`, from the last complete
     needle-screening entry logged for them, and the samples a depth it was
     drawn with, which gives those ids their samples."""
-    entries = [e for e in benchlog.read(log) if e["kind"] == "needle-screening"
-               and e["model"] == model and e["config"]["needle_seed"] == needle_seed
-               and e["config"]["haystack_tokens"] == haystack_tokens
-               and e["results"].get("complete", True)]
-    if not entries:
-        raise ValueError(f"no complete needle-screening logged for {model} at seed "
-                         f"{needle_seed} over haystacks of {haystack_tokens} tokens; run "
-                         f"tools/screen_needles.py")
-    return entries[-1]["results"]["kept"], entries[-1]["config"]["draws"]
+    entry = last_screening(benchlog.read(log), model, needle_seed, haystack_tokens)
+    return entry["results"]["kept"], entry["config"]["draws"]

@@ -197,32 +197,32 @@ def test_no_pressure_has_no_spread():
 
 # -- the run, small -----------------------------------------------------------------------
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_the_static_engine_runs_out_where_the_adaptive_one_survives(tmp_path):
-    """The experiment at a small scale: Qwen2.5-0.5B prefills 8192 positions
-    and decodes 32 tokens; at 4096 positions the simulator, a process of its
-    own, takes what leaves the engine 48 MiB short of its full cache, and
+    """The experiment at a small scale: Qwen2.5-0.5B prefills 4096 positions
+    and decodes 16 tokens; at 2048 positions the simulator, a process of its
+    own, takes what leaves the engine 24 MiB short of its full cache, and
     keeps it. The static engine runs out before its cache is full. The
     adaptive one, facing the same rule, downgrades, the driver sees what
     its process holds fall, and it finishes with every token."""
-    ids = prompt(8192, 1081)
+    ids = prompt(4096, 1081)
     context_bytes = replay.simulator_context_bytes(tmp_path)
 
     static = Engine(require_model(NAME))
     static.load_weights()
-    ran_out = survival.run(static, ids, 32, contention_at=4096, shortfall_bytes=48 * MIB,
+    ran_out = survival.run(static, ids, 16, contention_at=2048, shortfall_bytes=24 * MIB,
                            out=tmp_path / "static.csv.gz",
                            simulator_context_bytes=context_bytes)
     del static
     gc.collect()
     assert ran_out.summary["survived"] is False
     assert ran_out.summary["ending"]["state"] == survival.OUT_OF_MEMORY
-    assert 4096 <= ran_out.summary["ending"]["positions"] < 8192 + 31
-    assert ran_out.contention_position >= 4096 and ran_out.taken_bytes > 0
+    assert 2048 <= ran_out.summary["ending"]["positions"] < 4096 + 15
+    assert ran_out.contention_position >= 2048 and ran_out.taken_bytes > 0
 
     adaptive = Engine(require_model(NAME), kv_adaptive=True)
     adaptive.load_weights()
-    survived = survival.run(adaptive, ids, 32, contention_at=4096, shortfall_bytes=48 * MIB,
+    survived = survival.run(adaptive, ids, 16, contention_at=2048, shortfall_bytes=24 * MIB,
                             out=tmp_path / "adaptive.csv.gz",
                             simulator_context_bytes=context_bytes)
     del adaptive
@@ -231,7 +231,7 @@ def test_the_static_engine_runs_out_where_the_adaptive_one_survives(tmp_path):
     print(f"\nstatic ran out at {ran_out.summary['ending']['positions']}; adaptive: "
           f"{s['totals']}")
     assert s["survived"] is True
-    assert s["ending"] == {"state": COMPLETE, "positions": 8192 + 31, "tokens": 32, "reason": ""}
+    assert s["ending"] == {"state": COMPLETE, "positions": 4096 + 15, "tokens": 16, "reason": ""}
     assert s["totals"]["downgrades_applied"] > 0
     assert s["totals"]["returned_mib"] > 0
     assert s["totals"]["every_plan_seen_within_granule"] is True

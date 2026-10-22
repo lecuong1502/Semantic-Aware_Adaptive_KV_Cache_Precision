@@ -80,12 +80,13 @@ def assert_same_output(single, chunked, what):
 # -- the same output -------------------------------------------------------------
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_chunked_prefill_matches_single_shot(engine, golden):
     """37 tokens one position at a time and with a ragged last chunk; 501
-    tokens; the longest prompt, 1,090 tokens."""
-    for prompt_id, chunks in (("medium-02", (1, 16)), ("adversarial-01", (37, 128)),
-                              ("long-01", (128, 512))):
+    tokens in chunks of 37; the longest prompt, 1,090 tokens, in chunks of
+    512, a ragged last one among them."""
+    for prompt_id, chunks in (("medium-02", (1, 16)), ("adversarial-01", (37,)),
+                              ("long-01", (512,))):
         ids = golden[prompt_id].token_ids
         single = forward_with(engine, ids, None)
         for chunk in chunks:

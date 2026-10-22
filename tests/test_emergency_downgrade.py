@@ -191,7 +191,7 @@ def device_full(engine, new, monkeypatch):
     return out, before, nvml.settled_own_used_bytes()
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_a_full_device_is_recovered_from_by_an_emergency_plan(engine, monkeypatch):
     """The device filled mid decode, the next granule the cache needs is
     refused by the driver: the emergency plan's first downgrades go into
@@ -206,7 +206,7 @@ def test_a_full_device_is_recovered_from_by_an_emergency_plan(engine, monkeypatc
     assert engine.ending.state == COMPLETE and len(out) == 384
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_a_full_device_with_no_spares_ends_the_generation_exhausted(engine, monkeypatch):
     """Without the spare granules the emergency plan cannot start, its first
     downgrade refused a granule: the generation ends exhausted, with its

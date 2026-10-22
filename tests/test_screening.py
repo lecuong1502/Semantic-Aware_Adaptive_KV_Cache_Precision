@@ -10,21 +10,14 @@ Seams: the screening, pure; the screened set read from the log; and
 tools/screen_needles.py through the engine (Seam A).
 """
 
-import importlib.util
 from pathlib import Path
 
 import pytest
 
+from conftest import load_tool
 from microinfer import benchlog, needles, rq3
 
 REPO = Path(__file__).resolve().parent.parent
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(name, REPO / "tools" / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 class Fake:
@@ -107,7 +100,7 @@ def fp16_entry(log, sample_id, correct, *, screening=True, seed=140, haystack=10
 
 
 def test_a_rerun_at_the_same_commit_takes_the_fp16_runs_already_logged(tmp_path):
-    tool = load("screen_needles")
+    tool = load_tool("screen_needles")
     log = tmp_path / "benchmark.jsonl"
     fp16_entry(log, "d00-0", True)
     fp16_entry(log, "d00-1", False)
@@ -121,14 +114,24 @@ def test_a_rerun_at_the_same_commit_takes_the_fp16_runs_already_logged(tmp_path)
 
 @pytest.mark.slow
 def test_the_tool_logs_each_fp16_run_and_the_screened_set(tmp_path, monkeypatch):
-    """One a depth on Qwen2.5-0.5B over short haystacks: an FP16 entry for
-    each sample run, and one screening entry whose kept samples were all
-    answered correctly."""
-    tool = load("screen_needles")
+    """One a depth over short haystacks, Qwen2.5-0.5B's tokenizer drawing
+    them: an FP16 entry for each sample run, and one screening entry whose
+    kept samples were all answered correctly. The runs themselves are
+    stood in for, d00-0 and d40-0 answered wrongly: a run through the engine
+    is tests/test_rq3.py's."""
+    tool = load_tool("screen_needles")
     log = tmp_path / "benchmark.jsonl"
     real = benchlog.environment  # this test runs on a tree being changed
     monkeypatch.setattr(tool.benchlog, "environment",
                         lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    monkeypatch.setattr(tool.Engine, "load_weights", lambda engine: None)
+
+    def run(engine, sample, cond, experiment, plan_seed=0):
+        assert cond.name == "fp16" and experiment == "question-blind"
+        right = sample.sample_id not in ("d00-0", "d40-0")
+        return {"answer": "", "correct": right, "tier_shares": {"FP16": 1.0}}
+
+    monkeypatch.setattr(tool.rq3, "run", run)
     assert tool.main(["--issue", "148", "--model", "qwen2.5-0.5b-instruct", "--per-depth", "1",
                       "--haystack-tokens", "1024", "--log", str(log)]) == 0
     entries = benchlog.read(log)
@@ -136,16 +139,17 @@ def test_the_tool_logs_each_fp16_run_and_the_screened_set(tmp_path, monkeypatch)
     (screening,) = [e for e in entries if e["kind"] == "needle-screening"]
     right = {e["config"]["sample_id"] for e in runs if e["results"]["correct"]}
     kept, rejected = screening["results"]["kept"], screening["results"]["rejected"]
-    assert len(kept) == 10 and set(kept) <= right and not set(rejected) & right
+    assert len(kept) == 10 and set(kept) <= right and rejected == ["d00-0", "d40-0"]
     assert {e["config"]["sample_id"] for e in runs} == set(kept) | set(rejected)
-    assert all(e["config"]["condition"]["name"] == "fp16" for e in runs)
+    assert all(e["config"]["condition"]["name"] == "fp16" and e["config"]["screening"]
+               for e in runs)
 
 
 @pytest.mark.slow
 def test_the_rq3_tool_runs_the_screened_set(tmp_path, monkeypatch):
     """--screened runs the samples the last screening kept, drawn as many a
     depth as it drew them: d50-6 exists only in a set of 8 a depth."""
-    tool = load("rq3")
+    tool = load_tool("rq3")
     log = tmp_path / "benchmark.jsonl"
     name = "qwen2.5-0.5b-instruct"
     screening_entry(log, 140, ["d50-6"], ["d50-0"], model=name)
@@ -168,7 +172,7 @@ def test_the_rq3_tool_runs_the_screened_set(tmp_path, monkeypatch):
 def test_the_screened_set_s_fp16_runs_are_screening_s():
     """Screening ran the screened set at FP16 already: --screened leaves
     fp16 out unless it is asked for."""
-    tool = load("rq3")
+    tool = load_tool("rq3")
     assert tool.conditions_for(None, screened=True) == [
         c.name for c in rq3.CONDITIONS if c.name != "fp16"]
     assert tool.conditions_for(None, screened=False) == [c.name for c in rq3.CONDITIONS]

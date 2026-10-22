@@ -28,4 +28,5 @@ build-dir = "build/{wheel_tag}"
 testpaths = ["tests"]
 markers = [
     "slow: decodes a real model or times real work, 5 s or more; run with --runslow",
+    "slowest: a slow test of 10 s or more; run with --runslowest",
 ]

@@ -74,7 +74,7 @@ def test_a_simulated_red_makes_the_engine_return_memory_the_driver_sees():
     assert abs(seen - returned) <= _microinfer.granule_bytes()
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_at_yellow_no_step_is_delayed_beyond_the_budget():
     """YELLOW: the plan is applied over several steps, each step's planning
     and downgrades within the budget, the batches one after another, until
@@ -171,7 +171,7 @@ def test_pressure_that_persists_is_planned_for_again_as_pages_are_sealed():
     assert all(int(p.plan.pages.min()) > newest for p in later)
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_real_contention_makes_the_engine_downgrade():
     """Not a monitor told what to read: the contention simulator, a process
     of its own, takes device memory mid-decode until headroom by NVML is

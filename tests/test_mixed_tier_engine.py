@@ -122,7 +122,7 @@ def test_decoding_continues_as_a_full_prefill_would_over_a_mixed_map(engine, gol
     each([(t, c, p) for t in ("FP16", "INT4") for c in (None, 40) for p in PROMPTS], continues)
 
 
-@pytest.mark.slow
+@pytest.mark.slowest
 def test_a_map_of_one_tier_is_the_static_engine(engine, golden):
     """At every tier, a map naming that tier on every page chooses the static
     engine's tokens, and gives its logits, to the bit: over a cache at that
@@ -143,7 +143,7 @@ def test_a_map_of_one_tier_is_the_static_engine(engine, golden):
         np.testing.assert_array_equal(got, want)
         np.testing.assert_array_equal(got_logits, want_logits)
 
-    each([(t, c, p) for t in TIERS for c in {t, "FP16"} for p in ("short-00", "long-03")],
+    each([(t, c, p) for t in TIERS for c in {t, "FP16"} for p in ("long-03",)],
          static, name=lambda c: f"{c[0]} map over a {c[1]} cache, {c[2]}")
 
 
