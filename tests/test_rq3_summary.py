@@ -10,23 +10,16 @@ Seams: the statistics, pure; the summary of a log's entries; and
 tools/summarise_rq3.py, which logs it with the hashes of what it pooled.
 """
 
-import importlib.util
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from conftest import load_tool
 from microinfer import benchlog, needles, rq3, rq3_summary
 
 REPO = Path(__file__).resolve().parent.parent
 MODEL = "qwen2.5-1.5b-instruct"
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(name, REPO / "tools" / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 # -- the statistics ------------------------------------------------------------------------
@@ -63,19 +56,21 @@ def test_the_wilson_interval_stays_open_at_the_ceiling():
 SAMPLES = [f"d{d:02d}-{k}" for d in range(0, 100, 10) for k in range(5)]
 
 
-def entries(tmp_path, outcome, *, aware=True, extra=()):
+def entries(tmp_path, outcome, *, aware=True, extra=(), wrong_extra=False):
     """A log of a screening and a run under every condition, each answered
-    as `outcome(sample_id, experiment, condition)` says."""
+    as `outcome(sample_id, experiment, condition)` says, then the `extra`
+    runs, (sample, experiment, condition[, screening]), answered wrongly if
+    `wrong_extra`."""
     log = tmp_path / "benchmark.jsonl"
     # 750 entries of a log thrown away: the machine read once, and no fsync
     with pytest.MonkeyPatch.context() as patch:
         once = benchlog.environment(log)
         patch.setattr(benchlog, "environment", lambda log=None: dict(once))
         patch.setattr(benchlog.os, "fsync", lambda fd: None)
-        return _append(log, outcome, aware, extra)
+        return _append(log, outcome, aware, extra, wrong_extra)
 
 
-def _append(log, outcome, aware, extra):
+def _append(log, outcome, aware, extra, wrong_extra):
     benchlog.append("needle-screening", model=MODEL, context_length=8000,
                     precision_tiers={"FP16": 1.0},
                     config={"needle_seed": 140, "draws": 15, "haystack_tokens": 7936},
@@ -83,15 +78,17 @@ def _append(log, outcome, aware, extra):
     runs = [(s, "question-blind", c.name) for s in SAMPLES for c in rq3.CONDITIONS]
     if aware:
         runs += [(s, "question-aware", c) for s in SAMPLES for c in rq3.SOURCE_CONDITIONS]
-    for sample_id, experiment, name in [*runs, *extra]:
+    for i, (sample_id, experiment, name, *screening) in enumerate([*runs, *extra]):
         cond = rq3.condition(name)
+        is_extra = i >= len(runs)
         benchlog.append(
             "rq3-needle", model=MODEL, context_length=8000, precision_tiers={"FP16": 1.0},
             config={"sample_id": sample_id, "depth": int(sample_id[1:3]) / 100,
                     "condition": {"name": name}, "experiment": experiment,
                     "needle_seed": 140, "plan_seed": 0, "haystack_tokens": 7936,
-                    "screening": name == "fp16"},
-            results={"correct": outcome(sample_id, experiment, name),
+                    "screening": screening[0] if screening else name == "fp16"},
+            results={"correct": not (is_extra and wrong_extra)
+                     and outcome(sample_id, experiment, name),
                      "effective_bits": {"fp16": 16.0, "static-int4": 4.625,
                                         "static-int2": 2.625}.get(name, 3.4 if cond.share == 0.8
                                                                   else 4.98),
@@ -107,7 +104,11 @@ def test_accuracy_by_condition_level_and_depth(tmp_path):
     blind = summary["accuracy"]["question-blind"]
     assert list(blind) == [c.name for c in rq3.CONDITIONS]
     assert blind["static-int2"]["correct"] == 48 and blind["static-int2"]["n"] == 50
-    assert blind["static-int2"]["by_depth"]["20%"] == 3 and blind["static-int2"]["by_depth"]["0%"] == 5
+    at_20 = blind["static-int2"]["by_depth"]["20%"]
+    assert (at_20["correct"], at_20["n"], at_20["accuracy"]) == (3, 5, 0.6)
+    assert at_20["bootstrap_95"][0] < 0.6 < at_20["bootstrap_95"][1]
+    assert at_20["wilson_95"][0] < 0.6 < at_20["wilson_95"][1]
+    assert blind["static-int2"]["by_depth"]["0%"]["correct"] == 5
     assert blind["uniform-80"]["accuracy"] == pytest.approx(0.98)
     assert blind["fp16"]["bootstrap_95"] == [1.0, 1.0]
     assert blind["semantic-80"]["effective_bits"] == pytest.approx(3.4)
@@ -134,7 +135,9 @@ def test_semantic_is_paired_by_sample_against_uniform_and_random(tmp_path):
     assert set(summary["paired"]["question-blind"]["70%"]) == {"semantic-uniform", "semantic-random"}
     closing = summary["closing"]
     assert closing["experiment"] == "question-blind" and closing["level"] == "80%"
-    assert closing["semantic_beats_uniform"] is True and closing["mcnemar_p"] < closing["alpha"]
+    assert closing["semantic_beats_uniform"] is True
+    assert closing["mcnemar_p"] < closing["significance"] == rq3_summary.SIGNIFICANCE
+    assert (closing["semantic_only"], closing["uniform_only"]) == (10, 1)
 
 
 def test_a_null_result_is_the_answer(tmp_path):
@@ -146,7 +149,13 @@ def test_a_null_result_is_the_answer(tmp_path):
     closing = summary["closing"]
     assert closing["semantic_correct"] == 50 and closing["uniform_correct"] == 49
     assert closing["mcnemar_p"] == 1.0 and closing["semantic_beats_uniform"] is False
-    assert "no" in closing["answer"].lower()
+    assert closing["answer"].startswith("No:")
+    assert closing["fewest_discordant_to_reject"] == 6
+
+
+def test_six_discordant_samples_all_one_way_are_the_fewest_the_test_rejects_on():
+    assert rq3_summary.mcnemar(5, 0) > 0.05 > rq3_summary.mcnemar(6, 0)
+    assert rq3_summary.fewest_to_reject() == 6
 
 
 def test_the_latest_run_of_a_sample_counts_and_every_one_is_named_by_its_hash(tmp_path):
@@ -169,6 +178,27 @@ def test_the_latest_run_of_a_sample_counts_and_every_one_is_named_by_its_hash(tm
     assert len(pooled) == 50 * (len(rq3.CONDITIONS) + len(rq3.SOURCE_CONDITIONS))
 
 
+def test_fp16_is_screening_s_and_no_other_condition_is(tmp_path):
+    """An FP16 run not screening's, a check run later, stands for no sample:
+    FP16 is credited with the runs the screened set was kept on. Nor does a
+    run of another condition marked as screening's count."""
+    later = [("d10-0", "question-blind", "fp16", False),
+             ("d10-0", "question-blind", "uniform-80", True)]
+    log = entries(tmp_path, lambda s, x, c: True, extra=later,
+                  wrong_extra=True)
+    summary = rq3_summary.summarise(log, MODEL, 140, 7936)
+    assert log[-2]["sha256"] not in summary["entries"]
+    assert log[-1]["sha256"] not in summary["entries"]
+    blind = summary["accuracy"]["question-blind"]
+    assert blind["fp16"]["correct"] == blind["uniform-80"]["correct"] == 50
+
+
+def test_the_summary_answers_the_closing_question_always(tmp_path):
+    log = entries(tmp_path, lambda s, x, c: True)
+    with pytest.raises(ValueError, match="closing"):
+        rq3_summary.summarise(log, MODEL, 140, 7936, experiments=["question-aware"])
+
+
 def test_a_missing_run_is_refused(tmp_path):
     log = entries(tmp_path, lambda s, x, c: True, aware=False)
     with pytest.raises(ValueError, match="question-aware"):
@@ -181,21 +211,25 @@ def test_a_missing_run_is_refused(tmp_path):
 
 
 def test_the_repository_log_answers_the_closing_question():
-    """#149, #150 and #151's runs, as logged: the closing counts are the
-    logged outcomes of the screened set, counted directly."""
+    """#148 to #151's runs, as logged: the closing counts are #149's
+    outcomes, counted by issue rather than by the summary's latest-run rule,
+    and every FP16 run pooled is screening's."""
     log = benchlog.read()
     summary = rq3_summary.summarise(log, MODEL, 140, needles.DEFAULT_HAYSTACK_TOKENS)
     kept, _ = rq3.screened(MODEL, 140, needles.DEFAULT_HAYSTACK_TOKENS)
-    blind = {(e["config"]["sample_id"], e["config"]["condition"]["name"]): e["results"]["correct"]
-             for e in log if e["kind"] == "rq3-needle" and e["model"] == MODEL
-             and e["config"]["experiment"] == "question-blind"}
+    by_issue = {(e["config"]["sample_id"], e["config"]["condition"]["name"]):
+                e["results"]["correct"]
+                for e in log if e["kind"] == "rq3-needle" and e["config"].get("issue") == 149}
     closing = summary["closing"]
-    assert closing["semantic_correct"] == sum(blind[(s, "semantic-80")] for s in kept)
-    assert closing["uniform_correct"] == sum(blind[(s, "uniform-80")] for s in kept)
+    assert closing["semantic_correct"] == sum(by_issue[(s, "semantic-80")] for s in kept)
+    assert closing["uniform_correct"] == sum(by_issue[(s, "uniform-80")] for s in kept)
+    pooled = set(summary["entries"])
+    fp16 = [e for e in log if e["sha256"] in pooled and e["config"]["condition"]["name"] == "fp16"]
+    assert len(fp16) == 50 and all(e["config"]["screening"] for e in fp16)
 
 
 def test_the_tool_logs_the_summary(tmp_path, monkeypatch):
-    tool = load("summarise_rq3")
+    tool = load_tool("summarise_rq3")
     entries(tmp_path, lambda s, x, c: True)
     log = tmp_path / "benchmark.jsonl"
     real = benchlog.environment  # this test runs on a tree being changed

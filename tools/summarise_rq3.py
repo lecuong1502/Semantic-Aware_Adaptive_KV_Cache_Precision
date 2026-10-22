@@ -3,11 +3,12 @@
 
     .venv/bin/python tools/summarise_rq3.py --issue 152
 
-Reads the benchmark log, pools the screened set's runs (microinfer.rq3_summary):
-accuracy by condition, level and depth with bootstrap 95% intervals, and
-McNemar's test of semantic against uniform and against random, paired by
-sample. Logs the summary as an "rq3-summary" entry naming, by their hashes,
-the screening and every run it pooled, and prints it as tables with the
+Verifies the benchmark log's chain, then pools the screened set's runs
+(microinfer.rq3_summary): accuracy by condition, level and depth with
+bootstrap 95% intervals, and McNemar's test of the semantic source against
+uniform and against random, paired by sample. Logs the summary as an
+"rq3-summary" entry naming, by their hashes, the screening and every run it
+pooled, and prints it as tables, by condition and by depth, with the
 closing question's answer, whatever it is. Refuses a dirty tree.
 """
 
@@ -45,6 +46,7 @@ def main(argv: list[str]) -> int:
         parser.error("tracked files have uncommitted changes; commit first, so that the "
                      "entry names the code that produced it")
 
+    benchlog.verify(args.log)  # the hashes the summary names are of the entries as appended
     try:
         summary = rq3_summary.summarise(benchlog.read(args.log), args.model, args.needle_seed,
                                         args.haystack_tokens, plan_seed=args.plan_seed,
@@ -66,6 +68,12 @@ def main(argv: list[str]) -> int:
             print(f"| {name} | {a['correct']}/{a['n']} | {interval(a['bootstrap_95'])} "
                   f"| {interval(a['wilson_95'])} | {a['effective_bits']:.2f} "
                   f"| {a['needle_page_tiers'].get('INT2', 0):.0%} |")
+        depths = list(next(iter(conditions.values()))["by_depth"])
+        print(f"\n| Condition | {' | '.join(depths)} |")
+        print(f"|---|{'---|' * len(depths)}")
+        for name, a in conditions.items():
+            cells = " | ".join(f"{d['correct']}/{d['n']}" for d in a["by_depth"].values())
+            print(f"| {name} | {cells} |")
         print("\n| Level | Pair | Only semantic | Only other | McNemar p "
               "| Difference, bootstrap 95% |")
         print("|---|---|---|---|---|---|")
@@ -74,8 +82,7 @@ def main(argv: list[str]) -> int:
                 print(f"| {level} | {pair} | {p['semantic_only']} | {p['other_only']} "
                       f"| {p['mcnemar_p']:.3g} | {p['difference']:+.2f} "
                       f"{interval(p['difference_bootstrap_95'])} |")
-    if summary["closing"] is not None:
-        print(f"\n**{summary['closing']['question']}**\n\n{summary['closing']['answer']}.")
+    print(f"\n**{summary['closing']['question']}**\n\n{summary['closing']['answer']}.")
     return 0
 
 

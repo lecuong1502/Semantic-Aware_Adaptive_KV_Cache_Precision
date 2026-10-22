@@ -6,6 +6,7 @@ file that is complete.
 """
 
 import gc
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,15 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip)
+
+
+def load_tool(name: str):
+    """A script of tools/, as a module, for its main() and helpers."""
+    path = Path(__file__).resolve().parent.parent / "tools" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def require_model(name: str) -> Path:

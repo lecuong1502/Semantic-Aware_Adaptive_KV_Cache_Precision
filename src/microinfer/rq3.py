@@ -341,7 +341,8 @@ def screen(samples: Sequence, is_right: Callable[[needles.Sample], bool],
 def last_screening(entries: Sequence[dict], model: str, needle_seed: int,
                    haystack_tokens: int) -> dict:
     """The last complete needle-screening entry in `entries` for `model` and
-    the set of `needle_seed` and `haystack_tokens`."""
+    the set of `needle_seed` and `haystack_tokens`; a ValueError if there is
+    none."""
     found = [e for e in entries if e["kind"] == "needle-screening"
              and e["model"] == model and e["config"]["needle_seed"] == needle_seed
              and e["config"]["haystack_tokens"] == haystack_tokens
