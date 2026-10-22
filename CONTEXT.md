@@ -435,6 +435,17 @@ the KL divergence from the reference's logits, position by position.
 _Avoid_: perplexity (that is ADR-0011's measure of a whole tier), free
 generation (nothing is generated)
 
+**Anchor-fact dialogue** / **Gap**:
+RQ3's third task (ADR-0017, #154): a conversation of ten turns, each a
+WikiText-2 passage and a request to summarise it, its reply decoded. One
+turn opens with a **fact**, a needle stated as "Note for later: ...". After
+the last turn a controlled plan is applied, and the question asks for the
+fact back, scored as a needle answer is. Its **gap** is the turns between
+the fact's turn and the question, 0 to 9. The fact's positions depend on
+the replies before it, so a run records them.
+_Avoid_: depth (that is a needle's place in one document), distance (it
+reads as positions, not turns)
+
 **Closing question**:
 The one test Milestone 3 is closed on: whether the semantic source answers
 more needle samples than uniform at 80% of the FP16 bytes outside the

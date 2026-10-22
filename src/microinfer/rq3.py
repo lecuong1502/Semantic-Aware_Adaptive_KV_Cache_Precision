@@ -172,24 +172,40 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     page having gone below FP16 in an emergency, they run alone too."""
     _check(engine, experiment)
     seed = sample_seed(sample.sample_id, plan_seed)
+    yield from from_one_opening(
+        engine, conds, lambda chat: _open(engine, chat, sample, experiment),
+        lambda chat, cond, opened: _close(engine, chat, sample, cond, experiment, seed, opened),
+        lambda cond: run(engine, sample, cond, experiment, plan_seed=plan_seed))
+
+
+def from_one_opening(engine, conds: Sequence[Condition], opening: Callable,
+                     closing: Callable, alone: Callable) -> Iterator[tuple[Condition, dict]]:
+    """Each of `conds`, those that share what is run before the plan
+    (shares_turn_1) first, in their order, from one `opening`, then the
+    others, in theirs, by `alone` (#172): `opening(chat)` runs it on a
+    conversation made for a snapshot, and each shared condition starts from
+    the snapshot and runs `closing(chat, cond, opened)`, `opened` what
+    `opening` gave. A snapshot refused, a page having gone below FP16 in an
+    emergency, runs them all alone. The needle runs' and the anchor-fact
+    dialogue's (#154)."""
     shared = [c for c in conds if shares_turn_1(c)]
-    alone = [c for c in conds if not shares_turn_1(c)]
+    rest = [c for c in conds if not shares_turn_1(c)]
     snapshot = None
     if len(shared) > 1:
         with set_for(engine, shared[0]), engine.conversation(for_snapshot=True) as chat:
-            opened = _open(engine, chat, sample, experiment)
+            opened = opening(chat)
             try:
                 snapshot = chat.snapshot()
             except ValueError:
                 pass
     if snapshot is None:
-        alone, shared = [*shared, *alone], []
+        rest, shared = [*shared, *rest], []
     for cond in shared:
         with set_for(engine, cond), engine.conversation(start=snapshot) as chat:
-            results = _close(engine, chat, sample, cond, experiment, seed, opened)
+            results = closing(chat, cond, opened)
         yield cond, results
-    for cond in alone:
-        yield cond, run(engine, sample, cond, experiment, plan_seed=plan_seed)
+    for cond in rest:
+        yield cond, alone(cond)
 
 
 @dataclass(frozen=True)
@@ -310,25 +326,31 @@ class ShortScreening(ValueError):
     """A screening with a depth short of right answers: what it kept and
     rejected, and each short depth's count of right ones."""
 
-    def __init__(self, kept: list, rejected: list, short: dict[float, int], per_depth: int):
+    def __init__(self, kept: list, rejected: list, short: dict, per_depth: int,
+                 label: Callable = lambda d: f"{round(d * 100)}%", groups: str = "depths"):
         self.kept, self.rejected, self.short = kept, rejected, short
-        depths = ", ".join(f"{round(d * 100)}%: {n}" for d, n in short.items())
-        super().__init__(f"depths short of {per_depth} answered correctly at FP16 ({depths}); "
+        named = ", ".join(f"{label(d)}: {n}" for d, n in short.items())
+        super().__init__(f"{groups} short of {per_depth} answered correctly at FP16 ({named}); "
                          f"draw more")
 
 
 def screen(samples: Sequence, is_right: Callable[[needles.Sample], bool],
-           per_depth: int = needles.SAMPLES_PER_DEPTH) -> tuple[list, list]:
+           per_depth: int = needles.SAMPLES_PER_DEPTH, *, groups: Sequence = needles.DEPTHS,
+           group: Callable = lambda s: s.depth, label: Callable | None = None,
+           named: str = "depths") -> tuple[list, list]:
     """ADR-0017's screening (#148): of `samples`, a set drawn with more than
     `per_depth` a depth, in its order, keep for each depth the first
     `per_depth` that FP16 answers correctly, `is_right`, and reject those
     before them that it does not. A sample past a depth's last kept is not
     run. The kept and the rejected, each in the set's order; every depth is
-    screened before a ShortScreening names those short of `per_depth`."""
+    screened before a ShortScreening names those short of `per_depth`.
+    Another set screens by `group` of its samples rather than depth, over
+    `groups`, a ShortScreening naming them `named`, each by its `label`
+    (the anchor-fact set by its gap, #154)."""
     kept, rejected, short = [], [], {}
-    for depth in needles.DEPTHS:
+    for depth in groups:
         held = 0
-        for sample in (s for s in samples if s.depth == depth):
+        for sample in (s for s in samples if group(s) == depth):
             if held == per_depth:
                 break
             if is_right(sample):
@@ -339,7 +361,8 @@ def screen(samples: Sequence, is_right: Callable[[needles.Sample], bool],
         if held < per_depth:
             short[depth] = held
     if short:
-        raise ShortScreening(kept, rejected, short, per_depth)
+        raise ShortScreening(kept, rejected, short, per_depth,
+                             *(() if label is None else (label,)), groups=named)
     return kept, rejected
 
 

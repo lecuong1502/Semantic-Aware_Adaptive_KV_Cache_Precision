@@ -184,9 +184,9 @@ def needle_set(text: str, tokenizer, *, seed: int,
         for k in range(samples_per_depth):
             article = int(order[k % len(order)])
             name = NAMES[int(rng.integers(len(NAMES)))]
-            code = _code(rng)
+            code = draw_code(rng)
             while code in codes:  # WikiText writes a hyphen " @-@ ", so none is in a haystack
-                code = _code(rng)
+                code = draw_code(rng)
             codes.add(code)
 
             pieces = haystacks.starting_at(article)
@@ -210,7 +210,7 @@ def needle_set(text: str, tokenizer, *, seed: int,
     return samples
 
 
-def _code(rng: np.random.Generator) -> str:
+def draw_code(rng: np.random.Generator) -> str:
     return ("".join(LETTERS[i] for i in rng.integers(len(LETTERS), size=3)) + "-"
             + "".join(str(d) for d in rng.integers(10, size=4)))
 
