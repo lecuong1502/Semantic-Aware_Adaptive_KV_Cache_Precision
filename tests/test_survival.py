@@ -212,14 +212,20 @@ def applied(plan, *at, ended="applied"):
 
 
 def step(t, bits, below):
-    return {"t": t, "state": "decoding", "position": 0, "effective_bits": bits,
-            "pages_below_fp16": below}
+    return survival.Step(t, "decoding", 0, bits, below)
+
+
+def pulsed(timeline, *, took=100.0, ended=130.0, pulse_s=29.9):
+    """A run as recovery reads it: its steps, when the simulator took its
+    memory, for how long, and when pressure last ended."""
+    return survival.Run({}, 0, 0, 0, 0, timeline=timeline, took_at_seconds=took,
+                        pressure_ended_seconds=ended, pulse_s=pulse_s)
 
 
 def pulse_restored():
     """The take at 100 s; a RED plan applied at 100.1 s and 100.3 s; the
-    pulse ends at 130 s; upgrades from 135.5 s to 137 s; the cache back at
-    FP16 at the step of 137.2 s."""
+    memory given back at 129.9 s and pressure ended at 130 s; upgrades from
+    135.5 s to 137 s; the cache back at FP16 at the step of 137.2 s."""
     plans = [applied(Moves(monitor.RED, 1, 2), 100.1, 100.3),
              applied(upgrades(3), 135.5, 136.0, 137.0)]
     timeline = [step(99.0, 16.0, 0), step(100.5, 4.0, 500), step(130.0, 4.0, 500),
@@ -229,25 +235,25 @@ def pulse_restored():
 
 def test_a_pulse_restored_says_when_and_how_long_after_pressure_ended():
     timeline, plans = pulse_restored()
-    r = survival.recovery(timeline, plans, took_at_seconds=100.0, pressure_ended_seconds=130.0,
-                          cooldown_seconds=5.0)
-    assert r["pressure_ended_s"] == 30.0
+    r = survival.recovery(pulsed(timeline), plans, cooldown_seconds=5.0)
+    assert r["released_s"] == 29.9 and r["pressure_ended_s"] == 30.0
     assert r["last_downgrade_s"] == pytest.approx(0.3)
     assert r["first_upgrade_s"] == 35.5 and r["last_upgrade_s"] == 37.0
     assert r["first_upgrade_after_cooldown"] is True
     assert r["restored"] is True and r["time_to_restore_s"] == pytest.approx(7.2)
+    assert r["time_to_restore_from_release_s"] == pytest.approx(7.3)
     assert r["thrash"] == {"switches": 1, "downgrade_plans_after_first_upgrade": 0,
                            "upgrade_plans_cancelled_by_pressure": 0}
 
 
 def test_the_effective_bits_are_averaged_over_time_each_step_s_held_until_the_next():
-    """From the take: 4 bits for 35 s, 6 for 1.7 s, 16 for 2.8 s; under
-    pressure, 4; after it, 4 for 5.5 s, 6 for 1.7 s, 16 for 2.8 s."""
+    """From the take: the step before it, 16 bits, for 0.5 s, then 4 bits
+    for 35 s, 6 for 1.7 s, 16 for 2.8 s; under pressure, 16 for 0.5 s and 4
+    for 29.5 s; after it, 4 for 5.5 s, 6 for 1.7 s, 16 for 2.8 s."""
     timeline, plans = pulse_restored()
-    bits = survival.recovery(timeline, plans, took_at_seconds=100.0,
-                             pressure_ended_seconds=130.0, cooldown_seconds=5.0)["effective_bits"]
-    assert bits["mean"] == pytest.approx((4 * 35 + 6 * 1.7 + 16 * 2.8) / 39.5)
-    assert bits["mean_under_pressure"] == pytest.approx(4.0)
+    bits = survival.recovery(pulsed(timeline), plans, cooldown_seconds=5.0)["effective_bits"]
+    assert bits["mean"] == pytest.approx((16 * 0.5 + 4 * 35 + 6 * 1.7 + 16 * 2.8) / 40)
+    assert bits["mean_under_pressure"] == pytest.approx((16 * 0.5 + 4 * 29.5) / 30)
     assert bits["mean_after_pressure"] == pytest.approx((4 * 5.5 + 6 * 1.7 + 16 * 2.8) / 10)
     assert bits["lowest"] == 4.0
 
@@ -259,8 +265,8 @@ def test_downgrades_and_upgrades_that_alternate_are_thrash():
     plans = [applied(Moves(monitor.RED, 1, 1), 100.1),
              applied(upgrades(2), 102.0, ended="cancelled by pressure"),
              applied(Moves(monitor.YELLOW, 1, 1), 103.0), applied(upgrades(2), 110.0)]
-    r = survival.recovery([step(111.0, 16.0, 0)], plans, took_at_seconds=100.0,
-                          pressure_ended_seconds=104.0, cooldown_seconds=5.0)
+    r = survival.recovery(pulsed([step(111.0, 16.0, 0)], ended=104.0), plans,
+                          cooldown_seconds=5.0)
     assert r["thrash"] == {"switches": 3, "downgrade_plans_after_first_upgrade": 1,
                            "upgrade_plans_cancelled_by_pressure": 1}
     assert r["first_upgrade_after_cooldown"] is False
@@ -269,9 +275,10 @@ def test_downgrades_and_upgrades_that_alternate_are_thrash():
 
 def test_a_pulse_never_ended_is_never_restored():
     timeline, plans = pulse_restored()
-    r = survival.recovery(timeline, plans[:1], took_at_seconds=100.0,
-                          pressure_ended_seconds=None, cooldown_seconds=5.0)
+    r = survival.recovery(pulsed(timeline, ended=None, pulse_s=None), plans[:1],
+                          cooldown_seconds=5.0)
     assert r["restored"] is False and r["time_to_restore_s"] is None
+    assert r["released_s"] is None and r["time_to_restore_from_release_s"] is None
     assert r["first_upgrade_s"] is None and r["first_upgrade_after_cooldown"] is None
     assert r["effective_bits"]["mean_after_pressure"] is None
 
@@ -343,9 +350,7 @@ def test_a_pulse_released_is_restored_after_the_cooldown(tmp_path):
     result = survival.run(adaptive, ids, 600, contention_at=2048, shortfall_bytes=24 * MIB,
                           out=tmp_path / "pulse.csv.gz", simulator_context_bytes=context_bytes,
                           pulse_s=2.0)
-    r = survival.recovery(result.timeline, adaptive.plans,
-                          took_at_seconds=result.took_at_seconds,
-                          pressure_ended_seconds=result.pressure_ended_seconds,
+    r = survival.recovery(result, adaptive.plans,
                           cooldown_seconds=adaptive.kv_upgrade_cooldown_seconds)
     del adaptive
     gc.collect()
@@ -357,4 +362,4 @@ def test_a_pulse_released_is_restored_after_the_cooldown(tmp_path):
     assert r["first_upgrade_after_cooldown"] is True
     assert r["restored"] and r["time_to_restore_s"] >= 0.5
     assert r["thrash"]["switches"] == 1
-    assert r["effective_bits"]["lowest"] < 16 and result.timeline[-1]["effective_bits"] == 16.0
+    assert r["effective_bits"]["lowest"] < 16 and result.timeline[-1].effective_bits == 16.0

@@ -158,11 +158,11 @@ def shares_turn_1(cond: Condition) -> bool:
 #: What a run does after its question's answer, on the same conversation:
 #: `then(engine, chat, sample, cond, seed, results)`, the results so far,
 #: gives what to add to them. The recovery task's turn 3 (#155).
-Then = Callable[..., dict]
+AfterAnswer = Callable[..., dict]
 
 
 def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
-        plan_seed: int = 0, then: Then | None = None) -> dict:
+        plan_seed: int = 0, then: AfterAnswer | None = None) -> dict:
     """One sample through its turns: what a log entry's results hold. The
     effective bits, the tiers' shares and the needle's pages' tiers are what
     the cache holds at the plan, or where it would be: the full pages before
@@ -176,7 +176,7 @@ def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
 
 
 def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment: str, *,
-         plan_seed: int = 0, then: Then | None = None) -> Iterator[tuple[Condition, dict]]:
+         plan_seed: int = 0, then: AfterAnswer | None = None) -> Iterator[tuple[Condition, dict]]:
     """Each of `conds` on one sample, with what `run` gives it: those that
     share turn 1 (shares_turn_1) first, in their order, from one turn 1,
     then the others, in theirs, each run alone (#172). Turn 1, and
@@ -249,7 +249,7 @@ def _open(engine, chat, sample: needles.Sample, experiment: str) -> _Opened:
 
 
 def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: str, seed: int,
-           opened: _Opened, then: Then | None = None) -> dict:
+           opened: _Opened, then: AfterAnswer | None = None) -> dict:
     opening, answer = opened.opening, opened.answer
     planned = plan_at(chat, cond, seed)
     if experiment == "question-blind":

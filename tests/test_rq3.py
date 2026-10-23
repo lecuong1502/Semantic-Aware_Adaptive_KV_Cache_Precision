@@ -191,7 +191,7 @@ def test_a_snapshot_refused_runs_each_condition_alone(chunked, samples, monkeypa
     def refused(chat):
         raise ValueError("a page of this cache is below it now")
 
-    def run(engine, sample, cond, experiment, plan_seed=0):
+    def run(engine, sample, cond, experiment, plan_seed=0, then=None):
         alone.append(cond.name)
         return {"run": cond.name}
 

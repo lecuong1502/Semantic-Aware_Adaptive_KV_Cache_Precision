@@ -39,6 +39,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
@@ -182,20 +183,31 @@ class Run:
     #: What the cache held at each step, from the generation's first report
     #: (`sample`), and when the simulator had taken its memory, on
     #: time.monotonic(), the clock of the engine's plans.
-    timeline: list[dict] = field(default_factory=list)
+    timeline: list[Step] = field(default_factory=list)
     took_at_seconds: float | None = None
     #: When pressure last ended, GREEN after YELLOW or RED, on that clock.
     pressure_ended_seconds: float | None = None
+    #: How long the simulator kept what it took, or None, to the end.
+    pulse_s: float | None = None
 
 
-def sample(engine: Engine, state: str, position: int) -> dict:
-    """What a generation's cache holds at a step, when it reports one: the
+class Step(NamedTuple):
+    """What a generation's cache held at a step, when it reported one: the
     time, on time.monotonic(), the state and position reported, and the
-    cache's effective bits and (layer, page)s below FP16 (Engine.held_bits)."""
+    cache's effective bits and (layer, page)s below FP16 (Engine.held_bits),
+    None before it holds a full page."""
+
+    t: float
+    state: str
+    position: int
+    effective_bits: float | None
+    pages_below_fp16: int | None
+
+
+def sample(engine: Engine, state: str, position: int) -> Step:
     bits = engine.held_bits() or {}
-    return {"t": time.monotonic(), "state": state, "position": position,
-            "effective_bits": bits.get("effective_bits"),
-            "pages_below_fp16": bits.get("pages_below_fp16")}
+    return Step(time.monotonic(), state, position, bits.get("effective_bits"),
+                bits.get("pages_below_fp16"))
 
 
 def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: int,
@@ -216,7 +228,7 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
     failure: list[BaseException] = []
     took: dict = {}
     reached = [0]
-    timeline: list[dict] = []
+    timeline: list[Step] = []
 
     def contend() -> None:
         points = [(0.0, took["bytes"])] + ([] if pulse_s is None else [(pulse_s, 0)])
@@ -264,18 +276,23 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
     return Run(summarise(engine.plans, ending=ending, error=error, positions_reached=reached[0]),
                took["position"], took["headroom"], took["bytes"], took["started_ns"],
                list(engine.pressure_events), timeline, took["at_seconds"],
-               engine.pressure_ended_seconds)
+               engine.pressure_ended_seconds, pulse_s)
 
 
-def recovery(timeline: Sequence[dict], plans: Sequence[PlanRecord], *, took_at_seconds: float,
-             pressure_ended_seconds: float | None, cooldown_seconds: float) -> dict:
+def recovery(run: Run, plans: Sequence[PlanRecord], *, cooldown_seconds: float) -> dict:
     """What a pulse and release comes to, its times in seconds from when
     the simulator had taken its memory:
-    - when pressure last ended, the last downgrade, and the first and last
-      upgrade applied, the first as long after pressure ended or the last
-      downgrade before it, the later, as the cooldown asks at least;
+    - when it gave it back, `pulse_s` later, as it was scheduled, and when
+      pressure last ended, the monitor's GREEN after it, which lags the
+      release by the monitor's polls;
+    - the last downgrade applied, and the first and last upgrade applied;
+      whether the first came the cooldown after the end of pressure or the
+      last downgrade before it, the later, as the engine's cooldown runs
+      (for one pulse: under several, pressure that ended before the last
+      is not known);
     - the **time to restore**: from the end of pressure to the first step
-      after it whose cache holds no page below FP16; None if none did;
+      after it whose cache holds no page below FP16, and from the release;
+      None if no step did;
     - the **effective bits**, each step's held until the next, averaged over
       time from the take to the last step, under pressure and after it, and
       the lowest;
@@ -283,37 +300,45 @@ def recovery(timeline: Sequence[dict], plans: Sequence[PlanRecord], *, took_at_s
       applied, turn from downgrades to upgrades or back (one, for a pulse
       restored), the downgrade plans applied after the first upgrade, and
       the upgrade plans pressure cancelled."""
+    took = run.took_at_seconds
+
     def since(t: float | None) -> float | None:
-        return None if t is None else t - took_at_seconds
+        return None if t is None else t - took
 
     applied = sorted((p.batches[0].at_seconds, p.upgrades, p) for p in plans if p.batches)
     downs = [b.at_seconds for p in plans if not p.upgrades for b in p.batches]
     ups = [b.at_seconds for p in plans if p.upgrades for b in p.batches]
     first_up = min(ups, default=None)
-    ended = pressure_ended_seconds
+    ended = run.pressure_ended_seconds
+    released = None if run.pulse_s is None else took + run.pulse_s
     restored_at = None if ended is None else next(
-        (r["t"] for r in timeline if r["t"] >= ended and r["pages_below_fp16"] == 0), None)
-    held_from = None
+        (step.t for step in run.timeline if step.t >= ended and step.pages_below_fp16 == 0),
+        None)
+    cooldown_from = None
     if first_up is not None:
-        held_from = max([t for t in (ended, *downs) if t is not None and t <= first_up],
-                        default=None)
+        cooldown_from = max([t for t in (ended, *downs) if t is not None and t <= first_up],
+                            default=None)
     kinds = [up for _, up, _ in applied]
-    steps = [r for r in timeline if r["t"] >= took_at_seconds and r["effective_bits"] is not None]
+    held = [step for step in run.timeline if step.effective_bits is not None]
+    # From the step the take came at, whose bits it held: the steps after it.
+    first = max([i for i, step in enumerate(held) if step.t <= took], default=0)
+    steps = held[first:]
     return {
-        "pressure_ended_s": since(ended),
+        "released_s": run.pulse_s, "pressure_ended_s": since(ended),
         "last_downgrade_s": since(max(downs, default=None)),
         "first_upgrade_s": since(first_up), "last_upgrade_s": since(max(ups, default=None)),
         "cooldown_s": cooldown_seconds,
-        "first_upgrade_after_cooldown": None if held_from is None
-        else first_up - held_from >= cooldown_seconds,
+        "first_upgrade_after_cooldown": None if cooldown_from is None
+        else first_up - cooldown_from >= cooldown_seconds,
         "restored": restored_at is not None,
         "time_to_restore_s": None if restored_at is None else restored_at - ended,
+        "time_to_restore_from_release_s": None if restored_at is None or released is None
+        else restored_at - released,
         "effective_bits": {
-            "mean": _mean_over_time(steps, took_at_seconds, None),
-            "mean_under_pressure": None if ended is None
-            else _mean_over_time(steps, took_at_seconds, ended),
+            "mean": _mean_over_time(steps, took, None),
+            "mean_under_pressure": None if ended is None else _mean_over_time(steps, took, ended),
             "mean_after_pressure": None if ended is None else _mean_over_time(steps, ended, None),
-            "lowest": min((r["effective_bits"] for r in steps), default=None)},
+            "lowest": min((step.effective_bits for step in steps), default=None)},
         "thrash": {
             "switches": sum(a != b for a, b in zip(kinds, kinds[1:])),
             "downgrade_plans_after_first_upgrade": 0 if first_up is None else sum(
@@ -322,16 +347,18 @@ def recovery(timeline: Sequence[dict], plans: Sequence[PlanRecord], *, took_at_s
                 1 for p in plans if p.upgrades and p.ended == "cancelled by pressure")}}
 
 
-def _mean_over_time(steps: Sequence[dict], start: float, end: float | None) -> float | None:
+def _mean_over_time(steps: Sequence[Step], start: float, end: float | None) -> float | None:
     """The effective bits of `steps`, each held from its time to the next
     step's, averaged over [start, end), end the last step's time if None."""
-    times = [r["t"] for r in steps]
+    times = [step.t for step in steps]
     end = times[-1] if end is None and times else end
     total = weight = 0.0
-    for i, r in enumerate(steps):
-        a, b = max(r["t"], start), min(times[i + 1] if i + 1 < len(steps) else end, end)
-        if b > a:
-            total, weight = total + r["effective_bits"] * (b - a), weight + (b - a)
+    for i, step in enumerate(steps):
+        held_from = max(step.t, start)
+        held_to = min(times[i + 1] if i + 1 < len(steps) else end, end)
+        if held_to > held_from:
+            total += step.effective_bits * (held_to - held_from)
+            weight += held_to - held_from
     return None if weight == 0 else total / weight
 
 

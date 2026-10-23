@@ -174,6 +174,31 @@ def paired(semantic: np.ndarray, other: np.ndarray, rng: np.random.Generator) ->
             "difference_bootstrap_95": [float(v) for v in difference]}
 
 
+def proportion(right: np.ndarray, rng: np.random.Generator) -> dict:
+    """The samples `right` holds as right, of how many, with the bootstrap
+    and Wilson 95% intervals of their share: the anchor-fact and recovery
+    summaries' (#154, #155)."""
+    correct = int(right.sum())
+    return {"correct": correct, "n": len(right),
+            "bootstrap_95": [float(v) for v in bootstrap(right[None, :], rng)[0]],
+            "wilson_95": list(wilson(correct, len(right)))}
+
+
+def paired_at_levels(right: dict[str, np.ndarray], rng: np.random.Generator) -> dict:
+    """At each level, the semantic source paired against uniform and random
+    (`paired`), from each condition's outcomes in `right`, by name: for the
+    levels and sources it holds."""
+    pairs = {}
+    for share in LEVELS:
+        names = {c.source: c.name for c in rq3.CONDITIONS if c.share == share}
+        if names["semantic"] not in right:
+            continue
+        pairs[level_name(share)] = {
+            f"semantic-{other}": paired(right[names["semantic"]], right[names[other]], rng)
+            for other in OTHER_SOURCES if names[other] in right}
+    return pairs
+
+
 def summarise(entries: Sequence[dict], model: str, needle_seed: int, haystack_tokens: int, *,
               plan_seed: int = 0, experiments: Sequence[str] = rq3.EXPERIMENTS) -> dict:
     """The RQ3 summary of the screened set's runs in `entries`, as the

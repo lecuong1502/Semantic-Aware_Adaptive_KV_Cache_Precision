@@ -290,6 +290,8 @@ EMERGENCY_SPARES = 1
 #: How often, at GREEN with no plan in hand, the engine looks for upgrades to
 #: make (#106): not every step, most of which would find none.
 UPGRADE_RETRY_SECONDS = 0.25
+#: FP16's index into controller.TIERS, as a tier map holds it.
+FP16 = controller.TIERS.index("FP16")
 
 
 @dataclass
@@ -470,7 +472,7 @@ class Conversation:
             raise ValueError("a snapshot is of a conversation made for one, once: "
                              "Engine.conversation(for_snapshot=True)")
         tiers = cache.pages.page_tiers()
-        if (tiers[tiers >= 0] != controller.TIERS.index("FP16")).any():
+        if (tiers[tiers >= 0] != FP16).any():
             raise ValueError("a snapshot holds what was stored, at FP16; a page of this "
                              "cache is below it now")
         keys, values = cache.take_stored()
@@ -623,9 +625,7 @@ class Conversation:
         gives them (#142)."""
         if self._cache is None:
             raise RuntimeError(f"the conversation has ended: {self._ended}")
-        engine = self._engine
-        page_bytes = dict(zip(controller.TIERS, model.tier_page_bytes(engine.config)))
-        return engine._effective_bits(self._cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)
+        return self._engine._bits_held(self._cache)
 
     @property
     def score_alpha(self) -> float | None:
@@ -1393,11 +1393,7 @@ class Engine:
             target, RED, scores, tiers, page_bytes, errors, move_seconds=seconds,
             positions=cache.length, page_tokens=pages.page_tokens,
             budget_seconds=self.kv_plan_budget_seconds, options=self.kv_plan_options)
-        entry = PlanRecord(None, plan, time.perf_counter() - started, [],
-                           score_alpha=_alpha_of(cache, source))
-        self.plans.append(entry)
-        if self._pending is not None:
-            self._pending.ended = "replaced"
+        entry = self._controlled_record(cache, plan, source, started)
         if len(plan):
             self._pending, self._cursor = entry, 0
             self._recent_moves.clear()
@@ -1427,7 +1423,7 @@ class Engine:
         shadowed = pages.shadowed()
         page_bytes, errors, seconds = self._plan_inputs
         bytes_at = np.array([page_bytes[t] for t in controller.TIERS], dtype=np.int64)
-        below = shadowed & (tiers > controller.TIERS.index("FP16"))
+        below = shadowed & (tiers > FP16)
         needed = int((page_bytes["FP16"] - bytes_at[tiers[below]]).sum())
         thresholds = self._thresholds or DEFAULT_THRESHOLDS
         plan = controller.upgrade_plan_arrays(
@@ -1435,11 +1431,7 @@ class Engine:
             page_bytes, errors, move_seconds=seconds, last_downgrade_seconds=None,
             spike_bytes=0, budget_seconds=self.kv_plan_budget_seconds,
             options=self.kv_plan_options)
-        entry = PlanRecord(None, plan, time.perf_counter() - started, [],
-                           score_alpha=_alpha_of(cache, source))
-        self.plans.append(entry)
-        if self._pending is not None:
-            self._pending.ended = "replaced"
+        entry = self._controlled_record(cache, plan, source, started)
         self._pending, entry.ended = None, "applied"
         if len(plan):
             self._pending, self._cursor, entry.ended = entry, 0, ""
@@ -1453,8 +1445,19 @@ class Engine:
         entry.controlled = {
             "restore": True, "source": source, "seed": seed if source == "random" else None,
             "restored_bytes": -controller.bytes_given_back(tiers, after, page_bytes),
-            "restored": bool((after[shadowed] == controller.TIERS.index("FP16")).all()),
+            "restored": bool((after[shadowed] == FP16).all()),
             **self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)}
+        return entry
+
+    def _controlled_record(self, cache: model.PagedCache, plan, source: str,
+                           started: float) -> PlanRecord:
+        """A controlled plan's or restore's record, in `plans`, with no
+        pressure event; it replaces any plan in hand."""
+        entry = PlanRecord(None, plan, time.perf_counter() - started, [],
+                           score_alpha=_alpha_of(cache, source))
+        self.plans.append(entry)
+        if self._pending is not None:
+            self._pending.ended = "replaced"
         return entry
 
     def held_bits(self) -> dict | None:
@@ -1464,10 +1467,14 @@ class Engine:
         cache = self._cache
         if not isinstance(cache, model.PagedCache):
             return None
+        return {**self._bits_held(cache),
+                "pages_below_fp16": int((cache.pages.page_tiers() > FP16).sum())}
+
+    def _bits_held(self, cache: model.PagedCache) -> dict:
+        """_effective_bits of what `cache` holds now, outside the default
+        recency floor and over every full page."""
         page_bytes = dict(zip(controller.TIERS, model.tier_page_bytes(self.config)))
-        tiers = cache.pages.page_tiers()
-        return {**self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR),
-                "pages_below_fp16": int((tiers > controller.TIERS.index("FP16")).sum())}
+        return self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)
 
     def _tiers_and_scores(self, cache: model.PagedCache, source: str,
                           seed: int) -> tuple[np.ndarray, np.ndarray]:

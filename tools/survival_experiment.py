@@ -118,7 +118,7 @@ def main(argv: list[str]) -> int:
     files = replay.files(args.out) + [pressure]
     if args.pulse is not None:
         timeline = recorder.companion(args.out, ".timeline.jsonl")
-        timeline.write_text("".join(json.dumps(r) + "\n" for r in result.timeline))
+        timeline.write_text("".join(json.dumps(step._asdict()) + "\n" for step in result.timeline))
         files.append(timeline)
     context = args.prompt_positions + args.new_tokens - 1
     config = {"issue": args.issue, "engine": args.engine,
@@ -145,9 +145,7 @@ def main(argv: list[str]) -> int:
                "pressure": survival.waits(result.pressure_events, engine.plans)}
     if args.pulse is not None:
         results["recovery"] = survival.recovery(
-            result.timeline, engine.plans, took_at_seconds=result.took_at_seconds,
-            pressure_ended_seconds=result.pressure_ended_seconds,
-            cooldown_seconds=engine.kv_upgrade_cooldown_seconds)
+            result, engine.plans, cooldown_seconds=engine.kv_upgrade_cooldown_seconds)
     # An adaptive cache ends mixed, page by page; its plans say how.
     benchlog.append("survival" if args.pulse is None else "pulse-release",
                     model=args.model, context_length=context,

@@ -73,14 +73,17 @@ def restore_summary(record) -> dict | None:
     what it restored; None for no restore."""
     if record is None:
         return None
-    c = record.controlled
+    controlled = record.controlled
+    # The first batch's seconds count the plan's making too.
     return {"moves": len(record.plan), "applied": record.applied,
             "batches": len(record.batches), "ended": record.ended,
-            "seconds": record.planning_seconds + sum(b.seconds for b in record.batches),
-            "restored": c["restored"], "restored_bytes": c["restored_bytes"]}
+            "seconds": sum(b.seconds for b in record.batches),
+            "restored": controlled["restored"], "restored_bytes": controlled["restored_bytes"]}
 
 
 def run(engine, sample: needles.Sample, cond: rq3.Condition, *, plan_seed: int = 0) -> dict:
+    """One sample through its three turns under `cond`: rq3.run's results,
+    and turn_3's beside them."""
     return rq3.run(engine, sample, cond, EXPERIMENT, plan_seed=plan_seed, then=turn_3)
 
 
@@ -109,6 +112,7 @@ class NeedleSet(NamedTuple):
         return rq3.last_screening(entries, self.model, self.needle_seed, self.haystack_tokens)
 
     def config(self) -> dict:
+        """What a log entry's config names of the set, but its model."""
         return {"needle_seed": self.needle_seed, "haystack_tokens": self.haystack_tokens}
 
 
@@ -123,16 +127,17 @@ def logged(of: NeedleSet, commit: str, log: str | Path = benchlog.DEFAULT_LOG, *
     same_code = benchlog.same_code_as(commit, log)
     return {(e["config"]["sample_id"], e["config"]["condition"]["name"]):
             e["results"]["turn_3_correct"]
-            for e in benchlog.read(log)
-            if e["kind"] == KIND and of.holds(e) and e["config"]["plan_seed"] == plan_seed
-            and same_code(e["git_commit"])}
+            for e in _runs(benchlog.read(log), of, plan_seed) if same_code(e["git_commit"])}
+
+
+def _runs(entries: Sequence[dict], of: NeedleSet, plan_seed: int) -> Iterator[dict]:
+    """The recovery runs in `entries` of the set at `plan_seed`."""
+    return (e for e in entries
+            if e["kind"] == KIND and of.holds(e) and e["config"]["plan_seed"] == plan_seed)
 
 
 def _accuracy(right: np.ndarray, rng: np.random.Generator) -> dict:
-    correct = int(right.sum())
-    return {"correct": correct, "n": len(right), "accuracy": correct / len(right),
-            "bootstrap_95": [float(v) for v in rq3_summary.bootstrap(right[None, :], rng)[0]],
-            "wilson_95": list(rq3_summary.wilson(correct, len(right)))}
+    return {**rq3_summary.proportion(right, rng), "accuracy": float(right.mean())}
 
 
 def summarise(entries: Sequence[dict], of: NeedleSet, *, plan_seed: int = 0,
@@ -142,10 +147,8 @@ def summarise(entries: Sequence[dict], of: NeedleSet, *, plan_seed: int = 0,
     module describes. A ValueError naming what is missing."""
     screening = of.screening(entries)
     kept = screening["results"]["kept"]
-    latest = {}
-    for e in entries:
-        if e["kind"] == KIND and of.holds(e) and e["config"]["plan_seed"] == plan_seed:
-            latest[(e["config"]["sample_id"], e["config"]["condition"]["name"])] = e
+    latest = {(e["config"]["sample_id"], e["config"]["condition"]["name"]): e
+              for e in _runs(entries, of, plan_seed)}  # the latest of each stands
     missing = [(s, name) for name in conditions for s in kept if (s, name) not in latest]
     if missing:
         raise ValueError(f"no run of {len(missing)} samples' conditions, such as "
@@ -174,16 +177,8 @@ def summarise(entries: Sequence[dict], of: NeedleSet, *, plan_seed: int = 0,
                 "seconds_mean": float(np.mean([r["seconds"] for r in restores])),
                 "seconds_max": float(max(r["seconds"] for r in restores)),
                 "moves_mean": float(np.mean([r["moves"] for r in restores]))}}
-    pairs = {}
-    for turn in TURNS:
-        for share in rq3_summary.LEVELS:
-            names = {c.source: c.name for c in rq3.CONDITIONS if c.share == share}
-            if names["semantic"] not in conditions:
-                continue
-            pairs.setdefault(turn, {})[rq3_summary.level_name(share)] = {
-                f"semantic-{other}": rq3_summary.paired(right[(names["semantic"], turn)],
-                                                        right[(names[other], turn)], rng)
-                for other in rq3_summary.OTHER_SOURCES if names[other] in conditions}
+    pairs = {turn: rq3_summary.paired_at_levels(
+        {name: right[(name, turn)] for name in conditions}, rng) for turn in TURNS}
     return {"model": of.model, **of.config(), "plan_seed": plan_seed, "samples": len(kept),
             "bootstrap": {"resamples": rq3_summary.RESAMPLES, "seed": SEED},
             "accuracy": accuracy, "paired": pairs, "screening": screening["sha256"],
