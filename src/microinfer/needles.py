@@ -184,9 +184,9 @@ def needle_set(text: str, tokenizer, *, seed: int,
         for k in range(samples_per_depth):
             article = int(order[k % len(order)])
             name = NAMES[int(rng.integers(len(NAMES)))]
-            code = _code(rng)
+            code = draw_code(rng)
             while code in codes:  # WikiText writes a hyphen " @-@ ", so none is in a haystack
-                code = _code(rng)
+                code = draw_code(rng)
             codes.add(code)
 
             pieces = haystacks.starting_at(article)
@@ -205,12 +205,18 @@ def needle_set(text: str, tokenizer, *, seed: int,
                 document_start=len(opening), haystack_tokens=haystack_tokens,
                 first_article=article, first_title=haystacks.found[article][0],
                 needle_positions=(start, end),
-                needle_pages=(start // page_tokens, (end - 1) // page_tokens),
+                needle_pages=pages_holding((start, end), page_tokens),
                 page_tokens=page_tokens))
     return samples
 
 
-def _code(rng: np.random.Generator) -> str:
+def pages_holding(positions: tuple[int, int], page_tokens: int) -> tuple[int, int]:
+    """The first and last pages that hold `positions`, [start, end)."""
+    start, end = positions
+    return start // page_tokens, (end - 1) // page_tokens
+
+
+def draw_code(rng: np.random.Generator) -> str:
     return ("".join(LETTERS[i] for i in rng.integers(len(LETTERS), size=3)) + "-"
             + "".join(str(d) for d in rng.integers(10, size=4)))
 

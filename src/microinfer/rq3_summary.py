@@ -145,19 +145,25 @@ def _accuracy(runs: list[dict], right: np.ndarray, interval: np.ndarray,
             "accuracy": float(at.mean()),
             "bootstrap_95": [float(v) for v in bootstrap(at[None, :], rng)[0]],
             "wilson_95": list(wilson(int(at.sum()), len(at)))}
-    tiers = Counter()
-    for e in runs:
-        tiers.update(e["results"]["needle_page_tiers"])
-    held = sum(tiers.values())
     correct = int(right.sum())
     return {"correct": correct, "n": len(right), "accuracy": correct / len(right),
             "bootstrap_95": [float(v) for v in interval],
             "wilson_95": list(wilson(correct, len(right))), "by_depth": by_depth,
             "effective_bits": float(np.mean([e["results"]["effective_bits"] for e in runs])),
-            "needle_page_tiers": {t: n / held for t, n in sorted(tiers.items())}}
+            "needle_page_tiers": pooled_tiers(runs, "needle_page_tiers")}
 
 
-def _paired(semantic: np.ndarray, other: np.ndarray, rng: np.random.Generator) -> dict:
+def pooled_tiers(runs: list[dict], key: str) -> dict[str, float]:
+    """Each tier's share of every (layer, page) the runs' `key`, tier
+    counts, hold together."""
+    tiers = Counter()
+    for e in runs:
+        tiers.update(e["results"][key])
+    held = sum(tiers.values())
+    return {t: n / held for t, n in sorted(tiers.items())}
+
+
+def paired(semantic: np.ndarray, other: np.ndarray, rng: np.random.Generator) -> dict:
     """The semantic source against another, sample by sample."""
     semantic_only = int((semantic & ~other).sum())
     other_only = int((~semantic & other).sum())
@@ -188,7 +194,7 @@ def summarise(entries: Sequence[dict], model: str, needle_seed: int, haystack_to
                          f"{missing[:3]}; run tools/rq3.py for them")
 
     rng = np.random.default_rng(SEED)
-    accuracy, paired, pooled = {}, {}, []
+    accuracy, pairs, pooled = {}, {}, []
     for experiment in experiments:
         names = _conditions(experiment)
         runs = {name: [latest[(s, experiment, name)] for s in kept] for name in names}
@@ -199,16 +205,16 @@ def summarise(entries: Sequence[dict], model: str, needle_seed: int, haystack_to
         accuracy[experiment] = {
             name: _accuracy(runs[name], outcomes[name], interval, rng)
             for name, interval in zip(names, intervals)}
-        paired[experiment] = {
+        pairs[experiment] = {
             level_name(share): {
-                f"semantic-{other}": _paired(outcomes[_source_condition("semantic", share)],
+                f"semantic-{other}": paired(outcomes[_source_condition("semantic", share)],
                                              outcomes[_source_condition(other, share)], rng)
                 for other in OTHER_SOURCES}
             for share in LEVELS}
     return {"model": model, "needle_seed": needle_seed, "haystack_tokens": haystack_tokens,
             "plan_seed": plan_seed, "samples": len(kept), "significance": SIGNIFICANCE,
             "bootstrap": {"resamples": RESAMPLES, "seed": SEED},
-            "accuracy": accuracy, "paired": paired, "closing": _closing(accuracy, paired),
+            "accuracy": accuracy, "paired": pairs, "closing": _closing(accuracy, pairs),
             "screening": screening["sha256"], "entries": pooled}
 
 
