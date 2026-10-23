@@ -37,7 +37,12 @@ to (survival.recovery): the time from the end of pressure to every page back
 at FP16, the effective bits over time, and any downgrade and upgrade thrash;
 its every step's effective bits are in a companion .timeline.jsonl. For
 #155, a prompt of 30720 positions and 2048 new tokens leave minutes of
-steps after the pulse for the upgrades.
+steps after the pulse for the upgrades. The upgrades come a batch a step,
+so the restore takes as long as its steps: on the RTX 4050, 1.5B's restore
+took about 540 s, its prefill chunks up to 40 s each near 30K positions,
+and the run about 73 min, most of it 2048 tokens decoded at 1.8 s each
+after every page was back at FP16; 64 new tokens would end it within a
+minute of the restore.
 
 The rule, not a number, sets what the simulator takes, so that the two runs
 face the same contention whatever else the desktop holds. Each run is one
