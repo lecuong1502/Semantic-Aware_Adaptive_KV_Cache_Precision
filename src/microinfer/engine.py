@@ -342,7 +342,10 @@ class PlanRecord:
     #: score source rather than on an event: the source and its seed, the
     #: share, the byte target and the bytes the plan reclaimed, whether it
     #: met the target, and the average effective bits it left, over the
-    #: pages it could move and over every page of positions. None otherwise.
+    #: pages it could move and over every page of positions. For a
+    #: controlled restore (#155), upgrades: `restore` true, the source and
+    #: its seed, the bytes the pages took back, whether every page holding
+    #: a shadow is at FP16 after it, and the effective bits. None otherwise.
     controlled: dict | None = None
 
     @property
@@ -579,6 +582,20 @@ class Conversation:
         engine, whose cache seals and so can downgrade, and, for semantic
         scores, a cache that keeps them. The plan's record, in the engine's
         `plans`."""
+        return self._controlled(source)._controlled_plan(self._cache, share, source, seed)
+
+    def restore(self, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
+        """Restore, between turns, every page that holds a shadow to FP16,
+        as upgrades do once pressure has passed (#155, ADR-0017): the
+        upgrade policy's plan (#103), in its order from `source`'s scores,
+        `seed` the random one's, for headroom enough for every upgrade, with
+        no cooldown, at once. The same engine and cache as `plan` needs.
+        The plan's record, in the engine's `plans`."""
+        return self._controlled(source)._controlled_restore(self._cache, source, seed)
+
+    def _controlled(self, source: str) -> Engine:
+        """The engine, once it is known to hold a cache a controlled plan or
+        restore can move, from `source`'s scores."""
         if self._ended is not None:
             raise RuntimeError(f"the conversation has ended: {self._ended}")
         engine = self._engine
@@ -590,7 +607,7 @@ class Conversation:
                              "replace it, add to it, or upgrade its pages back")
         if source == "semantic" and self._cache.scores is None:
             raise ValueError("semantic scores need a cache that keeps them: kv_scoring=True")
-        return engine._controlled_plan(self._cache, share, source, seed)
+        return engine
 
     def tiers(self) -> np.ndarray:
         """Each page's tier, (layers, pages), as an index into controller.TIERS,
@@ -1396,6 +1413,61 @@ class Engine:
             "target_met": entry.ended == "applied" and reclaimed >= target,
             **self._effective_bits(cache, page_bytes, plan.recency_floor)}
         return entry
+
+    def _controlled_restore(self, cache: model.PagedCache, source: str,
+                            seed: int) -> PlanRecord:
+        """Conversation.restore: an upgrade plan at GREEN, for the headroom
+        that takes every page holding a shadow back to FP16, applied step by
+        step within the budget until it is done, recorded with no pressure
+        event and with what controlled it."""
+        own_before = self._own_bytes()
+        started = time.perf_counter()
+        pages = cache.pages
+        tiers, scores = self._tiers_and_scores(cache, source, seed)
+        shadowed = pages.shadowed()
+        page_bytes, errors, seconds = self._plan_inputs
+        bytes_at = np.array([page_bytes[t] for t in controller.TIERS], dtype=np.int64)
+        below = shadowed & (tiers > controller.TIERS.index("FP16"))
+        needed = int((page_bytes["FP16"] - bytes_at[tiers[below]]).sum())
+        thresholds = self._thresholds or DEFAULT_THRESHOLDS
+        plan = controller.upgrade_plan_arrays(
+            thresholds.yellow_below_bytes + needed + 1, thresholds, scores, tiers, shadowed,
+            page_bytes, errors, move_seconds=seconds, last_downgrade_seconds=None,
+            spike_bytes=0, budget_seconds=self.kv_plan_budget_seconds,
+            options=self.kv_plan_options)
+        entry = PlanRecord(None, plan, time.perf_counter() - started, [],
+                           score_alpha=_alpha_of(cache, source))
+        self.plans.append(entry)
+        if self._pending is not None:
+            self._pending.ended = "replaced"
+        self._pending, entry.ended = None, "applied"
+        if len(plan):
+            self._pending, self._cursor, entry.ended = entry, 0, ""
+            self._recent_moves.clear()
+            self._recent_moves.append(float(plan.seconds.max()))  # until one is timed
+            planned = True
+            while self._pending is entry:  # a step's budget at a time, as at GREEN
+                self._apply(cache, started, planned, own_before)
+                started, planned, own_before = time.perf_counter(), False, self._own_bytes()
+        after = pages.page_tiers()
+        entry.controlled = {
+            "restore": True, "source": source, "seed": seed if source == "random" else None,
+            "restored_bytes": -controller.bytes_given_back(tiers, after, page_bytes),
+            "restored": bool((after[shadowed] == controller.TIERS.index("FP16")).all()),
+            **self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)}
+        return entry
+
+    def held_bits(self) -> dict | None:
+        """While a generation holds a paged cache, as it does when it calls
+        its `report`: the cache's effective bits, as Conversation.effective_bits
+        gives them, and its (layer, page)s below FP16 (#155); None otherwise."""
+        cache = self._cache
+        if not isinstance(cache, model.PagedCache):
+            return None
+        page_bytes = dict(zip(controller.TIERS, model.tier_page_bytes(self.config)))
+        tiers = cache.pages.page_tiers()
+        return {**self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR),
+                "pages_below_fp16": int((tiers > controller.TIERS.index("FP16")).sum())}
 
     def _tiers_and_scores(self, cache: model.PagedCache, source: str,
                           seed: int) -> tuple[np.ndarray, np.ndarray]:

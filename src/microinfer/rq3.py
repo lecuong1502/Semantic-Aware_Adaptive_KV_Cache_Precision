@@ -155,21 +155,28 @@ def shares_turn_1(cond: Condition) -> bool:
     return cond.adaptive and cond.tier == "FP16"
 
 
+#: What a run does after its question's answer, on the same conversation:
+#: `then(engine, chat, sample, cond, seed, results)`, the results so far,
+#: gives what to add to them. The recovery task's turn 3 (#155).
+Then = Callable[..., dict]
+
+
 def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
-        plan_seed: int = 0) -> dict:
+        plan_seed: int = 0, then: Then | None = None) -> dict:
     """One sample through its turns: what a log entry's results hold. The
     effective bits, the tiers' shares and the needle's pages' tiers are what
     the cache holds at the plan, or where it would be: the full pages before
-    the question's answer, which adds its own at FP16."""
+    the question's answer, which adds its own at FP16. With `then`, what it
+    adds after the answer too."""
     _check(engine, experiment)
+    seed = sample_seed(sample.sample_id, plan_seed)
     with set_for(engine, cond), engine.conversation() as chat:
         opened = _open(engine, chat, sample, experiment)
-        return _close(engine, chat, sample, cond, experiment,
-                      sample_seed(sample.sample_id, plan_seed), opened)
+        return _close(engine, chat, sample, cond, experiment, seed, opened, then)
 
 
 def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment: str, *,
-         plan_seed: int = 0) -> Iterator[tuple[Condition, dict]]:
+         plan_seed: int = 0, then: Then | None = None) -> Iterator[tuple[Condition, dict]]:
     """Each of `conds` on one sample, with what `run` gives it: those that
     share turn 1 (shares_turn_1) first, in their order, from one turn 1,
     then the others, in theirs, each run alone (#172). Turn 1, and
@@ -180,8 +187,9 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     seed = sample_seed(sample.sample_id, plan_seed)
     yield from from_one_opening(
         engine, conds, lambda chat: _open(engine, chat, sample, experiment),
-        lambda chat, cond, opened: _close(engine, chat, sample, cond, experiment, seed, opened),
-        lambda cond: run(engine, sample, cond, experiment, plan_seed=plan_seed))
+        lambda chat, cond, opened: _close(engine, chat, sample, cond, experiment, seed, opened,
+                                          then),
+        lambda cond: run(engine, sample, cond, experiment, plan_seed=plan_seed, then=then))
 
 
 def from_one_opening(engine, conds: Sequence[Condition], opening: Callable,
@@ -241,7 +249,7 @@ def _open(engine, chat, sample: needles.Sample, experiment: str) -> _Opened:
 
 
 def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: str, seed: int,
-           opened: _Opened) -> dict:
+           opened: _Opened, then: Then | None = None) -> dict:
     opening, answer = opened.opening, opened.answer
     planned = plan_at(chat, cond, seed)
     if experiment == "question-blind":
@@ -250,7 +258,7 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         answer = np.concatenate([answer, chat.turn(np.empty(0, np.int32),
                                                    ANSWER_TOKENS - AWARE_TOKENS)])
     text = engine.decode(answer)
-    return {
+    results = {
         "answer": text, "correct": needles.correct(text, sample.code),
         "answer_tokens": answer.tolist(), "summary": engine.decode(opened.summary),
         "summary_length": len(opened.summary), "summary_stopped": opened.stopped,
@@ -260,6 +268,9 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         **planned.results(cond, seed, sample.page_tokens),
         "needle_page_tiers": planned.page_tiers(sample.needle_pages),
     }
+    if then is not None:
+        results.update(then(engine, chat, sample, cond, seed, results))
+    return results
 
 
 @dataclass(frozen=True)

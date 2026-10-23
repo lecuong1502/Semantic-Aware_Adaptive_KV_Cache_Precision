@@ -7,6 +7,7 @@
         --issue 108
         [--model qwen2.5-1.5b-instruct] [--prompt-positions 32704] [--new-tokens 64]
         [--contention-at 16384] [--shortfall 256] [--score-source semantic]
+        [--pulse SECONDS]
 
 Qwen2.5-1.5B prefills a prompt and decodes to 32K positions, its cache at
 FP16, with its pressure monitor on (microinfer.survival.run). When the cache
@@ -27,6 +28,16 @@ recorder records the device throughout.
   event is logged with how long it waited for the step boundary at which
   the engine drained it: under pressure, prefill chunks are sized to keep
   that short (#135).
+
+With `--pulse SECONDS`, an adaptive run's simulator gives its memory back
+that long after it took it, and the generation goes on (#155): pressure
+passes, and after the cooldown the upgrades restore the pages from their
+shadows. The run is one "pulse-release" entry, with what its recovery comes
+to (survival.recovery): the time from the end of pressure to every page back
+at FP16, the effective bits over time, and any downgrade and upgrade thrash;
+its every step's effective bits are in a companion .timeline.jsonl. For
+#155, a prompt of 30720 positions and 2048 new tokens leave minutes of
+steps after the pulse for the upgrades.
 
 The rule, not a number, sets what the simulator takes, so that the two runs
 face the same contention whatever else the desktop holds. Each run is one
@@ -73,10 +84,15 @@ def main(argv: list[str]) -> int:
                         help="MiB the engine is left short of its full FP16 cache")
     parser.add_argument("--score-source", choices=SOURCES, default="semantic",
                         help="where an adaptive engine's plans take their scores (#104)")
+    parser.add_argument("--pulse", type=float, default=None, metavar="SECONDS",
+                        help="give the memory back this long after it was taken (#155); "
+                             "adaptive only")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     if args.out.exists():
         parser.error(f"{args.out} exists; a run does not overwrite a recording")
+    if args.pulse is not None and args.engine != "adaptive":
+        parser.error("a pulse is released for the upgrades of an adaptive engine")
     if benchlog.environment(args.log)["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first, so that the "
                      "entry names the code that produced it")
@@ -93,13 +109,17 @@ def main(argv: list[str]) -> int:
         1000, engine.config.vocab_size - 1000, args.prompt_positions).astype(np.int32)
     result = survival.run(engine, prompt, args.new_tokens, contention_at=args.contention_at,
                           shortfall_bytes=int(args.shortfall * MIB), out=args.out,
-                          simulator_context_bytes=context_bytes)
+                          simulator_context_bytes=context_bytes, pulse_s=args.pulse)
 
     pressure = recorder.companion(args.out, ".pressure.jsonl")
     pressure.write_text("".join(
         json.dumps({**asdict(r.event), "positions_held": r.positions_held,
                     "drained_ns": r.drained_ns}) + "\n" for r in result.pressure_events))
     files = replay.files(args.out) + [pressure]
+    if args.pulse is not None:
+        timeline = recorder.companion(args.out, ".timeline.jsonl")
+        timeline.write_text("".join(json.dumps(r) + "\n" for r in result.timeline))
+        files.append(timeline)
     context = args.prompt_positions + args.new_tokens - 1
     config = {"issue": args.issue, "engine": args.engine,
               "score_source": args.score_source if adaptive else None,
@@ -109,7 +129,11 @@ def main(argv: list[str]) -> int:
               "pressure_chunk_seconds": engine.pressure_chunk_seconds if adaptive else None,
               "contention_rule": "the simulator takes what leaves the engine the shortfall "
                                  "short of its full FP16 cache, from the headroom when the "
-                                 "cache reaches contention_at, and keeps it to the end",
+                                 "cache reaches contention_at, and keeps it to the end"
+                                 + ("" if args.pulse is None
+                                    else ", or for pulse_s, and then gives it back"),
+              "pulse_s": args.pulse,
+              "upgrade_cooldown_seconds": engine.kv_upgrade_cooldown_seconds,
               "simulator_context_bytes": context_bytes, "poll_s": monitor.POLL_S,
               "thresholds": asdict(monitor.DEFAULT),
               "files": {f.name: benchlog.file_sha256(f) for f in files if f.exists()}}
@@ -119,13 +143,20 @@ def main(argv: list[str]) -> int:
                "pressure_events": len(result.pressure_events),
                "pressure_levels": [r.event.level.value for r in result.pressure_events],
                "pressure": survival.waits(result.pressure_events, engine.plans)}
+    if args.pulse is not None:
+        results["recovery"] = survival.recovery(
+            result.timeline, engine.plans, took_at_seconds=result.took_at_seconds,
+            pressure_ended_seconds=result.pressure_ended_seconds,
+            cooldown_seconds=engine.kv_upgrade_cooldown_seconds)
     # An adaptive cache ends mixed, page by page; its plans say how.
-    benchlog.append("survival", model=args.model, context_length=context,
+    benchlog.append("survival" if args.pulse is None else "pulse-release",
+                    model=args.model, context_length=context,
                     precision_tiers=None if adaptive else {"FP16": 1.0}, config=config,
                     results=results, log=args.log)
     print(json.dumps({"engine": args.engine, "survived": result.summary["survived"],
                       "ending": result.summary["ending"], "taken_mib": result.taken_bytes / MIB,
-                      **result.summary["totals"]}))
+                      **result.summary["totals"], **({} if args.pulse is None else {
+                          "recovery": results["recovery"]})}))
     return 0
 
 
