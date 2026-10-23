@@ -448,6 +448,28 @@ is; #154 names it so.
 _Avoid_: depth (that is a needle's place in one document), distance (it
 reads as positions, not turns)
 
+**Controlled restore** / **Turn 3**:
+RQ3's recovery task on the needle set (ADR-0017, #155). After turn 2, the
+compressed turn, a controlled restore stands for the GREEN after pressure,
+as a controlled plan stands for the pressure: the upgrade policy's plan for
+headroom enough for every upgrade, with no monitor and no cooldown, so that
+every page holding a shadow is back at FP16. Turn 3 then asks the same
+question again, over a cache that holds FP16's bytes but for turn 2's
+answer, decoded while compressed. A turn-3 answer that is turn 2's word for
+word **repeats** it.
+_Avoid_: recompute (the shadow restores the page; nothing is recomputed),
+re-ask (turn 3 is the term)
+
+**Pulse and release** / **Time to restore** / **Thrash**:
+The recovery task under the simulator (#155): it takes memory part way
+through a 32K generation and gives it back after the pulse. The time to
+restore runs from the end of pressure, the GREEN after the last YELLOW or
+RED, to the first step whose cache holds no page below FP16. Thrash is
+downgrades and upgrades alternating: the applied plans turning from one to
+the other more than once, a downgrade after the first upgrade, or upgrades
+that pressure cancelled.
+_Avoid_: recovery time (recovery is the task), oscillation
+
 **Closing question**:
 The one test Milestone 3 is closed on: whether the semantic source answers
 more needle samples than uniform at 80% of the FP16 bytes outside the

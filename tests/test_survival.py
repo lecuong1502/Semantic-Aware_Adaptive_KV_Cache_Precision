@@ -9,12 +9,14 @@ run itself, at a small scale: Qwen2.5-0.5B beside the real simulator.
 """
 
 import gc
+import importlib.util
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from conftest import require_model
-from microinfer import Engine, ModelConfig, monitor, replay, survival
+from microinfer import Engine, ModelConfig, controller, monitor, replay, survival
 from microinfer.engine import (COMPLETE, DECODING, EXHAUSTED, PREFILLING, AppliedBatch, Ending,
                                PlanRecord, PressureRecord)
 from microinfer.footprint import MIB
@@ -195,6 +197,102 @@ def test_no_pressure_has_no_spread():
     assert w["pressure_wait_ms"] is None and w["to_plan_ms"] is None
 
 
+# -- what a pulse and release comes to (#155) ---------------------------------------------
+
+def upgrades(n):
+    """An upgrade plan as recovery reads it, n upgrades."""
+    z = np.zeros(n, dtype=np.int64)
+    return controller.UpgradePlan(monitor.GREEN, 0, "", z, z, z, z, z, np.zeros(n),
+                                  np.zeros(n), np.zeros(n), 0.05)
+
+
+def applied(plan, *at, ended="applied"):
+    return PlanRecord(None, plan, 0.001, [AppliedBatch(0, 1, 0.01, 0, 0, at_seconds=t)
+                                          for t in at], ended=ended)
+
+
+def step(t, bits, below):
+    return survival.Step(t, "decoding", 0, bits, below)
+
+
+def pulsed(timeline, *, took=100.0, ended=130.0, pulse_s=29.9):
+    """A run as recovery reads it: its steps, when the simulator took its
+    memory, for how long, and when pressure last ended."""
+    return survival.Run({}, 0, 0, 0, 0, timeline=timeline, took_at_seconds=took,
+                        pressure_ended_seconds=ended, pulse_s=pulse_s)
+
+
+def pulse_restored():
+    """The take at 100 s; a RED plan applied at 100.1 s and 100.3 s; the
+    memory given back at 129.9 s and pressure ended at 130 s; upgrades from
+    135.5 s to 137 s; the cache back at FP16 at the step of 137.2 s."""
+    plans = [applied(Moves(monitor.RED, 1, 2), 100.1, 100.3),
+             applied(upgrades(3), 135.5, 136.0, 137.0)]
+    timeline = [step(99.0, 16.0, 0), step(100.5, 4.0, 500), step(130.0, 4.0, 500),
+                step(135.5, 6.0, 300), step(137.2, 16.0, 0), step(140.0, 16.0, 0)]
+    return timeline, plans
+
+
+def test_a_pulse_restored_says_when_and_how_long_after_pressure_ended():
+    timeline, plans = pulse_restored()
+    r = survival.recovery(pulsed(timeline), plans, cooldown_seconds=5.0)
+    assert r["released_s"] == 29.9 and r["pressure_ended_s"] == 30.0
+    assert r["last_downgrade_s"] == pytest.approx(0.3)
+    assert r["first_upgrade_s"] == 35.5 and r["last_upgrade_s"] == 37.0
+    assert r["first_upgrade_after_cooldown"] is True
+    assert r["restored"] is True and r["time_to_restore_s"] == pytest.approx(7.2)
+    assert r["time_to_restore_from_release_s"] == pytest.approx(7.3)
+    assert r["thrash"] == {"switches": 1, "downgrade_plans_after_first_upgrade": 0,
+                           "upgrade_plans_cancelled_by_pressure": 0}
+
+
+def test_the_effective_bits_are_averaged_over_time_each_step_s_held_until_the_next():
+    """From the take: the step before it, 16 bits, for 0.5 s, then 4 bits
+    for 35 s, 6 for 1.7 s, 16 for 2.8 s; under pressure, 16 for 0.5 s and 4
+    for 29.5 s; after it, 4 for 5.5 s, 6 for 1.7 s, 16 for 2.8 s."""
+    timeline, plans = pulse_restored()
+    bits = survival.recovery(pulsed(timeline), plans, cooldown_seconds=5.0)["effective_bits"]
+    assert bits["mean"] == pytest.approx((16 * 0.5 + 4 * 35 + 6 * 1.7 + 16 * 2.8) / 40)
+    assert bits["mean_under_pressure"] == pytest.approx((16 * 0.5 + 4 * 29.5) / 30)
+    assert bits["mean_after_pressure"] == pytest.approx((4 * 5.5 + 6 * 1.7 + 16 * 2.8) / 10)
+    assert bits["lowest"] == 4.0
+
+
+def test_downgrades_and_upgrades_that_alternate_are_thrash():
+    """Upgrades that pressure cancels, then a downgrade, then upgrades
+    again: three turns, one downgrade plan after the first upgrade, and the
+    first upgrades too early for the cooldown after the downgrade before."""
+    plans = [applied(Moves(monitor.RED, 1, 1), 100.1),
+             applied(upgrades(2), 102.0, ended="cancelled by pressure"),
+             applied(Moves(monitor.YELLOW, 1, 1), 103.0), applied(upgrades(2), 110.0)]
+    r = survival.recovery(pulsed([step(111.0, 16.0, 0)], ended=104.0), plans,
+                          cooldown_seconds=5.0)
+    assert r["thrash"] == {"switches": 3, "downgrade_plans_after_first_upgrade": 1,
+                           "upgrade_plans_cancelled_by_pressure": 1}
+    assert r["first_upgrade_after_cooldown"] is False
+    assert r["restored"] and r["time_to_restore_s"] == 7.0
+
+
+def test_a_pulse_never_ended_is_never_restored():
+    timeline, plans = pulse_restored()
+    r = survival.recovery(pulsed(timeline, ended=None, pulse_s=None), plans[:1],
+                          cooldown_seconds=5.0)
+    assert r["restored"] is False and r["time_to_restore_s"] is None
+    assert r["released_s"] is None and r["time_to_restore_from_release_s"] is None
+    assert r["first_upgrade_s"] is None and r["first_upgrade_after_cooldown"] is None
+    assert r["effective_bits"]["mean_after_pressure"] is None
+
+
+def test_the_tool_releases_a_pulse_for_an_adaptive_engine_only(tmp_path):
+    path = Path(__file__).resolve().parent.parent / "tools" / "survival_experiment.py"
+    spec = importlib.util.spec_from_file_location("survival_tool", path)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    with pytest.raises(SystemExit):
+        tool.main(["static", "--out", str(tmp_path / "s.csv.gz"), "--issue", "155",
+                   "--pulse", "30"])
+
+
 # -- the run, small -----------------------------------------------------------------------
 
 @pytest.mark.slowest
@@ -236,3 +334,32 @@ def test_the_static_engine_runs_out_where_the_adaptive_one_survives(tmp_path):
     assert s["totals"]["returned_mib"] > 0
     assert s["totals"]["every_plan_seen_within_granule"] is True
     assert (tmp_path / "adaptive.csv.gz").exists()
+
+
+@pytest.mark.slowest
+def test_a_pulse_released_is_restored_after_the_cooldown(tmp_path):
+    """The pulse at a small scale: at 2048 positions the simulator takes
+    what leaves Qwen2.5-0.5B 24 MiB short and gives it back 2 s later. The
+    engine downgrades, and once the pulse has passed and the cooldown run,
+    its upgrades bring every page back to FP16 before the generation ends,
+    with no thrash."""
+    ids = prompt(4096, 1551)
+    context_bytes = replay.simulator_context_bytes(tmp_path)
+    adaptive = Engine(require_model(NAME), kv_adaptive=True, kv_upgrade_cooldown_seconds=0.5)
+    adaptive.load_weights()
+    result = survival.run(adaptive, ids, 600, contention_at=2048, shortfall_bytes=24 * MIB,
+                          out=tmp_path / "pulse.csv.gz", simulator_context_bytes=context_bytes,
+                          pulse_s=2.0)
+    r = survival.recovery(result, adaptive.plans,
+                          cooldown_seconds=adaptive.kv_upgrade_cooldown_seconds)
+    del adaptive
+    gc.collect()
+    print(f"\n{r}")
+    assert result.summary["survived"] is True
+    assert result.summary["totals"]["downgrades_applied"] > 0
+    assert result.summary["totals"]["upgrades_applied"] > 0
+    assert r["pressure_ended_s"] >= 2.0
+    assert r["first_upgrade_after_cooldown"] is True
+    assert r["restored"] and r["time_to_restore_s"] >= 0.5
+    assert r["thrash"]["switches"] == 1
+    assert r["effective_bits"]["lowest"] < 16 and result.timeline[-1].effective_bits == 16.0

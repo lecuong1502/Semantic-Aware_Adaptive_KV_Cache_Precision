@@ -21,6 +21,15 @@ event waited for the step boundary at which the engine drained it (#135).
 **The run** pauses the generation at the chosen position until the
 simulator has taken its memory, so that contention arrives at the same place
 in every run however fast the engine and the simulator start.
+
+**A pulse and release** (#155) is the run with the simulator giving its
+memory back `pulse_s` after it took it, the generation going on: pressure
+passes, and once the cooldown has run the engine's upgrades restore the
+pages from their shadows (#106). A run samples, at every step, what its
+cache holds, its effective bits and its pages below FP16, and `recovery`
+gives what that comes to: the time from the end of pressure to every page
+back at FP16, the effective bits over time, and any thrash, downgrades and
+upgrades alternating.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
@@ -170,27 +180,60 @@ class Run:
     #: When the take began, on the recorder's clock (replay's return).
     started_ns: int
     pressure_events: list[PressureRecord] = field(default_factory=list)
+    #: What the cache held at each step, from the generation's first report
+    #: (`sample`), and when the simulator had taken its memory, on
+    #: time.monotonic(), the clock of the engine's plans.
+    timeline: list[Step] = field(default_factory=list)
+    took_at_seconds: float | None = None
+    #: When pressure last ended, GREEN after YELLOW or RED, on that clock.
+    pressure_ended_seconds: float | None = None
+    #: How long the simulator kept what it took, or None, to the end.
+    pulse_s: float | None = None
+
+
+class Step(NamedTuple):
+    """What a generation's cache held at a step, when it reported one: the
+    time, on time.monotonic(), the state and position reported, and the
+    cache's effective bits and (layer, page)s below FP16 (Engine.held_bits),
+    None before it holds a full page."""
+
+    t: float
+    state: str
+    position: int
+    effective_bits: float | None
+    pages_below_fp16: int | None
+
+
+def sample(engine: Engine, state: str, position: int) -> Step:
+    bits = engine.held_bits() or {}
+    return Step(time.monotonic(), state, position, bits.get("effective_bits"),
+                bits.get("pages_below_fp16"))
 
 
 def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: int,
-        shortfall_bytes: int, out: str | Path, simulator_context_bytes: int) -> Run:
+        shortfall_bytes: int, out: str | Path, simulator_context_bytes: int,
+        pulse_s: float | None = None) -> Run:
     """Generate `new_tokens` after `prompt` with the engine's monitor on and
     plans measured, while the recorder records the device to `out`. When
     the cache first reports `contention_at` positions or more, the
     simulator takes contention_bytes for `shortfall_bytes` and keeps it
-    until the generation ends; the generation waits there until it has.
-    A static engine that runs out raises OutOfMemory, which is caught and
-    summarised; an adaptive one ends as its `ending` says."""
+    until the generation ends, or, with `pulse_s`, for that long, and then
+    gives it back; the generation waits there until it has taken it. Every
+    step is sampled into the run's timeline. A static engine that runs out
+    raises OutOfMemory, which is caught and summarised; an adaptive one
+    ends as its `ending` says."""
     out = Path(out)
     context = len(prompt) + new_tokens - 1
     done = threading.Event()
     failure: list[BaseException] = []
     took: dict = {}
     reached = [0]
+    timeline: list[Step] = []
 
     def contend() -> None:
+        points = [(0.0, took["bytes"])] + ([] if pulse_s is None else [(pulse_s, 0)])
         try:
-            took["started_ns"] = replay.replay(Schedule([(0.0, took["bytes"])]), out,
+            took["started_ns"] = replay.replay(Schedule(points), out,
                                                lead_s=LEAD_S, tail_s=KEEP_S, stop=done)
         except BaseException as exc:  # noqa: BLE001 - raised by the caller's thread
             failure.append(exc)
@@ -199,6 +242,7 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
 
     def report(state: str, position: int, token: int | None) -> None:
         reached[0] = position
+        timeline.append(sample(engine, state, position))
         if took or position < contention_at:
             return
         took["position"], took["headroom"] = position, nvml.memory().free
@@ -208,6 +252,7 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
                                          shortfall_bytes=shortfall_bytes)
         simulating.start()
         _wait_for_take(recorder.companion(out, ".events.jsonl"), simulating, failure)
+        took["at_seconds"] = time.monotonic()
 
     engine.measure_plans = True
     engine.start_monitor()
@@ -230,7 +275,91 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
         raise RuntimeError(f"the cache never reached {contention_at} positions: no contention")
     return Run(summarise(engine.plans, ending=ending, error=error, positions_reached=reached[0]),
                took["position"], took["headroom"], took["bytes"], took["started_ns"],
-               list(engine.pressure_events))
+               list(engine.pressure_events), timeline, took["at_seconds"],
+               engine.pressure_ended_seconds, pulse_s)
+
+
+def recovery(run: Run, plans: Sequence[PlanRecord], *, cooldown_seconds: float) -> dict:
+    """What a pulse and release comes to, its times in seconds from when
+    the simulator had taken its memory:
+    - when it gave it back, `pulse_s` later, as it was scheduled, and when
+      pressure last ended, the monitor's GREEN after it, which lags the
+      release by the monitor's polls;
+    - the last downgrade applied, and the first and last upgrade applied;
+      whether the first came the cooldown after the end of pressure or the
+      last downgrade before it, the later, as the engine's cooldown runs
+      (for one pulse: under several, pressure that ended before the last
+      is not known);
+    - the **time to restore**: from the end of pressure to the first step
+      after it whose cache holds no page below FP16, and from the release;
+      None if no step did;
+    - the **effective bits**, each step's held until the next, averaged over
+      time from the take to the last step, under pressure and after it, and
+      the lowest;
+    - **thrash**: how often the applied plans, in the order they were first
+      applied, turn from downgrades to upgrades or back (one, for a pulse
+      restored), the downgrade plans applied after the first upgrade, and
+      the upgrade plans pressure cancelled."""
+    took = run.took_at_seconds
+
+    def since(t: float | None) -> float | None:
+        return None if t is None else t - took
+
+    applied = sorted((p.batches[0].at_seconds, p.upgrades, p) for p in plans if p.batches)
+    downs = [b.at_seconds for p in plans if not p.upgrades for b in p.batches]
+    ups = [b.at_seconds for p in plans if p.upgrades for b in p.batches]
+    first_up = min(ups, default=None)
+    ended = run.pressure_ended_seconds
+    released = None if run.pulse_s is None else took + run.pulse_s
+    restored_at = None if ended is None else next(
+        (step.t for step in run.timeline if step.t >= ended and step.pages_below_fp16 == 0),
+        None)
+    cooldown_from = None
+    if first_up is not None:
+        cooldown_from = max([t for t in (ended, *downs) if t is not None and t <= first_up],
+                            default=None)
+    kinds = [up for _, up, _ in applied]
+    held = [step for step in run.timeline if step.effective_bits is not None]
+    # From the step the take came at, whose bits it held: the steps after it.
+    first = max([i for i, step in enumerate(held) if step.t <= took], default=0)
+    steps = held[first:]
+    return {
+        "released_s": run.pulse_s, "pressure_ended_s": since(ended),
+        "last_downgrade_s": since(max(downs, default=None)),
+        "first_upgrade_s": since(first_up), "last_upgrade_s": since(max(ups, default=None)),
+        "cooldown_s": cooldown_seconds,
+        "first_upgrade_after_cooldown": None if cooldown_from is None
+        else first_up - cooldown_from >= cooldown_seconds,
+        "restored": restored_at is not None,
+        "time_to_restore_s": None if restored_at is None else restored_at - ended,
+        "time_to_restore_from_release_s": None if restored_at is None or released is None
+        else restored_at - released,
+        "effective_bits": {
+            "mean": _mean_over_time(steps, took, None),
+            "mean_under_pressure": None if ended is None else _mean_over_time(steps, took, ended),
+            "mean_after_pressure": None if ended is None else _mean_over_time(steps, ended, None),
+            "lowest": min((step.effective_bits for step in steps), default=None)},
+        "thrash": {
+            "switches": sum(a != b for a, b in zip(kinds, kinds[1:])),
+            "downgrade_plans_after_first_upgrade": 0 if first_up is None else sum(
+                1 for t, up, _ in applied if not up and t > first_up),
+            "upgrade_plans_cancelled_by_pressure": sum(
+                1 for p in plans if p.upgrades and p.ended == "cancelled by pressure")}}
+
+
+def _mean_over_time(steps: Sequence[Step], start: float, end: float | None) -> float | None:
+    """The effective bits of `steps`, each held from its time to the next
+    step's, averaged over [start, end), end the last step's time if None."""
+    times = [step.t for step in steps]
+    end = times[-1] if end is None and times else end
+    total = weight = 0.0
+    for i, step in enumerate(steps):
+        held_from = max(step.t, start)
+        held_to = min(times[i + 1] if i + 1 < len(steps) else end, end)
+        if held_to > held_from:
+            total += step.effective_bits * (held_to - held_from)
+            weight += held_to - held_from
+    return None if weight == 0 else total / weight
 
 
 def _wait_for_take(events: Path, simulating: threading.Thread,

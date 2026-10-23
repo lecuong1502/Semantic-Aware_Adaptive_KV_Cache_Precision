@@ -374,25 +374,13 @@ def summarise(entries: Sequence[dict], of: AnchorSet, *, plan_seed: int = 0,
                                          "wilson_95": list(rq3_summary.wilson(int(at.sum()),
                                                                               len(at)))}
         recall[name] = {
-            "correct": int(answered.sum()), "n": len(answered),
-            "recall": float(answered.mean()),
-            "bootstrap_95": [float(v)
-                             for v in rq3_summary.bootstrap(answered[None, :], rng)[0]],
-            "wilson_95": list(rq3_summary.wilson(int(answered.sum()), len(answered))),
+            **rq3_summary.proportion(answered, rng), "recall": float(answered.mean()),
             "by_gap": by_gap,
             "effective_bits": float(np.mean([e["results"]["effective_bits"]
                                              for e in condition_runs])),
             "fact_page_tiers": rq3_summary.pooled_tiers(condition_runs, "fact_page_tiers"),
             "code_echoed": sum(1 for e in condition_runs if e["results"]["code_echoed"])}
-    pairs = {}
-    for share in rq3_summary.LEVELS:
-        names = {c.source: c.name for c in rq3.CONDITIONS if c.share == share}
-        if names["semantic"] not in conditions:
-            continue
-        pairs[rq3_summary.level_name(share)] = {
-            f"semantic-{other}": rq3_summary.paired(right[names["semantic"]],
-                                                    right[names[other]], rng)
-            for other in rq3_summary.OTHER_SOURCES if names[other] in conditions}
+    pairs = rq3_summary.paired_at_levels(right, rng)
     return {"model": of.model, **of.config(), "plan_seed": plan_seed,
             "dialogues": len(kept),
             "bootstrap": {"resamples": rq3_summary.RESAMPLES, "seed": SEED},
