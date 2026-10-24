@@ -147,6 +147,8 @@ def table(summary: dict) -> str:
                     f"| {s['reclaimed_mib_mean']:.1f} | {s['reclaimed_mib_mean_at_answer']:.1f} "
                     f"| {s['returned_mib_mean']:.1f} | {s['target_met']} "
                     f"| {s['plans_done_before_question']} | {s['plans_done_at_answer']} |")
+    rows.append(f"\n{summary['same_contention']} of {summary['samples']} samples' runs met "
+                "the same contention, the same target at the same position")
     for pair, p in summary["paired"].items():
         rows.append(f"\n{pair}: {p['semantic_only']} only semantic answered, {p['other_only']} "
                     f"only the other; McNemar p = {p['mcnemar_p']:.3g}, difference "

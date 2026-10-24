@@ -1548,13 +1548,12 @@ class Engine:
         """Each tier's page bytes, its logged roundtrip error, and each
         downgrade's logged latency: this model's, or, not measured, any
         model's as an estimate."""
-        page_bytes = self.page_bytes
         errors = controller.logged_tier_errors(self.config.name)
         try:
             seconds = controller.logged_move_seconds(self.config.name)
         except ValueError:
             seconds = controller.logged_move_seconds(None)
-        return page_bytes, errors, seconds
+        return self.page_bytes, errors, seconds
 
     def _apply(self, cache: model.PagedCache, started: float, planned: bool,
                own_before: int | None) -> None:

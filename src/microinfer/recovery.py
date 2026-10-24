@@ -36,7 +36,6 @@ from pathlib import Path
 import numpy as np
 
 from . import benchlog, needles, rq3, rq3_summary
-from .rq3 import NeedleSet
 
 KIND = "rq3-recovery"
 SUMMARY_KIND = "recovery-summary"
@@ -94,21 +93,18 @@ def runs(engine, sample: needles.Sample, conds: Sequence[rq3.Condition], *,
     yield from rq3.runs(engine, sample, conds, EXPERIMENT, plan_seed=plan_seed, then=turn_3)
 
 
-def logged(of: NeedleSet, commit: str, log: str | Path = benchlog.DEFAULT_LOG, *,
+def logged(of: rq3.NeedleSet, commit: str, log: str | Path = benchlog.DEFAULT_LOG, *,
            plan_seed: int = 0) -> dict[tuple[str, str], bool]:
     """The runs already logged, by (sample id, condition), each with whether
     turn 3 was right: those of the set at the code of `commit`
     (benchlog.same_code) and this plan seed, as rq3.logged counts a needle
     run."""
-    if not Path(log).exists():
-        return {}
-    same_code = benchlog.same_code_as(commit, log)
     return {(e["config"]["sample_id"], e["config"]["condition"]["name"]):
             e["results"]["turn_3_correct"]
-            for e in _runs(benchlog.read(log), of, plan_seed) if same_code(e["git_commit"])}
+            for e in _runs(of.logged_at(KIND, commit, log), of, plan_seed)}
 
 
-def _runs(entries: Sequence[dict], of: NeedleSet, plan_seed: int) -> Iterator[dict]:
+def _runs(entries: Sequence[dict], of: rq3.NeedleSet, plan_seed: int) -> Iterator[dict]:
     """The recovery runs in `entries` of the set at `plan_seed`."""
     return (e for e in entries
             if e["kind"] == KIND and of.holds(e) and e["config"]["plan_seed"] == plan_seed)
@@ -118,7 +114,7 @@ def _accuracy(right: np.ndarray, rng: np.random.Generator) -> dict:
     return {**rq3_summary.proportion(right, rng), "accuracy": float(right.mean())}
 
 
-def summarise(entries: Sequence[dict], of: NeedleSet, *, plan_seed: int = 0,
+def summarise(entries: Sequence[dict], of: rq3.NeedleSet, *, plan_seed: int = 0,
               conditions: Sequence[str] = CONDITIONS) -> dict:
     """The recovery summary of the screened set's runs in `entries`, the
     latest of each sample under each of `conditions` at `plan_seed`, as the

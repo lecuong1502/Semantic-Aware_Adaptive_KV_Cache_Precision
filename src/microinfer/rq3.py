@@ -301,9 +301,15 @@ class Planned:
 
     def page_tiers(self, pages: tuple[int, int]) -> dict[str, int]:
         """The tiers of every (layer, page) of `pages`, first and last, by count."""
-        first, last = pages
-        counts = Counter(controller.TIERS[t] for t in self.tiers[:, first:last + 1].ravel())
-        return dict(sorted(counts.items()))
+        return page_tiers(self.tiers, pages)
+
+
+def page_tiers(tiers: np.ndarray, pages: tuple[int, int]) -> dict[str, int]:
+    """The tiers of every (layer, page) of `pages`, first and last, in
+    `tiers`, indices into controller.TIERS, by count."""
+    first, last = pages
+    counts = Counter(controller.TIERS[t] for t in tiers[:, first:last + 1].ravel())
+    return dict(sorted(counts.items()))
 
 
 def plan_at(chat, cond: Condition, seed: int) -> Planned:
@@ -463,6 +469,18 @@ class NeedleSet(NamedTuple):
     def config(self) -> dict:
         """What a log entry's config names of the set, but its model."""
         return {"needle_seed": self.needle_seed, "haystack_tokens": self.haystack_tokens}
+
+    def logged_at(self, kind: str, commit: str,
+                  log: str | Path = benchlog.DEFAULT_LOG) -> list[dict]:
+        """The `kind` entries of the set logged at the code of `commit`
+        (benchlog.same_code), though the log may differ, so that a run of
+        hours stopped part way is taken up again; none before the log
+        exists."""
+        if not Path(log).exists():
+            return []
+        same_code = benchlog.same_code_as(commit, log)
+        return [e for e in benchlog.read(log)
+                if e["kind"] == kind and self.holds(e) and same_code(e["git_commit"])]
 
 
 def screened(model: str, needle_seed: int, haystack_tokens: int,

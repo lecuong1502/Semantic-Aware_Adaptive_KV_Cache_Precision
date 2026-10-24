@@ -59,12 +59,13 @@ def entry(log, sample_id, source, correct, *, reclaimed_mib=180.0, done=True, ne
         config={"sample_id": sample_id, "source": source, "needle_seed": needle_seed,
                 "haystack_tokens": 7936},
         results={"correct": correct, "answer": "a",
-                 "contention": {"target_bytes": int(180 * MIB), "taken_bytes": int(1000 * MIB)},
+                 "contention": {"target_bytes": int(180 * MIB), "taken_bytes": int(1000 * MIB),
+                                "position": 8000 + (sample_id == "d30-0" and source == "uniform")},
                  "at_question": {"reclaimed_bytes": int(reclaimed_mib * MIB),
                                  "target_met": reclaimed_mib >= 180, "plans_done": done,
                                  "effective_bits": 3.4},
                  "at_answer": {"reclaimed_bytes": int((reclaimed_mib + 10) * MIB),
-                               "plans_done": True},
+                               "target_met": True, "plans_done": True},
                  "totals": {"returned_mib": reclaimed_mib, "seen_mib": reclaimed_mib}},
         log=log)
 
@@ -90,7 +91,8 @@ def test_the_summary_gives_each_source_its_answers_and_its_bytes(tmp_path):
     assert s["plans_done_before_question"] == 3 and s["plans_done_at_answer"] == 4
     assert s["reclaimed_mib_mean_at_answer"] == pytest.approx(190.0)
     assert u["reclaimed_mib_mean"] == pytest.approx(177.5)
-    assert u["taken_mib_mean"] == pytest.approx(1000.0)
+    assert u["taken_mib_mean"] == pytest.approx(1000.0) and u["target_met_at_answer"] == 4
+    assert summary["same_contention"] == 3  # d30-0's two runs met it at other positions
     pair = summary["paired"]["semantic-uniform"]
     assert (pair["semantic_only"], pair["other_only"]) == (1, 0)
     assert len(summary["entries"]) == 8
@@ -137,7 +139,8 @@ def test_the_monitor_s_plan_reclaims_under_the_simulator_before_the_question(
     assert at_question["effective_bits"] < 16
     assert results["at_answer"]["reclaimed_bytes"] >= at_question["reclaimed_bytes"]
     assert results["correct"] == needles.correct(results["answer"], sample.code)
-    assert not engine.kv_adaptive and engine._monitor is None
+    assert not engine.kv_adaptive and not engine.measure_plans
+    assert at_question["plans"] >= 1 and at_question["level"] in ("GREEN", "YELLOW", "RED")
     print(f"\ntarget {took['target_bytes'] / MIB:.1f} MiB, took {took['taken_bytes'] / MIB:.0f}, "
           f"reclaimed {at_question['reclaimed_bytes'] / MIB:.1f} at the question, "
           f"{at_question['effective_bits']:.2f} bits, plans done "

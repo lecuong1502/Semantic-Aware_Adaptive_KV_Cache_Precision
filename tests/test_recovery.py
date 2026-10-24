@@ -23,7 +23,7 @@ tool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tool)
 
 SMALL = "qwen2.5-0.5b-instruct"
-SET = recovery.NeedleSet("m", 140, 7936)
+SET = rq3.NeedleSet("m", 140, 7936)
 
 
 def screening(log, kept, *, draws=5):
