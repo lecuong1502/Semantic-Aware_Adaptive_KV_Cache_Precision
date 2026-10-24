@@ -177,12 +177,16 @@ def pooled_tiers(runs: list[dict], key: str) -> dict[str, float]:
     return {t: n / held for t, n in sorted(tiers.items())}
 
 
-def paired(semantic: np.ndarray, other: np.ndarray, rng: np.random.Generator) -> dict:
-    """The semantic source against another, sample by sample."""
+def paired(semantic: np.ndarray, other: np.ndarray, rng: np.random.Generator, *,
+           named: tuple[str, str] = ("semantic", "other")) -> dict:
+    """The semantic source against another, sample by sample, or, `named`
+    otherwise, any two conditions: the samples only each answered, under
+    its name, McNemar's test on them, and the first's difference in
+    accuracy from the second's."""
     semantic_only = int((semantic & ~other).sum())
     other_only = int((~semantic & other).sum())
     difference = bootstrap((semantic.astype(float) - other)[None, :], rng)[0]
-    return {"semantic_only": semantic_only, "other_only": other_only,
+    return {f"{named[0]}_only": semantic_only, f"{named[1]}_only": other_only,
             "mcnemar_p": mcnemar(semantic_only, other_only),
             "difference": (int(semantic.sum()) - int(other.sum())) / len(semantic),
             "difference_bootstrap_95": [float(v) for v in difference]}
@@ -307,32 +311,39 @@ def summarise_long(entries: Sequence[dict], model: str, needle_seed: int, *,
 def summarise_ablations(entries: Sequence[dict], model: str, needle_seed: int,
                         haystack_tokens: int, *, plan_seed: int = 0) -> dict:
     """ADR-0018's quality ablations (#158) on the screened set, each against
-    the full policy, rq3.FULL_POLICY, on the same samples: the latest
-    question-blind run of each under it and under every ablation. Each
-    gives:
+    the condition it changes, on the same samples: the full policy,
+    rq3.FULL_POLICY, or for no INT2 at rq3.NO_INT2_SHARE the semantic source
+    there (rq3.measured_against). The latest question-blind run of each
+    sample under each is pooled. Each ablation gives:
     - its accuracy, with its bootstrap and Wilson intervals;
-    - its change in accuracy from the full policy, with the paired
+    - its change in accuracy from the condition it changes, with the paired
       difference's bootstrap interval, and McNemar's exact test on the
       samples only one of the two answered;
     - its effective bits, over every full page and over the pages the share
       is of, the mean over the samples, and how many of its plans fell
-      short of the full policy's bytes, so that equal bytes are checked, not
-      assumed.
-    A ValueError names what is missing."""
+      short of the bytes asked, so that equal bytes are checked, not
+      assumed. No INT2 at 80% is short on every plan: INT4 gives back 71%
+      of a page's FP16 bytes at most.
+    A ValueError names what is missing, or the layer weights, should the
+    layer weights' runs have been made with more than one."""
     if rq3.FULL_POLICY.share != CLOSING_SHARE:
         raise ValueError("the ablations change the closing question's condition")
     screening = rq3.last_screening(entries, model, needle_seed, haystack_tokens)
     kept = screening["results"]["kept"]
     latest = _pool(entries, model, needle_seed, haystack_tokens, plan_seed, kept)
-    names = [rq3.FULL_POLICY.name, *rq3.ABLATION_NAMES]
+    names = [*rq3.ABLATED_FROM, *rq3.ABLATION_NAMES]
     missing = [(s, name) for name in names for s in kept
                if (s, CLOSING_EXPERIMENT, name) not in latest]
     if missing:
         raise ValueError(f"no run of {len(missing)} samples' conditions, such as "
                          f"{missing[:3]}; run tools/rq3.py --ablations for them")
     runs = {name: [latest[(s, CLOSING_EXPERIMENT, name)] for s in kept] for name in names}
+    weights = {tuple(e["config"]["condition"]["options"]["layer_weights"])
+               for e in runs[f"{rq3.FULL_POLICY.name}-layer-weights"]}
+    if len(weights) > 1:
+        raise ValueError(f"the layer weights' runs were made with {len(weights)} sets of "
+                         f"weights; run them again with the last logged")
     right = {name: np.array([e["results"]["correct"] for e in runs[name]]) for name in names}
-    full = right[rq3.FULL_POLICY.name]
     rng = np.random.default_rng(SEED)
 
     def held(name: str) -> dict:
@@ -346,19 +357,20 @@ def summarise_ablations(entries: Sequence[dict], model: str, needle_seed: int,
 
     ablations = {}
     for name in rq3.ABLATION_NAMES:
-        pair = paired(right[name], full, rng)
+        condition = runs[name][0]["config"]["condition"]
+        against = rq3.source_condition(condition["source"], condition["share"]).name
+        pair = paired(right[name], right[against], rng, named=("ablation", "against"))
         ablations[name] = {
-            "element": rq3.ABLATED_ELEMENTS[name], **held(name),
-            "change": pair["difference"],
-            "change_bootstrap_95": pair["difference_bootstrap_95"],
-            "ablation_only": pair["semantic_only"], "full_only": pair["other_only"],
-            "mcnemar_p": pair["mcnemar_p"]}
+            "element": condition["ablates"], "against": against, **held(name),
+            "change": pair.pop("difference"),
+            "change_bootstrap_95": pair.pop("difference_bootstrap_95"), **pair}
     return {"model": model, "needle_seed": needle_seed, "haystack_tokens": haystack_tokens,
             "plan_seed": plan_seed, "experiment": CLOSING_EXPERIMENT,
             "samples": len(kept), "significance": SIGNIFICANCE,
             "bootstrap": {"resamples": RESAMPLES, "seed": SEED},
-            "full_policy": {"name": rq3.FULL_POLICY.name, **held(rq3.FULL_POLICY.name)},
-            "ablations": ablations, "screening": screening["sha256"],
+            "against": {name: held(name) for name in rq3.ABLATED_FROM},
+            "ablations": ablations, "layer_weights": list(weights.pop()),
+            "screening": screening["sha256"],
             "entries": [e["sha256"] for name in names for e in runs[name]]}
 
 

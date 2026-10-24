@@ -60,9 +60,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--plan-seed", type=int, default=0)
     parser.add_argument("--experiments", nargs="+", default=list(rq3.EXPERIMENTS),
                         choices=rq3.EXPERIMENTS)
-    parser.add_argument("--long", action="store_true", help="the 32K subset (#156)")
-    parser.add_argument("--ablations", action="store_true",
-                        help="ADR-0018's quality ablations (#158)")
+    summaries_of_their_own = parser.add_mutually_exclusive_group()
+    summaries_of_their_own.add_argument("--long", action="store_true",
+                                        help="the 32K subset (#156)")
+    summaries_of_their_own.add_argument("--ablations", action="store_true",
+                                        help="ADR-0018's quality ablations (#158)")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     if benchlog.environment(args.log)["git_dirty"]:
@@ -70,8 +72,6 @@ def main(argv: list[str]) -> int:
                      "entry names the code that produced it")
 
     benchlog.verify(args.log)  # the hashes the summary names are of the entries as appended
-    if args.long and args.ablations:
-        parser.error("--long and --ablations are summaries of their own; choose one")
     if args.long:
         return long_subset(parser, args)
     if args.ablations:
@@ -152,14 +152,14 @@ def ablations(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                             "haystack_tokens": args.haystack_tokens,
                             "plan_seed": args.plan_seed, "experiments": [summary["experiment"]]},
                     results=summary, log=args.log)
-    full = summary["full_policy"]
-    print(f"\n### Quality ablations, {summary['experiment']} at 80%, against "
-          f"{full['name']}: {full['correct']}/{full['n']}, {full['effective_bits']:.2f} bits\n")
-    table(["Ablation", "Element", "Correct", "Change, bootstrap 95%", "Only ablation",
-           "Only full", "McNemar p", "Effective bits", "Short plans"],
-          [[name, a["element"], f"{a['correct']}/{a['n']}",
+    against = ", ".join(f"{name} {a['correct']}/{a['n']} at {a['effective_bits']:.2f} bits"
+                        for name, a in summary["against"].items())
+    print(f"\n### Quality ablations, {summary['experiment']}, against {against}\n")
+    table(["Ablation", "Element", "Against", "Correct", "Change, bootstrap 95%",
+           "Only ablation", "Only against", "McNemar p", "Effective bits", "Short plans"],
+          [[name, a["element"], a["against"], f"{a['correct']}/{a['n']}",
             f"{a['change']:+.2f} {interval(a['change_bootstrap_95'])}", a["ablation_only"],
-            a["full_only"], f"{a['mcnemar_p']:.3g}", f"{a['effective_bits']:.2f}", a["short"]]
+            a["against_only"], f"{a['mcnemar_p']:.3g}", f"{a['effective_bits']:.2f}", a["short"]]
            for name, a in summary["ablations"].items()])
     return 0
 

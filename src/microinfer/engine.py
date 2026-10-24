@@ -1404,9 +1404,13 @@ class Engine:
         pages = cache.pages
         tiers, scores = self._tiers_and_scores(cache, source, seed)
         page_bytes, errors, seconds = self._plan_inputs
+        # The share is of the pages outside the default floor, whatever floor
+        # the plan keeps, so that an ablation of W chases the same bytes.
+        share_floor = controller.DEFAULT_RECENCY_FLOOR
         target = controller.share_target_bytes(share, tiers, page_bytes,
                                                positions=cache.length,
-                                               page_tokens=pages.page_tokens)
+                                               page_tokens=pages.page_tokens,
+                                               recency_floor=share_floor)
         plan = controller.target_plan_arrays(
             target, RED, scores, tiers, page_bytes, errors, move_seconds=seconds,
             positions=cache.length, page_tokens=pages.page_tokens,
@@ -1426,8 +1430,7 @@ class Engine:
             "source": source, "seed": seed if source == "random" else None, "share": share,
             "target_bytes": target, "reclaimed_bytes": reclaimed,
             "target_met": entry.ended == "applied" and reclaimed >= target,
-            # over the pages the share is of, whatever floor the plan kept
-            **self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)}
+            **self._effective_bits(cache, page_bytes, share_floor)}
         return entry
 
     def _controlled_restore(self, cache: model.PagedCache, source: str,

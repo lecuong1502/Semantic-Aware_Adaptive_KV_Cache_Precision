@@ -10,7 +10,8 @@ how the cache is held:
   session, the uniform-quantisation family;
 - **an ablation** (ADR-0018, #158): the semantic source at 80%, the full
   policy, with one element changed, the recency floor, the scorer's
-  cadence or EWMA weight, or an option of the planner (`ablations`).
+  cadence or EWMA weight, or an option of the planner, and no INT2 at
+  70% too, against the semantic source there (`ablations`).
 
 An **experiment** is when the plan is made:
 - **question-blind**, the primary: turn 1, the document and a general
@@ -92,6 +93,8 @@ class Condition:
     score_every: int | None = None
     score_alpha: float | None = None
     options: controller.PlanOptions | None = None
+    #: The element of the policy an ablation changes, as ADR-0018 names it.
+    ablates: str | None = None
 
     def __post_init__(self):
         if self.source is not None:
@@ -119,35 +122,50 @@ def source_condition(source: str, share: float) -> Condition:
 #: The full policy ADR-0018's quality ablations change (#158): the closing
 #: question's condition, question-blind at 80%.
 FULL_POLICY = source_condition("semantic", 0.8)
-#: The ablations, each the suffix of its name, the element of the policy it
-#: changes, as ADR-0018 names it, and the change; the layer weights are
-#: those measured (#145), which `ablations` takes.
-ABLATIONS = (
-    ("w0", "recency floor", {"recency_floor": 0}),
-    ("w512", "recency floor", {"recency_floor": 512}),
-    ("every-step", "scoring cadence", {"score_every": 1}),
-    ("alpha-0.05", "EWMA weight", {"score_alpha": 0.05}),
-    ("alpha-0.5", "EWMA weight", {"score_alpha": 0.5}),
-    ("importance-only", "marginal cost",
-     {"options": controller.PlanOptions(importance_only=True)}),
-    ("no-int2", "the INT2 tier", {"options": controller.PlanOptions(lowest_tier="INT4")}),
-    ("layer-weights", "layer weights", None),
-    ("first-page", "attention sinks",
-     {"options": controller.PlanOptions(protect_first_page=True)}),
-)
-ABLATION_NAMES = tuple(f"{FULL_POLICY.name}-{suffix}" for suffix, _, _ in ABLATIONS)
-#: Each ablation's element, by its name.
-ABLATED_ELEMENTS = {f"{FULL_POLICY.name}-{suffix}": element
-                    for suffix, element, _ in ABLATIONS}
+#: The level no INT2 is also run at, against the semantic source there:
+#: INT4 gives back 71% of a page's FP16 bytes at most, short of 80% (#158).
+NO_INT2_SHARE = 0.7
 
 
 def ablations(layer_weights: Sequence[float]) -> tuple[Condition, ...]:
-    """ADR-0018's quality ablations, in ABLATIONS' order, the layer
-    weights' with `layer_weights`, one a layer (controller.logged_layer_weights)."""
-    weighted = {"options": controller.PlanOptions(layer_weights=tuple(layer_weights))}
-    return tuple(replace(FULL_POLICY, name=f"{FULL_POLICY.name}-{suffix}",
-                         **(weighted if change is None else change))
-                 for suffix, _, change in ABLATIONS)
+    """ADR-0018's quality ablations, each the full policy with one element
+    changed, and no INT2 at NO_INT2_SHARE too, the semantic source there
+    with it changed (measured_against). The layer weights' ablation weighs
+    scores by `layer_weights`, one weight a layer, as measured
+    (controller.logged_layer_weights, #145)."""
+    def ablated(suffix: str, element: str, against: Condition = FULL_POLICY,
+                **change) -> Condition:
+        return replace(against, name=f"{against.name}-{suffix}", ablates=element, **change)
+
+    options = controller.PlanOptions
+    return (
+        ablated("w0", "recency floor", recency_floor=0),
+        ablated("w512", "recency floor", recency_floor=512),
+        ablated("every-step", "scoring cadence", score_every=1),
+        ablated("alpha-0.05", "EWMA weight", score_alpha=0.05),
+        ablated("alpha-0.5", "EWMA weight", score_alpha=0.5),
+        ablated("importance-only", "marginal cost", options=options(importance_only=True)),
+        ablated("no-int2", "the INT2 tier", options=options(lowest_tier="INT4")),
+        ablated("no-int2", "the INT2 tier", source_condition("semantic", NO_INT2_SHARE),
+                options=options(lowest_tier="INT4")),
+        ablated("layer-weights", "layer weights",
+                options=options(layer_weights=tuple(layer_weights))),
+        ablated("first-page", "attention sinks", options=options(protect_first_page=True)),
+    )
+
+
+#: The ablations' names, in their order, which no layer weights change.
+ABLATION_NAMES = tuple(c.name for c in ablations((1.0,)))
+
+
+def measured_against(cond: Condition) -> Condition:
+    """The condition an ablation is measured against: the semantic source at
+    its level, the full policy but for no INT2 at NO_INT2_SHARE."""
+    return source_condition(cond.source, cond.share)
+
+
+#: The conditions the ablations are measured against, in their order.
+ABLATED_FROM = tuple(dict.fromkeys(measured_against(c).name for c in ablations((1.0,))))
 
 
 def condition(name: str) -> Condition:
@@ -184,30 +202,27 @@ def check_engine(engine) -> None:
         raise ValueError("a run holds its cache on pages, both halves at a page's tier")
 
 
-#: The engine's settings an ablation changes, by the Condition field that
-#: changes each.
-_ABLATED = {"recency_floor": "kv_recency_floor", "score_every": "kv_score_every",
-            "score_alpha": "kv_score_alpha", "options": "kv_plan_options"}
+#: The engine's attributes a condition sets, by the Condition field that
+#: gives each; an ablation's, None in a field, leaves the engine's own.
+_SETS = {"tier": "kv_tier", "adaptive": "kv_adaptive", "source": "kv_score_source",
+         "recency_floor": "kv_recency_floor", "score_every": "kv_score_every",
+         "score_alpha": "kv_score_alpha", "options": "kv_plan_options"}
 
 
 @contextmanager
 def set_for(engine, cond: Condition):
     """The engine set for `cond`: its tier, whether it adapts and scores,
     its score source, and what an ablation changes, put back after."""
-    kept = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
-    ablated = {setting: getattr(engine, setting) for setting in _ABLATED.values()}
-    engine.kv_tier, engine.kv_adaptive, engine.kv_scoring = cond.tier, cond.adaptive, cond.adaptive
-    engine.kv_score_source = cond.source or kept[3]
+    kept = {name: getattr(engine, name) for name in (*_SETS.values(), "kv_scoring")}
     try:
-        for field, setting in _ABLATED.items():
+        for field, name in _SETS.items():
             if getattr(cond, field) is not None:
-                setattr(engine, setting, getattr(cond, field))
+                setattr(engine, name, getattr(cond, field))
+        engine.kv_scoring = cond.adaptive
         yield
     finally:
-        (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring,
-         engine.kv_score_source) = kept
-        for setting, value in ablated.items():
-            setattr(engine, setting, value)
+        for name, value in kept.items():
+            setattr(engine, name, value)
 
 
 def shares_turn_1(cond: Condition) -> bool:
@@ -330,7 +345,7 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         "aware_opening": opening,
         "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
         "code_after_plan": None if opening is None else code_after(opening, sample.code),
-        "score_every": engine.kv_score_every, "score_alpha": chat.score_alpha,
+        "score_every": engine.kv_score_every, "score_alpha": engine.kv_score_alpha,
         **planned.results(cond, seed, sample.page_tokens),
         "needle_page_tiers": planned.page_tiers(sample.needle_pages),
     }

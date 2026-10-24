@@ -408,8 +408,10 @@ _Avoid_: baseline (uniform is the baseline), default policy
 A condition that is the full policy with one element changed (ADR-0018,
 #158): the recency floor at 0 or 512, scoring every step, the EWMA weight
 at 0.05 or 0.5, importance alone, no INT2, layer weights, or a protected
-first page. Each is reported by its change in needle accuracy from the full
-policy, McNemar's test against it and the effective bits it held. Those
+first page; and no INT2 at 70% too, against the semantic source there,
+since INT4 cannot give back 80% of the bytes. Each is reported by its
+change in needle accuracy from the condition it changes, McNemar's test
+against it and the effective bits it held. Those
 that change only the plan share turn 1 with the full policy; those of the
 scorer run it alone. The monitor's K is an ablation of RQ2, not a condition.
 _Avoid_: arm, treatment
