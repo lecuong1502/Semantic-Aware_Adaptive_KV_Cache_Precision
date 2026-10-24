@@ -32,6 +32,9 @@ answers more samples and the two-sided test rejects, which makes a one-sided
 test at half the level, were set here, after the runs were logged: ADR-0017
 names neither. The answer is reported whatever it is, with the fewest
 discordant samples, all one way, that could have rejected.
+
+The 32K subset (#156) is summarised apart, by summarise_long: its ten
+samples confirm the direction, with no test claimed.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ CLOSING_EXPERIMENT = "question-blind"
 CLOSING_SHARE = 0.8
 LEVELS = sorted({c.share for c in rq3.CONDITIONS if c.share is not None})
 OTHER_SOURCES = ("uniform", "random")
+LONG_SUMMARY_KIND = "rq3-long-summary"
 
 
 def mcnemar(only_a: int, only_b: int) -> float:
@@ -108,6 +112,12 @@ def _source_condition(source: str, share: float) -> str:
     return cond.name
 
 
+#: The 32K subset's conditions, question-blind (#156, ADR-0017): FP16, and
+#: the semantic and uniform sources at the closing question's level.
+LONG_CONDITIONS = ("fp16", *(_source_condition(source, CLOSING_SHARE)
+                             for source in ("semantic", "uniform")))
+
+
 def _conditions(experiment: str) -> list[str]:
     if experiment == "question-aware":
         return list(rq3.SOURCE_CONDITIONS)
@@ -115,8 +125,10 @@ def _conditions(experiment: str) -> list[str]:
 
 
 def _pool(entries: Sequence[dict], model: str, needle_seed: int, haystack_tokens: int,
-          plan_seed: int, kept: list[str]) -> dict[tuple[str, str, str], dict]:
-    """The latest pooled run of each (sample, experiment, condition)."""
+          plan_seed: int, kept: list[str], *,
+          screened_fp16: bool = True) -> dict[tuple[str, str, str], dict]:
+    """The latest pooled run of each (sample, experiment, condition): FP16's
+    screening's, if `screened_fp16`, and no other condition's."""
     latest = {}
     for e in entries:
         if e["kind"] != "rq3-needle" or e["model"] != model:
@@ -127,7 +139,7 @@ def _pool(entries: Sequence[dict], model: str, needle_seed: int, haystack_tokens
                 and config["haystack_tokens"] == haystack_tokens
                 and config["plan_seed"] == plan_seed and config["sample_id"] in kept
                 and name != rq3.NO_PLAN.name
-                and bool(config.get("screening")) == (name == "fp16")):
+                and bool(config.get("screening")) == (screened_fp16 and name == "fp16")):
             latest[(config["sample_id"], config["experiment"], name)] = e
     return latest
 
@@ -241,6 +253,54 @@ def summarise(entries: Sequence[dict], model: str, needle_seed: int, haystack_to
             "bootstrap": {"resamples": RESAMPLES, "seed": SEED},
             "accuracy": accuracy, "paired": pairs, "closing": _closing(accuracy, pairs),
             "screening": screening["sha256"], "entries": pooled}
+
+
+def summarise_long(entries: Sequence[dict], model: str, needle_seed: int, *,
+                   plan_seed: int = 0) -> dict:
+    """The 32K subset's summary (#156): of each of its ten samples, one a
+    depth at needles.LONG_HAYSTACK_TOKENS, the latest question-blind run
+    under each of LONG_CONDITIONS. Each condition's accuracy with its
+    bootstrap and Wilson intervals, which of the depths it answered, and its effective bits; the
+    semantic source against uniform, sample by sample, and the way they
+    point. It confirms the direction, with no test claimed (ADR-0017): ten
+    samples cannot reject, since McNemar's test needs fewest_to_reject()
+    discordant ones. A ValueError names what is missing."""
+    kept = [needles.sample_id(d, 0) for d in needles.DEPTHS]
+    latest = _pool(entries, model, needle_seed, needles.LONG_HAYSTACK_TOKENS, plan_seed,
+                   kept, screened_fp16=False)
+    missing = [(s, name) for name in LONG_CONDITIONS for s in kept
+               if (s, CLOSING_EXPERIMENT, name) not in latest]
+    if missing:
+        raise ValueError(f"no run of {len(missing)} samples' conditions, such as "
+                         f"{missing[:3]}; run tools/rq3.py --long for them")
+    runs = {name: [latest[(s, CLOSING_EXPERIMENT, name)] for s in kept]
+            for name in LONG_CONDITIONS}
+    right = {name: np.array([e["results"]["correct"] for e in runs[name]])
+             for name in LONG_CONDITIONS}
+    rng = np.random.default_rng(SEED)
+    accuracy = {}
+    for name in LONG_CONDITIONS:
+        accuracy[name] = {
+            **proportion(right[name], rng), "accuracy": float(right[name].mean()),
+            "by_depth": {_depth_name(d): bool(r) for d, r in zip(needles.DEPTHS, right[name])},
+            "effective_bits": float(np.mean([e["results"]["effective_bits"]
+                                             for e in runs[name]])),
+            "needle_page_tiers": pooled_tiers(runs[name], "needle_page_tiers")}
+    semantic, uniform = (right[name] for name in LONG_CONDITIONS[1:])
+    # named as the closing answer names its counts, with no test beside them
+    pair = {"semantic_only": int((semantic & ~uniform).sum()),
+            "uniform_only": int((~semantic & uniform).sum()),
+            "both": int((semantic & uniform).sum()), "neither": int((~semantic & ~uniform).sum())}
+    direction = (None if pair["semantic_only"] == pair["uniform_only"]
+                 else "semantic" if pair["semantic_only"] > pair["uniform_only"] else "uniform")
+    return {"model": model, "needle_seed": needle_seed,
+            "haystack_tokens": needles.LONG_HAYSTACK_TOKENS, "plan_seed": plan_seed,
+            "experiment": CLOSING_EXPERIMENT, "samples": len(kept),
+            "bootstrap": {"resamples": RESAMPLES, "seed": SEED},
+            "accuracy": accuracy, "paired": pair, "direction": direction,
+            "claim": f"the direction only, no test: McNemar's exact test rejects at "
+                     f"{SIGNIFICANCE} only on {fewest_to_reject()} discordant samples or more",
+            "entries": [e["sha256"] for name in LONG_CONDITIONS for e in runs[name]]}
 
 
 def _closing(accuracy: dict, paired: dict) -> dict:

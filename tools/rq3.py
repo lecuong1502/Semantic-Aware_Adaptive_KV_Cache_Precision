@@ -12,6 +12,16 @@ run of hours stopped part way, its log committed or not, is taken up by the
 same command (rq3.logged). A sample's conditions that hold turn 1 alike
 run it once (rq3.runs, #172), before the others of the sample. Refuses a dirty tree, as the checkpoint
 recorder does.
+
+With --long, the 32K subset (#156): one sample a depth of haystacks of
+needles.LONG_HAYSTACK_TOKENS, question-blind, under FP16 and both sources
+at 80% (rq3_summary.LONG_CONDITIONS), 30 runs:
+
+    .venv/bin/python tools/rq3.py --issue 156 --long
+
+A sample's prefill near 32K positions takes about 10 minutes on the RTX
+4050, and a token decoded there about 1.8 s, so the subset takes hours;
+stopped, the same command takes it up.
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ sys.path.insert(0, str(REPO / "tools"))
 
 from perplexity import held_out_text  # noqa: E402
 
-from microinfer import Engine, benchlog, needles, rq3  # noqa: E402
+from microinfer import Engine, benchlog, needles, rq3, rq3_summary  # noqa: E402
 
 #: The needle set's seed, fixed for Milestone 3 (#140).
 NEEDLE_SEED = 140
@@ -53,7 +63,9 @@ def main(argv: list[str]) -> int:
                         help="sources: every source at each level (#149); default: every "
                              "condition, but fp16 with --screened, whose FP16 runs screening "
                              "logged")
-    parser.add_argument("--experiments", nargs="+", default=["question-blind"],
+    parser.add_argument("--long", action="store_true",
+                        help="the 32K subset (#156): its samples, conditions and experiment")
+    parser.add_argument("--experiments", nargs="+", default=None,
                         choices=rq3.EXPERIMENTS)
     parser.add_argument("--samples", nargs="+", default=None,
                         help="sample ids, such as d50-0 (default: the whole set)")
@@ -65,9 +77,22 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--needle-seed", type=int, default=NEEDLE_SEED)
     parser.add_argument("--plan-seed", type=int, default=0,
                         help="the random source's seed, with each sample's id (rq3.sample_seed)")
-    parser.add_argument("--haystack-tokens", type=int, default=needles.DEFAULT_HAYSTACK_TOKENS)
+    parser.add_argument("--haystack-tokens", type=int, default=None,
+                        help=f"default: {needles.DEFAULT_HAYSTACK_TOKENS}")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
+    if args.long:
+        chosen = [flag for flag, value in (
+            ("--screened", args.screened), ("--samples", args.samples),
+            ("--samples-per-depth", args.samples_per_depth),
+            ("--conditions", args.conditions), ("--experiments", args.experiments),
+            ("--haystack-tokens", args.haystack_tokens)) if value]
+        if chosen:
+            parser.error(f"--long chooses the subset's runs; drop {' '.join(chosen)}")
+        args.haystack_tokens, args.samples_per_depth = needles.LONG_HAYSTACK_TOKENS, 1
+        args.conditions = list(rq3_summary.LONG_CONDITIONS)
+    args.haystack_tokens = args.haystack_tokens or needles.DEFAULT_HAYSTACK_TOKENS
+    args.experiments = args.experiments or [rq3_summary.CLOSING_EXPERIMENT]
 
     environment = benchlog.environment(args.log)
     if environment["git_dirty"]:

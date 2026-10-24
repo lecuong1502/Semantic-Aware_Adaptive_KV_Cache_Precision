@@ -488,6 +488,15 @@ intervals, the semantic source paired against uniform and random, and the
 closing question's answer. Every other comparison in it is descriptive.
 _Avoid_: report, results table (it is a log entry the tables are printed from)
 
+**32K subset**:
+Ten needle samples, one a depth, of haystacks of about 32K tokens, run
+question-blind under FP16 and both sources at 80%, unscreened (#156). Its
+summary, `rq3-long-summary`, gives the direction semantic and uniform point,
+with no test claimed: ten samples are too few for McNemar's test to reject
+(ADR-0017).
+_Avoid_: 32K set, long set (it confirms the 8K set; it is not one of its own).
+In code, "long" names it, as in `--long` and `summarise_long`.
+
 **Shortfall**:
 The device memory a survival experiment's contention leaves an engine short
 of its full FP16 cache: the simulator takes the headroom, less its own

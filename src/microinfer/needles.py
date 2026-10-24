@@ -43,6 +43,9 @@ import numpy as np
 #: The haystack's tokens: with the template, the needle and the request, a
 #: turn 1 of about 8K positions (ADR-0017).
 DEFAULT_HAYSTACK_TOKENS = 7936
+#: The 32K subset's haystack (#156): a turn 1 of about 32K positions, and
+#: every turn of a run within Qwen2.5's 32768.
+LONG_HAYSTACK_TOKENS = 32256
 DEPTHS = tuple(d / 10 for d in range(10))
 SAMPLES_PER_DEPTH = 5
 
@@ -198,7 +201,7 @@ def needle_set(text: str, tokenizer, *, seed: int,
             after_eos = ids(TURN_2_AFTER_EOS.format(question=question))
             start, end = len(before), len(before) + len(planted)
             samples.append(Sample(
-                sample_id=f"d{round(depth * 100):02d}-{k}", depth=depth, name=name, code=code,
+                sample_id=sample_id(depth, k), depth=depth, name=name, code=code,
                 needle=needle, question=question,
                 turn_1=np.concatenate([before, planted, *pieces[cut:], closing]),
                 turn_2=np.concatenate([end_of_turn, after_eos]), turn_2_after_eos=after_eos,
@@ -208,6 +211,11 @@ def needle_set(text: str, tokenizer, *, seed: int,
                 needle_pages=pages_holding((start, end), page_tokens),
                 page_tokens=page_tokens))
     return samples
+
+
+def sample_id(depth: float, k: int) -> str:
+    """The id of a depth's k-th sample, such as d50-0."""
+    return f"d{round(depth * 100):02d}-{k}"
 
 
 def pages_holding(positions: tuple[int, int], page_tokens: int) -> tuple[int, int]:
