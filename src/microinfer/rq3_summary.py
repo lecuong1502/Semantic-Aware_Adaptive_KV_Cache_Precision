@@ -34,7 +34,9 @@ names neither. The answer is reported whatever it is, with the fewest
 discordant samples, all one way, that could have rejected.
 
 The 32K subset (#156) is summarised apart, by summarise_long: its ten
-samples confirm the direction, with no test claimed.
+samples confirm the direction, with no test claimed. So are ADR-0018's
+quality ablations (#158), by summarise_ablations, each against the full
+policy.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ CLOSING_SHARE = 0.8
 LEVELS = sorted({c.share for c in rq3.CONDITIONS if c.share is not None})
 OTHER_SOURCES = ("uniform", "random")
 LONG_SUMMARY_KIND = "rq3-long-summary"
+ABLATION_SUMMARY_KIND = "rq3-ablation-summary"
 
 
 def mcnemar(only_a: int, only_b: int) -> float:
@@ -160,7 +163,7 @@ def _accuracy(runs: list[dict], right: np.ndarray, interval: np.ndarray,
     return {"correct": correct, "n": len(right), "accuracy": correct / len(right),
             "bootstrap_95": [float(v) for v in interval],
             "wilson_95": list(wilson(correct, len(right))), "by_depth": by_depth,
-            "effective_bits": float(np.mean([e["results"]["effective_bits"] for e in runs])),
+            "effective_bits": _mean(runs, "effective_bits"),
             "needle_page_tiers": pooled_tiers(runs, "needle_page_tiers")}
 
 
@@ -282,8 +285,7 @@ def summarise_long(entries: Sequence[dict], model: str, needle_seed: int, *,
         accuracy[name] = {
             **proportion(right[name], rng), "accuracy": float(right[name].mean()),
             "by_depth": {_depth_name(d): bool(r) for d, r in zip(needles.DEPTHS, right[name])},
-            "effective_bits": float(np.mean([e["results"]["effective_bits"]
-                                             for e in runs[name]])),
+            "effective_bits": _mean(runs[name], "effective_bits"),
             "needle_page_tiers": pooled_tiers(runs[name], "needle_page_tiers")}
     semantic, uniform = (right[name] for name in LONG_CONDITIONS[1:])
     # named as the closing answer names its counts, with no test beside them
@@ -300,6 +302,68 @@ def summarise_long(entries: Sequence[dict], model: str, needle_seed: int, *,
             "claim": f"the direction only, no test: McNemar's exact test rejects at "
                      f"{SIGNIFICANCE} only on {fewest_to_reject()} discordant samples or more",
             "entries": [e["sha256"] for name in LONG_CONDITIONS for e in runs[name]]}
+
+
+def summarise_ablations(entries: Sequence[dict], model: str, needle_seed: int,
+                        haystack_tokens: int, *, plan_seed: int = 0) -> dict:
+    """ADR-0018's quality ablations (#158) on the screened set, each against
+    the full policy, rq3.FULL_POLICY, on the same samples: the latest
+    question-blind run of each under it and under every ablation. Each
+    gives:
+    - its accuracy, with its bootstrap and Wilson intervals;
+    - its change in accuracy from the full policy, with the paired
+      difference's bootstrap interval, and McNemar's exact test on the
+      samples only one of the two answered;
+    - its effective bits, over every full page and over the pages the share
+      is of, the mean over the samples, and how many of its plans fell
+      short of the full policy's bytes, so that equal bytes are checked, not
+      assumed.
+    A ValueError names what is missing."""
+    if rq3.FULL_POLICY.share != CLOSING_SHARE:
+        raise ValueError("the ablations change the closing question's condition")
+    screening = rq3.last_screening(entries, model, needle_seed, haystack_tokens)
+    kept = screening["results"]["kept"]
+    latest = _pool(entries, model, needle_seed, haystack_tokens, plan_seed, kept)
+    names = [rq3.FULL_POLICY.name, *rq3.ABLATION_NAMES]
+    missing = [(s, name) for name in names for s in kept
+               if (s, CLOSING_EXPERIMENT, name) not in latest]
+    if missing:
+        raise ValueError(f"no run of {len(missing)} samples' conditions, such as "
+                         f"{missing[:3]}; run tools/rq3.py --ablations for them")
+    runs = {name: [latest[(s, CLOSING_EXPERIMENT, name)] for s in kept] for name in names}
+    right = {name: np.array([e["results"]["correct"] for e in runs[name]]) for name in names}
+    full = right[rq3.FULL_POLICY.name]
+    rng = np.random.default_rng(SEED)
+
+    def held(name: str) -> dict:
+        plans = [e["results"]["plan"] for e in runs[name]]
+        return {**proportion(right[name], rng), "accuracy": float(right[name].mean()),
+                "effective_bits": _mean(runs[name], "effective_bits"),
+                "candidate_effective_bits": _mean(runs[name], "candidate_effective_bits"),
+                "short": sum(p["short"] for p in plans),
+                "target_met": sum(p["target_met"] for p in plans),
+                "commits": sorted({e["git_commit"] for e in runs[name]})}
+
+    ablations = {}
+    for name in rq3.ABLATION_NAMES:
+        pair = paired(right[name], full, rng)
+        ablations[name] = {
+            "element": rq3.ABLATED_ELEMENTS[name], **held(name),
+            "change": pair["difference"],
+            "change_bootstrap_95": pair["difference_bootstrap_95"],
+            "ablation_only": pair["semantic_only"], "full_only": pair["other_only"],
+            "mcnemar_p": pair["mcnemar_p"]}
+    return {"model": model, "needle_seed": needle_seed, "haystack_tokens": haystack_tokens,
+            "plan_seed": plan_seed, "experiment": CLOSING_EXPERIMENT,
+            "samples": len(kept), "significance": SIGNIFICANCE,
+            "bootstrap": {"resamples": RESAMPLES, "seed": SEED},
+            "full_policy": {"name": rq3.FULL_POLICY.name, **held(rq3.FULL_POLICY.name)},
+            "ablations": ablations, "screening": screening["sha256"],
+            "entries": [e["sha256"] for name in names for e in runs[name]]}
+
+
+def _mean(runs: list[dict], key: str) -> float:
+    return float(np.mean([e["results"][key] for e in runs]))
 
 
 def _closing(accuracy: dict, paired: dict) -> dict:

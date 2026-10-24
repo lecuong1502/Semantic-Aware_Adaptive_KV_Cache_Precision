@@ -302,7 +302,9 @@ The most recent `W` token positions, `W = 128` by default and a parameter
 every plan records, excluded from downgrade regardless of importance score
 and policy, on the assumption that recent context is almost always relevant
 (#102). A page any of whose positions is among them is never downgraded,
-the open page with them.
+the open page with them. The engine's `kv_recency_floor` sets it for the
+ablations of W (#158); a controlled plan's share is still of the bytes
+outside the default floor.
 _Avoid_: recency window, protected window, sliding window
 
 ### The measurements
@@ -391,10 +393,26 @@ _Avoid_: fork, clone (the two conversations share nothing), checkpoint
 How an RQ3 run holds its cache (ADR-0017, #147): FP16; a score source at a
 level, a controlled plan from semantic, uniform or random scores for 70% or
 80% of the FP16 bytes outside the recency floor; or a static tier, every
-page born at INT4 or INT2. RQ3's two experiments, question-blind and
-question-aware, are when a condition's plan is made; a survival experiment
-is another kind, under contention.
+page born at INT4 or INT2; or an ablation. RQ3's two experiments,
+question-blind and question-aware, are when a condition's plan is made; a
+survival experiment is another kind, under contention.
 _Avoid_: arm, treatment, setting
+
+**Full policy**:
+ADR-0016's policy as RQ3 runs it, the semantic source at 80%,
+question-blind: the condition each ablation is measured against, on the
+same samples (ADR-0018).
+_Avoid_: baseline (uniform is the baseline), default policy
+
+**Ablation**:
+A condition that is the full policy with one element changed (ADR-0018,
+#158): the recency floor at 0 or 512, scoring every step, the EWMA weight
+at 0.05 or 0.5, importance alone, no INT2, layer weights, or a protected
+first page. Each is reported by its change in needle accuracy from the full
+policy, McNemar's test against it and the effective bits it held. Those
+that change only the plan share turn 1 with the full policy; those of the
+scorer run it alone. The monitor's K is an ablation of RQ2, not a condition.
+_Avoid_: arm, treatment
 
 **Controlled plan**:
 A requantisation plan the engine is asked for between two turns, for a byte

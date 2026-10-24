@@ -7,7 +7,10 @@ how the cache is held:
   controlled plan that reclaims 70% or 80% of the FP16 bytes of the pages
   outside the recency floor (#142);
 - **a static tier:** every page born at INT4 or INT2, for the whole
-  session, the uniform-quantisation family.
+  session, the uniform-quantisation family;
+- **an ablation** (ADR-0018, #158): the semantic source at 80%, the full
+  policy, with one element changed, the recency floor, the scorer's
+  cadence or EWMA weight, or an option of the planner (`ablations`).
 
 An **experiment** is when the plan is made:
 - **question-blind**, the primary: turn 1, the document and a general
@@ -53,7 +56,7 @@ import zlib
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -82,6 +85,13 @@ class Condition:
     tier: str = "FP16"
     #: Whether the engine adapts and scores, as a controlled plan needs.
     adaptive: bool = False
+    #: What an ablation changes (#158), each None for the engine's own: the
+    #: plan's recency floor, the scorer's cadence and EWMA weight, and the
+    #: planner's options.
+    recency_floor: int | None = None
+    score_every: int | None = None
+    score_alpha: float | None = None
+    options: controller.PlanOptions | None = None
 
     def __post_init__(self):
         if self.source is not None:
@@ -104,6 +114,40 @@ def source_condition(source: str, share: float) -> Condition:
     """The condition of `source`'s scores at the level `share`."""
     (cond,) = [c for c in CONDITIONS if c.source == source and c.share == share]
     return cond
+
+
+#: The full policy ADR-0018's quality ablations change (#158): the closing
+#: question's condition, question-blind at 80%.
+FULL_POLICY = source_condition("semantic", 0.8)
+#: The ablations, each the suffix of its name, the element of the policy it
+#: changes, as ADR-0018 names it, and the change; the layer weights are
+#: those measured (#145), which `ablations` takes.
+ABLATIONS = (
+    ("w0", "recency floor", {"recency_floor": 0}),
+    ("w512", "recency floor", {"recency_floor": 512}),
+    ("every-step", "scoring cadence", {"score_every": 1}),
+    ("alpha-0.05", "EWMA weight", {"score_alpha": 0.05}),
+    ("alpha-0.5", "EWMA weight", {"score_alpha": 0.5}),
+    ("importance-only", "marginal cost",
+     {"options": controller.PlanOptions(importance_only=True)}),
+    ("no-int2", "the INT2 tier", {"options": controller.PlanOptions(lowest_tier="INT4")}),
+    ("layer-weights", "layer weights", None),
+    ("first-page", "attention sinks",
+     {"options": controller.PlanOptions(protect_first_page=True)}),
+)
+ABLATION_NAMES = tuple(f"{FULL_POLICY.name}-{suffix}" for suffix, _, _ in ABLATIONS)
+#: Each ablation's element, by its name.
+ABLATED_ELEMENTS = {f"{FULL_POLICY.name}-{suffix}": element
+                    for suffix, element, _ in ABLATIONS}
+
+
+def ablations(layer_weights: Sequence[float]) -> tuple[Condition, ...]:
+    """ADR-0018's quality ablations, in ABLATIONS' order, the layer
+    weights' with `layer_weights`, one a layer (controller.logged_layer_weights)."""
+    weighted = {"options": controller.PlanOptions(layer_weights=tuple(layer_weights))}
+    return tuple(replace(FULL_POLICY, name=f"{FULL_POLICY.name}-{suffix}",
+                         **(weighted if change is None else change))
+                 for suffix, _, change in ABLATIONS)
 
 
 def condition(name: str) -> Condition:
@@ -140,25 +184,40 @@ def check_engine(engine) -> None:
         raise ValueError("a run holds its cache on pages, both halves at a page's tier")
 
 
+#: The engine's settings an ablation changes, by the Condition field that
+#: changes each.
+_ABLATED = {"recency_floor": "kv_recency_floor", "score_every": "kv_score_every",
+            "score_alpha": "kv_score_alpha", "options": "kv_plan_options"}
+
+
 @contextmanager
 def set_for(engine, cond: Condition):
-    """The engine set for `cond`: its tier, whether it adapts and scores, and
-    its score source, put back after."""
+    """The engine set for `cond`: its tier, whether it adapts and scores,
+    its score source, and what an ablation changes, put back after."""
     kept = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
+    ablated = {setting: getattr(engine, setting) for setting in _ABLATED.values()}
     engine.kv_tier, engine.kv_adaptive, engine.kv_scoring = cond.tier, cond.adaptive, cond.adaptive
     engine.kv_score_source = cond.source or kept[3]
     try:
+        for field, setting in _ABLATED.items():
+            if getattr(cond, field) is not None:
+                setattr(engine, setting, getattr(cond, field))
         yield
     finally:
         (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring,
          engine.kv_score_source) = kept
+        for setting, value in ablated.items():
+            setattr(engine, setting, value)
 
 
 def shares_turn_1(cond: Condition) -> bool:
     """Whether `cond` holds turn 1 as every source condition does: at FP16,
-    adaptive and scoring, which is all a cache is made with until the plan
-    reads its score source (#172). A static tier holds it at its own."""
-    return cond.adaptive and cond.tier == "FP16"
+    adaptive and scoring at the engine's cadence and EWMA weight, which is
+    all a cache is made with until the plan reads its score source and its
+    options (#172). A static tier holds it at its own, and an ablation of
+    the scorer (#158) scores it as no other does."""
+    return (cond.adaptive and cond.tier == "FP16"
+            and cond.score_every is None and cond.score_alpha is None)
 
 
 #: What a run does after its question's answer, on the same conversation:
@@ -271,6 +330,7 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         "aware_opening": opening,
         "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
         "code_after_plan": None if opening is None else code_after(opening, sample.code),
+        "score_every": engine.kv_score_every, "score_alpha": chat.score_alpha,
         **planned.results(cond, seed, sample.page_tokens),
         "needle_page_tiers": planned.page_tiers(sample.needle_pages),
     }
@@ -324,13 +384,15 @@ def plan_at(chat, cond: Condition, seed: int) -> Planned:
 
 def plan_summary(record) -> dict | None:
     """What a log entry's results hold of a controlled plan's record: its
-    controlled fields but the effective bits, given beside it, and its
-    moves, whether it fell short, and how it ended; None for no plan."""
+    controlled fields but the effective bits, given beside it, its moves,
+    whether it fell short, how it ended, and the recency floor and options
+    it was made with (#158); None for no plan."""
     if record is None:
         return None
     plan = {k: v for k, v in record.controlled.items()
             if k not in ("effective_bits", "candidate_effective_bits")}
-    plan.update(moves=len(record.plan), short=record.plan.short, ended=record.ended)
+    plan.update(moves=len(record.plan), short=record.plan.short, ended=record.ended,
+                recency_floor=record.plan.recency_floor, options=asdict(record.plan.options))
     return plan
 
 

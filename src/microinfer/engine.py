@@ -699,6 +699,7 @@ class Engine:
                  kv_score_every: int | None = None,
                  kv_score_alpha: float = DEFAULT_SCORE_ALPHA, kv_adaptive: bool = False,
                  kv_plan_options: controller.PlanOptions = controller.DEFAULT_OPTIONS,
+                 kv_recency_floor: int = controller.DEFAULT_RECENCY_FLOOR,
                  kv_score_source: str = "semantic", kv_score_seed: int = 0,
                  kv_plan_budget_seconds: float = controller.DEFAULT_BUDGET_SECONDS,
                  kv_upgrade_cooldown_seconds: float = controller.DEFAULT_UPGRADE_COOLDOWN_SECONDS,
@@ -738,6 +739,7 @@ class Engine:
         #: Where a plan's scores come from (#104), and the random one's seed.
         self.kv_score_source, self.kv_score_seed = kv_score_source, kv_score_seed
         self.kv_plan_options = kv_plan_options
+        self.kv_recency_floor = kv_recency_floor
         #: The time a YELLOW plan, or upgrades at GREEN, may take of one step,
         #: planning included.
         self.kv_plan_budget_seconds = kv_plan_budget_seconds
@@ -942,6 +944,22 @@ class Engine:
             raise ValueError(f"{len(options.layer_weights)} layer weights for a model of "
                              f"{layers} layers")
         self._kv_plan_options = options
+
+    @property
+    def kv_recency_floor(self) -> int:
+        """The recency floor of the engine's downgrade plans, W positions
+        (#102), for ADR-0018's ablation of it (#158): the open pages and the
+        last W positions are never downgraded. A controlled plan's share is
+        taken outside the default floor whatever W is (share_target_bytes),
+        so that W = 0 and W = 512 chase the full policy's bytes; W does not
+        change upgrades, which move only pages below FP16."""
+        return self._kv_recency_floor
+
+    @kv_recency_floor.setter
+    def kv_recency_floor(self, floor: int) -> None:
+        if isinstance(floor, bool) or not isinstance(floor, int) or floor < 0:
+            raise ValueError(f"kv_recency_floor is a count of positions, >= 0; got {floor!r}")
+        self._kv_recency_floor = floor
 
     @property
     def kv_tier_map(self) -> list[list[str]] | None:
@@ -1392,7 +1410,8 @@ class Engine:
         plan = controller.target_plan_arrays(
             target, RED, scores, tiers, page_bytes, errors, move_seconds=seconds,
             positions=cache.length, page_tokens=pages.page_tokens,
-            budget_seconds=self.kv_plan_budget_seconds, options=self.kv_plan_options)
+            recency_floor=self.kv_recency_floor, budget_seconds=self.kv_plan_budget_seconds,
+            options=self.kv_plan_options)
         entry = self._controlled_record(cache, plan, source, started)
         if len(plan):
             self._pending, self._cursor = entry, 0
@@ -1407,7 +1426,8 @@ class Engine:
             "source": source, "seed": seed if source == "random" else None, "share": share,
             "target_bytes": target, "reclaimed_bytes": reclaimed,
             "target_met": entry.ended == "applied" and reclaimed >= target,
-            **self._effective_bits(cache, page_bytes, plan.recency_floor)}
+            # over the pages the share is of, whatever floor the plan kept
+            **self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)}
         return entry
 
     def _controlled_restore(self, cache: model.PagedCache, source: str,
@@ -1524,7 +1544,8 @@ class Engine:
         plan = controller.plan_arrays(
             headroom, self._thresholds or DEFAULT_THRESHOLDS, scores, tiers, page_bytes, errors,
             move_seconds=seconds, positions=cache.length, page_tokens=pages.page_tokens,
-            budget_seconds=self.kv_plan_budget_seconds, options=self.kv_plan_options)
+            recency_floor=self.kv_recency_floor, budget_seconds=self.kv_plan_budget_seconds,
+            options=self.kv_plan_options)
         entry = PlanRecord(record, plan, time.perf_counter() - started, [],
                            score_alpha=_alpha_of(cache, self.kv_score_source),
                            headroom_bytes=headroom, persisting=persisting, emergency=emergency)

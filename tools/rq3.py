@@ -22,6 +22,19 @@ at 80% (rq3_summary.LONG_CONDITIONS), 30 runs:
 A sample's prefill near 32K positions takes about 10 minutes on the RTX
 4050, and a token decoded there about 1.8 s, so the subset takes hours;
 stopped, the same command takes it up.
+
+With --ablations, ADR-0018's quality ablations (#158): the screened set,
+question-blind, under the full policy, semantic at 80%, and each of the
+nine ablations (rq3.ablations), the layer weights' from the last
+layer-sensitivity logged for the model (#145), 500 runs; --haystack-tokens
+names the screened set:
+
+    .venv/bin/python tools/rq3.py --issue 158 --ablations
+
+A run takes about 77 s at 8K positions on the RTX 4050, as #149's did, so
+the 500 take about 11 hours; they are best run in batches, each stopped
+with Ctrl-C and taken up by the same command. The full policy is run again
+beside them, at the same code, rather than paired with #149's runs.
 """
 
 from __future__ import annotations
@@ -37,7 +50,7 @@ sys.path.insert(0, str(REPO / "tools"))
 
 from perplexity import held_out_text  # noqa: E402
 
-from microinfer import Engine, benchlog, needles, rq3, rq3_summary  # noqa: E402
+from microinfer import Engine, benchlog, controller, needles, rq3, rq3_summary  # noqa: E402
 
 #: The needle set's seed, fixed for Milestone 3 (#140).
 NEEDLE_SEED = 140
@@ -65,6 +78,8 @@ def main(argv: list[str]) -> int:
                              "logged")
     parser.add_argument("--long", action="store_true",
                         help="the 32K subset (#156): its samples, conditions and experiment")
+    parser.add_argument("--ablations", action="store_true",
+                        help="ADR-0018's quality ablations (#158) on the screened set")
     parser.add_argument("--experiments", nargs="+", default=None,
                         choices=rq3.EXPERIMENTS)
     parser.add_argument("--samples", nargs="+", default=None,
@@ -81,16 +96,30 @@ def main(argv: list[str]) -> int:
                         help=f"default: {needles.DEFAULT_HAYSTACK_TOKENS}")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
-    if args.long:
+    if args.long and args.ablations:
+        parser.error("--long and --ablations are runs of their own; choose one")
+    by_name = {c.name: c for c in (*rq3.CONDITIONS, rq3.NO_PLAN)}
+    if args.long or args.ablations:
         chosen = [flag for flag, value in (
-            ("--screened", args.screened), ("--samples", args.samples),
-            ("--samples-per-depth", args.samples_per_depth),
+            ("--screened", args.screened), ("--samples-per-depth", args.samples_per_depth),
             ("--conditions", args.conditions), ("--experiments", args.experiments),
-            ("--haystack-tokens", args.haystack_tokens)) if value]
+            ("--haystack-tokens", args.long and args.haystack_tokens),
+            ("--samples", args.samples)) if value]
         if chosen:
-            parser.error(f"--long chooses the subset's runs; drop {' '.join(chosen)}")
+            parser.error(f"{'--long' if args.long else '--ablations'} chooses its runs; "
+                         f"drop {' '.join(chosen)}")
+    if args.long:
         args.haystack_tokens, args.samples_per_depth = needles.LONG_HAYSTACK_TOKENS, 1
         args.conditions = list(rq3_summary.LONG_CONDITIONS)
+    if args.ablations:
+        try:
+            weights = controller.logged_layer_weights(args.model, args.log)
+        except ValueError as exc:
+            parser.error(str(exc))
+        ablations = rq3.ablations(weights)
+        by_name.update({c.name: c for c in ablations})
+        args.conditions = [rq3.FULL_POLICY.name, *(c.name for c in ablations)]
+        args.screened = True
     args.haystack_tokens = args.haystack_tokens or needles.DEFAULT_HAYSTACK_TOKENS
     args.experiments = args.experiments or [rq3_summary.CLOSING_EXPERIMENT]
 
@@ -138,7 +167,7 @@ def main(argv: list[str]) -> int:
     ran = 0
     for (sample_id, experiment), names in together.items():
         sample = by_id[sample_id]
-        for cond, results in rq3.runs(engine, sample, [rq3.condition(n) for n in names],
+        for cond, results in rq3.runs(engine, sample, [by_name[n] for n in names],
                                       experiment, plan_seed=args.plan_seed):
             benchlog.append(
                 "rq3-needle", model=args.model, context_length=len(sample.turn_1),
