@@ -108,8 +108,7 @@ def _depth_name(depth: float) -> str:
 
 
 def _source_condition(source: str, share: float) -> str:
-    (cond,) = [c for c in rq3.CONDITIONS if c.source == source and c.share == share]
-    return cond.name
+    return rq3.source_condition(source, share).name
 
 
 #: The 32K subset's conditions, question-blind (#156, ADR-0017): FP16, and

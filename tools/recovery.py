@@ -49,7 +49,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--haystack-tokens", type=int, default=needles.DEFAULT_HAYSTACK_TOKENS)
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
-    of = recovery.NeedleSet(args.model, args.needle_seed, args.haystack_tokens)
+    of = rq3.NeedleSet(args.model, args.needle_seed, args.haystack_tokens)
     names = list(dict.fromkeys(args.conditions))
 
     if args.summarise:

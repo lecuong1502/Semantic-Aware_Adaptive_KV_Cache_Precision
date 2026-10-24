@@ -55,7 +55,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -98,6 +98,12 @@ CONDITIONS = (
 NO_PLAN = Condition("no-plan", adaptive=True)
 #: The conditions of a score source at a level, question-blind's closing run (#149).
 SOURCE_CONDITIONS = tuple(c.name for c in CONDITIONS if c.source is not None)
+
+
+def source_condition(source: str, share: float) -> Condition:
+    """The condition of `source`'s scores at the level `share`."""
+    (cond,) = [c for c in CONDITIONS if c.source == source and c.share == share]
+    return cond
 
 
 def condition(name: str) -> Condition:
@@ -295,9 +301,15 @@ class Planned:
 
     def page_tiers(self, pages: tuple[int, int]) -> dict[str, int]:
         """The tiers of every (layer, page) of `pages`, first and last, by count."""
-        first, last = pages
-        counts = Counter(controller.TIERS[t] for t in self.tiers[:, first:last + 1].ravel())
-        return dict(sorted(counts.items()))
+        return page_tiers(self.tiers, pages)
+
+
+def page_tiers(tiers: np.ndarray, pages: tuple[int, int]) -> dict[str, int]:
+    """The tiers of every (layer, page) of `pages`, first and last, in
+    `tiers`, indices into controller.TIERS, by count."""
+    first, last = pages
+    counts = Counter(controller.TIERS[t] for t in tiers[:, first:last + 1].ravel())
+    return dict(sorted(counts.items()))
 
 
 def plan_at(chat, cond: Condition, seed: int) -> Planned:
@@ -435,6 +447,40 @@ def last_screening(entries: Sequence[dict], model: str, needle_seed: int,
                          f"{needle_seed} over haystacks of {haystack_tokens} tokens; run "
                          f"tools/screen_needles.py")
     return found[-1]
+
+
+class NeedleSet(NamedTuple):
+    """The needle set a run is of, and the model it is run on."""
+
+    model: str
+    needle_seed: int
+    haystack_tokens: int = needles.DEFAULT_HAYSTACK_TOKENS
+
+    def holds(self, entry: dict) -> bool:
+        """Whether a log entry is of this set and model."""
+        return (entry["model"] == self.model
+                and entry["config"]["needle_seed"] == self.needle_seed
+                and entry["config"]["haystack_tokens"] == self.haystack_tokens)
+
+    def screening(self, entries: Sequence[dict]) -> dict:
+        """The set's last complete needle-screening entry (#148)."""
+        return last_screening(entries, self.model, self.needle_seed, self.haystack_tokens)
+
+    def config(self) -> dict:
+        """What a log entry's config names of the set, but its model."""
+        return {"needle_seed": self.needle_seed, "haystack_tokens": self.haystack_tokens}
+
+    def logged_at(self, kind: str, commit: str,
+                  log: str | Path = benchlog.DEFAULT_LOG) -> list[dict]:
+        """The `kind` entries of the set logged at the code of `commit`
+        (benchlog.same_code), though the log may differ, so that a run of
+        hours stopped part way is taken up again; none before the log
+        exists."""
+        if not Path(log).exists():
+            return []
+        same_code = benchlog.same_code_as(commit, log)
+        return [e for e in benchlog.read(log)
+                if e["kind"] == kind and self.holds(e) and same_code(e["git_commit"])]
 
 
 def screened(model: str, needle_seed: int, haystack_tokens: int,
