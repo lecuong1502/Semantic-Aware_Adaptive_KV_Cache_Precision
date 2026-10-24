@@ -470,6 +470,14 @@ the other more than once, a downgrade after the first upgrade, or upgrades
 that pressure cancelled.
 _Avoid_: recovery time (recovery is the task), oscillation
 
+**End-to-end run**:
+The question-blind needle task with the plan made by the monitor and the
+controller, not controlled (#157): part way through turn 1 the simulator
+takes what leaves the engine's headroom below YELLOW by the bytes a
+controlled plan at 80% reclaims, the same rule for semantic and uniform.
+A run logs the bytes its pages gave back beside its answer.
+_Avoid_: live run, real-pressure run (the pressure is simulated)
+
 **Closing question**:
 The one test Milestone 3 is closed on: whether the semantic source answers
 more needle samples than uniform at 80% of the FP16 bytes outside the

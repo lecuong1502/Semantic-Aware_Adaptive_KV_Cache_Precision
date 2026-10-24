@@ -1473,8 +1473,7 @@ class Engine:
     def _bits_held(self, cache: model.PagedCache) -> dict:
         """_effective_bits of what `cache` holds now, outside the default
         recency floor and over every full page."""
-        page_bytes = dict(zip(controller.TIERS, model.tier_page_bytes(self.config)))
-        return self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)
+        return self._effective_bits(cache, self.page_bytes, controller.DEFAULT_RECENCY_FLOOR)
 
     def _tiers_and_scores(self, cache: model.PagedCache, source: str,
                           seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1539,11 +1538,17 @@ class Engine:
         return entry
 
     @cached_property
+    def page_bytes(self) -> dict[str, int]:
+        """The bytes one page of one layer holds at each tier, metadata
+        counted, by tier name."""
+        return dict(zip(controller.TIERS, model.tier_page_bytes(self.config)))
+
+    @cached_property
     def _plan_inputs(self):
         """Each tier's page bytes, its logged roundtrip error, and each
         downgrade's logged latency: this model's, or, not measured, any
         model's as an estimate."""
-        page_bytes = dict(zip(controller.TIERS, model.tier_page_bytes(self.config)))
+        page_bytes = self.page_bytes
         errors = controller.logged_tier_errors(self.config.name)
         try:
             seconds = controller.logged_move_seconds(self.config.name)

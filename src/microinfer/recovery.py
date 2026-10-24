@@ -32,11 +32,11 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import NamedTuple
 
 import numpy as np
 
 from . import benchlog, needles, rq3, rq3_summary
+from .rq3 import NeedleSet
 
 KIND = "rq3-recovery"
 SUMMARY_KIND = "recovery-summary"
@@ -92,28 +92,6 @@ def runs(engine, sample: needles.Sample, conds: Sequence[rq3.Condition], *,
     """Each of `conds` on one sample, as `run` gives it, the source
     conditions from one turn 1 (rq3.runs)."""
     yield from rq3.runs(engine, sample, conds, EXPERIMENT, plan_seed=plan_seed, then=turn_3)
-
-
-class NeedleSet(NamedTuple):
-    """The needle set a run is of, and the model it is run on."""
-
-    model: str
-    needle_seed: int
-    haystack_tokens: int = needles.DEFAULT_HAYSTACK_TOKENS
-
-    def holds(self, entry: dict) -> bool:
-        """Whether a log entry is of this set and model."""
-        return (entry["model"] == self.model
-                and entry["config"]["needle_seed"] == self.needle_seed
-                and entry["config"]["haystack_tokens"] == self.haystack_tokens)
-
-    def screening(self, entries: Sequence[dict]) -> dict:
-        """The set's last complete needle-screening entry (#148)."""
-        return rq3.last_screening(entries, self.model, self.needle_seed, self.haystack_tokens)
-
-    def config(self) -> dict:
-        """What a log entry's config names of the set, but its model."""
-        return {"needle_seed": self.needle_seed, "haystack_tokens": self.haystack_tokens}
 
 
 def logged(of: NeedleSet, commit: str, log: str | Path = benchlog.DEFAULT_LOG, *,

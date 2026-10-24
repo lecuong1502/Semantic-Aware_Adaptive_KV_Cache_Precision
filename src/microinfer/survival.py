@@ -222,23 +222,11 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
     step is sampled into the run's timeline. A static engine that runs out
     raises OutOfMemory, which is caught and summarised; an adaptive one
     ends as its `ending` says."""
-    out = Path(out)
     context = len(prompt) + new_tokens - 1
-    done = threading.Event()
-    failure: list[BaseException] = []
+    simulator = Simulator(out)
     took: dict = {}
     reached = [0]
     timeline: list[Step] = []
-
-    def contend() -> None:
-        points = [(0.0, took["bytes"])] + ([] if pulse_s is None else [(pulse_s, 0)])
-        try:
-            took["started_ns"] = replay.replay(Schedule(points), out,
-                                               lead_s=LEAD_S, tail_s=KEEP_S, stop=done)
-        except BaseException as exc:  # noqa: BLE001 - raised by the caller's thread
-            failure.append(exc)
-
-    simulating = threading.Thread(target=contend, name="survival-simulator")
 
     def report(state: str, position: int, token: int | None) -> None:
         reached[0] = position
@@ -250,8 +238,7 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
                                          positions=position, context=context,
                                          simulator_context_bytes=simulator_context_bytes,
                                          shortfall_bytes=shortfall_bytes)
-        simulating.start()
-        _wait_for_take(recorder.companion(out, ".events.jsonl"), simulating, failure)
+        simulator.take(took["bytes"], pulse_s=pulse_s)
         took["at_seconds"] = time.monotonic()
 
     engine.measure_plans = True
@@ -266,15 +253,11 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
         error = str(exc)
     finally:
         engine.stop_monitor()
-        done.set()
-        if simulating.is_alive():
-            simulating.join()
-    if failure:
-        raise failure[0]
+        simulator.close()
     if not took:
         raise RuntimeError(f"the cache never reached {contention_at} positions: no contention")
     return Run(summarise(engine.plans, ending=ending, error=error, positions_reached=reached[0]),
-               took["position"], took["headroom"], took["bytes"], took["started_ns"],
+               took["position"], took["headroom"], took["bytes"], simulator.started_ns,
                list(engine.pressure_events), timeline, took["at_seconds"],
                engine.pressure_ended_seconds, pulse_s)
 
@@ -360,6 +343,49 @@ def _mean_over_time(steps: Sequence[Step], start: float, end: float | None) -> f
             total += step.effective_bits * (held_to - held_from)
             weight += held_to - held_from
     return None if weight == 0 else total / weight
+
+
+class Simulator:
+    """The contention simulator, a process of its own, run on a thread of
+    this one while the recorder records the device to `out` (replay):
+    `take` starts it and returns once it has taken its memory, which it
+    keeps until `close`, or, with a pulse, gives back that long after."""
+
+    def __init__(self, out: str | Path):
+        self.out = Path(out)
+        #: When the take began, on the recorder's clock; None before it.
+        self.started_ns: int | None = None
+        self._done = threading.Event()
+        self._failure: list[BaseException] = []
+        self._thread: threading.Thread | None = None
+
+    def take(self, nbytes: int, *, pulse_s: float | None = None) -> None:
+        """Take `nbytes` beyond the simulator's own context, waiting until
+        it has; with `pulse_s`, give them back that long after."""
+        if self._thread is not None:
+            raise RuntimeError("a simulator takes once")
+        points = [(0.0, nbytes)] + ([] if pulse_s is None else [(pulse_s, 0)])
+
+        def contend() -> None:
+            try:
+                self.started_ns = replay.replay(Schedule(points), self.out, lead_s=LEAD_S,
+                                                tail_s=KEEP_S, stop=self._done)
+            except BaseException as exc:  # noqa: BLE001 - raised by the caller's thread
+                self._failure.append(exc)
+
+        self._thread = threading.Thread(target=contend, name="contention-simulator")
+        self._thread.start()
+        _wait_for_take(recorder.companion(self.out, ".events.jsonl"), self._thread,
+                       self._failure)
+
+    def close(self) -> None:
+        """Stop the simulator, giving back what it holds, and raise what
+        stopped it, if anything did."""
+        self._done.set()
+        if self._thread is not None:
+            self._thread.join()
+        if self._failure:
+            raise self._failure[0]
 
 
 def _wait_for_take(events: Path, simulating: threading.Thread,
