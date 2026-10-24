@@ -22,6 +22,20 @@ at 80% (rq3_summary.LONG_CONDITIONS), 30 runs:
 A sample's prefill near 32K positions takes about 10 minutes on the RTX
 4050, and a token decoded there about 1.8 s, so the subset takes hours;
 stopped, the same command takes it up.
+
+With --ablations, ADR-0018's quality ablations (#158): the screened set,
+question-blind, under the full policy, semantic at 80%, and each of the
+nine ablations, with no INT2 at 70% too, and semantic at 70% for it
+(rq3.ablations), the layer weights' from the last layer-sensitivity logged
+for the model (#145), 600 runs; --haystack-tokens names the screened set:
+
+    .venv/bin/python tools/rq3.py --issue 158 --ablations
+
+A run takes about 77 s at 8K positions on the RTX 4050, as #149's did, so
+the 600 take about 13 hours; they are best run in batches, each stopped
+with Ctrl-C and taken up by the same command. The semantic source at both
+levels is run again beside them, at the same code, rather than paired with
+#149's runs.
 """
 
 from __future__ import annotations
@@ -37,7 +51,7 @@ sys.path.insert(0, str(REPO / "tools"))
 
 from perplexity import held_out_text  # noqa: E402
 
-from microinfer import Engine, benchlog, needles, rq3, rq3_summary  # noqa: E402
+from microinfer import Engine, benchlog, controller, needles, rq3, rq3_summary  # noqa: E402
 
 #: The needle set's seed, fixed for Milestone 3 (#140).
 NEEDLE_SEED = 140
@@ -63,8 +77,13 @@ def main(argv: list[str]) -> int:
                         help="sources: every source at each level (#149); default: every "
                              "condition, but fp16 with --screened, whose FP16 runs screening "
                              "logged")
-    parser.add_argument("--long", action="store_true",
-                        help="the 32K subset (#156): its samples, conditions and experiment")
+    runs_of_their_own = parser.add_mutually_exclusive_group()
+    runs_of_their_own.add_argument(
+        "--long", action="store_true",
+        help="the 32K subset (#156): its samples, conditions and experiment")
+    runs_of_their_own.add_argument(
+        "--ablations", action="store_true",
+        help="ADR-0018's quality ablations (#158) on the screened set")
     parser.add_argument("--experiments", nargs="+", default=None,
                         choices=rq3.EXPERIMENTS)
     parser.add_argument("--samples", nargs="+", default=None,
@@ -81,16 +100,33 @@ def main(argv: list[str]) -> int:
                         help=f"default: {needles.DEFAULT_HAYSTACK_TOKENS}")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
-    if args.long:
-        chosen = [flag for flag, value in (
-            ("--screened", args.screened), ("--samples", args.samples),
-            ("--samples-per-depth", args.samples_per_depth),
-            ("--conditions", args.conditions), ("--experiments", args.experiments),
-            ("--haystack-tokens", args.haystack_tokens)) if value]
+    ablated: dict[str, rq3.Condition] = {}
+    if args.long or args.ablations:
+        chooses = [("--screened", args.screened), ("--samples", args.samples),
+                   ("--samples-per-depth", args.samples_per_depth),
+                   ("--conditions", args.conditions), ("--experiments", args.experiments)]
+        if args.long:  # the ablations' screened set may be of any haystack
+            chooses.append(("--haystack-tokens", args.haystack_tokens))
+        chosen = [flag for flag, value in chooses if value]
         if chosen:
-            parser.error(f"--long chooses the subset's runs; drop {' '.join(chosen)}")
+            parser.error(f"{'--long' if args.long else '--ablations'} chooses its runs; "
+                         f"drop {' '.join(chosen)}")
+    if args.long:
         args.haystack_tokens, args.samples_per_depth = needles.LONG_HAYSTACK_TOKENS, 1
         args.conditions = list(rq3_summary.LONG_CONDITIONS)
+    if args.ablations:
+        try:
+            weights = controller.logged_layer_weights(args.model, args.log)
+        except ValueError as exc:
+            parser.error(str(exc))
+        ablated = {c.name: c for c in rq3.ablations(weights)}
+        args.conditions = [*rq3.ABLATED_FROM, *ablated]
+        args.screened = True
+        other = other_weights(args, weights)
+        if other:
+            parser.error(f"{other} layer weights' runs of this set were logged with other "
+                         f"weights than the last layer-sensitivity's; their summary would "
+                         f"pool both, so log the sensitivity they were run with again first")
     args.haystack_tokens = args.haystack_tokens or needles.DEFAULT_HAYSTACK_TOKENS
     args.experiments = args.experiments or [rq3_summary.CLOSING_EXPERIMENT]
 
@@ -138,7 +174,7 @@ def main(argv: list[str]) -> int:
     ran = 0
     for (sample_id, experiment), names in together.items():
         sample = by_id[sample_id]
-        for cond, results in rq3.runs(engine, sample, [rq3.condition(n) for n in names],
+        for cond, results in rq3.runs(engine, sample, [ablated.get(n) or rq3.condition(n) for n in names],
                                       experiment, plan_seed=args.plan_seed):
             benchlog.append(
                 "rq3-needle", model=args.model, context_length=len(sample.turn_1),
@@ -153,6 +189,21 @@ def main(argv: list[str]) -> int:
                   f"{results['effective_bits']:.2f} bits  {results['answer']!r}  "
                   f"({time.perf_counter() - start:.0f} s)", flush=True)
     return 0
+
+
+def other_weights(args: argparse.Namespace, weights: tuple[float, ...]) -> int:
+    """How many of the set's layer weights' runs (#158), at any code, were
+    made with other weights than `weights`: the summary refuses to pool
+    them with these, and a run logged at this code is not run again."""
+    if not args.log.exists():
+        return 0
+    name = f"{rq3.FULL_POLICY.name}-layer-weights"
+    of = rq3.NeedleSet(args.model, args.needle_seed,
+                       args.haystack_tokens or needles.DEFAULT_HAYSTACK_TOKENS)
+    return sum(1 for e in benchlog.read(args.log)
+               if e["kind"] == "rq3-needle" and of.holds(e)
+               and e["config"]["condition"]["name"] == name
+               and tuple(e["config"]["condition"]["options"]["layer_weights"]) != weights)
 
 
 if __name__ == "__main__":

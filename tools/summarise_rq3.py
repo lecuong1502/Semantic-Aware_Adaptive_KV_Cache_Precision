@@ -15,6 +15,13 @@ With --long, the 32K subset's runs instead (#156, rq3_summary.summarise_long),
 logged as an "rq3-long-summary" entry: the direction they point, no test.
 
     .venv/bin/python tools/summarise_rq3.py --issue 156 --long
+
+With --ablations, ADR-0018's quality ablations instead (#158,
+rq3_summary.summarise_ablations), logged as an "rq3-ablation-summary"
+entry: each one's change in accuracy from the full policy, its interval,
+McNemar's test and its effective bits.
+
+    .venv/bin/python tools/summarise_rq3.py --issue 158 --ablations
 """
 
 from __future__ import annotations
@@ -53,7 +60,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--plan-seed", type=int, default=0)
     parser.add_argument("--experiments", nargs="+", default=list(rq3.EXPERIMENTS),
                         choices=rq3.EXPERIMENTS)
-    parser.add_argument("--long", action="store_true", help="the 32K subset (#156)")
+    summaries_of_their_own = parser.add_mutually_exclusive_group()
+    summaries_of_their_own.add_argument("--long", action="store_true",
+                                        help="the 32K subset (#156)")
+    summaries_of_their_own.add_argument("--ablations", action="store_true",
+                                        help="ADR-0018's quality ablations (#158)")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     if benchlog.environment(args.log)["git_dirty"]:
@@ -63,6 +74,8 @@ def main(argv: list[str]) -> int:
     benchlog.verify(args.log)  # the hashes the summary names are of the entries as appended
     if args.long:
         return long_subset(parser, args)
+    if args.ablations:
+        return ablations(parser, args)
     try:
         summary = rq3_summary.summarise(benchlog.read(args.log), args.model, args.needle_seed,
                                         args.haystack_tokens, plan_seed=args.plan_seed,
@@ -122,6 +135,32 @@ def long_subset(parser: argparse.ArgumentParser, args: argparse.Namespace) -> in
     print(f"\nSemantic against uniform at 80%: {p['semantic_only']} only semantic answered, "
           f"{p['uniform_only']} only uniform, {p['both']} both, {p['neither']} neither; "
           f"direction: {summary['direction'] or 'none'} ({summary['claim']}).")
+    return 0
+
+
+def ablations(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Log and print the quality ablations' summary."""
+    try:
+        summary = rq3_summary.summarise_ablations(benchlog.read(args.log), args.model,
+                                                  args.needle_seed, args.haystack_tokens,
+                                                  plan_seed=args.plan_seed)
+    except ValueError as exc:
+        parser.error(str(exc))
+    benchlog.append(rq3_summary.ABLATION_SUMMARY_KIND, model=args.model, context_length=None,
+                    precision_tiers=None,
+                    config={"issue": args.issue, "needle_seed": args.needle_seed,
+                            "haystack_tokens": args.haystack_tokens,
+                            "plan_seed": args.plan_seed, "experiments": [summary["experiment"]]},
+                    results=summary, log=args.log)
+    against = ", ".join(f"{name} {a['correct']}/{a['n']} at {a['effective_bits']:.2f} bits"
+                        for name, a in summary["against"].items())
+    print(f"\n### Quality ablations, {summary['experiment']}, against {against}\n")
+    table(["Ablation", "Element", "Against", "Correct", "Change, bootstrap 95%",
+           "Only ablation", "Only against", "McNemar p", "Effective bits", "Short plans"],
+          [[name, a["element"], a["against"], f"{a['correct']}/{a['n']}",
+            f"{a['change']:+.2f} {interval(a['change_bootstrap_95'])}", a["ablation_only"],
+            a["against_only"], f"{a['mcnemar_p']:.3g}", f"{a['effective_bits']:.2f}", a["short"]]
+           for name, a in summary["ablations"].items()])
     return 0
 
 

@@ -73,3 +73,14 @@ same samples. The exception is the monitor's K, below.
 - **A variant that beats the full policy is reported as such.** The policy
   is not changed after the results are read without a new ADR (ADR-0016's
   consequence).
+
+## Amendment (#158)
+
+**No INT2 is run at 70% as well.** INT4 gives back at most 71% of a page's
+FP16 bytes on Qwen2.5-1.5B (9,472 bytes of 32,768). Without INT2, a plan at
+80% is therefore short on every sample, holding about every page outside
+the floor at INT4, and is not at equal bytes. The variant is still run at
+80%, as decided, and its short plans are reported. It is also run at 70%,
+against the semantic source at 70% on the same samples, where the bytes
+can be met. The owner chose this after the review of #158, before any
+ablation was run.

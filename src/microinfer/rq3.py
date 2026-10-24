@@ -7,7 +7,11 @@ how the cache is held:
   controlled plan that reclaims 70% or 80% of the FP16 bytes of the pages
   outside the recency floor (#142);
 - **a static tier:** every page born at INT4 or INT2, for the whole
-  session, the uniform-quantisation family.
+  session, the uniform-quantisation family;
+- **an ablation** (ADR-0018, #158): the semantic source at 80%, the full
+  policy, with one element changed, the recency floor, the scorer's
+  cadence or EWMA weight, or an option of the planner, and no INT2 at
+  70% too, against the semantic source there (`ablations`).
 
 An **experiment** is when the plan is made:
 - **question-blind**, the primary: turn 1, the document and a general
@@ -53,7 +57,7 @@ import zlib
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -82,6 +86,15 @@ class Condition:
     tier: str = "FP16"
     #: Whether the engine adapts and scores, as a controlled plan needs.
     adaptive: bool = False
+    #: What an ablation changes (#158), each None for the engine's own: the
+    #: plan's recency floor, the scorer's cadence and EWMA weight, and the
+    #: planner's options.
+    recency_floor: int | None = None
+    score_every: int | None = None
+    score_alpha: float | None = None
+    options: controller.PlanOptions | None = None
+    #: The element of the policy an ablation changes, as ADR-0018 names it.
+    ablates: str | None = None
 
     def __post_init__(self):
         if self.source is not None:
@@ -104,6 +117,55 @@ def source_condition(source: str, share: float) -> Condition:
     """The condition of `source`'s scores at the level `share`."""
     (cond,) = [c for c in CONDITIONS if c.source == source and c.share == share]
     return cond
+
+
+#: The full policy ADR-0018's quality ablations change (#158): the closing
+#: question's condition, question-blind at 80%.
+FULL_POLICY = source_condition("semantic", 0.8)
+#: The level no INT2 is also run at, against the semantic source there:
+#: INT4 gives back 71% of a page's FP16 bytes at most, short of 80% (#158).
+NO_INT2_SHARE = 0.7
+
+
+def ablations(layer_weights: Sequence[float]) -> tuple[Condition, ...]:
+    """ADR-0018's quality ablations, each the full policy with one element
+    changed, and no INT2 at NO_INT2_SHARE too, the semantic source there
+    with it changed (measured_against). The layer weights' ablation weighs
+    scores by `layer_weights`, one weight a layer, as measured
+    (controller.logged_layer_weights, #145)."""
+    def ablated(suffix: str, element: str, against: Condition = FULL_POLICY,
+                **change) -> Condition:
+        return replace(against, name=f"{against.name}-{suffix}", ablates=element, **change)
+
+    options = controller.PlanOptions
+    return (
+        ablated("w0", "recency floor", recency_floor=0),
+        ablated("w512", "recency floor", recency_floor=512),
+        ablated("every-step", "scoring cadence", score_every=1),
+        ablated("alpha-0.05", "EWMA weight", score_alpha=0.05),
+        ablated("alpha-0.5", "EWMA weight", score_alpha=0.5),
+        ablated("importance-only", "marginal cost", options=options(importance_only=True)),
+        ablated("no-int2", "the INT2 tier", options=options(lowest_tier="INT4")),
+        ablated("no-int2", "the INT2 tier", source_condition("semantic", NO_INT2_SHARE),
+                options=options(lowest_tier="INT4")),
+        ablated("layer-weights", "layer weights",
+                options=options(layer_weights=tuple(layer_weights))),
+        ablated("first-page", "attention sinks", options=options(protect_first_page=True)),
+    )
+
+
+#: The ablations' names, in their order, which no layer weights change.
+ABLATION_NAMES = tuple(c.name for c in ablations((1.0,)))
+
+
+def measured_against(cond: Condition) -> Condition:
+    """The condition an ablation is measured against: the semantic source at
+    its level, the full policy but for no INT2 at NO_INT2_SHARE."""
+    return source_condition(cond.source, cond.share)
+
+
+#: The conditions the ablations are measured against, in their order.
+ABLATED_FROM = tuple(dict.fromkeys(measured_against(c).name for c in ablations((1.0,))))
 
 
 def condition(name: str) -> Condition:
@@ -140,25 +202,37 @@ def check_engine(engine) -> None:
         raise ValueError("a run holds its cache on pages, both halves at a page's tier")
 
 
+#: The engine's attributes a condition sets, by the Condition field that
+#: gives each; an ablation's, None in a field, leaves the engine's own.
+_SETS = {"tier": "kv_tier", "adaptive": "kv_adaptive", "source": "kv_score_source",
+         "recency_floor": "kv_recency_floor", "score_every": "kv_score_every",
+         "score_alpha": "kv_score_alpha", "options": "kv_plan_options"}
+
+
 @contextmanager
 def set_for(engine, cond: Condition):
-    """The engine set for `cond`: its tier, whether it adapts and scores, and
-    its score source, put back after."""
-    kept = (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring, engine.kv_score_source)
-    engine.kv_tier, engine.kv_adaptive, engine.kv_scoring = cond.tier, cond.adaptive, cond.adaptive
-    engine.kv_score_source = cond.source or kept[3]
+    """The engine set for `cond`: its tier, whether it adapts and scores,
+    its score source, and what an ablation changes, put back after."""
+    kept = {name: getattr(engine, name) for name in (*_SETS.values(), "kv_scoring")}
     try:
+        for field, name in _SETS.items():
+            if getattr(cond, field) is not None:
+                setattr(engine, name, getattr(cond, field))
+        engine.kv_scoring = cond.adaptive
         yield
     finally:
-        (engine.kv_tier, engine.kv_adaptive, engine.kv_scoring,
-         engine.kv_score_source) = kept
+        for name, value in kept.items():
+            setattr(engine, name, value)
 
 
 def shares_turn_1(cond: Condition) -> bool:
     """Whether `cond` holds turn 1 as every source condition does: at FP16,
-    adaptive and scoring, which is all a cache is made with until the plan
-    reads its score source (#172). A static tier holds it at its own."""
-    return cond.adaptive and cond.tier == "FP16"
+    adaptive and scoring at the engine's cadence and EWMA weight, which is
+    all a cache is made with until the plan reads its score source and its
+    options (#172). A static tier holds it at its own, and an ablation of
+    the scorer (#158) scores it as no other does."""
+    return (cond.adaptive and cond.tier == "FP16"
+            and cond.score_every is None and cond.score_alpha is None)
 
 
 #: What a run does after its question's answer, on the same conversation:
@@ -271,6 +345,7 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         "aware_opening": opening,
         "opened_as_asked": None if opening is None else opening.startswith(AWARE_OPENING),
         "code_after_plan": None if opening is None else code_after(opening, sample.code),
+        "score_every": engine.kv_score_every, "score_alpha": engine.kv_score_alpha,
         **planned.results(cond, seed, sample.page_tokens),
         "needle_page_tiers": planned.page_tiers(sample.needle_pages),
     }
@@ -324,13 +399,15 @@ def plan_at(chat, cond: Condition, seed: int) -> Planned:
 
 def plan_summary(record) -> dict | None:
     """What a log entry's results hold of a controlled plan's record: its
-    controlled fields but the effective bits, given beside it, and its
-    moves, whether it fell short, and how it ended; None for no plan."""
+    controlled fields but the effective bits, given beside it, its moves,
+    whether it fell short, how it ended, and the recency floor and options
+    it was made with (#158); None for no plan."""
     if record is None:
         return None
     plan = {k: v for k, v in record.controlled.items()
             if k not in ("effective_bits", "candidate_effective_bits")}
-    plan.update(moves=len(record.plan), short=record.plan.short, ended=record.ended)
+    plan.update(moves=len(record.plan), short=record.plan.short, ended=record.ended,
+                recency_floor=record.plan.recency_floor, options=asdict(record.plan.options))
     return plan
 
 
