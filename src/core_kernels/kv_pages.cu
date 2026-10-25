@@ -515,19 +515,19 @@ namespace microinfer
                                   "nothing can " +
                                   verb + " it (#160)");
     }
-    if (std::string(verb) == "evict" && masked(key))
-    {
-      throw std::invalid_argument(
-          page_name(key) +
-          " is masked, the reference an eviction is measured against; "
-          "evict another cache's page");
-    }
     return key;
   }
 
   void KVPages::evict(int layer, int page)
   {
     const PageKey key = require_held(layer, page, "evict");
+    if (masked(key))
+    {
+      throw std::invalid_argument(
+          page_name(key) +
+          " is masked, the reference an eviction is measured against; "
+          "evict another cache's page");
+    }
     // The free moves the tier's tail into the slot and advances the
     // allocator's generation, so the next launch resolves the tables anew.
     allocator_.free(key);

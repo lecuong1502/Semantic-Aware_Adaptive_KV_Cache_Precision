@@ -281,7 +281,7 @@ namespace microinfer
                       int start, int n);
     // The key of a sealed page of positions that is not evicted, for
     // `verb`, or why not: require_movable's, and refused for a page
-    // already evicted, or, for "evict", masked.
+    // already evicted.
     PageKey require_held(int layer, int page, const char *verb) const;
     // Seals the page of positions `span` from rows (page_tokens, kv_width) of
     // keys and of values, into its place at its own tier.

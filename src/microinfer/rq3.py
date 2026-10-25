@@ -12,7 +12,7 @@ how the cache is held:
   policy, with one element changed, the recency floor, the scorer's
   cadence or EWMA weight, or an option of the planner, and no INT2 at
   70% too, against the semantic source there (`ablations`);
-- **eviction at a level** (#160), the H2O-style baseline that does not
+- **eviction at a level** (#160), H2O's family, a condition that does not
   hold the closing: the pages the semantic source's plan at that level
   would downgrade most are evicted instead, for the same bytes
   (`EVICTIONS`, Conversation.evict).
@@ -117,9 +117,11 @@ CONDITIONS = (
 NO_PLAN = Condition("no-plan", adaptive=True)
 #: The conditions of a score source at a level, question-blind's closing run (#149).
 SOURCE_CONDITIONS = tuple(c.name for c in CONDITIONS if c.source is not None)
+#: The levels, the shares a controlled plan reclaims.
+LEVELS = sorted({c.share for c in CONDITIONS if c.share is not None})
 #: Eviction at each level (#160), against the semantic source there.
 EVICTIONS = tuple(Condition(f"evict-{round(share * 100)}", source="semantic", share=share,
-                            evicts=True) for share in (0.7, 0.8))
+                            evicts=True) for share in LEVELS)
 EVICTION_CONDITIONS = tuple(c.name for c in EVICTIONS)
 
 

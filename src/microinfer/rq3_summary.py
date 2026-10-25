@@ -58,10 +58,12 @@ SEED = 152
 Z_95 = 1.959964
 CLOSING_EXPERIMENT = "question-blind"
 CLOSING_SHARE = 0.8
-LEVELS = sorted({c.share for c in rq3.CONDITIONS if c.share is not None})
+LEVELS = rq3.LEVELS
 OTHER_SOURCES = ("uniform", "random")
 LONG_SUMMARY_KIND = "rq3-long-summary"
 ABLATION_SUMMARY_KIND = "rq3-ablation-summary"
+#: The needle's eviction summary and the anchor-fact dialogue's, the `task`
+#: of its config telling them apart (#160).
 EVICTION_SUMMARY_KIND = "rq3-eviction-summary"
 
 
@@ -410,6 +412,25 @@ def evictions(runs: dict[str, list[dict]], rng: np.random.Generator) -> dict:
             "change": pair.pop("difference"),
             "change_bootstrap_95": pair.pop("difference_bootstrap_95"), **pair}
     return out
+
+
+def eviction_table(levels: dict) -> str:
+    """`evictions`' levels as a markdown table: the needle's and the
+    anchor-fact dialogue's (#160)."""
+    rows = ["| Level | Eviction | Semantic | Change, bootstrap 95% | Only eviction "
+            "| Only semantic | McNemar p | Bits, eviction / semantic "
+            "| Bytes reclaimed, eviction / semantic (MiB) | Short plans |",
+            "|---|---|---|---|---|---|---|---|---|---|"]
+    for level, x in levels.items():
+        e, m = x["eviction"], x["semantic"]
+        low, high = x["change_bootstrap_95"]
+        rows.append(f"| {level} | {e['correct']}/{e['n']} | {m['correct']}/{m['n']} "
+                    f"| {x['change']:+.2f} [{low:.2f}, {high:.2f}] | {x['eviction_only']} "
+                    f"| {x['semantic_only']} | {x['mcnemar_p']:.3g} "
+                    f"| {e['effective_bits']:.2f} / {m['effective_bits']:.2f} "
+                    f"| {e['reclaimed_bytes'] / 2**20:.1f} / {m['reclaimed_bytes'] / 2**20:.1f} "
+                    f"| {e['short']} / {m['short']} |")
+    return "\n".join(rows)
 
 
 def summarise_evictions(entries: Sequence[dict], model: str, needle_seed: int,

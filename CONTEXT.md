@@ -417,13 +417,15 @@ scorer run it alone. The monitor's K is an ablation of RQ2, not a condition.
 _Avoid_: arm, treatment
 
 **Eviction**:
-The H2O-style baseline (#160): at a level, the pages the semantic source's
-controlled plan would downgrade most, those it leaves lowest first, are
-dropped instead until they give back the same bytes. An evicted page is
-freed, its memory back to the driver, and no query attends to its positions
-again; none comes back, and its shadow, if it had one, is never read. It is
+A condition of H2O's family (#160): at a level, the pages the semantic
+source's controlled plan would downgrade most, those it leaves lowest
+first, are evicted instead until they give back the same bytes. An evicted
+page is freed, its memory back to the driver, and no query attends to its
+positions again; none comes back. A shadow it had stays in host memory,
+never read, until the cache goes: the shadow store only ever adds. It is
 measured against the same pages masked, kept and read by no query, to the
-bit. A page, not a token, is what is evicted: the cache's unit.
+bit; masked as a later position is, by the attention kernel's -inf. A
+page, not a token, is what is evicted: the cache's unit.
 _Avoid_: dropping, pruning, offloading (that keeps the bytes elsewhere)
 
 **Controlled plan**:

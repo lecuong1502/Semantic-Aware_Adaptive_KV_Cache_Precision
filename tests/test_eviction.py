@@ -1,4 +1,4 @@
-"""Eviction at equal bytes, the H2O-style baseline (#160).
+"""Eviction at equal bytes, a condition of H2O's family (#160).
 
 An evicted page is freed, its memory back to the driver, and no query
 attends to its positions again. The proof is equality, not tolerance:
@@ -147,7 +147,9 @@ def test_an_evicted_pages_memory_returns_to_the_driver():
         np.testing.assert_array_equal(allocator.read(*key), held[key])
     assert cache.evicted()[:, :400].all() and not cache.evicted()[:, 400:].any()
     tiers = cache.page_tiers()
-    assert (tiers[:, :400] == 4).all() and (tiers[:, 400:] == int(Tier.FP16)).all()
+    assert controller.EVICTED == device.evicted_tier  # the planner's name for it
+    assert (tiers[:, :400] == controller.EVICTED).all()
+    assert (tiers[:, 400:] == int(Tier.FP16)).all()
 
 
 def test_what_an_eviction_refuses():
@@ -221,7 +223,7 @@ def test_an_evicted_page_holds_nothing_and_no_plan_moves_it():
     assert controller.full_pages(after, 6 * 32, 32, 0)[0, 1]
     assert controller.share_target_bytes(0.5, after, PAGE_BYTES, positions=6 * 32,
                                          page_tokens=32, recency_floor=0) == 2500
-    assert controller.PLACES[controller.EVICTED] == "evicted"
+    assert controller.PLACES[controller.EVICTED] == benchlog.EVICTED == "evicted"
 
 
 # -- through a conversation -------------------------------------------------------------
@@ -372,6 +374,9 @@ def test_the_tools_run_and_summarise_eviction_on_the_needles_and_the_dialogue(tm
                     precision_tiers={"FP16": 1.0},
                     config={"needle_seed": 160, "draws": 1, "haystack_tokens": 1024},
                     results={"kept": ["d50-0"], "rejected": [], "complete": True}, log=log)
+    with pytest.raises(SystemExit):  # eviction does not hold the closing question
+        needle_tool.main([*shape, "--screened", "--conditions", "evict-80",
+                          "--experiments", "question-aware"])
     assert needle_tool.main([*shape, "--evictions"]) == 0
     runs = [e for e in benchlog.read(log) if e["kind"] == "rq3-needle"]
     assert [e["config"]["condition"]["name"] for e in runs] == list(rq3_summary.EVICTION_NAMES)
@@ -391,6 +396,8 @@ def test_the_tools_run_and_summarise_eviction_on_the_needles_and_the_dialogue(tm
                           *dialogue])
     assert anchor_tool.main(["--issue", "160", "--evictions", *dialogue]) == 0
     assert anchor_tool.main(["--issue", "160", "--evictions", "--summarise", *dialogue]) == 0
-    (anchor_summary,) = [e for e in benchlog.read(log) if e["kind"] == "anchor-summary"]
+    (anchor_summary,) = [e for e in benchlog.read(log)
+                         if e["kind"] == rq3_summary.EVICTION_SUMMARY_KIND
+                         and e["config"].get("task") == "anchor-fact"]
     levels = anchor_summary["results"]["evictions"]
     assert set(levels) == {"70%", "80%"} and levels["80%"]["eviction"]["n"] == 2

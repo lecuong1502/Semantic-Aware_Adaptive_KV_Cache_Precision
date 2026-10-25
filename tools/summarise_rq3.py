@@ -191,23 +191,8 @@ def eviction_summary(parser: argparse.ArgumentParser, args: argparse.Namespace) 
                             "plan_seed": args.plan_seed, "experiments": [summary["experiment"]]},
                     results=summary, log=args.log)
     print(f"\n### Eviction on the needle set, {summary['experiment']}\n")
-    print_evictions(summary["levels"])
+    print(rq3_summary.eviction_table(summary["levels"]))
     return 0
-
-
-def print_evictions(levels: dict) -> None:
-    """Eviction against the semantic source at each level, as a table: the
-    needle's and the anchor-fact dialogue's (#160)."""
-    table(["Level", "Eviction", "Semantic", "Change, bootstrap 95%", "Only eviction",
-           "Only semantic", "McNemar p", "Bits, eviction / semantic",
-           "Bytes reclaimed, eviction / semantic (MiB)", "Short plans"],
-          [[level, f"{e['correct']}/{e['n']}", f"{m['correct']}/{m['n']}",
-            f"{x['change']:+.2f} {interval(x['change_bootstrap_95'])}", x["eviction_only"],
-            x["semantic_only"], f"{x['mcnemar_p']:.3g}",
-            f"{e['effective_bits']:.2f} / {m['effective_bits']:.2f}",
-            f"{e['reclaimed_bytes'] / 2**20:.1f} / {m['reclaimed_bytes'] / 2**20:.1f}",
-            f"{e['short']} / {m['short']}"]
-           for level, x in levels.items() for e, m in [(x["eviction"], x["semantic"])]])
 
 
 if __name__ == "__main__":

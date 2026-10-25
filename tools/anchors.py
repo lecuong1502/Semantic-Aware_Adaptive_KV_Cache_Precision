@@ -11,7 +11,9 @@ Three steps, each a command (microinfer.anchors):
    entry a run. A dialogue's source conditions run its turns once
    (anchors.runs).
 3. `--summarise`: the anchor-summary entry, recall per condition by gap and
-   the semantic source paired against uniform and random, and its tables.
+   the semantic source paired against uniform and random, and its tables;
+   with --evictions, an rq3-eviction-summary entry, its task anchor-fact,
+   eviction paired against the semantic source at each level besides.
 
 With --evictions, the conditions are eviction at each level (#160) and the
 semantic source there, both run at the same code, and summarised against
@@ -37,7 +39,6 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "tools"))
 
 from perplexity import held_out_text  # noqa: E402
-from summarise_rq3 import print_evictions  # noqa: E402
 
 from microinfer import Engine, anchors, benchlog, rq3, rq3_summary  # noqa: E402
 
@@ -82,15 +83,16 @@ def main(argv: list[str]) -> int:
         names = list(dict.fromkeys(args.conditions))
         summary = anchors.summarise(benchlog.read(args.log), of, plan_seed=args.plan_seed,
                                     conditions=[FP16.name, *names])
+        # Eviction's apart from #154's, which a reader takes the latest of.
         entry = benchlog.append(
-            "anchor-summary", model=args.model, context_length=None,
-            precision_tiers=None,
-            config={**of.config(), "plan_seed": args.plan_seed, "issue": args.issue},
+            rq3_summary.EVICTION_SUMMARY_KIND if args.evictions else "anchor-summary",
+            model=args.model, context_length=None, precision_tiers=None,
+            config={**of.config(), "plan_seed": args.plan_seed, "issue": args.issue,
+                    **({"task": "anchor-fact"} if args.evictions else {})},
             results=summary, log=args.log)
         print(tables(summary))
         if summary["evictions"] is not None:
-            print()
-            print_evictions(summary["evictions"])
+            print(f"\n{rq3_summary.eviction_table(summary['evictions'])}")
         print(f"\nlogged {entry['sha256'][:12]}")
         return 0
 

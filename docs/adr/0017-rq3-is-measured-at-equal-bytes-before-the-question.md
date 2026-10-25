@@ -144,7 +144,7 @@ the same bytes is a separate ticket that does not hold the closing.
 
 ## Amendment (#160): eviction at the same bytes
 
-Eviction is run as a baseline that does not hold the closing question, at
+Eviction is run as a condition that does not hold the closing question, at
 both levels, against the semantic source there.
 
 - **Which pages.** The pages the semantic source's controlled plan for the
@@ -160,6 +160,13 @@ both levels, against the semantic source there.
 - **How it is checked.** Attention over a cache with pages evicted is, to
   the bit, attention over the same cache with those pages masked, and its
   memory returns to the driver to a granule (`tests/test_eviction.py`).
+  Masked is defined by the attention kernel: a masked page's scores are
+  -inf by the same select a later position's are. Its output is checked
+  against attention over the keys without those positions, near, not to
+  the bit, since the tiles fall otherwise.
+- **The shadow.** A page downgraded before it was evicted keeps its FP16
+  shadow in pinned host memory, never read, until the cache goes: the
+  shadow store only ever adds (#94). The device memory is what returns.
 - **Where it is run.** The screened needle set and the anchor-fact
   dialogue, question-blind, with the semantic source at both levels run
   again beside it at the same code (`tools/rq3.py --evictions`,

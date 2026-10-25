@@ -389,7 +389,7 @@ def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tier
 
 @dataclass(frozen=True, eq=False)
 class EvictionPlan:
-    """The pages an eviction drops (#160), in the order it takes them, and
+    """The pages an eviction evicts (#160), in the order it takes them, and
     what each gives back, `freed`: the bytes it held. `short` if every page
     the plan it follows moves was taken and the byte target was still not
     met. That plan's recency floor and options are recorded with it."""
@@ -413,7 +413,7 @@ class EvictionPlan:
 def eviction_plan(target_bytes: int, plan: Plan, tiers: np.ndarray,
                   page_bytes: dict[str, int]) -> EvictionPlan:
     """The pages `plan` would downgrade most, evicted instead until they give
-    back `target_bytes` (#160), H2O's baseline at a policy's bytes: every
+    back `target_bytes` (#160), H2O's family at a policy's bytes: every
     page the plan moves, those it leaves at the lowest tier first, and of
     those it leaves at one tier, the first it took there first, by its
     last downgrade. Each gives back what it holds now, in `tiers`, as

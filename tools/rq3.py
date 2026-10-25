@@ -112,7 +112,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     ablated: dict[str, rq3.Condition] = {}
-    if args.long or args.ablations or args.evictions:
+    # The mode that chooses its runs, if one does.
+    mode = next((f"--{m}" for m in ("long", "ablations", "evictions") if getattr(args, m)),
+                None)
+    if mode is not None:
         chooses = [("--screened", args.screened), ("--samples", args.samples),
                    ("--samples-per-depth", args.samples_per_depth),
                    ("--conditions", args.conditions), ("--experiments", args.experiments)]
@@ -120,9 +123,7 @@ def main(argv: list[str]) -> int:
             chooses.append(("--haystack-tokens", args.haystack_tokens))
         chosen = [flag for flag, value in chooses if value]
         if chosen:
-            flag = next(f for f in ("--long", "--ablations", "--evictions")
-                        if getattr(args, f[2:]))
-            parser.error(f"{flag} chooses its runs; drop {' '.join(chosen)}")
+            parser.error(f"{mode} chooses its runs; drop {' '.join(chosen)}")
     if args.long:
         args.haystack_tokens, args.samples_per_depth = needles.LONG_HAYSTACK_TOKENS, 1
         args.conditions = list(rq3_summary.LONG_CONDITIONS)
@@ -159,6 +160,10 @@ def main(argv: list[str]) -> int:
                                                args.haystack_tokens, args.log)
     args.conditions = conditions_for(args.conditions, screened=args.screened)
     args.experiments = list(dict.fromkeys(args.experiments))
+    if (set(args.conditions) & set(rq3.EVICTION_CONDITIONS)
+            and args.experiments != [rq3_summary.CLOSING_EXPERIMENT]):
+        parser.error(f"eviction is run {rq3_summary.CLOSING_EXPERIMENT} only (#160, "
+                     f"ADR-0017's amendment); drop the other experiments")
 
     engine = Engine(REPO / "models" / args.model)
     every = needles.needle_set(held_out_text(), engine.tokenizer, seed=args.needle_seed,
