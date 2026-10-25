@@ -32,7 +32,8 @@ simulator plays, not a spike: a spike is what spikes.py finds in a trace.
 #65 applies them to RQ1's recordings replayed on a base that leaves the
 original's headroom (tools/evaluate_monitor.py replay), and summarise pools
 the latest evaluation of each, per workload, for RQ2
-(tools/summarise_monitor.py).
+(tools/summarise_monitor.py), at ADR-0013's thresholds and K. #159 runs the
+grid again at other K, and grid_by_persist_polls takes the latest at each.
 
 This is measurement, not inference, so it computes in NumPy on the host
 (ADR-0002, amendment on its scope).
@@ -40,13 +41,14 @@ This is measurement, not inference, so it computes in NumPy on the host
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass, replace
 
 import numpy as np
 
 from . import patterns
 from .contention import spread
-from .monitor import POLL_S, RED, Level, PressureEvent, Thresholds
+from .monitor import DEFAULT, POLL_S, RED, Level, PressureEvent, Thresholds
 from .schedule import Schedule
 
 #: The shortest true RED episode a monitor is expected to catch (#45).
@@ -209,16 +211,20 @@ def grid_schedule(cells: list[Cell], base_bytes: int, repeats: int, gap_s: float
     return Grid(list(cells), schedule, pulses)
 
 
-def applied_starts(grid: Grid, started_ns: int, simulator_events: list[dict]) -> list[int]:
-    """When each pulse of `grid`, run from `started_ns`, began to be applied:
-    the simulator's first change due at or after its start (its events,
-    simulator.run's), when that change was applied. A pulse whose change the
-    simulator never made keeps its due time."""
-    due = sorted((e["scheduled_ns"], e["applied_ns"]) for e in simulator_events)
+def pulse_starts(grid: Grid, started_ns: int, simulator_events: list[dict]) -> list[int]:
+    """When each pulse of `grid`, run from `started_ns`, began: the
+    simulator's first change due at or after its start (its events,
+    simulator.run's), when the simulator began it, late_s after it was due.
+    Not when its calls returned (applied_ns): the device shows the memory
+    taken while they run, and a sheer edge's true RED can begin before they
+    return (#159). A pulse whose change the simulator never made keeps its
+    due time."""
+    due = sorted((e["scheduled_ns"], e["scheduled_ns"] + round(e["late_s"] * _NS))
+                 for e in simulator_events)
     starts = []
     for pulse in grid.pulses:
         at = started_ns + int(pulse.start_s * _NS) - 1_000_000  # a ms for rounding
-        starts.append(next((applied for scheduled, applied in due if scheduled >= at),
+        starts.append(next((began for scheduled, began in due if scheduled >= at),
                            at + 1_000_000))
     return starts
 
@@ -247,28 +253,46 @@ def _sum(scores: list[Score]) -> Score:
 _COUNTS = tuple(f for f, kind in Score.__annotations__.items() if kind == "int")
 
 
-def summarise(entries) -> dict:
-    """RQ2's summary from the benchmark log's `entries`: per workload, the
-    latest "monitor-evaluation" of the grid, and of each recording replayed
-    whole, that no correction supersedes, their counts summed and their
-    latencies pooled, with the sha256 of the entries taken. A replay of part
-    of a recording is left out: it is not that recording's replay. A
-    correction supersedes the entries it corrects unless it says it does not
+#: What the grid's evaluations at each K must share beside their code (#159):
+#: its cells, how often and how far apart they are played, and its base.
+GRID_SHAPE = ("amplitudes_mib", "ramps_s", "plateaus_s", "repeats", "gap_s", "lead_s",
+              "phase_seed", "start_headroom_mib")
+
+
+def _latest_evaluations(entries, key) -> dict:
+    """The latest "monitor-evaluation" of `entries` at each key(entry), of
+    those no correction supersedes and key does not give None. A correction
+    supersedes the entries it corrects unless it says it does not
     ("supersedes": false), as one that amends what an entry's config says."""
     entries = list(entries)
     superseded = {sha for e in entries if e.get("kind") == "correction"
                   and e["results"].get("supersedes", True)
                   for sha in e["results"].get("corrects", [])}
-    latest: dict[tuple[str, str | None], dict] = {}
+    latest = {}
     for e in entries:
-        if e.get("kind") != "monitor-evaluation" or e["sha256"] in superseded:
-            continue
+        if e.get("kind") == "monitor-evaluation" and e["sha256"] not in superseded:
+            k = key(e)
+            if k is not None:
+                latest[k] = e
+    return latest
+
+
+def summarise(entries) -> dict:
+    """RQ2's summary from the benchmark log's `entries`: per workload, the
+    latest "monitor-evaluation" of the grid, and of each recording replayed
+    whole, that no correction supersedes, at ADR-0013's thresholds and K,
+    their counts summed and their latencies pooled, with the sha256 of the
+    entries taken. A replay of part of a recording is left out: it is not
+    that recording's replay; and so is an evaluation at another K (#159):
+    it is not the monitor's."""
+    def key(e):
         config = e["config"]
-        if config.get("to_s") is not None:
-            continue
-        latest[(config["workload"], config.get("recording"))] = e
+        if config.get("to_s") is None and config["thresholds"] == asdict(DEFAULT):
+            return config["workload"], config.get("recording")
+        return None
+
     summary: dict[str, dict] = {}
-    for (workload, _), e in latest.items():
+    for (workload, _), e in _latest_evaluations(entries, key).items():
         into = summary.setdefault(workload, {"entries": [], "latencies_ms": [],
                                              "latencies_polls": [],
                                              **{k: 0 for k in _COUNTS}})
@@ -282,3 +306,33 @@ def summarise(entries) -> dict:
         into["latency_ms"] = spread(into.pop("latencies_ms"))
         into["latency_polls"] = spread(into.pop("latencies_polls"))
     return summary
+
+
+def grid_by_persist_polls(entries) -> dict[int, dict]:
+    """The synthetic grid at each K (#159), in order of K: the latest
+    "monitor-evaluation" of the grid at that K, its thresholds otherwise
+    ADR-0013's, that no correction supersedes; its counts, the spread of
+    its latencies, and its sha256 and commit. Raises ValueError unless they
+    share their code and the grid's shape (GRID_SHAPE): what differs
+    between them is then K alone."""
+    def key(e):
+        config = e["config"]
+        k = config["thresholds"]["persist_polls"]
+        if (config["workload"] == "synthetic grid"
+                and config["thresholds"] == asdict(replace(DEFAULT, persist_polls=k))):
+            return k
+        return None
+
+    latest = dict(sorted(_latest_evaluations(entries, key).items()))
+    runs = {json.dumps([e["git_commit"], *(e["config"].get(f) for f in GRID_SHAPE)])
+            for e in latest.values()}
+    if len(runs) > 1:
+        raise ValueError(
+            "the grid's latest evaluations at each K differ in code or shape: "
+            + "; ".join(f"K = {k} at {e['git_commit'][:7]}" for k, e in latest.items())
+            + "; run them again at one code")
+    return {k: {"entry": e["sha256"], "commit": e["git_commit"],
+                **{c: e["results"]["overall"][c] for c in _COUNTS},
+                "latency_ms": spread(e["results"]["overall"]["latencies_ms"]),
+                "latency_polls": spread(e["results"]["overall"]["latencies_polls"])}
+            for k, e in latest.items()}

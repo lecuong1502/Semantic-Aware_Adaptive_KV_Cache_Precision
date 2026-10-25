@@ -25,12 +25,13 @@ a generation with the monitor on:
   played what the other processes held, on a base that left the original's
   headroom.
 
-The summary is `monitor-summary` entry `552515de…`, pooling the evaluation
-entries it names:
+The summary is `monitor-summary` entry `9b896683…`, pooling the evaluation
+entries it names. The grid's is #159's at K = 3 (see the amendment), which
+supersedes #64's `6ea7e707…`:
 
 | Workload | True RED episodes | Detectable | False negatives | Under K | Already RED | False positives | Latency median / P90 / max |
 |---|---|---|---|---|---|---|---|
-| Synthetic grid (`6ea7e707…`) | 67 | 57 | **0** | 2 | 0 | **0** | 126 / 172 / 246 ms |
+| Synthetic grid (`cdd31183…`) | 68 | 57 | **0** | 5 | 0 | **0** | 116 / 176 / 236 ms |
 | Replayed RQ1 (5 recordings) | 30 | 27 | **0** | 0 | 4 | **0** | 114 / 134 / 143 ms |
 
 Per replayed recording, from its `monitor-evaluation` entry:
@@ -58,15 +59,16 @@ The terms:
   no RED event was false,** in either kind of contention: 84 detectable
   episodes, 0 false negatives, 0 false positives.
 - **Detection takes two to three polls after RED begins:**
-  - a median of 114–126 ms, about 2.5 polls;
-  - at most 246 ms, 4.9 polls.
+  - a median of 114–116 ms, about 2.3 polls;
+  - at most 236 ms, 4.7 polls.
 
-  The slowest were the grid's 0.25 s ramps. Headroom crosses RED part way
+  Most of the slowest were the grid's 0.25 s ramps. Headroom crosses RED part way
   up such a ramp, and settles below it only a few samples later.
-- **Two episodes of 100–220 ms went unreported, by design.** A pulse with a
-  sheer edge and a 0.1 s plateau leaves a RED episode shorter than the
-  K = 3 polls the monitor needs. RQ1's recordings had no RED episode that
-  short to replay.
+- **Five episodes of 100–200 ms went unreported, by design.** Pulses with a
+  sheer edge and a 0.1 or 0.2 s plateau, or a 0.25 s ramp and a 0.1 s
+  plateau, leave RED episodes shorter than the K + 1 polls and a sample the
+  monitor is sure to catch. RQ1's recordings had no RED episode that short
+  to replay.
 - **A replay reproduces its original to within tens of MiB, not exactly.**
   The median offset is −43 to +28 MiB. RQ1's with-engine headroom hovered
   at 490–510 MiB, close to RED, so an offset that size changes how many
@@ -85,8 +87,9 @@ poll or a smaller K. The controller can count on a RED event within about
 ## Consequences
 
 - **The controller's budget.** ADR-0013's YELLOW margin assumed detection
-  within 200 ms, (K + 1) polls. Measured detection reaches 246 ms on slow
-  ramps, which are also the spikes that take longest to fill the margin.
+  within 200 ms, (K + 1) polls. Measured detection reaches 236 ms, on a
+  sheer pulse, and 186 ms on the 0.25 s ramps, which are also the spikes
+  that take longest to fill the margin.
   The margin is the whole P90 amplitude either way (ADR-0013), so it does
   not move. Milestone 2's measured plan time is what may.
 - **What the evaluation does not cover:**
@@ -97,11 +100,66 @@ poll or a smaller K. The controller can count on a RED event within about
     the entries record them among the other GPU processes. They add their
     own movement to both the truth and the monitor's readings. No false
     positive came of it.
-- **The grid's own record is amended, not superseded.** Its base was set
-  before the simulator's 82 MiB context was accounted for. It began about
-  1454 MiB of headroom, not the 1536 its entry logs (correction entry on
-  `6ea7e707…`). Every cell still went from GREEN into the level it was meant
-  to reach.
+- **#64's grid is superseded by #159's at K = 3.** Its base was set before
+  the simulator's 82 MiB context was accounted for: it began about 1454 MiB
+  of headroom, not the 1536 its entry logs (correction entry on
+  `6ea7e707…`). #159's began from 1536, its base set after.
 - **`tools/summarise_monitor.py` regenerates this table** from the log. A
   later evaluation, logged, supersedes the one it replays in the summary,
   and this note is then updated to match.
+
+## Amendment (#159): K = 1 and K = 5
+
+#159 ran the grid at K = 1, 3 and 5, one after another at the same code,
+the thresholds ADR-0013's (`tools/evaluate_monitor.py grid --persist-polls`).
+The comparison is `monitor-hysteresis-summary` entry `15a4d371…`
+(`tools/summarise_monitor.py --hysteresis`):
+
+| K | Entry | True RED episodes | Detectable | False negatives | Under K | Already RED | False positives | RED events | Latency median / P90 / max |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `e7f3d389…` | 68 | 66 | **0** | 0 | 11 | **0** | 72 | 28 / 38 / 48 ms |
+| 3 | `cdd31183…` | 68 | 57 | **0** | 5 | 0 | **0** | 63 | 116 / 176 / 236 ms |
+| 5 | `8b4ceb0a…` | 66 | 51 | **3** | 15 | 0 | **0** | 48 | 215 / 399 / 430 ms |
+
+Detectable episodes last K + 1 polls and a sample: 120, 220 and 320 ms.
+
+### Findings
+
+- **K = 1 was faster on the grid and no less exact.**
+  - It detected within one poll, a median of 28 ms.
+  - It caught the five episodes that are false negatives under K at K = 3.
+  - It raised no false RED.
+  - Its 11 episodes already RED were reported before the recorder's first
+    sample below RED. The poll that saw RED fell between two of the
+    recorder's samples, 20 ms apart, so the episode was caught with no
+    latency to count, and the median leaves them out.
+  - It reported 328 transitions where K = 3 reported 297.
+- **K = 5 was slower, with three false negatives among the detectable.**
+  - Detection took a median of 215 ms, at most 430 ms.
+  - Its three false negatives were 340 ms episodes, from the 1408 MiB
+    pulses with a 0.25 s ramp and a 0.2 s plateau.
+  - Their ramp kept headroom in YELLOW for five polls first. The monitor
+    reported YELLOW, and then needed five polls of RED, longer than RED
+    lasted. A climb through YELLOW can take up to 2K polls to report RED.
+- **The per-cell scores were wrong until #159, the overall scores never.**
+  - A pulse's cell began when the simulator's change returned. A sheer
+    edge's true RED begins about 6 ms before that, while the allocator's
+    calls run, so it fell in the cell of the pulse before: a false negative
+    there, and in its own cell a RED event with no episode.
+  - `evaluation.pulse_starts` now starts a cell when the change began.
+  - The three grids were rescored from their files
+    (`tools/evaluate_monitor.py rescore`). #64's per-cell scores, superseded
+    and never reported, are left as logged.
+
+Regenerate with `tools/evaluate_monitor.py grid --out data/monitor/grid-k1.csv.gz
+--issue 159 --persist-polls 1`, the same at 3 and 5, then
+`tools/evaluate_monitor.py rescore` and `tools/summarise_monitor.py
+--hysteresis` (the rescore is needed only for entries scored before
+`pulse_starts`).
+
+### Decision
+
+**K stays 3.** Every controller result was measured at it. The grid alone
+does not show what K = 1 does on noisier contention, since RQ1's replays
+were not run at it. On this evidence a smaller K costs nothing on the grid,
+and a larger one costs detection.

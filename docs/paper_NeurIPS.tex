@@ -60,8 +60,8 @@ from a full-precision copy in host memory once pressure passes. Freed memory is
 returned to the driver through the virtual memory management interface, so the
 saving is visible to the other process and to the measurement. On a 6\,GiB
 laptop GPU, everyday applications take hundreds of MiB and mostly keep them;
-the monitor detects every catchable episode within 246\,ms with no false
-alarm; and with Qwen2.5-1.5B at 32K positions, a contention that runs the
+the monitor detects every catchable episode within 236\,ms with no false
+positive; and with Qwen2.5-1.5B at 32K positions, a contention that runs the
 static engine out of memory is survived by the adaptive one, which returns
 746\,MiB that the driver sees returned, to a granule, at every plan.
 \end{abstract}
@@ -131,7 +131,7 @@ laptop}, attributed to the processes that cause it: spikes are large (P90
 506\,MiB), rise over seconds (median 1.09\,s) and mostly persist (45 of 48).
 \item \textbf{A scheduler-agnostic pressure monitor} whose thresholds follow
 from that measurement by a fixed rule, and which detected all 84 catchable RED
-episodes within 246\,ms with no false alarm.
+episodes within 236\,ms with no false positive.
 \item \textbf{A runtime precision policy and the engine that runs it}: a paged
 cache whose pages change tier between decoding steps, every move quantising
 from an FP16 shadow so that upgrades restore exactly, freed memory returned to
@@ -438,7 +438,7 @@ with-engine recordings.
 \caption{The monitor against the recorder's truth: true RED episodes, those long
 enough to catch, false negatives (FN), false negatives shorter than $K+1$
 polls, false positives (FP), and detection latency. Every catchable episode was
-caught, with no false alarm.}
+caught, with no false positive.}
 \label{tab:detection}
 \centering
 \small
@@ -446,17 +446,22 @@ caught, with no false alarm.}
 \toprule
 Workload & RED & Catchable & FN & FN under $K$ & FP & Latency, median / max (ms) \\
 \midrule
-Synthetic grid & 67 & 57 & 0 & 2 & 0 & 126 / 246 \\
+Synthetic grid & 68 & 57 & 0 & 5 & 0 & 116 / 236 \\
 RQ1 replayed & 30 & 27 & 0 & 0 & 0 & 114 / 143 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Over the 84 catchable episodes there were no false negatives and no false
-positives (Table~\ref{tab:detection}). Detection took about two and a half
-polls, at most 246\,ms, against a median spike rise of 1.09\,s. The two missed
-episodes came from pulses with a sheer edge and a 0.1\,s plateau, shorter than
-the three polls the monitor needs; RQ1's recordings held none that short. The
+positives (Table~\ref{tab:detection}). Detection took two to three polls, at
+most 236\,ms, against a median spike rise of 1.09\,s. The five false negatives
+under $K$, episodes of 100 to 200\,ms, came from pulses with a sheer edge and a
+0.1 or 0.2\,s plateau, or a 0.25\,s ramp and a 0.1\,s plateau: shorter than
+the $K + 1$ polls and a recorder sample, 220\,ms, the monitor is sure to catch;
+RQ1's recordings held none that short. On the grid, $K = 1$ caught all 66
+catchable episodes at a median of 28\,ms with no false positive, and $K = 5$
+took a median of 215\,ms, with three false negatives among the catchable;
+$K = 3$, at which every controller result was measured, stays. The
 monitor costs decoding nothing measurable: $+0.17\%$ on Qwen2.5-0.5B and
 $-0.32\%$ on Qwen2.5-1.5B, both within twice their standard error.
 
