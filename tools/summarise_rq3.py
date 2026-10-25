@@ -22,6 +22,13 @@ entry: each one's change in accuracy from the full policy, its interval,
 McNemar's test and its effective bits.
 
     .venv/bin/python tools/summarise_rq3.py --issue 158 --ablations
+
+With --evictions, eviction at each level instead (#160,
+rq3_summary.summarise_evictions), logged as an "rq3-eviction-summary"
+entry: eviction against the semantic source at each level, by McNemar's
+test, at the same bytes.
+
+    .venv/bin/python tools/summarise_rq3.py --issue 160 --evictions
 """
 
 from __future__ import annotations
@@ -65,6 +72,8 @@ def main(argv: list[str]) -> int:
                                         help="the 32K subset (#156)")
     summaries_of_their_own.add_argument("--ablations", action="store_true",
                                         help="ADR-0018's quality ablations (#158)")
+    summaries_of_their_own.add_argument("--evictions", action="store_true",
+                                        help="eviction at each level (#160)")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     if benchlog.environment(args.log)["git_dirty"]:
@@ -76,6 +85,8 @@ def main(argv: list[str]) -> int:
         return long_subset(parser, args)
     if args.ablations:
         return ablations(parser, args)
+    if args.evictions:
+        return eviction_summary(parser, args)
     try:
         summary = rq3_summary.summarise(benchlog.read(args.log), args.model, args.needle_seed,
                                         args.haystack_tokens, plan_seed=args.plan_seed,
@@ -162,6 +173,41 @@ def ablations(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             a["against_only"], f"{a['mcnemar_p']:.3g}", f"{a['effective_bits']:.2f}", a["short"]]
            for name, a in summary["ablations"].items()])
     return 0
+
+
+def eviction_summary(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Log and print eviction's summary on the needle set."""
+    try:
+        summary = rq3_summary.summarise_evictions(benchlog.read(args.log), args.model,
+                                                  args.needle_seed, args.haystack_tokens,
+                                                  plan_seed=args.plan_seed)
+    except ValueError as exc:
+        parser.error(str(exc))
+    benchlog.append(rq3_summary.EVICTION_SUMMARY_KIND, model=args.model, context_length=None,
+                    precision_tiers=None,
+                    config={"issue": args.issue, "task": "needle",
+                            "needle_seed": args.needle_seed,
+                            "haystack_tokens": args.haystack_tokens,
+                            "plan_seed": args.plan_seed, "experiments": [summary["experiment"]]},
+                    results=summary, log=args.log)
+    print(f"\n### Eviction on the needle set, {summary['experiment']}\n")
+    print_evictions(summary["levels"])
+    return 0
+
+
+def print_evictions(levels: dict) -> None:
+    """Eviction against the semantic source at each level, as a table: the
+    needle's and the anchor-fact dialogue's (#160)."""
+    table(["Level", "Eviction", "Semantic", "Change, bootstrap 95%", "Only eviction",
+           "Only semantic", "McNemar p", "Bits, eviction / semantic",
+           "Bytes reclaimed, eviction / semantic (MiB)", "Short plans"],
+          [[level, f"{e['correct']}/{e['n']}", f"{m['correct']}/{m['n']}",
+            f"{x['change']:+.2f} {interval(x['change_bootstrap_95'])}", x["eviction_only"],
+            x["semantic_only"], f"{x['mcnemar_p']:.3g}",
+            f"{e['effective_bits']:.2f} / {m['effective_bits']:.2f}",
+            f"{e['reclaimed_bytes'] / 2**20:.1f} / {m['reclaimed_bytes'] / 2**20:.1f}",
+            f"{e['short']} / {m['short']}"]
+           for level, x in levels.items() for e, m in [(x["eviction"], x["semantic"])]])
 
 
 if __name__ == "__main__":

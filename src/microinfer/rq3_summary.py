@@ -36,7 +36,8 @@ discordant samples, all one way, that could have rejected.
 The 32K subset (#156) is summarised apart, by summarise_long: its ten
 samples confirm the direction, with no test claimed. So are ADR-0018's
 quality ablations (#158), by summarise_ablations, each against the full
-policy.
+policy, and eviction at each level (#160), by summarise_evictions, against
+the semantic source there (evictions, the anchor-fact dialogue's too).
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ LEVELS = sorted({c.share for c in rq3.CONDITIONS if c.share is not None})
 OTHER_SOURCES = ("uniform", "random")
 LONG_SUMMARY_KIND = "rq3-long-summary"
 ABLATION_SUMMARY_KIND = "rq3-ablation-summary"
+EVICTION_SUMMARY_KIND = "rq3-eviction-summary"
 
 
 def mcnemar(only_a: int, only_b: int) -> float:
@@ -347,13 +349,7 @@ def summarise_ablations(entries: Sequence[dict], model: str, needle_seed: int,
     rng = np.random.default_rng(SEED)
 
     def held(name: str) -> dict:
-        plans = [e["results"]["plan"] for e in runs[name]]
-        return {**proportion(right[name], rng), "accuracy": float(right[name].mean()),
-                "effective_bits": _mean(runs[name], "effective_bits"),
-                "candidate_effective_bits": _mean(runs[name], "candidate_effective_bits"),
-                "short": sum(p["short"] for p in plans),
-                "target_met": sum(p["target_met"] for p in plans),
-                "commits": sorted({e["git_commit"] for e in runs[name]})}
+        return held_at(runs[name], right[name], rng)
 
     ablations = {}
     for name in rq3.ABLATION_NAMES:
@@ -372,6 +368,72 @@ def summarise_ablations(entries: Sequence[dict], model: str, needle_seed: int,
             "ablations": ablations, "layer_weights": list(weights.pop()),
             "screening": screening["sha256"],
             "entries": [e["sha256"] for name in names for e in runs[name]]}
+
+
+def held_at(runs: list[dict], right: np.ndarray, rng: np.random.Generator) -> dict:
+    """One condition's runs, `right` their outcomes: its accuracy with its
+    bootstrap and Wilson intervals, its effective bits, over every full
+    page and over the pages the share is of, the mean over the runs, and
+    how many of its plans met the bytes asked and fell short, so that
+    equal bytes are checked, not assumed; and the commits it ran at."""
+    plans = [e["results"]["plan"] for e in runs]
+    return {**proportion(right, rng), "accuracy": float(right.mean()),
+            "effective_bits": _mean(runs, "effective_bits"),
+            "candidate_effective_bits": _mean(runs, "candidate_effective_bits"),
+            "reclaimed_bytes": float(np.mean([p["reclaimed_bytes"] for p in plans])),
+            "short": sum(p["short"] for p in plans),
+            "target_met": sum(p["target_met"] for p in plans),
+            "commits": sorted({e["git_commit"] for e in runs})}
+
+
+#: The conditions an eviction summary pools: each level's semantic source,
+#: and eviction there (#160).
+EVICTED_FROM = tuple(rq3.source_condition("semantic", c.share).name for c in rq3.EVICTIONS)
+EVICTION_NAMES = (*EVICTED_FROM, *rq3.EVICTION_CONDITIONS)
+
+
+def evictions(runs: dict[str, list[dict]], rng: np.random.Generator) -> dict:
+    """At each level, eviction (#160) against the semantic source there, on
+    the same samples, from each condition's runs in `runs`, by name: each
+    held (held_at), the samples only each answered, McNemar's exact test
+    on them, and eviction's change in accuracy from semantic, with the
+    paired difference's bootstrap interval."""
+    right = {name: np.array([e["results"]["correct"] for e in runs[name]])
+             for name in EVICTION_NAMES}
+    out = {}
+    for cond in rq3.EVICTIONS:
+        against = rq3.source_condition("semantic", cond.share).name
+        pair = paired(right[cond.name], right[against], rng, named=("eviction", "semantic"))
+        out[level_name(cond.share)] = {
+            "eviction": {"name": cond.name, **held_at(runs[cond.name], right[cond.name], rng)},
+            "semantic": {"name": against, **held_at(runs[against], right[against], rng)},
+            "change": pair.pop("difference"),
+            "change_bootstrap_95": pair.pop("difference_bootstrap_95"), **pair}
+    return out
+
+
+def summarise_evictions(entries: Sequence[dict], model: str, needle_seed: int,
+                        haystack_tokens: int, *, plan_seed: int = 0) -> dict:
+    """Eviction on the screened needle set (#160), question-blind, against
+    the semantic source at each level (evictions): the latest run of each
+    sample under each. A ValueError names what is missing."""
+    screening = rq3.last_screening(entries, model, needle_seed, haystack_tokens)
+    kept = screening["results"]["kept"]
+    latest = _pool(entries, model, needle_seed, haystack_tokens, plan_seed, kept)
+    missing = [(s, name) for name in EVICTION_NAMES for s in kept
+               if (s, CLOSING_EXPERIMENT, name) not in latest]
+    if missing:
+        raise ValueError(f"no run of {len(missing)} samples' conditions, such as "
+                         f"{missing[:3]}; run tools/rq3.py --evictions for them")
+    runs = {name: [latest[(s, CLOSING_EXPERIMENT, name)] for s in kept]
+            for name in EVICTION_NAMES}
+    return {"model": model, "needle_seed": needle_seed, "haystack_tokens": haystack_tokens,
+            "plan_seed": plan_seed, "experiment": CLOSING_EXPERIMENT,
+            "samples": len(kept), "significance": SIGNIFICANCE,
+            "bootstrap": {"resamples": RESAMPLES, "seed": SEED},
+            "levels": evictions(runs, np.random.default_rng(SEED)),
+            "screening": screening["sha256"],
+            "entries": [e["sha256"] for name in EVICTION_NAMES for e in runs[name]]}
 
 
 def _mean(runs: list[dict], key: str) -> float:

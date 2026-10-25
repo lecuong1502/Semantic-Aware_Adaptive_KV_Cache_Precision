@@ -13,6 +13,13 @@ Three steps, each a command (microinfer.anchors):
 3. `--summarise`: the anchor-summary entry, recall per condition by gap and
    the semantic source paired against uniform and random, and its tables.
 
+With --evictions, the conditions are eviction at each level (#160) and the
+semantic source there, both run at the same code, and summarised against
+each other (rq3_summary.EVICTION_NAMES):
+
+    .venv/bin/python tools/anchors.py --issue 160 --evictions
+    .venv/bin/python tools/anchors.py --issue 160 --evictions --summarise
+
 A run already logged at the same code, for the model, set and plan seed,
 is not run again, so that a run of hours stopped part way is taken up by
 the same command. Refuses a dirty tree, as the checkpoint recorder does.
@@ -30,8 +37,9 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "tools"))
 
 from perplexity import held_out_text  # noqa: E402
+from summarise_rq3 import print_evictions  # noqa: E402
 
-from microinfer import Engine, anchors, benchlog, rq3  # noqa: E402
+from microinfer import Engine, anchors, benchlog, rq3, rq3_summary  # noqa: E402
 
 FP16 = rq3.condition("fp16")
 
@@ -45,10 +53,12 @@ def main(argv: list[str]) -> int:
     step.add_argument("--screen", action="store_true", help="screen the set at FP16")
     step.add_argument("--summarise", action="store_true",
                       help="log the summary of the screened set's runs")
-    parser.add_argument("--conditions", nargs="+", default=list(rq3.SOURCE_CONDITIONS),
-                        choices=rq3.SOURCE_CONDITIONS,
+    parser.add_argument("--conditions", nargs="+", default=None,
+                        choices=[*rq3.SOURCE_CONDITIONS, *rq3.EVICTION_CONDITIONS],
                         help="default: every score source at each level; fp16's runs are "
                              "screening's")
+    parser.add_argument("--evictions", action="store_true",
+                        help="eviction at each level and the semantic source there (#160)")
     parser.add_argument("--per-gap", type=int, default=anchors.SAMPLES_PER_GAP)
     parser.add_argument("--draws", type=int, default=15,
                         help="dialogues a gap drawn, at most, to screen")
@@ -59,6 +69,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--passage-tokens", type=int, default=anchors.PASSAGE_TOKENS)
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
+    if args.evictions:
+        if args.screen or args.conditions:
+            parser.error("--evictions chooses its conditions, of the screened set; drop "
+                         "--screen and --conditions")
+        args.conditions = list(rq3_summary.EVICTION_NAMES)
+    args.conditions = args.conditions or list(rq3.SOURCE_CONDITIONS)
     of = anchors.AnchorSet(args.model, args.anchor_seed, args.turns, args.passage_tokens)
 
     if args.summarise:
@@ -72,6 +88,9 @@ def main(argv: list[str]) -> int:
             config={**of.config(), "plan_seed": args.plan_seed, "issue": args.issue},
             results=summary, log=args.log)
         print(tables(summary))
+        if summary["evictions"] is not None:
+            print()
+            print_evictions(summary["evictions"])
         print(f"\nlogged {entry['sha256'][:12]}")
         return 0
 

@@ -393,7 +393,7 @@ _Avoid_: fork, clone (the two conversations share nothing), checkpoint
 How an RQ3 run holds its cache (ADR-0017, #147): FP16; a score source at a
 level, a controlled plan from semantic, uniform or random scores for 70% or
 80% of the FP16 bytes outside the recency floor; or a static tier, every
-page born at INT4 or INT2; or an ablation. RQ3's two experiments,
+page born at INT4 or INT2; an ablation; or eviction at a level. RQ3's two experiments,
 question-blind and question-aware, are when a condition's plan is made; a
 survival experiment is another kind, under contention.
 _Avoid_: arm, treatment, setting
@@ -415,6 +415,16 @@ against it and the effective bits it held. Those
 that change only the plan share turn 1 with the full policy; those of the
 scorer run it alone. The monitor's K is an ablation of RQ2, not a condition.
 _Avoid_: arm, treatment
+
+**Eviction**:
+The H2O-style baseline (#160): at a level, the pages the semantic source's
+controlled plan would downgrade most, those it leaves lowest first, are
+dropped instead until they give back the same bytes. An evicted page is
+freed, its memory back to the driver, and no query attends to its positions
+again; none comes back, and its shadow, if it had one, is never read. It is
+measured against the same pages masked, kept and read by no query, to the
+bit. A page, not a token, is what is evicted: the cache's unit.
+_Avoid_: dropping, pruning, offloading (that keeps the bytes elsewhere)
 
 **Controlled plan**:
 A requantisation plan the engine is asked for between two turns, for a byte

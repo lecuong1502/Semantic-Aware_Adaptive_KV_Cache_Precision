@@ -180,7 +180,7 @@ def run(log, sample_id, name, correct, *, bits=3.4, short=False, weights=WEIGHTS
                 "experiment": "question-blind", "needle_seed": 140, "plan_seed": 0,
                 "haystack_tokens": 7936},
         results={"correct": correct, "effective_bits": bits, "candidate_effective_bits": bits,
-                 "plan": {"short": short, "target_met": not short}},
+                 "plan": {"short": short, "target_met": not short, "reclaimed_bytes": 1000}},
         log=log)
 
 

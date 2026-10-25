@@ -42,8 +42,10 @@ REPO = Path(__file__).resolve().parents[2]
 DEFAULT_LOG = REPO / "experiments" / "logs" / "benchmark.jsonl"
 
 #: The precision tiers of ADR-0008 and CONTEXT.md: the only names a tier
-#: configuration may use.
+#: configuration may use, but for the share of pages evicted (#160), which
+#: are held at none.
 TIERS = frozenset({"FP16", "INT8", "INT4", "INT2"})
+EVICTED = "evicted"
 
 #: A kind is kebab-case, so a plot can group by it. `peak_memory` predates the
 #: rule and stays: every entry of one measurement must share a kind, and the
@@ -219,8 +221,9 @@ def append(kind: str, *, results: dict, model: str | list[str] | None,
     log = Path(log)
     _check_kind(kind)
     _check_context_length(context_length)
-    if precision_tiers is not None and not set(precision_tiers) <= TIERS:
-        raise ValueError(f"precision tiers are {sorted(TIERS)}; got {sorted(precision_tiers)}")
+    if precision_tiers is not None and not set(precision_tiers) <= TIERS | {EVICTED}:
+        raise ValueError(f"precision tiers are {sorted(TIERS)}, and {EVICTED!r} the pages "
+                         f"evicted; got {sorted(precision_tiers)}")
     fields = {**environment(log), "kind": kind, "model": model,
               "context_length": context_length, "precision_tiers": precision_tiers,
               "config": config or {}, "results": results}

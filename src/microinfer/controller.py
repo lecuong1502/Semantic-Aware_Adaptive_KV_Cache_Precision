@@ -71,6 +71,11 @@ from .monitor import GREEN, RED, Level, Thresholds
 
 #: The tiers, from FP16 down: a downgrade takes a page one step along it.
 TIERS = ("FP16", "INT8", "INT4", "INT2")
+#: A page evicted (#160), in a tier map as plan_arrays takes one: one past
+#: the lowest tier, holding no bytes, and moved by no plan.
+EVICTED = len(TIERS)
+#: Where a page of positions is, by its index in a tier map: a tier, or evicted.
+PLACES = (*TIERS, benchlog.EVICTED)
 #: The headroom kept above YELLOW's threshold once a plan is applied.
 DEFAULT_MARGIN_BYTES = 64 * MIB
 #: The time one batch of moves may take between two decode steps.
@@ -297,7 +302,7 @@ def share_target_bytes(share: float, tiers: np.ndarray, page_bytes: dict[str, in
         raise ValueError(f"a share is a fraction of the bytes, in [0, 1]; got {share}")
     _check_plan_inputs(None, tiers, positions, page_tokens, recency_floor)
     candidate = candidates(tiers, positions, page_tokens, recency_floor)
-    held = int(_bytes_at(page_bytes)[tiers[candidate]].sum())
+    held = int(place_bytes(page_bytes)[tiers[candidate]].sum())
     # In exact fractions: a share of 0.8 is 4/5, and the bytes are whole.
     left = (1 - Fraction(str(share))) * page_bytes["FP16"] * int(candidate.sum())
     return max(0, math.ceil(held - left))
@@ -308,12 +313,14 @@ def bytes_given_back(before: np.ndarray, after: np.ndarray, page_bytes: dict[str
     them, both of the same pages: the bytes they held before less those
     they hold after, each page at its tier's bytes."""
     held = (before >= 0) & (after >= 0)
-    at = _bytes_at(page_bytes)
+    at = place_bytes(page_bytes)
     return int(at[before[held]].sum() - at[after[held]].sum())
 
 
-def _bytes_at(page_bytes: dict[str, int]) -> np.ndarray:
-    return np.array([page_bytes[t] for t in TIERS], dtype=np.int64)
+def place_bytes(page_bytes: dict[str, int]) -> np.ndarray:
+    """What a page holds, by its index in a tier map: each tier's bytes,
+    and an evicted page's, none."""
+    return np.array([*(page_bytes[t] for t in TIERS), 0], dtype=np.int64)
 
 
 def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tiers: np.ndarray,
@@ -380,6 +387,53 @@ def target_plan_arrays(target_bytes: int, level: Level, scores: np.ndarray, tier
                 seconds=seconds[steps_taken], budget_seconds=budget_seconds, options=options)
 
 
+@dataclass(frozen=True, eq=False)
+class EvictionPlan:
+    """The pages an eviction drops (#160), in the order it takes them, and
+    what each gives back, `freed`: the bytes it held. `short` if every page
+    the plan it follows moves was taken and the byte target was still not
+    met. That plan's recency floor and options are recorded with it."""
+
+    target_bytes: int
+    short: bool
+    recency_floor: int
+    options: PlanOptions
+    layers: np.ndarray
+    pages: np.ndarray
+    freed: np.ndarray
+
+    @property
+    def reclaimed_bytes(self) -> int:
+        return int(self.freed.sum())
+
+    def __len__(self) -> int:
+        return len(self.layers)
+
+
+def eviction_plan(target_bytes: int, plan: Plan, tiers: np.ndarray,
+                  page_bytes: dict[str, int]) -> EvictionPlan:
+    """The pages `plan` would downgrade most, evicted instead until they give
+    back `target_bytes` (#160), H2O's baseline at a policy's bytes: every
+    page the plan moves, those it leaves at the lowest tier first, and of
+    those it leaves at one tier, the first it took there first, by its
+    last downgrade. Each gives back what it holds now, in `tiers`, as
+    plan_arrays takes them; the last is the one that meets the target."""
+    key = plan.layers * tiers.shape[1] + plan.pages
+    # Each page's last downgrade: the first of its key from the end.
+    _, from_end = np.unique(key[::-1], return_index=True)
+    last = len(key) - 1 - from_end
+    order = last[np.lexsort((last, -plan.lower[last]))]
+    layers, pages = plan.layers[order], plan.pages[order]
+    freed = place_bytes(page_bytes)[tiers[layers, pages]]
+    reclaimed = np.cumsum(freed)
+    count = int(np.searchsorted(reclaimed, target_bytes)) + 1 if target_bytes > 0 else 0
+    return EvictionPlan(target_bytes=target_bytes,
+                        short=bool(target_bytes > 0 and (len(order) == 0
+                                                         or reclaimed[-1] < target_bytes)),
+                        recency_floor=plan.recency_floor, options=plan.options,
+                        layers=layers[:count], pages=pages[:count], freed=freed[:count])
+
+
 def _check_plan_inputs(scores: np.ndarray | None, tiers: np.ndarray, positions: int,
                        page_tokens: int, recency_floor: int) -> None:
     if recency_floor < 0:
@@ -394,8 +448,16 @@ def _check_plan_inputs(scores: np.ndarray | None, tiers: np.ndarray, positions: 
 def candidates(tiers: np.ndarray, positions: int, page_tokens: int,
                 recency_floor: int) -> np.ndarray:
     """The pages a plan may downgrade: pages of positions whose last position
-    comes before the floor's first. No open page is one, and the partly
-    filled last page never is."""
+    comes before the floor's first, but those evicted. No open page is one,
+    and the partly filled last page never is."""
+    return (full_pages(tiers, positions, page_tokens, recency_floor)
+            & (tiers != EVICTED))
+
+
+def full_pages(tiers: np.ndarray, positions: int, page_tokens: int,
+               recency_floor: int) -> np.ndarray:
+    """The pages of positions whose last position comes before the floor's
+    first, held or evicted (#160): what effective bits are taken over."""
     pages = tiers.shape[1]
     ends = (np.arange(pages) + 1) * page_tokens
     return (tiers >= 0) & (ends <= positions - recency_floor)[None, :]
