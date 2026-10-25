@@ -36,6 +36,13 @@ the 600 take about 13 hours; they are best run in batches, each stopped
 with Ctrl-C and taken up by the same command. The semantic source at both
 levels is run again beside them, at the same code, rather than paired with
 #149's runs.
+
+With --evictions, eviction at each level (#160): the screened set,
+question-blind, under the semantic source at 70% and 80% and eviction at
+each (rq3_summary.EVICTION_NAMES), 200 runs, a sample's four from one
+turn 1; the semantic source is run again beside them, at the same code:
+
+    .venv/bin/python tools/rq3.py --issue 160 --evictions
 """
 
 from __future__ import annotations
@@ -73,7 +80,8 @@ def main(argv: list[str]) -> int:
                         help="the ticket these runs are made for")
     parser.add_argument("--model", default="qwen2.5-1.5b-instruct")
     parser.add_argument("--conditions", nargs="+", default=None,
-                        choices=["sources", *(c.name for c in (*rq3.CONDITIONS, rq3.NO_PLAN))],
+                        choices=["sources", *(c.name for c in (*rq3.CONDITIONS, *rq3.EVICTIONS,
+                                                               rq3.NO_PLAN))],
                         help="sources: every source at each level (#149); default: every "
                              "condition, but fp16 with --screened, whose FP16 runs screening "
                              "logged")
@@ -84,6 +92,9 @@ def main(argv: list[str]) -> int:
     runs_of_their_own.add_argument(
         "--ablations", action="store_true",
         help="ADR-0018's quality ablations (#158) on the screened set")
+    runs_of_their_own.add_argument(
+        "--evictions", action="store_true",
+        help="eviction at each level (#160) on the screened set")
     parser.add_argument("--experiments", nargs="+", default=None,
                         choices=rq3.EXPERIMENTS)
     parser.add_argument("--samples", nargs="+", default=None,
@@ -101,16 +112,18 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     ablated: dict[str, rq3.Condition] = {}
-    if args.long or args.ablations:
+    # The mode that chooses its runs, if one does.
+    mode = next((f"--{m}" for m in ("long", "ablations", "evictions") if getattr(args, m)),
+                None)
+    if mode is not None:
         chooses = [("--screened", args.screened), ("--samples", args.samples),
                    ("--samples-per-depth", args.samples_per_depth),
                    ("--conditions", args.conditions), ("--experiments", args.experiments)]
-        if args.long:  # the ablations' screened set may be of any haystack
+        if args.long:  # the ablations' and evictions' screened set may be of any haystack
             chooses.append(("--haystack-tokens", args.haystack_tokens))
         chosen = [flag for flag, value in chooses if value]
         if chosen:
-            parser.error(f"{'--long' if args.long else '--ablations'} chooses its runs; "
-                         f"drop {' '.join(chosen)}")
+            parser.error(f"{mode} chooses its runs; drop {' '.join(chosen)}")
     if args.long:
         args.haystack_tokens, args.samples_per_depth = needles.LONG_HAYSTACK_TOKENS, 1
         args.conditions = list(rq3_summary.LONG_CONDITIONS)
@@ -127,6 +140,8 @@ def main(argv: list[str]) -> int:
             parser.error(f"{other} layer weights' runs of this set were logged with other "
                          f"weights than the last layer-sensitivity's; their summary would "
                          f"pool both, so log the sensitivity they were run with again first")
+    if args.evictions:
+        args.conditions, args.screened = list(rq3_summary.EVICTION_NAMES), True
     args.haystack_tokens = args.haystack_tokens or needles.DEFAULT_HAYSTACK_TOKENS
     args.experiments = args.experiments or [rq3_summary.CLOSING_EXPERIMENT]
 
@@ -145,6 +160,10 @@ def main(argv: list[str]) -> int:
                                                args.haystack_tokens, args.log)
     args.conditions = conditions_for(args.conditions, screened=args.screened)
     args.experiments = list(dict.fromkeys(args.experiments))
+    if (set(args.conditions) & set(rq3.EVICTION_CONDITIONS)
+            and args.experiments != [rq3_summary.CLOSING_EXPERIMENT]):
+        parser.error(f"eviction is run {rq3_summary.CLOSING_EXPERIMENT} only (#160, "
+                     f"ADR-0017's amendment); drop the other experiments")
 
     engine = Engine(REPO / "models" / args.model)
     every = needles.needle_set(held_out_text(), engine.tokenizer, seed=args.needle_seed,

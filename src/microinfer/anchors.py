@@ -38,7 +38,9 @@ condition holds the turns alike until the plan, so they run once and each
 condition starts from their snapshot (rq3.from_one_opening). The summary
 gives each condition's recall, overall and by gap, with Wilson and
 bootstrap intervals, and at each level the semantic source paired against
-uniform and random by McNemar's exact test, as the needle's summary does.
+uniform and random by McNemar's exact test, as the needle's summary does;
+with eviction's conditions among them (#160), eviction against the semantic
+source at each level too (rq3_summary.evictions).
 """
 
 from __future__ import annotations
@@ -341,8 +343,9 @@ def summarise(entries: Sequence[dict], of: AnchorSet, *, plan_seed: int = 0,
     """The anchor-fact summary of the screened set's runs in `entries`, the
     latest of each dialogue under each of `conditions`, as the module
     describes: fp16's are screening's, which make no plan and so are of
-    any plan seed, and the others' at `plan_seed`. A ValueError naming what
-    is missing."""
+    any plan seed, and the others' at `plan_seed`. With every one of
+    rq3_summary.EVICTION_NAMES among `conditions`, eviction's pairs too, as
+    `evictions` (#160). A ValueError naming what is missing."""
     screening = last_screening(entries, of)
     kept = screening["results"]["kept"]
     latest = {}
@@ -381,9 +384,12 @@ def summarise(entries: Sequence[dict], of: AnchorSet, *, plan_seed: int = 0,
             "fact_page_tiers": rq3_summary.pooled_tiers(condition_runs, "fact_page_tiers"),
             "code_echoed": sum(1 for e in condition_runs if e["results"]["code_echoed"])}
     pairs = rq3_summary.paired_at_levels(right, rng)
+    evicted = (rq3_summary.evictions(runs_of, rng)
+               if set(rq3_summary.EVICTION_NAMES) <= set(conditions) else None)
     return {"model": of.model, **of.config(), "plan_seed": plan_seed,
             "dialogues": len(kept),
             "bootstrap": {"resamples": rq3_summary.RESAMPLES, "seed": SEED},
-            "recall": recall, "paired": pairs, "screening": screening["sha256"],
+            "recall": recall, "paired": pairs, "evictions": evicted,
+            "screening": screening["sha256"],
             "commits": sorted({e["git_commit"] for name in conditions for e in runs_of[name]}),
             "entries": [e["sha256"] for name in conditions for e in runs_of[name]]}

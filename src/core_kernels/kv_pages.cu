@@ -193,7 +193,10 @@ namespace microinfer
       {
         for (int layer = layers_ - 1; layer >= 0; --layer)
         {
-          allocator_.free({layer, page});
+          if (!evicted({layer, page}))
+          {
+            allocator_.free({layer, page});
+          }
         }
       }
       if (open_pages_)
@@ -313,10 +316,19 @@ namespace microinfer
       {
         for (int page = 0; page < pages_; ++page)
         {
-          const ResolvedPage resolved = resolve_page({l, page});
           const size_t at = static_cast<size_t>(l) * table_stride_ + page;
+          // An evicted page has no address, and attention reads it as it
+          // reads a masked one: not at all (#160).
+          if (evicted({l, page}))
+          {
+            tiers[at] = device::kUnreadPage;
+            continue;
+          }
+          const ResolvedPage resolved = resolve_page({l, page});
           host[at] = resolved.address;
-          tiers[at] = static_cast<std::uint8_t>(resolved.tier);
+          tiers[at] = masked({l, page})
+                          ? device::kUnreadPage
+                          : static_cast<std::uint8_t>(resolved.tier);
         }
       }
       // On the legacy default stream, so ordered after every launch already
@@ -493,6 +505,42 @@ namespace microinfer
     return {layer, page};
   }
 
+  PageKey KVPages::require_held(int layer, int page, const char *verb) const
+  {
+    const PageKey key = require_movable(layer, page, verb);
+    if (evicted(key))
+    {
+      throw std::invalid_argument(page_name(key) +
+                                  " is evicted: its positions are gone, and "
+                                  "nothing can " +
+                                  verb + " it (#160)");
+    }
+    return key;
+  }
+
+  void KVPages::evict(int layer, int page)
+  {
+    const PageKey key = require_held(layer, page, "evict");
+    if (masked(key))
+    {
+      throw std::invalid_argument(
+          page_name(key) +
+          " is masked, the reference an eviction is measured against; "
+          "evict another cache's page");
+    }
+    // The free moves the tier's tail into the slot and advances the
+    // allocator's generation, so the next launch resolves the tables anew.
+    allocator_.free(key);
+    evicted_.insert(key);
+  }
+
+  void KVPages::mask(int layer, int page)
+  {
+    const PageKey key = require_held(layer, page, "mask");
+    masked_.insert(key);
+    resolved_pages_ = -1; // the allocator's generation has not moved
+  }
+
   std::string KVPages::page_name(PageKey key)
   {
     return "page " + std::to_string(key.page_index) + " of layer " +
@@ -501,7 +549,7 @@ namespace microinfer
 
   void KVPages::downgrade(int layer, int page, Tier target)
   {
-    const PageKey key = require_movable(layer, page, "downgrade");
+    const PageKey key = require_held(layer, page, "downgrade");
     const Tier current = page_tier(key);
     if (!is_lower(target, current))
     {
@@ -525,7 +573,7 @@ namespace microinfer
 
   void KVPages::upgrade(int layer, int page, Tier target)
   {
-    const PageKey key = require_movable(layer, page, "upgrade");
+    const PageKey key = require_held(layer, page, "upgrade");
     const Tier current = page_tier(key);
     if (!is_lower(current, target))
     {

@@ -11,7 +11,11 @@ how the cache is held:
 - **an ablation** (ADR-0018, #158): the semantic source at 80%, the full
   policy, with one element changed, the recency floor, the scorer's
   cadence or EWMA weight, or an option of the planner, and no INT2 at
-  70% too, against the semantic source there (`ablations`).
+  70% too, against the semantic source there (`ablations`);
+- **eviction at a level** (#160), H2O's family, a condition that does not
+  hold the closing: the pages the semantic source's plan at that level
+  would downgrade most are evicted instead, for the same bytes
+  (`EVICTIONS`, Conversation.evict).
 
 An **experiment** is when the plan is made:
 - **question-blind**, the primary: turn 1, the document and a general
@@ -95,6 +99,8 @@ class Condition:
     options: controller.PlanOptions | None = None
     #: The element of the policy an ablation changes, as ADR-0018 names it.
     ablates: str | None = None
+    #: Whether the source's plan is evicted rather than applied (#160).
+    evicts: bool = False
 
     def __post_init__(self):
         if self.source is not None:
@@ -111,6 +117,12 @@ CONDITIONS = (
 NO_PLAN = Condition("no-plan", adaptive=True)
 #: The conditions of a score source at a level, question-blind's closing run (#149).
 SOURCE_CONDITIONS = tuple(c.name for c in CONDITIONS if c.source is not None)
+#: The levels, the shares a controlled plan reclaims.
+LEVELS = sorted({c.share for c in CONDITIONS if c.share is not None})
+#: Eviction at each level (#160), against the semantic source there.
+EVICTIONS = tuple(Condition(f"evict-{round(share * 100)}", source="semantic", share=share,
+                            evicts=True) for share in LEVELS)
+EVICTION_CONDITIONS = tuple(c.name for c in EVICTIONS)
 
 
 def source_condition(source: str, share: float) -> Condition:
@@ -169,11 +181,11 @@ ABLATED_FROM = tuple(dict.fromkeys(measured_against(c).name for c in ablations((
 
 
 def condition(name: str) -> Condition:
-    for c in (*CONDITIONS, NO_PLAN):
+    for c in (*CONDITIONS, *EVICTIONS, NO_PLAN):
         if c.name == name:
             return c
     raise ValueError(f"no condition {name!r}; ADR-0017's are {[c.name for c in CONDITIONS]}, "
-                     f"and {NO_PLAN.name!r} the check")
+                     f"eviction's {list(EVICTION_CONDITIONS)}, and {NO_PLAN.name!r} the check")
 
 
 def code_after(opening: str, code: str) -> bool:
@@ -381,19 +393,20 @@ class Planned:
 
 def page_tiers(tiers: np.ndarray, pages: tuple[int, int]) -> dict[str, int]:
     """The tiers of every (layer, page) of `pages`, first and last, in
-    `tiers`, indices into controller.TIERS, by count."""
+    `tiers`, indices into controller.PLACES, by count, evicted pages too."""
     first, last = pages
-    counts = Counter(controller.TIERS[t] for t in tiers[:, first:last + 1].ravel())
+    counts = Counter(controller.PLACES[t] for t in tiers[:, first:last + 1].ravel())
     return dict(sorted(counts.items()))
 
 
 def plan_at(chat, cond: Condition, seed: int) -> Planned:
-    """`cond`'s controlled plan applied, if it makes one, and what the cache
-    then holds."""
+    """`cond`'s controlled plan applied, or evicted, if it makes one, and
+    what the cache then holds."""
     positions = chat.positions
     record = None
     if cond.source is not None:
-        record = chat.plan(cond.share, source=cond.source, seed=seed)
+        act = chat.evict if cond.evicts else chat.plan
+        record = act(cond.share, source=cond.source, seed=seed)
     return Planned(positions, record, chat.effective_bits(), chat.tiers())
 
 
@@ -412,9 +425,10 @@ def plan_summary(record) -> dict | None:
 
 
 def tier_shares(tiers: np.ndarray) -> dict[str, float]:
-    """Each tier's share of `tiers`, indices into controller.TIERS."""
-    counts = Counter(controller.TIERS[t] for t in tiers.ravel())
-    return {t: counts[t] / tiers.size for t in controller.TIERS if counts[t]}
+    """Each tier's share of `tiers`, indices into controller.PLACES, and
+    evicted pages' (#160)."""
+    counts = Counter(controller.PLACES[t] for t in tiers.ravel())
+    return {t: counts[t] / tiers.size for t in controller.PLACES if counts[t]}
 
 
 def config(sample: needles.Sample, cond: Condition, experiment: str, **more) -> dict:

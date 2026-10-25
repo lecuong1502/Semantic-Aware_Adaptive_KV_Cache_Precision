@@ -197,6 +197,25 @@ namespace
   };
   using IndexHolder = std::unique_ptr<DeviceIndex, FreeWithoutGil>;
 
+  // One value for each page of positions of a cache, (layers,
+  // pages_per_layer), each from of(PageKey): the page table's arrays.
+  template <typename T, typename Of>
+  py::array_t<T> per_page(const microinfer::KVPages &c, Of of)
+  {
+    const int layers = c.layers();
+    const int pages = c.pages_per_layer();
+    py::array_t<T> out({layers, pages});
+    auto view = out.template mutable_unchecked<2>();
+    for (int l = 0; l < layers; ++l)
+    {
+      for (int i = 0; i < pages; ++i)
+      {
+        view(l, i) = of(microinfer::PageKey{l, i});
+      }
+    }
+    return out;
+  }
+
 } // namespace
 
 // Every call that launches device work releases the GIL (ADR-0012). A launch
@@ -775,40 +794,39 @@ void bind_device(py::module_ &parent)
           "shadowed",
           [](const KVPages &c)
           {
-            const int layers = c.layers();
-            const int pages = c.pages_per_layer();
-            py::array_t<bool> out({layers, pages});
-            auto view = out.mutable_unchecked<2>();
-            for (int l = 0; l < layers; ++l)
-            {
-              for (int i = 0; i < pages; ++i)
-              {
-                view(l, i) = c.shadows().contains({l, i});
-              }
-            }
-            return out;
+            return per_page<bool>(
+                c, [&](microinfer::PageKey key)
+                { return c.shadows().contains(key) && !c.evicted(key); });
           },
           "Whether each page of positions holds an FP16 shadow, (layers, "
-          "pages_per_layer): the pages an upgrade plan may restore (#106).")
+          "pages_per_layer): the pages an upgrade plan may restore (#106). An "
+          "evicted page's is left unread, and it holds none (#160).")
+      .def(
+          "evicted",
+          [](const KVPages &c)
+          {
+            return per_page<bool>(c, [&](microinfer::PageKey key)
+                                  { return c.evicted(key); });
+          },
+          "Whether each page of positions has been evicted, (layers, "
+          "pages_per_layer) (#160).")
       .def(
           "page_tiers",
           [](const KVPages &c)
           {
-            const int layers = c.layers();
-            const int pages = c.pages_per_layer();
-            py::array_t<std::int8_t> out({layers, pages});
-            auto view = out.mutable_unchecked<2>();
-            for (int l = 0; l < layers; ++l)
-            {
-              for (int i = 0; i < pages; ++i)
-              {
-                view(l, i) = static_cast<std::int8_t>(c.page_tier({l, i}));
-              }
-            }
-            return out;
+            return per_page<std::int8_t>(
+                c,
+                [&](microinfer::PageKey key)
+                {
+                  return static_cast<std::int8_t>(
+                      c.evicted(key) ? microinfer::kTierCount
+                                     : static_cast<int>(c.page_tier(key)));
+                });
           },
           "Every page of positions' tier, (layers, pages_per_layer), as the "
-          "page table records it: one call, for a plan (#105).")
+          "page table records it: one call, for a plan (#105). An evicted "
+          "page, which the table no longer holds, is evicted_tier, one past "
+          "the lowest tier (#160).")
       .def_property_readonly("capacity_tokens", &KVPages::capacity_tokens)
       .def_property_readonly("page_bytes", &KVPages::page_bytes)
       .def_property_readonly("kv_width", &KVPages::kv_width)
@@ -824,6 +842,13 @@ void bind_device(py::module_ &parent)
            "put in its place in the page table, and the old page freed, its "
            "tier's tail moving into the slot (ADR-0007). If the allocation "
            "fails, the cache is as it was.")
+      .def("evict", &KVPages::evict, py::call_guard<py::gil_scoped_release>(),
+           py::arg("layer"), py::arg("page"),
+           "Drop a sealed page of positions for good (#160): freed, its "
+           "memory back to the driver, and attended to by no query again.")
+      .def("mask", &KVPages::mask, py::arg("layer"), py::arg("page"),
+           "Keep a sealed page of positions, and let no query attend to it: "
+           "the reference an eviction is measured against (#160).")
       .def("upgrade", &KVPages::upgrade,
            py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
            py::arg("page"), py::arg("target"),
@@ -871,6 +896,8 @@ void bind_device(py::module_ &parent)
       py::make_tuple(microinfer::kOpenPages[0], microinfer::kOpenPages[1]);
   m.attr("staging_page") = microinfer::kStagingPage;
   m.attr("shadow_upload_page") = microinfer::kShadowUploadPage;
+  // What page_tiers gives an evicted page (#160): controller.EVICTED.
+  m.attr("evicted_tier") = microinfer::kTierCount;
 
   m.def("page_bytes", &KVPages::page_bytes_for, py::arg("page_tokens"),
         py::arg("kv_width"),

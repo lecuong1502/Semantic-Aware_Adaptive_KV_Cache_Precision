@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import numpy as np
 
@@ -315,16 +315,17 @@ class AppliedBatch:
 
 @dataclass
 class PlanRecord:
-    """A plan the engine made, downgrades or upgrades, with the pressure
-    event that caused it, and what became of it: the batches applied, the
-    moves skipped (their page had moved since), and how it ended,
+    """A plan the engine made, downgrades, upgrades or evictions (#160),
+    with the pressure event that caused it, and what became of it: the
+    batches applied, the moves skipped (their page had moved since), and
+    how it ended,
     "applied", "cancelled at GREEN", "replaced" by a later plan,
     "cancelled by pressure" (upgrades), or the error that stopped it. An
     emergency plan answers an allocation that failed, not an event: its
     `pressure` is the last event, if any, and `emergency` the error."""
 
     pressure: PressureRecord | None
-    plan: controller.Plan | controller.UpgradePlan
+    plan: controller.Plan | controller.UpgradePlan | controller.EvictionPlan
     planning_seconds: float
     batches: list[AppliedBatch]
     skipped: int = 0
@@ -347,7 +348,9 @@ class PlanRecord:
     #: pages it could move and over every page of positions. For a
     #: controlled restore (#155), upgrades: `restore` true, the source and
     #: its seed, the bytes the pages took back, whether every page holding
-    #: a shadow is at FP16 after it, and the effective bits. None otherwise.
+    #: a shadow is at FP16 after it, and the effective bits. For a
+    #: controlled eviction (#160), a controlled plan's, `evicts` true, the
+    #: bytes those evicted held reclaimed. None otherwise.
     controlled: dict | None = None
 
     @property
@@ -357,6 +360,15 @@ class PlanRecord:
     @property
     def upgrades(self) -> bool:
         return isinstance(self.plan, controller.UpgradePlan)
+
+
+class ShareAsked(NamedTuple):
+    """What a controlled plan or eviction is asked for (#142, #160): the
+    share of the bytes, and the score source and its seed."""
+
+    share: float
+    source: str
+    seed: int
 
 
 def _alpha_of(cache, source: str) -> float | None:
@@ -585,6 +597,14 @@ class Conversation:
         scores, a cache that keeps them. The plan's record, in the engine's
         `plans`."""
         return self._controlled(source)._controlled_plan(self._cache, share, source, seed)
+
+    def evict(self, share: float, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
+        """Evict, between turns, the pages `plan` would downgrade most, for
+        the same share's bytes (#160): H2O's family, as a condition. Each
+        page is freed, its memory back to the driver, and attended to by no query
+        again; none comes back. The same engine and cache as `plan` needs.
+        The eviction's record, in the engine's `plans`."""
+        return self._controlled(source)._controlled_eviction(self._cache, share, source, seed)
 
     def restore(self, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
         """Restore, between turns, every page that holds a shadow to FP16,
@@ -1394,6 +1414,40 @@ class Engine:
         self._recent_moves.append(float(plan.seconds.max()))  # until one is timed
         return entry
 
+    def _share_plan(self, cache: model.PagedCache,
+                    asked: ShareAsked) -> tuple[np.ndarray, int, controller.Plan]:
+        """The cache's tiers, the share's byte target, and a RED plan for it
+        from the source's scores, so that it is applied at once."""
+        pages, share = cache.pages, asked.share
+        tiers, scores = self._tiers_and_scores(cache, asked.source, asked.seed)
+        page_bytes, errors, seconds = self._plan_inputs
+        # The share is of the pages outside the default floor, whatever floor
+        # the plan keeps, so that an ablation of W chases the same bytes.
+        target = controller.share_target_bytes(share, tiers, page_bytes,
+                                               positions=cache.length,
+                                               page_tokens=pages.page_tokens,
+                                               recency_floor=controller.DEFAULT_RECENCY_FLOOR)
+        plan = controller.target_plan_arrays(
+            target, RED, scores, tiers, page_bytes, errors, move_seconds=seconds,
+            positions=cache.length, page_tokens=pages.page_tokens,
+            recency_floor=self.kv_recency_floor, budget_seconds=self.kv_plan_budget_seconds,
+            options=self.kv_plan_options)
+        return tiers, target, plan
+
+    def _share_controlled(self, cache: model.PagedCache, entry: PlanRecord, tiers: np.ndarray,
+                          asked: ShareAsked, *, evicts: bool = False) -> dict:
+        """A controlled plan's or eviction's `controlled` fields: what it
+        reclaimed from `tiers`, the cache's before it, against its target."""
+        page_bytes = self.page_bytes
+        reclaimed = controller.bytes_given_back(tiers, cache.pages.page_tiers(), page_bytes)
+        target = entry.plan.target_bytes
+        source = asked.source
+        return {"source": source, "seed": asked.seed if source == "random" else None,
+                "share": asked.share, "evicts": evicts,
+                "target_bytes": target, "reclaimed_bytes": reclaimed,
+                "target_met": entry.ended == "applied" and reclaimed >= target,
+                **self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)}
+
     def _controlled_plan(self, cache: model.PagedCache, share: float, source: str,
                          seed: int) -> PlanRecord:
         """Conversation.plan: a RED plan for the share's byte target, so that
@@ -1401,21 +1455,8 @@ class Engine:
         controlled it."""
         own_before = self._own_bytes()
         started = time.perf_counter()
-        pages = cache.pages
-        tiers, scores = self._tiers_and_scores(cache, source, seed)
-        page_bytes, errors, seconds = self._plan_inputs
-        # The share is of the pages outside the default floor, whatever floor
-        # the plan keeps, so that an ablation of W chases the same bytes.
-        share_floor = controller.DEFAULT_RECENCY_FLOOR
-        target = controller.share_target_bytes(share, tiers, page_bytes,
-                                               positions=cache.length,
-                                               page_tokens=pages.page_tokens,
-                                               recency_floor=share_floor)
-        plan = controller.target_plan_arrays(
-            target, RED, scores, tiers, page_bytes, errors, move_seconds=seconds,
-            positions=cache.length, page_tokens=pages.page_tokens,
-            recency_floor=self.kv_recency_floor, budget_seconds=self.kv_plan_budget_seconds,
-            options=self.kv_plan_options)
+        asked = ShareAsked(share, source, seed)
+        tiers, _, plan = self._share_plan(cache, asked)
         entry = self._controlled_record(cache, plan, source, started)
         if len(plan):
             self._pending, self._cursor = entry, 0
@@ -1425,12 +1466,30 @@ class Engine:
             self._pending, entry.ended = None, "applied"
         # What the pages gave back, which a plan stopped part way, or one
         # whose moves were skipped, makes less than was planned.
-        reclaimed = controller.bytes_given_back(tiers, pages.page_tiers(), page_bytes)
-        entry.controlled = {
-            "source": source, "seed": seed if source == "random" else None, "share": share,
-            "target_bytes": target, "reclaimed_bytes": reclaimed,
-            "target_met": entry.ended == "applied" and reclaimed >= target,
-            **self._effective_bits(cache, page_bytes, share_floor)}
+        entry.controlled = self._share_controlled(cache, entry, tiers, asked)
+        return entry
+
+    def _controlled_eviction(self, cache: model.PagedCache, share: float, source: str,
+                             seed: int) -> PlanRecord:
+        """Conversation.evict: the pages the share's controlled plan would
+        downgrade most, evicted at once in the plan's stead
+        (controller.eviction_plan), recorded as a controlled plan is, its
+        eviction in one batch."""
+        own_before = self._own_bytes()
+        started = time.perf_counter()
+        asked = ShareAsked(share, source, seed)
+        tiers, target, plan = self._share_plan(cache, asked)
+        eviction = controller.eviction_plan(target, plan, tiers, self.page_bytes)
+        entry = self._controlled_record(cache, eviction, source, started)
+        self._pending = None  # the record replaced any plan in hand
+        pages, cache_before = cache.pages, cache.nbytes
+        for layer, page in zip(eviction.layers.tolist(), eviction.pages.tolist()):
+            pages.evict(layer, page)
+        entry.batches.append(AppliedBatch(0, len(eviction), time.perf_counter() - started,
+                                          cache_before, cache.nbytes, own_before,
+                                          self._own_bytes(), time.monotonic()))
+        entry.ended = "applied"
+        entry.controlled = self._share_controlled(cache, entry, tiers, asked, evicts=True)
         return entry
 
     def _controlled_restore(self, cache: model.PagedCache, source: str,
@@ -1445,7 +1504,7 @@ class Engine:
         tiers, scores = self._tiers_and_scores(cache, source, seed)
         shadowed = pages.shadowed()
         page_bytes, errors, seconds = self._plan_inputs
-        bytes_at = np.array([page_bytes[t] for t in controller.TIERS], dtype=np.int64)
+        bytes_at = controller.place_bytes(page_bytes)
         below = shadowed & (tiers > FP16)
         needed = int((page_bytes["FP16"] - bytes_at[tiers[below]]).sum())
         thresholds = self._thresholds or DEFAULT_THRESHOLDS
@@ -1491,7 +1550,8 @@ class Engine:
         if not isinstance(cache, model.PagedCache):
             return None
         return {**self._bits_held(cache),
-                "pages_below_fp16": int((cache.pages.page_tiers() > FP16).sum())}
+                "pages_below_fp16": int(np.isin(cache.pages.page_tiers(),
+                                                range(FP16 + 1, controller.EVICTED)).sum())}
 
     def _bits_held(self, cache: model.PagedCache) -> dict:
         """_effective_bits of what `cache` holds now, outside the default
@@ -1511,13 +1571,14 @@ class Engine:
         """The average effective bits per cached element of the pages a plan
         may move, those outside `recency_floor`, and of every full page of
         positions: each tier's bytes, metadata counted, over the elements a
-        full page holds. A page still being filled is left out of both."""
+        full page holds, an evicted page's none (#160). A page still being
+        filled is left out of both."""
         pages = cache.pages
         tiers = pages.page_tiers()
-        bytes_at = np.array([page_bytes[t] for t in controller.TIERS], dtype=np.int64)
+        bytes_at = controller.place_bytes(page_bytes)
         elements = 2 * pages.page_tokens * self.config.num_key_value_heads * self.config.head_dim
-        held = controller.candidates(tiers, cache.length, pages.page_tokens, 0)
-        movable = controller.candidates(tiers, cache.length, pages.page_tokens, recency_floor)
+        held = controller.full_pages(tiers, cache.length, pages.page_tokens, 0)
+        movable = controller.full_pages(tiers, cache.length, pages.page_tokens, recency_floor)
 
         def bits(where: np.ndarray) -> float | None:
             n = int(where.sum())
