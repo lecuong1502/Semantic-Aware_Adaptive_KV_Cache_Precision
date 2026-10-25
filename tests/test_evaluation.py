@@ -6,13 +6,14 @@ never the monitor's own events. Tested on traces and events written here,
 whose every episode is known, and on the grid's schedule.
 """
 
+import json
 from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
 
 from conftest import each, load_tool
-from microinfer import benchlog, evaluation, patterns
+from microinfer import benchlog, evaluation, patterns, recorder
 from microinfer.footprint import MIB
 from microinfer.monitor import DEFAULT, GREEN, RED, YELLOW, PressureEvent, Thresholds
 
@@ -94,8 +95,10 @@ def test_the_grid_schedule_takes_a_base_then_each_cell_in_turn_and_is_scored_per
     """The base is taken first and kept, so that headroom starts in GREEN;
     each cell's pulses follow in turn, a gap apart, seeded gaps a fraction
     of a poll longer; and the schedule gives everything back at its end.
-    Each pulse's start is when the simulator applied its first change, and
-    a cell is scored on what begins from its pulses' starts to the next."""
+    Each pulse's start is when the simulator began its first change, not
+    when the change returned: the device shows memory taken while the
+    allocator's calls are still running (#159). A cell is scored on what
+    begins from its pulses' starts to the next."""
     cells = [evaluation.Cell(256 * MIB, ramp_s=0.0, plateau_s=0.5),
              evaluation.Cell(512 * MIB, ramp_s=0.2, plateau_s=0.1)]
     grid = evaluation.grid_schedule(cells, base_bytes=1024 * MIB, repeats=2, gap_s=1.0,
@@ -115,18 +118,22 @@ def test_the_grid_schedule_takes_a_base_then_each_cell_in_turn_and_is_scored_per
     assert all(0 <= x < 0.05 for x in extra) and len(set(np.round(extra, 9))) > 1
 
     started = 10**12
-    # The simulator's changes: every point of the schedule, applied 3 ms late.
-    changes = [{"scheduled_ns": started + int(t * 1e9), "applied_ns": started + int(t * 1e9)
-                + 3 * MS} for t, _ in s.points]
-    at = evaluation.applied_starts(grid, started, changes)
+    # The simulator's changes: every point of the schedule, begun 1 ms late
+    # and returned 8 ms late.
+    changes = [{"scheduled_ns": started + int(t * 1e9), "late_s": 0.001,
+                "applied_ns": started + int(t * 1e9) + 8 * MS} for t, _ in s.points]
+    at = evaluation.pulse_starts(grid, started, changes)
     # A ramp's first change is one step of the schedule's resolution in.
-    assert all(3 * MS <= a - started - int(t * 1e9) <= 23 * MS for a, t in zip(at, starts))
+    assert all(1 * MS <= a - started - int(t * 1e9) <= 21 * MS for a, t in zip(at, starts))
+    assert at[0] - started - int(starts[0] * 1e9) == 1 * MS  # a sheer edge's is its first
     ms = [a // MS for a in at]
-    episodes = [episode(ms[0] + 10, ms[0] + 400), episode(ms[2] + 50, ms[2] + 300)]
-    events = [red(ms[0] + 160), back(ms[0] + 500), red(ms[1] + 100), back(ms[1] + 400)]
+    # The first pulse's RED begins before its change returned.
+    episodes = [episode(ms[0] + 4, ms[0] + 400), episode(ms[2] + 50, ms[2] + 300)]
+    events = [red(ms[0] + 154), back(ms[0] + 500), red(ms[1] + 100), back(ms[1] + 400)]
     first, second = evaluation.score_cells(grid, at, started + int(s.duration_s * 1e9),
                                            episodes, events, T)
     assert (first.episodes, first.latencies_ms, first.false_positives) == (1, [150.0], 1)
+    assert first.missed_detectable == 0
     assert (second.episodes, second.missed_detectable, second.red_events) == (1, 1, 0)
 
 
@@ -236,3 +243,60 @@ def test_the_tools_take_k_and_summarise_the_grid_at_each(tmp_path, monkeypatch, 
     assert logged["results"]["1"]["episodes"] == 2
     assert summarise.main(["--issue", "159", "--log", str(log)]) == 0
     assert list(benchlog.read(log))[-1]["results"]["synthetic grid"]["episodes"] == 1
+
+
+def test_a_grid_is_rescored_from_its_files(tmp_path, monkeypatch, capsys):
+    """A grid's evaluation, scored again from its trace, the simulator's
+    changes and the monitor's events, is logged as an entry of the same
+    config naming the one it rescores. A sheer edge's RED, begun before its
+    change returned, is its own pulse's (#159). A file changed since is
+    refused."""
+    evaluate = load_tool("evaluate_monitor")
+    log, out = tmp_path / "benchmark.jsonl", tmp_path / "grid.csv.gz"
+    real = benchlog.environment  # this test runs on a tree being changed
+    monkeypatch.setattr(evaluate.benchlog, "environment",
+                        lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    config = {"workload": "synthetic grid", "repeats": 2, "gap_s": 1.0, "lead_s": 1.0,
+              "phase_seed": evaluate.SEED, "start_headroom_mib": 1536.0,
+              "amplitudes_mib": [1408.0], "ramps_s": [0.0], "plateaus_s": [0.5],
+              "base_bytes": 512 * MIB, "thresholds": asdict(T)}
+    grid = evaluation.grid_schedule([evaluation.Cell(1408 * MIB, 0.0, 0.5)], 512 * MIB, 2,
+                                    1.0, 1.0, seed=evaluate.SEED)
+    started = 10**12
+    changes = [{"scheduled_ns": started + int(t * 1e9), "late_s": 0.001,
+                "applied_ns": started + int(t * 1e9) + 30 * MS} for t, _ in grid.schedule.points]
+    recorder.companion(out, ".events.jsonl").write_text(
+        "".join(json.dumps(c) + "\n" for c in changes))
+    recorder.companion(out, ".replay.json").write_text(json.dumps({"started_ns": started}))
+    t = started + np.arange(int(grid.schedule.duration_s * 50)) * 20 * MS
+    rises = [started + int(t * 1e9) for t, b in grid.schedule.points if b > 512 * MIB]
+    reds = [(r + 5 * MS, r + 505 * MS) for r in rises]  # before the change returned
+    free = np.where([any(a <= x < b for a, b in reds) for x in t], 300 * MIB, 2000 * MIB)
+    trace = recorder._TraceWriter(out, recorder.FORMAT, {}, recorder.COLUMNS)
+    for ti, f in zip(t, free):
+        trace.row(int(ti), 0.0, int(f), 1000 * MIB, 1000)
+    trace.close({"samples": len(t), "missed": 0})
+    events = [PressureEvent(started - 10**9, 0, None, GREEN, 2000 * MIB)]
+    for a, b in reds:
+        events += [PressureEvent(a + 150 * MS, 1, GREEN, RED, 300 * MIB),
+                   PressureEvent(b + 150 * MS, 2, RED, GREEN, 2000 * MIB)]
+    pressure = recorder.companion(out, ".pressure.jsonl")
+    pressure.write_text("".join(json.dumps(asdict(e)) + "\n" for e in events))
+    files = [out, recorder.companion(out, ".events.jsonl"),
+             recorder.companion(out, ".replay.json"), pressure]
+    config["files"] = {f.name: benchlog.file_sha256(f) for f in files}
+    benchlog.append("monitor-evaluation", model="m", context_length=1088,
+                    precision_tiers={"FP16": 1.0}, config={**config, "issue": 64},
+                    results={"overall": {}, "cells": [], "missed_polls": 0}, log=log)
+    shape = ["rescore", "--out", str(out), "--issue", "159", "--log", str(log)]
+    assert evaluate.main(shape) == 0
+    first, rescored = list(benchlog.read(log))
+    assert rescored["config"] == {**config, "issue": 159, "rescores": first["sha256"]}
+    (cell,) = rescored["results"]["cells"]
+    assert (cell["episodes"], cell["missed_detectable"]) == (2, 0)
+    assert cell["latencies_ms"] == pytest.approx([135.0, 135.0])  # from the sample at 20 ms
+    assert rescored["results"]["overall"]["episodes"] == 2
+    assert rescored["results"]["missed_polls"] == 0
+    pressure.write_text("")
+    with pytest.raises(SystemExit):
+        evaluate.main(shape)

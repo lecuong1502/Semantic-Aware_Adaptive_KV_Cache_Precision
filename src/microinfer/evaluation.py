@@ -211,16 +211,20 @@ def grid_schedule(cells: list[Cell], base_bytes: int, repeats: int, gap_s: float
     return Grid(list(cells), schedule, pulses)
 
 
-def applied_starts(grid: Grid, started_ns: int, simulator_events: list[dict]) -> list[int]:
-    """When each pulse of `grid`, run from `started_ns`, began to be applied:
-    the simulator's first change due at or after its start (its events,
-    simulator.run's), when that change was applied. A pulse whose change the
-    simulator never made keeps its due time."""
-    due = sorted((e["scheduled_ns"], e["applied_ns"]) for e in simulator_events)
+def pulse_starts(grid: Grid, started_ns: int, simulator_events: list[dict]) -> list[int]:
+    """When each pulse of `grid`, run from `started_ns`, began: the
+    simulator's first change due at or after its start (its events,
+    simulator.run's), when the simulator began it, late_s after it was due.
+    Not when its calls returned (applied_ns): the device shows the memory
+    taken while they run, and a sheer edge's true RED can begin before they
+    return (#159). A pulse whose change the simulator never made keeps its
+    due time."""
+    due = sorted((e["scheduled_ns"], e["scheduled_ns"] + int(e["late_s"] * _NS))
+                 for e in simulator_events)
     starts = []
     for pulse in grid.pulses:
         at = started_ns + int(pulse.start_s * _NS) - 1_000_000  # a ms for rounding
-        starts.append(next((applied for scheduled, applied in due if scheduled >= at),
+        starts.append(next((began for scheduled, began in due if scheduled >= at),
                            at + 1_000_000))
     return starts
 

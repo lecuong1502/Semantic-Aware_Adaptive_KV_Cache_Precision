@@ -6,6 +6,7 @@
         [--repeats 3] [--gap 3] [--start-headroom 1536] [--persist-polls 3]
     .venv/bin/python tools/evaluate_monitor.py replay --recording data/rq1/scenario-with-r1.csv.gz
         --out data/monitor/replay-with-r1.csv.gz --issue 65 [--from S] [--to S]
+    .venv/bin/python tools/evaluate_monitor.py rescore --out data/monitor/grid-k1.csv.gz --issue 159
 
 Either way the engine holds a generation (Engine.hold) with its pressure
 monitor on, recording every event between steps. Once its cache has stopped
@@ -45,6 +46,15 @@ differs between them:
 and the same with 3 and 5. The summary for RQ2 takes ADR-0013's K alone, so
 the K = 3 grid supersedes #64's there; tools/summarise_monitor.py
 --hysteresis compares the grid at each.
+
+`rescore` scores a grid's evaluation again from its files, the trace and
+the monitor's events beside it, without running again: the latest entry
+whose files they are, their sha256 checked. It logs a "monitor-evaluation"
+entry of the same config, naming the entry it rescores, which supersedes it
+as the latest. #159 rescored its grids once each pulse's cell began when
+the simulator began its change, not when the change returned
+(evaluation.pulse_starts): a sheer edge's true RED began before, in the
+cell of the pulse before.
 
 Close every application first: the desktop moves headroom too, and what it
 does counts against the monitor as if the simulator had done it. Refuses a
@@ -114,7 +124,7 @@ class GridWorkload:
     def results(self, started: int, end: int, episodes, events, thresholds) -> dict:
         changes = [json.loads(line) for line in recorder.companion(
             self.args.out, ".events.jsonl").read_text().splitlines()]
-        starts = evaluation.applied_starts(self.grid, started, changes)
+        starts = evaluation.pulse_starts(self.grid, started, changes)
         per_cell = evaluation.score_cells(self.grid, starts, end, episodes, events, thresholds)
         return {"cells": [{**asdict(c), "amplitude_mib": c.amplitude_bytes / MIB, **summary(s)}
                           for c, s in zip(self.cells, per_cell)]}
@@ -161,14 +171,17 @@ def main(argv: list[str]) -> int:
     workloads = parser.add_subparsers(dest="workload", required=True)
     grid_args = workloads.add_parser("grid", help="a synthetic grid of pulses (#64)")
     replay_args = workloads.add_parser("replay", help="a replayed RQ1 recording (#65)")
-    for sub in (grid_args, replay_args):
+    rescore_args = workloads.add_parser("rescore", help="a grid's evaluation scored again "
+                                                        "from its files (#159)")
+    for sub in (grid_args, replay_args, rescore_args):
         sub.add_argument("--out", type=Path, required=True, help="the recorder's trace")
         sub.add_argument("--issue", type=int, required=True)
+        sub.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
+    for sub in (grid_args, replay_args):
         sub.add_argument("--model", default="qwen2.5-1.5b-instruct")
         sub.add_argument("--prompt-positions", type=int, default=1024)
         sub.add_argument("--decode-positions", type=int, default=64,
                          help="the span the hold decodes again and again")
-        sub.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     grid_args.add_argument("--amplitudes", type=float, nargs="+", default=[768, 1152, 1408],
                            help="MiB above the base")
     grid_args.add_argument("--ramps", type=float, nargs="+", default=[0.0, 0.25, 1.0],
@@ -194,6 +207,8 @@ def main(argv: list[str]) -> int:
                              help="the same; its end if omitted, and only a replay to the "
                                   "end enters the summary")
     args = parser.parse_args(argv)
+    if args.workload == "rescore":
+        return rescore(parser, args)
     k = getattr(args, "persist_polls", monitor.DEFAULT.persist_polls)  # the grid's alone
     if k < 1:
         parser.error(f"--persist-polls is at least 1; got {k}")
@@ -250,15 +265,11 @@ def main(argv: list[str]) -> int:
 
     thresholds = watching.thresholds
     events = [r.event for r in engine.pressure_events]
-    _, samples = recorder.read(args.out)
-    episodes = evaluation.true_red(samples["t_mono_ns"], samples["free_bytes"], thresholds)
-    end = started + int(schedule.duration_s * 1e9)
-    overall = evaluation.score(episodes, events, thresholds, within=(started, end))
+    overall, scores = scored(workload, started, schedule, events, thresholds)
     results = {"overall": summary(overall), "events_recorded": len(events),
                "monitor_error": None if engine.monitor_error is None
                else str(engine.monitor_error),
-               "missed_polls": watching.missed,
-               **workload.results(started, end, episodes, events, thresholds)}
+               "missed_polls": watching.missed, **scores}
 
     # The monitor's events, as the engine recorded them, beside the trace:
     # the truth can be scored again without running again.
@@ -281,6 +292,60 @@ def main(argv: list[str]) -> int:
                       "already_red": overall.already_red,
                       "false_positives": overall.false_positives,
                       **{k: v for k, v in results.items() if k == "original_red_episodes"}}))
+    return 0
+
+
+def scored(workload, started: int, schedule: Schedule, events, thresholds):
+    """The monitor's `events` scored against the trace at the workload's
+    --out, over the schedule played from `started`: overall, and the
+    workload's own results."""
+    _, samples = recorder.read(workload.args.out)
+    episodes = evaluation.true_red(samples["t_mono_ns"], samples["free_bytes"], thresholds)
+    end = started + int(schedule.duration_s * 1e9)
+    overall = evaluation.score(episodes, events, thresholds, within=(started, end))
+    return overall, workload.results(started, end, episodes, events, thresholds)
+
+
+def rescore(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """A grid's evaluation scored again from its files at --out (#159)."""
+    if benchlog.environment(args.log)["git_dirty"]:
+        parser.error("tracked files have uncommitted changes; commit first, so that the "
+                     "entry names the code that scored it")
+    trace = benchlog.file_sha256(args.out)
+    of = [e for e in benchlog.read(args.log) if e["kind"] == "monitor-evaluation"
+          and e["config"]["files"].get(args.out.name) == trace]
+    if not of:
+        parser.error(f"no evaluation in the log was made with {args.out}")
+    entry = of[-1]
+    config = entry["config"]
+    if config["workload"] != "synthetic grid" or config["phase_seed"] != SEED:
+        parser.error("only a grid's evaluation, of this tool's phase seed, is rescored")
+    for name, sha in config["files"].items():
+        if benchlog.file_sha256(args.out.parent / name) != sha:
+            parser.error(f"{name} is not the file the evaluation logged")
+    workload = GridWorkload(argparse.Namespace(
+        out=args.out, amplitudes=config["amplitudes_mib"], ramps=config["ramps_s"],
+        plateaus=config["plateaus_s"], repeats=config["repeats"], gap=config["gap_s"],
+        lead=config["lead_s"]))
+    schedule = workload.schedule(config["base_bytes"])
+    started = json.loads(recorder.companion(args.out, ".replay.json").read_text())["started_ns"]
+    events = [monitor.PressureEvent(r["t_mono_ns"], r["poll"],
+                                    r["previous"] and monitor.Level(r["previous"]),
+                                    monitor.Level(r["level"]), r["headroom_bytes"])
+              for r in map(json.loads, recorder.companion(
+                  args.out, ".pressure.jsonl").read_text().splitlines())]
+    overall, scores = scored(workload, started, schedule, events,
+                             monitor.Thresholds(**config["thresholds"]))
+    benchlog.append("monitor-evaluation", model=entry["model"],
+                    context_length=entry["context_length"],
+                    precision_tiers=entry["precision_tiers"],
+                    config={**config, "issue": args.issue, "rescores": entry["sha256"]},
+                    results={**entry["results"], "overall": summary(overall), **scores},
+                    log=args.log)
+    print(json.dumps({"rescores": entry["sha256"][:8], "episodes": overall.episodes,
+                      "false_negatives_detectable": overall.missed_detectable,
+                      "per_cell_false_negatives_detectable": sum(
+                          c["missed_detectable"] for c in scores["cells"])}))
     return 0
 
 
