@@ -34,14 +34,16 @@ ADR-0013's K cannot be sure to catch them. The result is logged as a
 events among them (.pressure.jsonl), so that it can be scored again without
 running again.
 
---persist-polls sets the monitor's K, ADR-0013's 3 by default, its
-thresholds left as they are; #159 runs the grid at K = 1, 3 and 5, each to
-an --out of its own, all three at the same code:
+For the grid, --persist-polls sets the monitor's K, ADR-0013's 3 by
+default, its thresholds left as they are. #159 runs the grid at K = 1, 3
+and 5, each to an --out of its own, all three at one code, so that K alone
+differs between them:
 
     .venv/bin/python tools/evaluate_monitor.py grid --out data/monitor/grid-k1.csv.gz \
         --issue 159 --persist-polls 1
 
-The summary for RQ2 takes ADR-0013's K alone; tools/summarise_monitor.py
+and the same with 3 and 5. The summary for RQ2 takes ADR-0013's K alone, so
+the K = 3 grid supersedes #64's there; tools/summarise_monitor.py
 --hysteresis compares the grid at each.
 
 Close every application first: the desktop moves headroom too, and what it
@@ -167,9 +169,6 @@ def main(argv: list[str]) -> int:
         sub.add_argument("--decode-positions", type=int, default=64,
                          help="the span the hold decodes again and again")
         sub.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
-        sub.add_argument("--persist-polls", type=int, default=monitor.DEFAULT.persist_polls,
-                         help="K, the polls a new level must hold for (#159); ADR-0013's "
-                              "by default")
     grid_args.add_argument("--amplitudes", type=float, nargs="+", default=[768, 1152, 1408],
                            help="MiB above the base")
     grid_args.add_argument("--ramps", type=float, nargs="+", default=[0.0, 0.25, 1.0],
@@ -181,6 +180,9 @@ def main(argv: list[str]) -> int:
     grid_args.add_argument("--gap", type=float, default=3.0, help="seconds between pulses")
     grid_args.add_argument("--lead", type=float, default=5.0,
                            help="seconds on the base before the first pulse")
+    grid_args.add_argument("--persist-polls", type=int, default=monitor.DEFAULT.persist_polls,
+                           help="K, the polls a new level must hold for (#159); ADR-0013's "
+                                "by default")
     grid_args.add_argument("--start-headroom", type=float, default=1536,
                            help="MiB of headroom the base leaves")
     replay_args.add_argument("--recording", type=Path, required=True,
@@ -192,8 +194,9 @@ def main(argv: list[str]) -> int:
                              help="the same; its end if omitted, and only a replay to the "
                                   "end enters the summary")
     args = parser.parse_args(argv)
-    if args.persist_polls < 1:
-        parser.error(f"--persist-polls is at least 1; got {args.persist_polls}")
+    k = getattr(args, "persist_polls", monitor.DEFAULT.persist_polls)  # the grid's alone
+    if k < 1:
+        parser.error(f"--persist-polls is at least 1; got {k}")
     if args.out.exists():
         parser.error(f"{args.out} exists; an evaluation does not overwrite a recording")
     args.out.parent.mkdir(parents=True, exist_ok=True)  # before minutes of loading
@@ -223,7 +226,7 @@ def main(argv: list[str]) -> int:
         target=lambda: engine.hold(prompt, context=context, stop=halt, report=report),
         name="hold")
     watching = engine.start_monitor(monitor.Monitor(
-        thresholds=replace(monitor.DEFAULT, persist_polls=args.persist_polls)))
+        thresholds=replace(monitor.DEFAULT, persist_polls=k)))
     holding.start()
     try:
         while not full.wait(0.5):

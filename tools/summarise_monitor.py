@@ -14,8 +14,11 @@ table for the ADR note. Only evaluations at ADR-0013's thresholds and K
 enter it.
 
 With --hysteresis, the synthetic grid at each K instead (#159,
-microinfer.evaluation.grid_by_persist_polls): the latest grid at each, logged
-as a "monitor-hysteresis-summary" entry. Refuses a dirty tree.
+microinfer.evaluation.grid_by_persist_polls): the latest grid at each, all at
+one code and of one shape, logged as a "monitor-hysteresis-summary" entry
+whose results are keyed by K as a string, as JSON keys are.
+
+Refuses a dirty tree.
 """
 
 from __future__ import annotations
@@ -56,17 +59,23 @@ def main(argv: list[str]) -> int:
     for workload, s in summary.items():
         print(f"| {workload} | {len(s['entries'])} | {s['episodes']} | {s['detectable']} "
               f"| {s['missed_detectable']} | {s['missed_below_k']} | {s['already_red']} "
-              f"| {s['false_positives']} | {latencies(s['latency_ms'])} |")
+              f"| {s['false_positives']} | {latency_cell(s['latency_ms'])} |")
     return 0
 
 
-def latencies(spread: dict | None) -> str:
+def latency_cell(spread: dict | None) -> str:
+    """A spread of latencies as the table's cell: median / P90 / max."""
     return "-" if spread is None else (
         f"{spread['median']:.0f} / {spread['p90']:.0f} / {spread['max']:.0f}")
 
 
 def hysteresis(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
-    by_k = evaluation.grid_by_persist_polls(benchlog.read(args.log))
+    """The grid at each K (#159): logged, and printed as a table for
+    ADR-0014's amendment."""
+    try:
+        by_k = evaluation.grid_by_persist_polls(benchlog.read(args.log))
+    except ValueError as exc:
+        parser.error(str(exc))
     if not by_k:
         parser.error("the log has no evaluation of the synthetic grid to summarise")
     benchlog.append("monitor-hysteresis-summary", model=None, context_length=None,
@@ -81,7 +90,7 @@ def hysteresis(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         print(f"| {k} | `{s['entry'][:8]}…` | {s['commit'][:7]} | {s['episodes']} "
               f"| {s['detectable']} | {s['missed_detectable']} | {s['missed_below_k']} "
               f"| {s['already_red']} | {s['false_positives']} | {s['red_events']} "
-              f"| {latencies(s['latency_ms'])} |")
+              f"| {latency_cell(s['latency_ms'])} |")
     return 0
 
 

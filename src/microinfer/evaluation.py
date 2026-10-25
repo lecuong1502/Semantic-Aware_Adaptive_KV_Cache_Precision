@@ -41,7 +41,8 @@ This is measurement, not inference, so it computes in NumPy on the host
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import json
+from dataclasses import asdict, dataclass, replace
 
 import numpy as np
 
@@ -248,17 +249,28 @@ def _sum(scores: list[Score]) -> Score:
 _COUNTS = tuple(f for f, kind in Score.__annotations__.items() if kind == "int")
 
 
-def _uncorrected(entries) -> list[dict]:
-    """The "monitor-evaluation" entries of `entries` that no correction
-    supersedes, in the log's order. A correction supersedes the entries it
-    corrects unless it says it does not ("supersedes": false), as one that
-    amends what an entry's config says."""
+#: What the grid's evaluations at each K must share beside their code (#159):
+#: its cells, how often and how far apart they are played, and its base.
+GRID_SHAPE = ("amplitudes_mib", "ramps_s", "plateaus_s", "repeats", "gap_s", "lead_s",
+              "phase_seed", "start_headroom_mib")
+
+
+def _latest_evaluations(entries, key) -> dict:
+    """The latest "monitor-evaluation" of `entries` at each key(entry), of
+    those no correction supersedes and key does not give None. A correction
+    supersedes the entries it corrects unless it says it does not
+    ("supersedes": false), as one that amends what an entry's config says."""
     entries = list(entries)
     superseded = {sha for e in entries if e.get("kind") == "correction"
                   and e["results"].get("supersedes", True)
                   for sha in e["results"].get("corrects", [])}
-    return [e for e in entries
-            if e.get("kind") == "monitor-evaluation" and e["sha256"] not in superseded]
+    latest = {}
+    for e in entries:
+        if e.get("kind") == "monitor-evaluation" and e["sha256"] not in superseded:
+            k = key(e)
+            if k is not None:
+                latest[k] = e
+    return latest
 
 
 def summarise(entries) -> dict:
@@ -269,14 +281,14 @@ def summarise(entries) -> dict:
     entries taken. A replay of part of a recording is left out: it is not
     that recording's replay; and so is an evaluation at another K (#159):
     it is not the monitor's."""
-    latest: dict[tuple[str, str | None], dict] = {}
-    for e in _uncorrected(entries):
+    def key(e):
         config = e["config"]
-        if config.get("to_s") is not None or config["thresholds"] != asdict(DEFAULT):
-            continue
-        latest[(config["workload"], config.get("recording"))] = e
+        if config.get("to_s") is None and config["thresholds"] == asdict(DEFAULT):
+            return config["workload"], config.get("recording")
+        return None
+
     summary: dict[str, dict] = {}
-    for (workload, _), e in latest.items():
+    for (workload, _), e in _latest_evaluations(entries, key).items():
         into = summary.setdefault(workload, {"entries": [], "latencies_ms": [],
                                              "latencies_polls": [],
                                              **{k: 0 for k in _COUNTS}})
@@ -294,16 +306,29 @@ def summarise(entries) -> dict:
 
 def grid_by_persist_polls(entries) -> dict[int, dict]:
     """The synthetic grid at each K (#159), in order of K: the latest
-    "monitor-evaluation" of the grid at that K that no correction
-    supersedes, its counts, the spread of its latencies, and its sha256 and
-    commit."""
-    latest = {e["config"]["thresholds"]["persist_polls"]: e for e in _uncorrected(entries)
-              if e["config"]["workload"] == "synthetic grid"}
-    by_k = {}
-    for k, e in sorted(latest.items()):
-        overall = e["results"]["overall"]
-        by_k[k] = {"entry": e["sha256"], "commit": e["git_commit"],
-                   **{c: overall[c] for c in _COUNTS},
-                   "latency_ms": spread(overall["latencies_ms"]),
-                   "latency_polls": spread(overall["latencies_polls"])}
-    return by_k
+    "monitor-evaluation" of the grid at that K, its thresholds otherwise
+    ADR-0013's, that no correction supersedes; its counts, the spread of
+    its latencies, and its sha256 and commit. Raises ValueError unless they
+    share their code and the grid's shape (GRID_SHAPE): what differs
+    between them is then K alone."""
+    def key(e):
+        config = e["config"]
+        k = config["thresholds"]["persist_polls"]
+        if (config["workload"] == "synthetic grid"
+                and config["thresholds"] == asdict(replace(DEFAULT, persist_polls=k))):
+            return k
+        return None
+
+    latest = dict(sorted(_latest_evaluations(entries, key).items()))
+    runs = {json.dumps([e["git_commit"], *(e["config"].get(f) for f in GRID_SHAPE)])
+            for e in latest.values()}
+    if len(runs) > 1:
+        raise ValueError(
+            "the grid's latest evaluations at each K differ in code or shape: "
+            + "; ".join(f"K = {k} at {e['git_commit'][:7]}" for k, e in latest.items())
+            + "; run them again at one code")
+    return {k: {"entry": e["sha256"], "commit": e["git_commit"],
+                **{c: e["results"]["overall"][c] for c in _COUNTS},
+                "latency_ms": spread(e["results"]["overall"]["latencies_ms"]),
+                "latency_polls": spread(e["results"]["overall"]["latencies_polls"])}
+            for k, e in latest.items()}

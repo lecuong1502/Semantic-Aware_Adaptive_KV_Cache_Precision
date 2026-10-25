@@ -136,7 +136,7 @@ def entry(sha, workload, recording=None, latencies=(), missed=0, false=0, to_s=N
     thresholds = asdict(replace(DEFAULT, persist_polls=persist_polls))
     return {"sha256": sha, "kind": "monitor-evaluation", "git_commit": f"commit-{sha}",
             "config": {"workload": workload, "recording": recording, "to_s": to_s,
-                       "thresholds": thresholds},
+                       "thresholds": thresholds, "amplitudes_mib": [768, 1152]},
             "results": {"overall": {"episodes": len(latencies) + missed,
                                     "detectable": len(latencies) + missed,
                                     "latencies_ms": list(latencies),
@@ -174,8 +174,9 @@ def test_the_summary_pools_the_latest_uncorrected_evaluation_of_each_workload():
 
 
 def test_the_grid_at_each_k_is_its_latest_uncorrected_evaluation():
-    """Per K, the latest grid that no correction supersedes, whichever its
-    K, with its counts, latencies, entry and code (#159); no replay."""
+    """Per K, the latest grid that no correction supersedes, its thresholds
+    otherwise ADR-0013's, with its counts, latencies, entry and code (#159);
+    no replay. Grids at other code, or of another shape, are refused."""
     entries = [
         entry("a", "synthetic grid", latencies=[120, 200]),
         entry("b", "synthetic grid", latencies=[60], false=2, persist_polls=1),
@@ -184,23 +185,36 @@ def test_the_grid_at_each_k_is_its_latest_uncorrected_evaluation():
         entry("d", "synthetic grid", latencies=[300], missed=1, persist_polls=5),
         entry("e", "replayed RQ1 recording", "r1.csv.gz", latencies=[10], persist_polls=5),
     ]
-    by_k = evaluation.grid_by_persist_polls(entries)
+    other_red = entry("f", "synthetic grid", latencies=[1], persist_polls=5)
+    other_red["config"]["thresholds"]["red_below_bytes"] = 256 * MIB
+    for e in entries:
+        e["git_commit"] = "one"
+    by_k = evaluation.grid_by_persist_polls([*entries, other_red])
     assert list(by_k) == [1, 3, 5]
     assert (by_k[1]["entry"], by_k[1]["commit"], by_k[1]["false_positives"]) == \
-        ("b", "commit-b", 2)
+        ("b", "one", 2)
     assert by_k[3]["latency_ms"]["median"] == 160 and by_k[3]["episodes"] == 2
     assert (by_k[5]["entry"], by_k[5]["missed_detectable"]) == ("d", 1)
-
+    later = entry("g", "synthetic grid", latencies=[2], persist_polls=5)
+    with pytest.raises(ValueError, match="code or shape"):
+        evaluation.grid_by_persist_polls([*entries, later])
+    later["git_commit"], later["config"]["repeats"] = "one", 5
+    with pytest.raises(ValueError, match="code or shape"):
+        evaluation.grid_by_persist_polls([*entries, later])
 
 
 def test_the_tools_take_k_and_summarise_the_grid_at_each(tmp_path, monkeypatch, capsys):
-    """The evaluation refuses a K below one before it loads anything; the
-    summary of the grid at each K is logged and printed, one row a K, and
-    RQ2's summary leaves the other K out (#159)."""
+    """The evaluation refuses a K below one before it loads anything, and a
+    K for a replay; the summary of the grid at each K is logged and printed,
+    one row a K, and RQ2's summary leaves the other K out (#159)."""
     evaluate, summarise = load_tool("evaluate_monitor"), load_tool("summarise_monitor")
     with pytest.raises(SystemExit):
         evaluate.main(["grid", "--out", str(tmp_path / "grid.csv.gz"), "--issue", "159",
                        "--persist-polls", "0"])
+    with pytest.raises(SystemExit):
+        evaluate.main(["replay", "--recording", "r.csv.gz", "--out",
+                       str(tmp_path / "replay.csv.gz"), "--issue", "159",
+                       "--persist-polls", "1"])
     log = tmp_path / "benchmark.jsonl"
     real = benchlog.environment  # this test runs on a tree being changed
     monkeypatch.setattr(summarise.benchlog, "environment",
