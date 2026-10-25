@@ -195,12 +195,14 @@ def tables(summary: dict) -> str:
         cells = [f"{g['correct']}/{g['n']}" for g in r["by_gap"].values()]
         rows.append(f"| {name} | {r['correct']}/{r['n']} | [{low:.2f}, {high:.2f}] | "
                     f"{r['effective_bits']:.2f} | " + " | ".join(cells) + " |")
-    rows += ["", "| Level | Pair | Only semantic | Only other | McNemar p | Difference |",
-             "|---|---|---|---|---|---|"]
-    for level, pairs in summary["paired"].items():
-        for pair, p in pairs.items():
-            rows.append(f"| {level} | {pair} | {p['semantic_only']} | {p['other_only']} | "
-                        f"{p['mcnemar_p']:.3g} | {p['difference']:+.2f} |")
+    pairs = [(level, pair, p) for level, by_pair in summary["paired"].items()
+             for pair, p in by_pair.items()]
+    if pairs:  # eviction's conditions hold no uniform or random to pair with
+        rows += ["", "| Level | Pair | Only semantic | Only other | McNemar p | Difference |",
+                 "|---|---|---|---|---|---|"]
+    for level, pair, p in pairs:
+        rows.append(f"| {level} | {pair} | {p['semantic_only']} | {p['other_only']} | "
+                    f"{p['mcnemar_p']:.3g} | {p['difference']:+.2f} |")
     return "\n".join(rows)
 
 
