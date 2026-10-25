@@ -48,7 +48,11 @@ namespace microinfer
     //     would let it.
     //
     // No mask tensor exists anywhere: whether key j is visible to query i is
-    // the comparison j <= i + (seq_k - seq_q), computed where it is needed.
+    // the comparison j <= i + (seq_k - seq_q), computed where it is needed,
+    // and whether the layout reads key j at all, reads(j), true but for a
+    // causal cache's unread pages (#160). That is asked once a key, as its
+    // tile is loaded, and joins the same select: an unread key's score is
+    // -inf as a later one's is, and its bytes are never touched.
     //
     // Layout is (tokens, heads, head_dim), row-major, for q and out, and
     // (tokens, kv_heads, head_dim) for k and v.
@@ -118,6 +122,8 @@ namespace microinfer
       // What a query tile starting at `position` reads: the same for every
       // tile here. Only the causal layout below depends on it.
       __device__ ContiguousKV view_for(int) const { return *this; }
+      // Every key is read here; only a causal cache's pages may be unread.
+      __device__ bool reads(int) const { return true; }
     };
 
     // Paged (ADR-0004, ADR-0007): key j is in page j / page_tokens at row
@@ -145,6 +151,7 @@ namespace microinfer
         return key_row(j)[static_cast<size_t>(page_tokens) * row + at];
       }
       __device__ PagedKV view_for(int) const { return *this; }
+      __device__ bool reads(int) const { return true; }
     };
 
     // How a sealed page's rows are read: a quantised page in quant.h's
@@ -264,7 +271,10 @@ namespace microinfer
     // open page they were written to; the rest are the rows this launch's
     // queries brought, `chunk_k` and `chunk_v`. The kernel's query tiles are
     // aligned so that no tile spans two pages, and view_for binds a tile's
-    // page.
+    // page. A sealed page whose tier is kUnreadPage, evicted or masked
+    // (#160), is read by no query: reads() says so, and key() and value()
+    // give zeros for it without touching its address, which may have been
+    // freed.
     struct CausalPagedKV
     {
       const unsigned long long *sealed;
@@ -287,13 +297,23 @@ namespace microinfer
       {
         return reinterpret_cast<const std::uint8_t *>(sealed[p]);
       }
+      __device__ bool unread(int p) const
+      {
+        return formats.tiers[p] == device::kUnreadPage;
+      }
+      // A query's own page and those after it are always read.
+      __device__ bool reads(int j) const
+      {
+        const int p = j / page_tokens;
+        return p >= own || !unread(p);
+      }
       __device__ float key(int j, size_t at) const
       {
         const int p = j / page_tokens;
         const int t = j % page_tokens;
         if (p < own)
         {
-          return formats.key(p, page(p), t, at);
+          return unread(p) ? 0.0f : formats.key(p, page(p), t, at);
         }
         if (j >= start)
         {
@@ -308,7 +328,8 @@ namespace microinfer
         const int t = j % page_tokens;
         if (p < own)
         {
-          return formats.value(p, page(p), t, at);
+          return unread(p) ? __float2half(0.0f)
+                           : formats.value(p, page(p), t, at);
         }
         if (j >= start)
         {
@@ -380,7 +401,9 @@ namespace microinfer
       float *m_s = s_s + kAttentionTileQ * kAttentionTileK; // kAttentionTileQ
       float *l_s = m_s + kAttentionTileQ;                   // kAttentionTileQ
       float *rescale_s = l_s + kAttentionTileQ;             // kAttentionTileQ
-      float *k_s = rescale_s + kAttentionTileQ; // kAttentionTileK x head_dim
+      // Whether the layout reads each key of the tile: 1 or 0.
+      float *reads_s = rescale_s + kAttentionTileQ; // kAttentionTileK
+      float *k_s = reads_s + kAttentionTileK; // kAttentionTileK x head_dim
       __half *v_s = reinterpret_cast<__half *>(
           k_s + kAttentionTileK * head_dim); // kAttentionTileK x head_dim
       // With the masses only: two floats per page, after the rest.
@@ -455,6 +478,11 @@ namespace microinfer
           }
           k_s[i] = key;
           v_s[i] = in_range ? view.value(k_first + c, at) : __float2half(0.0f);
+          if (d == 0)
+          {
+            // A key past seq_k is masked by position already.
+            reads_s[c] = !in_range || view.reads(k_first + c) ? 1.0f : 0.0f;
+          }
         }
         __syncthreads();
 
@@ -470,14 +498,18 @@ namespace microinfer
           }
           // Keys past seq_k are covered too: a valid query's position is at
           // most seq_k - 1, and a padding row's output is never stored.
-          const bool visible = k_first + c <= q_first + r + shift;
+          const bool visible =
+              k_first + c <= q_first + r + shift && reads_s[c] != 0.0f;
           s_s[i] = visible ? dot : -INFINITY;
         }
         __syncthreads();
 
-        // Per-row bookkeeping, one thread per query row. The first tile always
-        // contains key 0, which every query sees, so m is finite from the first
-        // tile onward and m_old - m_new is never -inf - -inf.
+        // Per-row bookkeeping, one thread per query row. A row's every score
+        // in a tile can be -inf: a tile of unread keys (#160), or a padding
+        // row's. m is then -inf still, and exponents are taken from 0
+        // instead, so that every p and the rescale are exactly 0, never
+        // exp(-inf - -inf). Once m is finite it is used itself, so a row
+        // that reads key 0 computes exactly what it always did.
         for (int r = threadIdx.x; r < kAttentionTileQ; r += blockDim.x)
         {
           float *row = s_s + r * kAttentionTileK;
@@ -487,14 +519,15 @@ namespace microinfer
           {
             m_new = fmaxf(m_new, row[c]);
           }
+          const float m_from = m_new == -INFINITY ? 0.0f : m_new;
           float sum = 0.0f;
           for (int c = 0; c < kAttentionTileK; ++c)
           {
-            const float p = expf(row[c] - m_new); // exp(-inf) is exactly 0
+            const float p = expf(row[c] - m_from); // exp(-inf) is exactly 0
             row[c] = p;
             sum += p;
           }
-          const float rescale = expf(m_old - m_new); // 0 on the first tile
+          const float rescale = expf(m_old - m_from); // 0 while m_old is -inf
           l_s[r] = l_s[r] * rescale + sum;
           m_s[r] = m_new;
           rescale_s[r] = rescale;
@@ -580,7 +613,7 @@ namespace microinfer
       const size_t floats =
           2 * static_cast<size_t>(kAttentionTileQ) * head_dim +
           kAttentionTileQ * kAttentionTileK + 3 * kAttentionTileQ +
-          static_cast<size_t>(kAttentionTileK) * head_dim;
+          kAttentionTileK + static_cast<size_t>(kAttentionTileK) * head_dim;
       const size_t halves = static_cast<size_t>(kAttentionTileK) * head_dim;
       return floats * sizeof(float) + halves * sizeof(__half);
     }

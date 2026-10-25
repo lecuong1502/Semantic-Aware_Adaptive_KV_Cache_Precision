@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -195,6 +196,25 @@ namespace microinfer
     // allocation fails, the cache is as it was.
     void upgrade(int layer, int page, Tier target);
 
+    // Drops page `page` of `layer`, a sealed page of positions, for good
+    // (#160), as H2O drops a token: the page is freed, its tier's tail
+    // moving into its slot (ADR-0007), so that its memory returns to the
+    // driver, and from then on no query attends to its positions. Nothing
+    // brings it back: it never moves again, and a shadow it had is left
+    // unread. Needs a cache that seals, and no diagnostic Halves.
+    void evict(int layer, int page);
+
+    // Masks page `page` of `layer`, a sealed page of positions: kept, and
+    // read by no query, as an evicted page is not (#160). The reference an
+    // eviction is measured against: attention over a cache with pages
+    // evicted is, to the bit, attention over the same cache with them
+    // masked. A masked page still moves.
+    void mask(int layer, int page);
+
+    // Whether the page has been evicted, or masked.
+    bool evicted(PageKey key) const { return evicted_.count(key) != 0; }
+    bool masked(PageKey key) const { return masked_.count(key) != 0; }
+
     // What a downgrade or an upgrade took (#97): the page, its tiers and
     // its bytes at each, and the wall time of the whole move, from once the
     // device has finished what it was given before, to the end of its last
@@ -221,7 +241,8 @@ namespace microinfer
     const ShadowStore &shadows() const { return shadows_; }
 
     // The tier the page table records for a page; the open pages are
-    // (layer, kOpenPages[k]). PageNotFound if the table holds no such page.
+    // (layer, kOpenPages[k]). PageNotFound if the table holds no such page,
+    // as it holds no evicted one.
     Tier page_tier(PageKey key) const;
 
     int page_tokens() const { return page_tokens_; }
@@ -258,6 +279,10 @@ namespace microinfer
     // store() at a quantised tier, span by span (ADR-0011).
     void store_sealed(int layer, const __half *keys, const __half *values,
                       int start, int n);
+    // The key of a sealed page of positions that is not evicted, for
+    // `verb`, or why not: require_movable's, and refused for a page
+    // already evicted, or, for "evict", masked.
+    PageKey require_held(int layer, int page, const char *verb) const;
     // Seals the page of positions `span` from rows (page_tokens, kv_width) of
     // keys and of values, into its place at its own tier.
     // Copies rows of keys and of values into an FP16 page, keys then values.
@@ -330,6 +355,9 @@ namespace microinfer
     // Per layer: how many pages of positions are sealed, from page 0 up.
     std::vector<int> sealed_;
     ShadowStore shadows_;
+    // The pages no query reads (#160): freed, or kept as the reference.
+    std::set<PageKey> evicted_;
+    std::set<PageKey> masked_;
     std::optional<MoveRecord> last_move_;
     // For a diagnostic Halves only: a quantised page and its dequantised
     // halves, the scratch a seal goes through.

@@ -78,6 +78,11 @@ namespace microinfer
     // decode step's: each page's share of each query head's softmax mass,
     // pages of page_tokens positions from position 0 (#98). Refused for
     // seq_q other than 1. Asking for it changes no bit of `out`.
+    // The entry of a page in a causal table of tiers that no query reads
+    // (#160): an evicted page, or one masked for the reference evicting is
+    // measured against. Never a Tier's value.
+    constexpr std::uint8_t kUnreadPage = 0xFF;
+
     void attention_paged(const __half *q, const unsigned long long *pages,
                          int page_tokens, const __half *k_bias,
                          const RopeTable *rope, __half *out, int seq_q,
@@ -95,6 +100,11 @@ namespace microinfer
     // seq_k - seq_q, are read from `open`, an FP16 page; the rest from
     // chunk_k and chunk_v, the seq_q rows the queries brought. page_tokens
     // must be a multiple of kAttentionTileQ. `mass` as attention_paged's.
+    //
+    // A sealed page whose entry in `tiers` is kUnreadPage is read by no
+    // query (#160): its positions are masked, as a position after a query's
+    // is, and its address is never read, so it may be one the allocator has
+    // freed. A query's own page is never one.
     void attention_paged_causal(const __half *q,
                                 const unsigned long long *sealed,
                                 const std::uint8_t *tiers,
