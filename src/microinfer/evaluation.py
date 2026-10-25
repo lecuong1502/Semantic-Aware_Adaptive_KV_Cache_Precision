@@ -219,7 +219,7 @@ def pulse_starts(grid: Grid, started_ns: int, simulator_events: list[dict]) -> l
     taken while they run, and a sheer edge's true RED can begin before they
     return (#159). A pulse whose change the simulator never made keeps its
     due time."""
-    due = sorted((e["scheduled_ns"], e["scheduled_ns"] + int(e["late_s"] * _NS))
+    due = sorted((e["scheduled_ns"], e["scheduled_ns"] + round(e["late_s"] * _NS))
                  for e in simulator_events)
     starts = []
     for pulse in grid.pulses:

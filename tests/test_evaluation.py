@@ -210,6 +210,15 @@ def test_the_grid_at_each_k_is_its_latest_uncorrected_evaluation():
         evaluation.grid_by_persist_polls([*entries, later])
 
 
+def clean_tree(monkeypatch, *tools):
+    """The tools' benchmark logs read a clean tree: these tests run on a
+    tree being changed."""
+    real = benchlog.environment
+    for tool in tools:
+        monkeypatch.setattr(tool.benchlog, "environment",
+                            lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+
+
 def test_the_tools_take_k_and_summarise_the_grid_at_each(tmp_path, monkeypatch, capsys):
     """The evaluation refuses a K below one before it loads anything, and a
     K for a replay; the summary of the grid at each K is logged and printed,
@@ -223,9 +232,7 @@ def test_the_tools_take_k_and_summarise_the_grid_at_each(tmp_path, monkeypatch, 
                        str(tmp_path / "replay.csv.gz"), "--issue", "159",
                        "--persist-polls", "1"])
     log = tmp_path / "benchmark.jsonl"
-    real = benchlog.environment  # this test runs on a tree being changed
-    monkeypatch.setattr(summarise.benchlog, "environment",
-                        lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    clean_tree(monkeypatch, summarise)
     log.write_text("")
     with pytest.raises(SystemExit):  # nothing to summarise yet
         summarise.main(["--issue", "159", "--hysteresis", "--log", str(log)])
@@ -253,13 +260,12 @@ def test_a_grid_is_rescored_from_its_files(tmp_path, monkeypatch, capsys):
     refused."""
     evaluate = load_tool("evaluate_monitor")
     log, out = tmp_path / "benchmark.jsonl", tmp_path / "grid.csv.gz"
-    real = benchlog.environment  # this test runs on a tree being changed
-    monkeypatch.setattr(evaluate.benchlog, "environment",
-                        lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    clean_tree(monkeypatch, evaluate)
     config = {"workload": "synthetic grid", "repeats": 2, "gap_s": 1.0, "lead_s": 1.0,
               "phase_seed": evaluate.SEED, "start_headroom_mib": 1536.0,
               "amplitudes_mib": [1408.0], "ramps_s": [0.0], "plateaus_s": [0.5],
-              "base_bytes": 512 * MIB, "thresholds": asdict(T)}
+              "base_bytes": 512 * MIB, "thresholds": asdict(T),
+              "min_episode_s": evaluation.MIN_EPISODE_S}
     grid = evaluation.grid_schedule([evaluation.Cell(1408 * MIB, 0.0, 0.5)], 512 * MIB, 2,
                                     1.0, 1.0, seed=evaluate.SEED)
     started = 10**12
@@ -297,6 +303,8 @@ def test_a_grid_is_rescored_from_its_files(tmp_path, monkeypatch, capsys):
     assert cell["latencies_ms"] == pytest.approx([135.0, 135.0])  # from the sample at 20 ms
     assert rescored["results"]["overall"]["episodes"] == 2
     assert rescored["results"]["missed_polls"] == 0
+    assert evaluate.main(shape) == 0  # again: the run's entry, not its rescore
+    assert list(benchlog.read(log))[-1]["config"]["rescores"] == first["sha256"]
     pressure.write_text("")
     with pytest.raises(SystemExit):
         evaluate.main(shape)

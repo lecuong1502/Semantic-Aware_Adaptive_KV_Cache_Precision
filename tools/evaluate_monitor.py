@@ -114,6 +114,15 @@ class GridWorkload:
               flush=True)
         return self.grid.schedule
 
+    @classmethod
+    def from_config(cls, config: dict, out: Path) -> GridWorkload:
+        """The grid an entry's `config` logged, its trace at `out`: the inverse
+        of config() (#159)."""
+        return cls(argparse.Namespace(
+            out=out, amplitudes=config["amplitudes_mib"], ramps=config["ramps_s"],
+            plateaus=config["plateaus_s"], repeats=config["repeats"], gap=config["gap_s"],
+            lead=config["lead_s"], start_headroom=config["start_headroom_mib"]))
+
     def config(self) -> dict:
         a = self.args
         return {"workload": "synthetic grid", "repeats": a.repeats, "gap_s": a.gap,
@@ -265,18 +274,15 @@ def main(argv: list[str]) -> int:
 
     thresholds = watching.thresholds
     events = [r.event for r in engine.pressure_events]
-    overall, scores = scored(workload, started, schedule, events, thresholds)
+    end = started + int(schedule.duration_s * 1e9)
+    overall, scores = score_against_trace(workload, started, end, events, thresholds)
     results = {"overall": summary(overall), "events_recorded": len(events),
                "monitor_error": None if engine.monitor_error is None
                else str(engine.monitor_error),
                "missed_polls": watching.missed, **scores}
 
-    # The monitor's events, as the engine recorded them, beside the trace:
-    # the truth can be scored again without running again.
     pressure = recorder.companion(args.out, ".pressure.jsonl")
-    pressure.write_text("".join(
-        json.dumps({**asdict(r.event), "positions_held": r.positions_held,
-                    "drained_ns": r.drained_ns}) + "\n" for r in engine.pressure_events))
+    write_pressure(pressure, engine.pressure_events)
     files = replay.files(args.out) + [pressure]
     config = {"issue": args.issue, "base_bytes": base,
               "simulator_context_bytes": context_bytes, "poll_s": monitor.POLL_S,
@@ -295,47 +301,61 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def scored(workload, started: int, schedule: Schedule, events, thresholds):
+def write_pressure(path: Path, records) -> None:
+    """The monitor's events as the engine recorded them, a JSON line each,
+    beside the trace: the truth can be scored again without running again."""
+    path.write_text("".join(
+        json.dumps({**asdict(r.event), "positions_held": r.positions_held,
+                    "drained_ns": r.drained_ns}) + "\n" for r in records))
+
+
+def read_pressure(path: Path) -> list[monitor.PressureEvent]:
+    """The events write_pressure wrote, as far as scoring reads them: when,
+    at which poll, from and to which level, on what headroom."""
+    return [monitor.PressureEvent(r["t_mono_ns"], r["poll"],
+                                  r["previous"] and monitor.Level(r["previous"]),
+                                  monitor.Level(r["level"]), r["headroom_bytes"])
+            for r in map(json.loads, path.read_text().splitlines())]
+
+
+def score_against_trace(workload, started: int, end: int, events, thresholds):
     """The monitor's `events` scored against the trace at the workload's
-    --out, over the schedule played from `started`: overall, and the
-    workload's own results."""
+    --out, over [started, end): overall, and the workload's own results."""
     _, samples = recorder.read(workload.args.out)
     episodes = evaluation.true_red(samples["t_mono_ns"], samples["free_bytes"], thresholds)
-    end = started + int(schedule.duration_s * 1e9)
     overall = evaluation.score(episodes, events, thresholds, within=(started, end))
     return overall, workload.results(started, end, episodes, events, thresholds)
 
 
 def rescore(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
-    """A grid's evaluation scored again from its files at --out (#159)."""
+    """A grid's evaluation scored again from its files at --out (#159): the
+    run's own entry, never an earlier rescore of it."""
     if benchlog.environment(args.log)["git_dirty"]:
         parser.error("tracked files have uncommitted changes; commit first, so that the "
                      "entry names the code that scored it")
     trace = benchlog.file_sha256(args.out)
-    of = [e for e in benchlog.read(args.log) if e["kind"] == "monitor-evaluation"
-          and e["config"]["files"].get(args.out.name) == trace]
-    if not of:
+    made_with = [e for e in benchlog.read(args.log) if e["kind"] == "monitor-evaluation"
+                 and "rescores" not in e["config"]
+                 and e["config"]["files"].get(args.out.name) == trace]
+    if not made_with:
         parser.error(f"no evaluation in the log was made with {args.out}")
-    entry = of[-1]
+    entry = made_with[-1]
     config = entry["config"]
     if config["workload"] != "synthetic grid" or config["phase_seed"] != SEED:
         parser.error("only a grid's evaluation, of this tool's phase seed, is rescored")
+    if config["min_episode_s"] != evaluation.MIN_EPISODE_S:
+        parser.error(f"the evaluation counted episodes from {config['min_episode_s']} s, "
+                     f"this code from {evaluation.MIN_EPISODE_S} s")
     for name, sha in config["files"].items():
         if benchlog.file_sha256(args.out.parent / name) != sha:
             parser.error(f"{name} is not the file the evaluation logged")
-    workload = GridWorkload(argparse.Namespace(
-        out=args.out, amplitudes=config["amplitudes_mib"], ramps=config["ramps_s"],
-        plateaus=config["plateaus_s"], repeats=config["repeats"], gap=config["gap_s"],
-        lead=config["lead_s"]))
+    workload = GridWorkload.from_config(config, args.out)
     schedule = workload.schedule(config["base_bytes"])
     started = json.loads(recorder.companion(args.out, ".replay.json").read_text())["started_ns"]
-    events = [monitor.PressureEvent(r["t_mono_ns"], r["poll"],
-                                    r["previous"] and monitor.Level(r["previous"]),
-                                    monitor.Level(r["level"]), r["headroom_bytes"])
-              for r in map(json.loads, recorder.companion(
-                  args.out, ".pressure.jsonl").read_text().splitlines())]
-    overall, scores = scored(workload, started, schedule, events,
-                             monitor.Thresholds(**config["thresholds"]))
+    events = read_pressure(recorder.companion(args.out, ".pressure.jsonl"))
+    overall, scores = score_against_trace(workload, started,
+                                          started + int(schedule.duration_s * 1e9), events,
+                                          monitor.Thresholds(**config["thresholds"]))
     benchlog.append("monitor-evaluation", model=entry["model"],
                     context_length=entry["context_length"],
                     precision_tiers=entry["precision_tiers"],
@@ -347,7 +367,6 @@ def rescore(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                       "per_cell_false_negatives_detectable": sum(
                           c["missed_detectable"] for c in scores["cells"])}))
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

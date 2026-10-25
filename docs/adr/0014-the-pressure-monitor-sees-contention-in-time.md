@@ -87,7 +87,9 @@ poll or a smaller K. The controller can count on a RED event within about
 ## Consequences
 
 - **The controller's budget.** ADR-0013's YELLOW margin assumed detection
-  within 200 ms, (K + 1) polls. Measured detection reaches 236 ms, which are also the spikes that take longest to fill the margin.
+  within 200 ms, (K + 1) polls. Measured detection reaches 236 ms, on a
+  sheer pulse, and 186 ms on the 0.25 s ramps, which are also the spikes
+  that take longest to fill the margin.
   The margin is the whole P90 amplitude either way (ADR-0013), so it does
   not move. Milestone 2's measured plan time is what may.
 - **What the evaluation does not cover:**
@@ -125,14 +127,14 @@ Detectable episodes last K + 1 polls and a sample: 120, 220 and 320 ms.
 
 - **K = 1 was faster on the grid and no less exact.**
   - It detected within one poll, a median of 28 ms.
-  - It caught the five episodes K = 3 misses by design.
+  - It caught the five episodes that are false negatives under K at K = 3.
   - It raised no false RED.
   - Its 11 episodes already RED were reported before the recorder's first
     sample below RED. The poll that saw RED fell between two of the
     recorder's samples, 20 ms apart, so the episode was caught with no
     latency to count, and the median leaves them out.
   - It reported 328 transitions where K = 3 reported 297.
-- **K = 5 was slower, and missed three episodes it could have caught.**
+- **K = 5 was slower, with three false negatives among the detectable.**
   - Detection took a median of 215 ms, at most 430 ms.
   - Its three false negatives were 340 ms episodes, from the 1408 MiB
     pulses with a 0.25 s ramp and a 0.2 s plateau.
@@ -148,6 +150,12 @@ Detectable episodes last K + 1 polls and a sample: 120, 220 and 320 ms.
   - The three grids were rescored from their files
     (`tools/evaluate_monitor.py rescore`). #64's per-cell scores, superseded
     and never reported, are left as logged.
+
+Regenerate with `tools/evaluate_monitor.py grid --out data/monitor/grid-k1.csv.gz
+--issue 159 --persist-polls 1`, the same at 3 and 5, then
+`tools/evaluate_monitor.py rescore` and `tools/summarise_monitor.py
+--hysteresis` (the rescore is needed only for entries scored before
+`pulse_starts`).
 
 ### Decision
 
