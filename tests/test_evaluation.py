@@ -1,18 +1,20 @@
-"""Evaluating the pressure monitor on synthetic and replayed contention, and
-the summary across both (#64, #65).
+"""Evaluating the pressure monitor on synthetic and replayed contention, the
+summary across both (#64, #65), and the grid at each K (#159).
 
 Ground truth is the recorder's trace with the monitor's thresholds applied,
 never the monitor's own events. Tested on traces and events written here,
 whose every episode is known, and on the grid's schedule.
 """
 
+from dataclasses import asdict, replace
+
 import numpy as np
 import pytest
 
-from conftest import each
-from microinfer import evaluation, patterns
+from conftest import each, load_tool
+from microinfer import benchlog, evaluation, patterns
 from microinfer.footprint import MIB
-from microinfer.monitor import GREEN, RED, YELLOW, PressureEvent, Thresholds
+from microinfer.monitor import DEFAULT, GREEN, RED, YELLOW, PressureEvent, Thresholds
 
 T = Thresholds(red_below_bytes=512 * MIB, yellow_below_bytes=1024 * MIB, persist_polls=3)
 MS = 1_000_000
@@ -128,23 +130,29 @@ def test_the_grid_schedule_takes_a_base_then_each_cell_in_turn_and_is_scored_per
     assert (second.episodes, second.missed_detectable, second.red_events) == (1, 1, 0)
 
 
+def entry(sha, workload, recording=None, latencies=(), missed=0, false=0, to_s=None,
+          persist_polls=DEFAULT.persist_polls):
+    """A monitor-evaluation entry, its thresholds ADR-0013's but for K."""
+    thresholds = asdict(replace(DEFAULT, persist_polls=persist_polls))
+    return {"sha256": sha, "kind": "monitor-evaluation", "git_commit": f"commit-{sha}",
+            "config": {"workload": workload, "recording": recording, "to_s": to_s,
+                       "thresholds": thresholds},
+            "results": {"overall": {"episodes": len(latencies) + missed,
+                                    "detectable": len(latencies) + missed,
+                                    "latencies_ms": list(latencies),
+                                    "latencies_polls": [x / 50 for x in latencies],
+                                    "missed_detectable": missed, "missed_below_k": 0,
+                                    "already_red": 0, "false_positives": false,
+                                    "red_events": len(latencies) + false}}}
+
+
 def test_the_summary_pools_the_latest_uncorrected_evaluation_of_each_workload():
     """Per workload, the latest entry of the grid and of each recording
     replayed whole that no correction supersedes: their episodes, false
     negatives and false positives summed, their latencies pooled. A
     correction that amends, and says it does not supersede, leaves it in; a
-    replay of part of a recording is not that recording's."""
-    def entry(sha, workload, recording=None, latencies=(), missed=0, false=0, to_s=None):
-        return {"sha256": sha, "kind": "monitor-evaluation",
-                "config": {"workload": workload, "recording": recording, "to_s": to_s},
-                "results": {"overall": {"episodes": len(latencies) + missed,
-                                        "detectable": len(latencies) + missed,
-                                        "latencies_ms": list(latencies),
-                                        "latencies_polls": [x / 50 for x in latencies],
-                                        "missed_detectable": missed, "missed_below_k": 0,
-                                        "already_red": 0, "false_positives": false,
-                                        "red_events": len(latencies) + false}}}
-
+    replay of part of a recording is not that recording's, and an evaluation
+    at another K than ADR-0013's is not the monitor's (#159)."""
     entries = [
         entry("a", "synthetic grid", latencies=[100], missed=1),
         {"kind": "correction", "results": {"corrects": ["a"]}},
@@ -154,6 +162,7 @@ def test_the_summary_pools_the_latest_uncorrected_evaluation_of_each_workload():
         entry("e", "replayed RQ1 recording", "r2.csv.gz", latencies=[90, 170]),
         {"kind": "correction", "results": {"corrects": ["b"], "supersedes": False}},
         entry("g", "replayed RQ1 recording", "r2.csv.gz", latencies=[5], to_s=60.0),
+        entry("h", "synthetic grid", latencies=[60], persist_polls=1),
         {"kind": "decode-throughput", "sha256": "f"},
     ]
     s = evaluation.summarise(entries)
@@ -162,3 +171,54 @@ def test_the_summary_pools_the_latest_uncorrected_evaluation_of_each_workload():
     assert replays["entries"] == ["d", "e"] and replays["episodes"] == 3
     assert replays["false_positives"] == 1
     assert replays["latency_ms"]["median"] == 150 and replays["latency_ms"]["max"] == 170
+
+
+def test_the_grid_at_each_k_is_its_latest_uncorrected_evaluation():
+    """Per K, the latest grid that no correction supersedes, whichever its
+    K, with its counts, latencies, entry and code (#159); no replay."""
+    entries = [
+        entry("a", "synthetic grid", latencies=[120, 200]),
+        entry("b", "synthetic grid", latencies=[60], false=2, persist_polls=1),
+        entry("c", "synthetic grid", latencies=[50, 70], false=3, persist_polls=1),
+        {"kind": "correction", "results": {"corrects": ["c"]}},
+        entry("d", "synthetic grid", latencies=[300], missed=1, persist_polls=5),
+        entry("e", "replayed RQ1 recording", "r1.csv.gz", latencies=[10], persist_polls=5),
+    ]
+    by_k = evaluation.grid_by_persist_polls(entries)
+    assert list(by_k) == [1, 3, 5]
+    assert (by_k[1]["entry"], by_k[1]["commit"], by_k[1]["false_positives"]) == \
+        ("b", "commit-b", 2)
+    assert by_k[3]["latency_ms"]["median"] == 160 and by_k[3]["episodes"] == 2
+    assert (by_k[5]["entry"], by_k[5]["missed_detectable"]) == ("d", 1)
+
+
+
+def test_the_tools_take_k_and_summarise_the_grid_at_each(tmp_path, monkeypatch, capsys):
+    """The evaluation refuses a K below one before it loads anything; the
+    summary of the grid at each K is logged and printed, one row a K, and
+    RQ2's summary leaves the other K out (#159)."""
+    evaluate, summarise = load_tool("evaluate_monitor"), load_tool("summarise_monitor")
+    with pytest.raises(SystemExit):
+        evaluate.main(["grid", "--out", str(tmp_path / "grid.csv.gz"), "--issue", "159",
+                       "--persist-polls", "0"])
+    log = tmp_path / "benchmark.jsonl"
+    real = benchlog.environment  # this test runs on a tree being changed
+    monkeypatch.setattr(summarise.benchlog, "environment",
+                        lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    log.write_text("")
+    with pytest.raises(SystemExit):  # nothing to summarise yet
+        summarise.main(["--issue", "159", "--hysteresis", "--log", str(log)])
+    for k, latencies in ((5, [300]), (1, [60, 80]), (3, [120])):
+        e = entry("-", "synthetic grid", latencies=latencies, persist_polls=k)
+        benchlog.append("monitor-evaluation", model="m", context_length=None,
+                        precision_tiers=None, config=e["config"], results=e["results"],
+                        log=log)
+    capsys.readouterr()
+    assert summarise.main(["--issue", "159", "--hysteresis", "--log", str(log)]) == 0
+    rows = [r for r in capsys.readouterr().out.splitlines() if r[:4] in ("| 1 ", "| 3 ", "| 5 ")]
+    assert [r[:3] for r in rows] == ["| 1", "| 3", "| 5"]
+    logged = list(benchlog.read(log))[-1]
+    assert logged["kind"] == "monitor-hysteresis-summary"
+    assert logged["results"]["1"]["episodes"] == 2
+    assert summarise.main(["--issue", "159", "--log", str(log)]) == 0
+    assert list(benchlog.read(log))[-1]["results"]["synthetic grid"]["episodes"] == 1

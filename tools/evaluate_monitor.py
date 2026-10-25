@@ -3,7 +3,7 @@
 
     .venv/bin/python tools/evaluate_monitor.py grid --out data/monitor/grid.csv.gz --issue 64
         [--amplitudes 768 1152 1408] [--ramps 0 0.25 1] [--plateaus 0.1 0.2 0.5 2]
-        [--repeats 3] [--gap 3] [--start-headroom 1536]
+        [--repeats 3] [--gap 3] [--start-headroom 1536] [--persist-polls 3]
     .venv/bin/python tools/evaluate_monitor.py replay --recording data/rq1/scenario-with-r1.csv.gz
         --out data/monitor/replay-with-r1.csv.gz --issue 65 [--from S] [--to S]
 
@@ -34,6 +34,16 @@ ADR-0013's K cannot be sure to catch them. The result is logged as a
 events among them (.pressure.jsonl), so that it can be scored again without
 running again.
 
+--persist-polls sets the monitor's K, ADR-0013's 3 by default, its
+thresholds left as they are; #159 runs the grid at K = 1, 3 and 5, each to
+an --out of its own, all three at the same code:
+
+    .venv/bin/python tools/evaluate_monitor.py grid --out data/monitor/grid-k1.csv.gz \
+        --issue 159 --persist-polls 1
+
+The summary for RQ2 takes ADR-0013's K alone; tools/summarise_monitor.py
+--hysteresis compares the grid at each.
+
 Close every application first: the desktop moves headroom too, and what it
 does counts against the monitor as if the simulator had done it. Refuses a
 dirty tree, and an --out that exists.
@@ -47,7 +57,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -157,6 +167,9 @@ def main(argv: list[str]) -> int:
         sub.add_argument("--decode-positions", type=int, default=64,
                          help="the span the hold decodes again and again")
         sub.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
+        sub.add_argument("--persist-polls", type=int, default=monitor.DEFAULT.persist_polls,
+                         help="K, the polls a new level must hold for (#159); ADR-0013's "
+                              "by default")
     grid_args.add_argument("--amplitudes", type=float, nargs="+", default=[768, 1152, 1408],
                            help="MiB above the base")
     grid_args.add_argument("--ramps", type=float, nargs="+", default=[0.0, 0.25, 1.0],
@@ -179,6 +192,8 @@ def main(argv: list[str]) -> int:
                              help="the same; its end if omitted, and only a replay to the "
                                   "end enters the summary")
     args = parser.parse_args(argv)
+    if args.persist_polls < 1:
+        parser.error(f"--persist-polls is at least 1; got {args.persist_polls}")
     if args.out.exists():
         parser.error(f"{args.out} exists; an evaluation does not overwrite a recording")
     args.out.parent.mkdir(parents=True, exist_ok=True)  # before minutes of loading
@@ -207,7 +222,8 @@ def main(argv: list[str]) -> int:
     holding = threading.Thread(
         target=lambda: engine.hold(prompt, context=context, stop=halt, report=report),
         name="hold")
-    watching = engine.start_monitor()
+    watching = engine.start_monitor(monitor.Monitor(
+        thresholds=replace(monitor.DEFAULT, persist_polls=args.persist_polls)))
     holding.start()
     try:
         while not full.wait(0.5):
