@@ -304,7 +304,10 @@ quantises from the shadow; to FP16 it restores the page bit for bit. Decoding
 the codes back up was rejected, since it would give FP16's size at the lower
 tier's error. A move of one page of one layer takes 8 to 39\,$\mu$s at the
 median on Qwen2.5-1.5B (Appendix~\ref{app:moves}), and the shadows of a whole
-32K cache take about 0.9\,GiB of host memory.
+32K cache take about 0.9\,GiB of host memory. The tier a cache is held at
+changes its decoding speed: at 32K positions a cache at INT8 decoded 13\%
+faster than at FP16, but one at INT4 34\% slower and one at INT2 55\% slower,
+one run each (Appendix~\ref{app:moves}).
 
 \subsection{The importance scorer}
 \label{sec:scorer}
@@ -472,7 +475,11 @@ catchable episodes at a median of 28\,ms with no false positive, and $K = 5$
 took a median of 215\,ms, with three false negatives among the catchable;
 $K = 3$, at which every controller result was measured, stays. The
 monitor costs decoding nothing measurable: $+0.17\%$ on Qwen2.5-0.5B and
-$-0.32\%$ on Qwen2.5-1.5B, both within twice their standard error.
+$-0.32\%$ on Qwen2.5-1.5B, both within twice their standard error. A later
+measurement over ten interleaved runs of each gave the monitor $+2.5\%$ and
+$-1.7\%$, and the monitor with the scorer $-0.6\%$ and $+0.2\%$, each within
+twice its standard error, about 3\%; a token's median latency moved by at most
+0.8\,ms and its P99 by at most 1.5\,ms.
 
 \subsection{RQ2: surviving pressure}
 \label{sec:survival}
@@ -751,7 +758,9 @@ INT2 & 150 & 2.63 & 11.541 \\
 
 \begin{table}[h]
 \caption{The time to move one page of one layer on Qwen2.5-1.5B, median of 256
-moves. Copying the shadow on a first downgrade adds about 7\,$\mu$s.}
+moves. Copying the shadow on a first downgrade takes about 7\,$\mu$s of the
+move. Below, decode throughput at 32K positions with the whole cache at each
+tier, one run of 32 steps each, the FP16 run from an earlier commit.}
 \label{tab:moves}
 \centering
 \small
@@ -762,7 +771,11 @@ Move & Median ($\mu$s) \\
 FP16 to INT8 / INT4 / INT2 & 13 / 19 / 30 \\
 The same, a first downgrade, copying the shadow & 23 / 29 / 39 \\
 INT8 to INT4 / INT2, from the shadow & 32 / 37 \\
+INT4 to INT8 / INT2, from the shadow & 21 / 37 \\
+INT2 to INT8 / INT4, from the shadow & 21 / 26 \\
 Any tier to FP16, from the shadow & 8 \\
+\midrule
+Decode at 32K, FP16 / INT8 / INT4 / INT2 (tokens/s) & 0.673 / 0.760 / 0.441 / 0.301 \\
 \bottomrule
 \end{tabular}
 \end{table}
