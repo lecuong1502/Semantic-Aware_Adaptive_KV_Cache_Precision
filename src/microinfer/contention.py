@@ -133,15 +133,15 @@ def spread(values: list[float]) -> dict | None:
     return None if p is None else {k: p[k] for k in ("median", "p90", "max")}
 
 
-def percentiles(values: list[float]) -> dict | None:
-    """P10, median, P90 and max, and how many values, or None if there are
-    none."""
+def percentiles(values: list[float], at: tuple[int, ...] = (10, 50, 90)) -> dict | None:
+    """The percentiles `at`, P10, median and P90 by default, the 50th named
+    the median, and the max and how many values; None if there are none."""
     if not values:
         return None
     a = np.array(values, dtype=float)
-    p10, median, p90 = np.percentile(a, [10, 50, 90])
-    return {"p10": float(p10), "median": float(median), "p90": float(p90),
-            "max": float(a.max()), "n": len(a)}
+    out = {"median" if q == 50 else f"p{q}": float(v)
+           for q, v in zip(at, np.percentile(a, list(at)))}
+    return {**out, "max": float(a.max()), "n": len(a)}
 
 
 def _ms(seconds: list[float | None]) -> dict | None:

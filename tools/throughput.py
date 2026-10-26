@@ -55,7 +55,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from microinfer import Engine, _microinfer, benchlog, monitor  # noqa: E402
 from microinfer.engine import DECODING  # noqa: E402
-from microinfer.contention import spread  # noqa: E402
+from microinfer.contention import percentiles, spread  # noqa: E402
 
 SEED = 15
 DECODE_STEPS = 32
@@ -91,16 +91,20 @@ def with_steps(engine: Engine, prompt: np.ndarray, report=None):
     return lambda: engine.generate(prompt, DECODE_STEPS + 1, stop_at_eos=False, report=report)
 
 
-def step_clock(steps: list[float], now=time.perf_counter):
-    """A report for generate that appends to `steps` each decoded token's
-    time: from the report before it, the last prefill chunk's for the first."""
+def step_clock(token_s: list[float], now=time.perf_counter):
+    """A report for generate that appends to `token_s` each decoded token's
+    time, from the report of the token before it. The first decoded token's
+    has none: the last prefill chunk's report comes before the prefill's own
+    greedy choice and the decoding workspace, which are not a step's."""
     last = None
 
     def report(phase: str, positions: int, token: int | None) -> None:
         nonlocal last
+        if phase != DECODING:
+            return
         t = now()
-        if phase == DECODING and last is not None:
-            steps.append(t - last)
+        if last is not None:
+            token_s.append(t - last)
         last = t
     return report
 
@@ -111,10 +115,11 @@ def decode_prompt(engine: Engine, ids: np.ndarray) -> np.ndarray:
     return ids[: min(len(ids), engine.config.max_position_embeddings - DECODE_STEPS)]
 
 
-def decode_rate(engine: Engine, prompt: np.ndarray, steps: list[float] | None = None) -> float:
+def decode_rate(engine: Engine, prompt: np.ndarray,
+                token_s: list[float] | None = None) -> float:
     """Decode tokens per second after `prompt`, from one timing of each;
-    each decoded token's time appended to `steps`, if given (step_clock)."""
-    report = None if steps is None else step_clock(steps)
+    each decoded token's time appended to `token_s`, if given (step_clock)."""
+    report = None if token_s is None else step_clock(token_s)
     decoding = seconds(with_steps(engine, prompt, report)) - seconds(first_token(engine, prompt))
     return DECODE_STEPS / max(decoding, 1e-9)
 
@@ -131,7 +136,7 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
     for _ in range(warmup):
         decode_rate(engine, prompt)
     rates: dict[bool, list[float]] = {False: [], True: []}
-    steps: dict[bool, list[float]] = {False: [], True: []}
+    token_s: dict[bool, list[float]] = {False: [], True: []}
     events, errors = 0, []
     for r in range(repeat):
         for on in ((False, True) if r % 2 == 0 else (True, False)):
@@ -139,7 +144,7 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
                 engine.start_monitor()
                 engine.kv_scoring = scorer
             try:
-                rates[on].append(decode_rate(engine, prompt, steps[on]))
+                rates[on].append(decode_rate(engine, prompt, token_s[on]))
             finally:
                 engine.stop_monitor()
                 engine.kv_scoring = False
@@ -161,18 +166,18 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
             "within_noise": abs(difference) <= noise,
             "events_recorded": events, "monitor_errors": errors,
             # Each decoded token's time, over every run of each side (#187).
-            "step_ms": {side: latency([t * 1e3 for t in steps[on]])
-                        for side, on in (("off", False), ("on", True))},
+            "token_ms": {"off": token_ms(token_s[False]), "on": token_ms(token_s[True])},
             # A transition also reads the own/others split: rare, and timed
             # here, since the runs above may see none.
             "split_read_ms": spread([seconds(monitor.nvml_split) * 1e3
                                      for _ in range(SPLIT_READS)])}
 
 
-def latency(values: list[float]) -> dict:
-    """The P50 and P99 of `values`, and how many there are."""
-    p50, p99 = np.percentile(values, [50, 99])
-    return {"p50": float(p50), "p99": float(p99), "n": len(values)}
+def token_ms(token_s: list[float]) -> dict:
+    """Decoded tokens' times in ms: the median, P99 and max, how many, and
+    every one, so that another percentile can be drawn later."""
+    ms = [t * 1e3 for t in token_s]
+    return {**percentiles(ms, at=(50, 99)), "runs": ms}
 
 
 def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
@@ -198,9 +203,9 @@ def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
           f"{what}, {results['on']['mean']:8.1f} with "
           f"({results['difference_percent']:+.2f}%, noise +-{results['noise']:.1f}): "
           f"{'within' if results['within_noise'] else 'OUTSIDE'} noise; a split read "
-          f"{results['split_read_ms']['median']:.2f} ms; a token P50/P99 "
-          + ", ".join(f"{side} {t['p50']:.1f}/{t['p99']:.1f} ms"
-                      for side, t in results["step_ms"].items()))
+          f"{results['split_read_ms']['median']:.2f} ms; a token's median/P99 "
+          + ", ".join(f"{side} {t['median']:.1f}/{t['p99']:.1f} ms"
+                      for side, t in results["token_ms"].items()))
     benchlog.append("monitor-scorer-overhead" if args.scorer else "monitor-overhead",
                     model=args.model,
                     context_length=len(prompt) + DECODE_STEPS, precision_tiers=tiers,
