@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import zlib
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
@@ -52,6 +54,14 @@ KIND = "page-damage"
 SUMMARY_KIND = "page-damage-summary"
 #: The bootstrap's seed: the summary repeats exactly.
 SEED = 188
+
+
+@contextmanager
+def _held(engine, **conversation):
+    """A conversation on `engine` set as every source condition holds its
+    cache until the plan (rq3.NO_PLAN)."""
+    with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation(**conversation) as chat:
+        yield chat
 
 
 @dataclass(frozen=True)
@@ -86,7 +96,7 @@ def anchor_point(engine, dialogue) -> PlanPoint:
 
 def continuation_point(engine, passage) -> PlanPoint:
     """A passage at the end of its warm tokens, its measured tokens after."""
-    with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation(for_snapshot=True) as chat:
+    with _held(engine, for_snapshot=True) as chat:
         chat.force(passage.prefix)
         chat.force(passage.warm, one_by_one=True)
         snapshot, positions = chat.snapshot(), chat.positions
@@ -96,10 +106,10 @@ def continuation_point(engine, passage) -> PlanPoint:
 def _answered(engine, opening, answer_tokens: int) -> PlanPoint:
     """The plan point after `opening(chat)`, which gives the question's
     prompt, and FP16's answer to it."""
-    with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation(for_snapshot=True) as chat:
+    with _held(engine, for_snapshot=True) as chat:
         question = opening(chat)
         snapshot, positions = chat.snapshot(), chat.positions
-    with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation(start=snapshot) as chat:
+    with _held(engine, start=snapshot) as chat:
         answer = chat.turn(question, answer_tokens)
     return PlanPoint(snapshot, positions, np.concatenate([question, answer[:-1]]),
                      len(answer), True)
@@ -131,9 +141,9 @@ def draw_pages(movable: np.ndarray, count: int, seed: int) -> tuple[np.ndarray, 
 def forced_logits(engine, point: PlanPoint, move: tuple[int, int] | None = None) -> np.ndarray:
     """The rows of logits compared, forced from the snapshot, with page
     `move`, (layer, page), moved to TIER first if given."""
-    with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation(start=point.snapshot) as chat:
+    with _held(engine, start=point.snapshot) as chat:
         if move is not None:
-            chat.move(*move, TIER)
+            chat.downgrade(*move, TIER)
         logits = chat.force(point.forced, logits=True, after_turn=point.after_turn)
     return logits[-point.measured:]
 
@@ -170,7 +180,7 @@ def run(engine, point: PlanPoint, count: int, seed: int) -> dict:
     hold, each pair's layer, page, score and damage, the sample's rho."""
     rq3.check_engine(engine)
     reference = Reference(forced_logits(engine, point))
-    with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation(start=point.snapshot) as chat:
+    with _held(engine, start=point.snapshot) as chat:
         scores, tiers = chat.scores(), chat.tiers()
     movable = drawable(scores, tiers, point.positions, _microinfer.device.page_tokens)
     layers, pages = draw_pages(movable, count, seed)
@@ -204,41 +214,51 @@ def spearman(x: Sequence[float], y: Sequence[float]) -> float | None:
     return None if norm == 0 else float((rx * ry).sum() / norm)
 
 
-def config(task: str, sample_id: str, count: int, seed: int, **more) -> dict:
-    """What a log entry's config names of a sample's run."""
-    return {"task": task, "sample_id": sample_id, "pages_per_sample": count,
-            "page_seed": seed, "tier": TIER,
-            "recency_floor": controller.DEFAULT_RECENCY_FLOOR, **more}
+class Draws(NamedTuple):
+    """What names one series of a task's runs: the task and model, the pairs
+    drawn a sample and their seed, and whether the set is the screened one."""
+
+    task: str
+    model: str
+    pages_per_sample: int = PAGES_PER_SAMPLE
+    page_seed: int = 0
+    screened: bool = True
+
+    def holds(self, entry: dict) -> bool:
+        """Whether a log entry is a sample's run of this series."""
+        c = entry["config"]
+        return (entry["kind"] == KIND and entry["model"] == self.model
+                and c["task"] == self.task and c["pages_per_sample"] == self.pages_per_sample
+                and c["page_seed"] == self.page_seed and c["screened"] == self.screened)
+
+    def config(self, sample_id: str, **more) -> dict:
+        """What a log entry's config names of a sample's run, but its model."""
+        return {"task": self.task, "sample_id": sample_id,
+                "pages_per_sample": self.pages_per_sample, "page_seed": self.page_seed,
+                "screened": self.screened, "tier": TIER,
+                "recency_floor": controller.DEFAULT_RECENCY_FLOOR, **more}
 
 
-def _of(entry: dict, task: str, model: str, count: int, seed: int) -> bool:
-    c = entry["config"]
-    return (entry["kind"] == KIND and entry["model"] == model and c["task"] == task
-            and c["pages_per_sample"] == count and c["page_seed"] == seed)
-
-
-def logged(task: str, model: str, count: int, seed: int, commit: str,
-           log: str | Path = benchlog.DEFAULT_LOG) -> set[str]:
-    """The samples of `task` logged for `model`, `count` pairs each drawn by
-    `seed`, at the code of `commit` (benchlog.same_code): a run of hours
-    stopped part way is taken up again from them."""
+def logged(of: Draws, commit: str, log: str | Path = benchlog.DEFAULT_LOG) -> set[str]:
+    """The samples of the series `of` logged at the code of `commit`
+    (benchlog.same_code): a run of hours stopped part way is taken up again
+    from them."""
     if not Path(log).exists():
         return set()
     held = benchlog.same_code_as(commit, log)
     return {e["config"]["sample_id"] for e in benchlog.read(log)
-            if _of(e, task, model, count, seed) and held(e["git_commit"])}
+            if of.holds(e) and held(e["git_commit"])}
 
 
-def summarise(entries: Sequence[dict], task: str, model: str, sample_ids: Sequence[str],
-              count: int = PAGES_PER_SAMPLE, seed: int = 0) -> dict:
-    """The page-damage summary of `task` over the samples `sample_ids`, the
-    latest entry of each: rho pooled over every pair and its mean per
-    sample, each with a 95% bootstrap interval over samples, as the module
-    describes; a ValueError naming the samples missing."""
-    latest = {e["config"]["sample_id"]: e for e in entries if _of(e, task, model, count, seed)}
+def summarise(entries: Sequence[dict], of: Draws, sample_ids: Sequence[str]) -> dict:
+    """The page-damage summary of the series `of` over the samples
+    `sample_ids`, the latest entry of each: rho pooled over every pair and
+    its mean per sample, each with a 95% bootstrap interval over samples, as
+    the module describes; a ValueError naming the samples missing."""
+    latest = {e["config"]["sample_id"]: e for e in entries if of.holds(e)}
     missing = [s for s in sample_ids if s not in latest]
     if missing:
-        raise ValueError(f"no {task} run of {len(missing)} of the {len(sample_ids)} samples, "
+        raise ValueError(f"no {of.task} run of {len(missing)} of the {len(sample_ids)} samples, "
                          f"such as {missing[:3]}; run tools/page_damage.py for them")
     runs = [latest[s]["results"] for s in sample_ids]
     per_sample = np.array([np.nan if r["rho"] is None else r["rho"] for r in runs])
@@ -255,9 +275,8 @@ def summarise(entries: Sequence[dict], task: str, model: str, sample_ids: Sequen
     def interval(values: np.ndarray) -> list[float]:
         return [float(v) for v in np.nanpercentile(values, [2.5, 97.5])]
 
-    return {"task": task, "model": model, "samples": len(runs),
-            "pairs": sum(len(r["kl"]) for r in runs), "pages_per_sample": count,
-            "page_seed": seed, "tier": TIER,
+    return {**of._asdict(), "samples": len(runs), "pairs": sum(len(r["kl"]) for r in runs),
+            "tier": TIER,
             "pooled_rho": pooled(range(len(runs))),
             "pooled_rho_bootstrap_95": interval(resampled_pooled),
             "mean_sample_rho": float(np.nanmean(per_sample)),

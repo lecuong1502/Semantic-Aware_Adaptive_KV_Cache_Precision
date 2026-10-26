@@ -389,6 +389,17 @@ conversation made for one, which keeps on the host what its cache stores,
 can take one, once, and only while every page is at FP16.
 _Avoid_: fork, clone (the two conversations share nothing), checkpoint
 
+**Plan point**:
+Where a task's controlled plan is applied (ADR-0017): a needle sample's end
+of turn 1, a passage's end of its warm tokens, an anchor-fact dialogue's end
+of its last turn. A page's damage is measured there (#188).
+
+**Page damage**:
+What downgrading one (layer, page) alone to INT4 at the plan point costs:
+the mean KL from FP16 over the measured positions, the answer FP16 gives or
+a passage's measured tokens (#188). Set against the page's importance score
+by Spearman's rho, it tests the policy's premise page by page.
+
 **Condition**:
 How an RQ3 run holds its cache (ADR-0017, #147): FP16; a score source at a
 level, a controlled plan from semantic, uniform or random scores for 70% or

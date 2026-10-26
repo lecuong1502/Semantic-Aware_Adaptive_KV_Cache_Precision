@@ -68,9 +68,10 @@ def test_pages_are_drawn_from_those_a_plan_may_move_that_were_scored():
     assert len(every[0]) == int(movable.sum())
 
 
-def logged_sample(log, sample_id, scores, kl, task="needle"):
+def logged_sample(log, sample_id, scores, kl, task="needle", screened=True):
+    of = page_damage.Draws(task, "m", screened=screened)
     benchlog.append(page_damage.KIND, model="m", context_length=None, precision_tiers=None,
-                    config=page_damage.config(task, sample_id, 64, 0),
+                    config=of.config(sample_id),
                     results={"scores": scores, "kl": kl,
                              "rho": page_damage.spearman(scores, kl)},
                     log=log)
@@ -82,7 +83,9 @@ def test_the_summary_gives_rho_pooled_and_per_sample_with_intervals(tmp_path):
     logged_sample(log, "b", [5, 6, 7, 8], [8, 7, 6, 5])
     logged_sample(log, "c", [1, 2, 3, 4], [1, 3, 2, 4])
     logged_sample(log, "c", [1, 2, 3, 4], [9, 9, 9, 9], task="anchor")  # another task's
-    s = page_damage.summarise(benchlog.read(log), "needle", "m", ["a", "b", "c"])
+    logged_sample(log, "b", [1, 2, 3, 4], [9, 9, 9, 9], screened=False)  # a check's
+    needle = page_damage.Draws("needle", "m")
+    s = page_damage.summarise(benchlog.read(log), needle, ["a", "b", "c"])
     assert s["samples"] == 3 and s["pairs"] == 12
     assert s["mean_sample_rho"] == pytest.approx((1 - 1 + 0.8) / 3)
     scores = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4]
@@ -94,9 +97,14 @@ def test_the_summary_gives_rho_pooled_and_per_sample_with_intervals(tmp_path):
     assert s["positive_samples"] == 2
     assert len(s["entries"]) == 3
     with pytest.raises(ValueError, match="d"):
-        page_damage.summarise(benchlog.read(log), "needle", "m", ["a", "d"])
+        page_damage.summarise(benchlog.read(log), needle, ["a", "d"])
+    commit = benchlog.read(log)[0]["git_commit"]
+    assert page_damage.logged(needle, commit, log) == {"a", "b", "c"}
+    assert page_damage.logged(needle._replace(screened=False), commit, log) == {"b"}
+    assert page_damage.logged(needle, "another commit", log) == set()
 
 
+@pytest.mark.slow
 def test_a_page_moved_down_and_back_gives_the_logits_of_a_cache_never_moved(engine):
     """Moved to INT4 and back to FP16 from its shadow, a page is its bytes
     before, and the next forward pass's logits are those of a cache never
@@ -106,23 +114,35 @@ def test_a_page_moved_down_and_back_gives_the_logits_of_a_cache_never_moved(engi
         snapshot = chat.snapshot()
     question = prompt(20, 2)
 
-    def forced(*moves):
+    def forced(back: bool | None):
         with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation(start=snapshot) as chat:
-            for layer, page, tier in moves:
-                chat.move(layer, page, tier)
+            if back is not None:
+                chat.downgrade(3, 2, "INT4")
+            if back:
+                chat.upgrade(3, 2)
             return chat.force(question, logits=True, after_turn=True)
 
-    never = forced()
+    never = forced(None)
     assert never.shape[0] == len(question) + 1  # the token turn 1 chose last, first
-    assert np.array_equal(forced((3, 2, "INT4"), (3, 2, "FP16")), never)
-    assert not np.array_equal(forced((3, 2, "INT4")), never)
+    assert np.array_equal(forced(True), never)
+    assert not np.array_equal(forced(False), never)
 
 
-def test_a_page_already_at_a_tier_is_not_moved_there(engine):
+@pytest.mark.slow
+def test_a_page_moves_only_the_way_it_is_named(engine):
+    """A downgrade goes down, an upgrade up, and forcing after a turn needs
+    one to have left its last token."""
     with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation() as chat:
-        chat.turn(prompt(300, 1), 4)
-        with pytest.raises(ValueError, match="already"):
-            chat.move(0, 0, "FP16")
+        chat.force(prompt(300, 1))
+        with pytest.raises(RuntimeError, match="no turn"):
+            chat.force(prompt(4, 2), after_turn=True)
+        with pytest.raises(ValueError, match="no such move"):
+            chat.downgrade(0, 0, "FP16")
+        with pytest.raises(ValueError, match="no such move"):
+            chat.upgrade(0, 0)
+        chat.downgrade(0, 0, "INT4")
+        with pytest.raises(ValueError, match="no such move"):
+            chat.downgrade(0, 0, "INT8")
 
 
 @pytest.mark.slowest

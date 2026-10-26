@@ -567,6 +567,9 @@ class Conversation:
         if len(self._unfed) and not after_turn:
             raise RuntimeError("forcing feeds only the tokens it is given; after a turn, the "
                                "token the turn chose last waits to be fed first")
+        if after_turn and not len(self._unfed):
+            raise RuntimeError("forcing after a turn feeds the token it chose last first; "
+                               "no turn has left one")
         engine = self._engine
         ids = np.concatenate([self._unfed, engine._check_ids(ids)])
         engine._check_window(self._cache.length + len(ids))
@@ -592,19 +595,28 @@ class Conversation:
         self._unfed = np.empty(0, dtype=np.int32)
         return None if out is None else np.concatenate(out)
 
-    def move(self, layer: int, page: int, tier: str) -> None:
-        """Move one page of positions of `layer` to `tier`, between turns
-        (#188): down, quantised from FP16, the page's or its shadow's
-        (KVPages.downgrade), or up, from its shadow, to FP16 exactly its
-        bytes before its first downgrade (KVPages.upgrade). No plan is
-        made or recorded. The same engine and cache as `plan` needs, and
-        a sealed page."""
+    def downgrade(self, layer: int, page: int, tier: str) -> None:
+        """Downgrade one page of positions of `layer` to the lower `tier`,
+        between turns (#188), quantised from FP16, the page's or its
+        shadow's (KVPages.downgrade). No plan is made or recorded. The same
+        engine and cache as `plan` needs, and a sealed page."""
+        self._move(layer, page, tier, lower=True)
+
+    def upgrade(self, layer: int, page: int, tier: str = "FP16") -> None:
+        """Upgrade one downgraded page of positions of `layer` to the higher
+        `tier`, between turns (#188), from its shadow: to FP16, exactly its
+        bytes before its first downgrade (KVPages.upgrade). As `downgrade`."""
+        self._move(layer, page, tier, lower=False)
+
+    def _move(self, layer: int, page: int, tier: str, *, lower: bool) -> None:
         self._controlled("uniform")  # a source that reads no scores
         pages = self._cache.pages
+        at = int(pages.page_tier(layer, page))
         target = controller.TIERS.index(tier)
-        if target == int(pages.page_tier(layer, page)):
-            raise ValueError(f"page {page} of layer {layer} is at {tier} already")
-        move = pages.downgrade if target > int(pages.page_tier(layer, page)) else pages.upgrade
+        if (target > at) != lower or target == at:
+            raise ValueError(f"page {page} of layer {layer} is at {controller.TIERS[at]}: "
+                             f"{'downgrade' if lower else 'upgrade'} to {tier} is no such move")
+        move = pages.downgrade if lower else pages.upgrade
         move(layer, page, getattr(_microinfer.Tier, tier))
 
     def plan(self, share: float, *, source: str = "semantic", seed: int = 0) -> PlanRecord:

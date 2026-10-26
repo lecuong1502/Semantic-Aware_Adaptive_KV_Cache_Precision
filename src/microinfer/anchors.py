@@ -201,9 +201,10 @@ class _Opened:
 
 
 def before_plan(engine, chat, dialogue: Dialogue) -> _Opened:
-    """What a run holds before its plan, on `chat`: every turn, each after the last one's reply. A prompt starts where
-    the last one's tokens and reply end: the reply's last token, not yet
-    fed, takes the position before it."""
+    """What a run holds before its plan, on `chat`: every turn, each after
+    the last one's reply. A prompt starts where the last one's tokens and
+    reply end: the reply's last token, not yet fed, takes the position
+    before it."""
     end_of_turn = engine.tokenizer.token_to_id(rq3.END_OF_TURN)
     replies, stopped, position, fact = [], [], 0, None
 
