@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from conftest import load_tool
 from microinfer import benchlog, contention, recorder, spikes
 from microinfer.contention import Unnamed
 
@@ -196,3 +197,59 @@ def test_a_recording_is_logged_with_every_spike_and_the_sha256_of_its_files(tmp_
     assert result.returncode == 1
     assert f"MISMATCH  {scenario_log}" in result.stdout
     assert f"UNLOGGED  {unlogged}" in result.stdout and f"ok        {path}" in result.stdout
+
+
+def logged_spikes(sha: str, *spikes_: tuple[str, float, float | None, float]) -> dict:
+    """A "contention-trace" entry of its spikes: ending, amplitude in MiB,
+    rise and duration in ms."""
+    return {"sha256": sha, "config": {"trace": f"{sha}.csv.gz", "files": {f"{sha}.csv.gz": sha}},
+            "results": {"spikes": [
+                {"ending": e, "amplitude_mib": a, "rise_ms": r, "duration_ms": d,
+                 "process": None if a < 100 else "chrome"} for e, a, r, d in spikes_]}}
+
+
+def test_rq1s_spikes_are_pooled_over_its_recordings_by_percentile():
+    """Every spike of every recording, censored ones aside: their amplitude
+    and rise at P10, median, P90 and max, the duration of the recovered,
+    the endings, and how many name a process; each recording by its
+    entry's hash and its trace's."""
+    entries = [logged_spikes("aa", ("lasting", 50, 100, 5000), ("recovered", 150, 200, 300)),
+               logged_spikes("bb", ("lasting", 250, None, 5000), ("recovered", 350, 400, 700),
+                             ("censored", 1000, 50, 10))]
+    pooled = contention.pooled(entries)
+    assert pooled["count"] == 4
+    assert pooled["endings"] == {"recovered": 2, "lasting": 2, "censored": 1}
+    assert pooled["amplitude_mib"] == {"p10": pytest.approx(80), "median": 200, "p90": 320,
+                                       "max": 350, "n": 4}
+    assert pooled["rise_ms"]["median"] == 200 and pooled["rise_ms"]["n"] == 3
+    assert pooled["duration_ms"] == {"p10": pytest.approx(340), "median": 500,
+                                     "p90": pytest.approx(660), "max": 700, "n": 2}
+    assert pooled["attributed"] == 3
+    assert pooled["recordings"] == [{"entry": "aa", "trace": "aa.csv.gz", "sha256": "aa"},
+                                    {"entry": "bb", "trace": "bb.csv.gz", "sha256": "bb"}]
+
+
+def test_the_summary_tool_logs_the_pooled_spikes_and_the_host(tmp_path, monkeypatch, capsys):
+    """Over the logged RQ1 recordings, one "contention-summary" entry with the
+    pooled spikes and the host, the CPU, memory and CUDA toolkit; refused on
+    a log with no recording."""
+    tool = load_tool("summarise_contention")
+    real = benchlog.environment  # this test runs on a tree being changed
+    monkeypatch.setattr(tool.benchlog, "environment",
+                        lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    log = tmp_path / "benchmark.jsonl"
+    benchlog.append("smoke", model=None, context_length=None, precision_tiers=None,
+                    config={}, results={}, log=log)
+    with pytest.raises(SystemExit):
+        tool.main(["--issue", "186", "--log", str(log)])
+    entry = logged_spikes("aa", ("lasting", 50, 100, 5000), ("recovered", 150, 200, 300))
+    benchlog.append("contention-trace", model=None, context_length=None, precision_tiers=None,
+                    config={"issue": 56, **entry["config"]}, results=entry["results"], log=log)
+    assert tool.main(["--issue", "186", "--log", str(log)]) == 0
+    summary = benchlog.read(log)[-1]
+    assert summary["kind"] == "contention-summary"
+    assert summary["results"]["spikes"]["count"] == 2
+    machine = summary["results"]["host"]
+    assert machine["cpu"] and machine["threads"] >= machine["cores"] >= 1
+    assert machine["memory_bytes"] > 2**30
+    assert "Duration, recovered spikes" in capsys.readouterr().out

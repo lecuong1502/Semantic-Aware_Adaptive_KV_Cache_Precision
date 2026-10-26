@@ -21,6 +21,8 @@ A recording's spikes (spikes.py) become RQ1's results here:
   with every spike and its attribution, and the sha256 of each of the
   recording's files, so that a published trace can be matched to the
   statistics drawn from it.
+- **RQ1 pooled.** pooled gives every recording's spikes together, as the
+  thesis reports RQ1: P10, median, P90 and max (#186).
 
 This is measurement, not inference, so it computes in NumPy on the host
 (ADR-0002, amendment on its scope).
@@ -236,6 +238,39 @@ def logged_recordings(log: str | Path = benchlog.DEFAULT_LOG, issues=RQ1_ISSUES)
     for entry in benchlog.read(log):
         if entry["kind"] == "contention-trace" and entry["config"].get("issue") in issues:
             yield entry
+
+
+def percentiles(values: list[float]) -> dict | None:
+    """P10, median, P90 and max, and how many values, or None if there are
+    none."""
+    if not values:
+        return None
+    a = np.array(values, dtype=float)
+    p10, median, p90 = np.percentile(a, [10, 50, 90])
+    return {"p10": float(p10), "median": float(median), "p90": float(p90),
+            "max": float(a.max()), "n": len(a)}
+
+
+def pooled(entries) -> dict:
+    """The spikes of every recording in `entries`, "contention-trace"
+    entries, pooled as RQ1 reports them: censored spikes counted among the
+    endings but left out of the rest; amplitude and rise time over every
+    other spike, rises not measured left out; duration over the recovered;
+    how many name a process; and each recording, by its entry's hash and
+    its trace's (#186)."""
+    entries = list(entries)
+    found = [s for e in entries for s in e["results"]["spikes"]]
+    endings = {e: sum(s["ending"] == e for s in found) for e in get_args(spikes.Ending)}
+    kept = [s for s in found if s["ending"] != "censored"]
+    return {"count": len(kept), "endings": endings,
+            "amplitude_mib": percentiles([s["amplitude_mib"] for s in kept]),
+            "rise_ms": percentiles([s["rise_ms"] for s in kept if s["rise_ms"] is not None]),
+            "duration_ms": percentiles([s["duration_ms"] for s in kept
+                                        if s["ending"] == "recovered"]),
+            "attributed": sum(s["process"] is not None for s in kept),
+            "recordings": [{"entry": e["sha256"], "trace": e["config"]["trace"],
+                            "sha256": e["config"]["files"][e["config"]["trace"]]}
+                           for e in entries]}
 
 
 def log_recording(path: str | Path, *, issue: int, log: str | Path = benchlog.DEFAULT_LOG,
