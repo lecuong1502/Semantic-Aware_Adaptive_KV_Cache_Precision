@@ -542,14 +542,17 @@ class Conversation:
             self._unfed = ending.tokens[-1:]
         return engine._end(ending)
 
-    def force(self, ids, *, one_by_one: bool = False, logits: bool = False) -> np.ndarray | None:
+    def force(self, ids, *, one_by_one: bool = False, logits: bool = False,
+              after_turn: bool = False) -> np.ndarray | None:
         """Teacher-force `ids`, token ids, into the cache (#153): the tokens
         given, not those the model would choose, after what it holds. At
         once, in prefill chunks, or `one_by_one`, a position a step, so
         that the scorer folds each in as it does a decoded token. With
         `logits`, the fp32 logits after each position, (len(ids), vocab);
         else None. Refused after a turn, whose last chosen token waits to be
-        fed first; a turn after forcing appends its prompt to what was
+        fed first, unless `after_turn`: that token is then forced first, as
+        the next turn would feed it, and has a row of logits of its own
+        (#188). A turn after forcing appends its prompt to what was
         forced. Each step allocates as a decode step does, an adaptive
         engine answering a failure with an emergency plan; one that still
         fails ends the conversation and raises ForcingExhausted. No monitor
@@ -561,11 +564,14 @@ class Conversation:
         if self._engine._monitor is not None:
             raise ValueError("forcing drains no monitor's events: one running would go "
                              "unheard, or plan against the tokens being forced")
-        if len(self._unfed):
+        if len(self._unfed) and not after_turn:
             raise RuntimeError("forcing feeds only the tokens it is given; after a turn, the "
                                "token the turn chose last waits to be fed first")
+        if after_turn and not len(self._unfed):
+            raise RuntimeError("forcing after a turn feeds the token it chose last first; "
+                               "no turn has left one")
         engine = self._engine
-        ids = engine._check_ids(ids)
+        ids = np.concatenate([self._unfed, engine._check_ids(ids)])
         engine._check_window(self._cache.length + len(ids))
         out = [] if logits else None
         try:
@@ -586,7 +592,32 @@ class Conversation:
         except BaseException as exc:
             self.close(f"forcing raised {type(exc).__name__}")
             raise
+        self._unfed = np.empty(0, dtype=np.int32)
         return None if out is None else np.concatenate(out)
+
+    def downgrade(self, layer: int, page: int, tier: str) -> None:
+        """Downgrade one page of positions of `layer` to the lower `tier`,
+        between turns (#188), quantised from FP16, the page's or its
+        shadow's (KVPages.downgrade). No plan is made or recorded. The same
+        engine and cache as `plan` needs, and a sealed page."""
+        self._move(layer, page, tier, lower=True)
+
+    def upgrade(self, layer: int, page: int, tier: str = "FP16") -> None:
+        """Upgrade one downgraded page of positions of `layer` to the higher
+        `tier`, between turns (#188), from its shadow: to FP16, exactly its
+        bytes before its first downgrade (KVPages.upgrade). As `downgrade`."""
+        self._move(layer, page, tier, lower=False)
+
+    def _move(self, layer: int, page: int, tier: str, *, lower: bool) -> None:
+        self._controlled("uniform")  # a source that reads no scores
+        pages = self._cache.pages
+        at = int(pages.page_tier(layer, page))
+        target = controller.TIERS.index(tier)
+        if (target > at) != lower or target == at:
+            raise ValueError(f"page {page} of layer {layer} is at {controller.TIERS[at]}: "
+                             f"{'downgrade' if lower else 'upgrade'} to {tier} is no such move")
+        move = pages.downgrade if lower else pages.upgrade
+        move(layer, page, getattr(_microinfer.Tier, tier))
 
     def plan(self, share: float, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
         """Apply a controlled plan between turns (#142, ADR-0017): reclaim

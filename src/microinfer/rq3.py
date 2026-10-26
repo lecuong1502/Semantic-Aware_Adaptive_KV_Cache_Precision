@@ -263,7 +263,7 @@ def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
     _check(engine, experiment)
     seed = sample_seed(sample.sample_id, plan_seed)
     with set_for(engine, cond), engine.conversation() as chat:
-        opened = _open(engine, chat, sample, experiment)
+        opened = before_plan(engine, chat, sample, experiment)
         return _close(engine, chat, sample, cond, experiment, seed, opened, then)
 
 
@@ -278,7 +278,7 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     _check(engine, experiment)
     seed = sample_seed(sample.sample_id, plan_seed)
     yield from from_one_opening(
-        engine, conds, lambda chat: _open(engine, chat, sample, experiment),
+        engine, conds, lambda chat: before_plan(engine, chat, sample, experiment),
         lambda chat, cond, opened: _close(engine, chat, sample, cond, experiment, seed, opened,
                                           then),
         lambda cond: run(engine, sample, cond, experiment, plan_seed=plan_seed, then=then))
@@ -328,7 +328,9 @@ class _Opened:
     opening: str | None
 
 
-def _open(engine, chat, sample: needles.Sample, experiment: str) -> _Opened:
+def before_plan(engine, chat, sample: needles.Sample, experiment: str) -> _Opened:
+    """Turn 1, and question-aware the answer's first tokens: what a run
+    holds before its plan, on `chat`."""
     end_of_turn = engine.tokenizer.token_to_id(END_OF_TURN)
     summary = chat.turn(sample.turn_1, SUMMARY_TOKENS)
     stopped = int(summary[-1]) == end_of_turn

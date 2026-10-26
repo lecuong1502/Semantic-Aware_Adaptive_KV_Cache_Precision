@@ -233,3 +233,39 @@ length to separate them. It kept the output distribution closer to FP16,
 where the measure is graded. The thesis's premise was tested by these
 outcomes only. The correlation between a page's score and the damage its
 downgrade causes, by single-page downgrades, was not measured.
+
+## Amendment (#188): a page's score against its own downgrade's damage
+
+The premise behind RQ3 is tested page by page, on all three tasks
+(`microinfer.page_damage`, `tools/page_damage.py`).
+
+- **Where.** Each task's plan point, where its controlled plan would be
+  applied: the needle at the end of turn 1, question-blind; continuation at
+  the end of the warm tokens; the anchor-fact dialogue at the end of its
+  last turn. The cache is held there as every source condition holds it,
+  at FP16, adaptive and scoring.
+- **Which pages.** For each sample, 64 (layer, page) pairs drawn without
+  replacement, from a seed and the sample's id, among the pages a plan may
+  move, outside the recency floor, that the scorer has observed. A page's
+  score is the scorer's EWMA there. The samples are RQ3's: the screened
+  needle set, the screened anchor-fact set and the first 50 passages.
+- **The damage.** The page alone is moved to INT4, and the measured tokens
+  are teacher-forced: for the needle and the dialogue, the question and the
+  answer FP16 gives to it from the plan point, the KL over the positions
+  that predict the answer's tokens; for continuation, its 128 measured
+  tokens. The damage is the mean over those positions of KL(FP16 || INT4),
+  in float64, against the same tokens forced with no page moved.
+- **Each page from the plan point.** Every pair starts a conversation from
+  the plan point's snapshot, so that no pair's move, nor the tokens forced
+  after it, reaches another's. The forced tokens are what would have to be
+  undone: the cache cannot be cut back, so the page is not moved back and
+  the conversation is dropped instead. A page moved down and back from its
+  shadow gives the next forward pass's logits of a cache never moved, to
+  the bit (`tests/test_page_damage.py`).
+- **Forced in prefill chunks**, not a position a step as continuation
+  fidelity forces its measured tokens. The reference is forced the same
+  way, so the damage is the move's alone.
+- **The statistic.** Spearman's rho between score and damage, per task,
+  pooled over every sample's pairs and per sample, their mean, each with a
+  95% bootstrap interval over samples, since a sample's pages share its
+  text and its answer.
