@@ -152,12 +152,14 @@ def _pool(entries: Sequence[dict], model: str, needle_seed: int, haystack_tokens
 
 def _accuracy(runs: list[dict], right: np.ndarray, interval: np.ndarray,
               rng: np.random.Generator) -> dict:
-    """One condition's accuracy, overall and at each depth, its effective
-    bits and its needle's pages' tiers."""
+    """One condition's accuracy, overall and at each depth the runs hold, its
+    effective bits and its needle's pages' tiers."""
     depths = np.array([e["config"]["depth"] for e in runs])
     by_depth = {}
     for depth in needles.DEPTHS:
         at = right[np.isclose(depths, depth)]
+        if not len(at):
+            continue
         by_depth[_depth_name(depth)] = {
             "correct": int(at.sum()), "n": len(at),
             "accuracy": float(at.mean()),
@@ -437,7 +439,9 @@ def summarise_evictions(entries: Sequence[dict], model: str, needle_seed: int,
                         haystack_tokens: int, *, plan_seed: int = 0) -> dict:
     """Eviction on the screened needle set (#160), question-blind, against
     the semantic source at each level (evictions): the latest run of each
-    sample under each. A ValueError names what is missing."""
+    sample under each, with each condition's accuracy by depth and where its
+    needles' pages were held, or whether they were evicted. A ValueError
+    names what is missing."""
     screening = rq3.last_screening(entries, model, needle_seed, haystack_tokens)
     kept = screening["results"]["kept"]
     latest = _pool(entries, model, needle_seed, haystack_tokens, plan_seed, kept)
@@ -448,11 +452,18 @@ def summarise_evictions(entries: Sequence[dict], model: str, needle_seed: int,
                          f"{missing[:3]}; run tools/rq3.py --evictions for them")
     runs = {name: [latest[(s, CLOSING_EXPERIMENT, name)] for s in kept]
             for name in EVICTION_NAMES}
+    rng = np.random.default_rng(SEED)
+    levels = evictions(runs, rng)
+    accuracy = {}
+    for name in EVICTION_NAMES:
+        right = np.array([e["results"]["correct"] for e in runs[name]])
+        accuracy[name] = _accuracy(runs[name], right, bootstrap(right[None, :], rng)[0], rng)
     return {"model": model, "needle_seed": needle_seed, "haystack_tokens": haystack_tokens,
             "plan_seed": plan_seed, "experiment": CLOSING_EXPERIMENT,
             "samples": len(kept), "significance": SIGNIFICANCE,
-            "bootstrap": {"resamples": RESAMPLES, "seed": SEED},
-            "levels": evictions(runs, np.random.default_rng(SEED)),
+            "bootstrap": {"resamples": RESAMPLES, "seed": SEED}, "levels": levels,
+            "by_depth": {name: a["by_depth"] for name, a in accuracy.items()},
+            "needle_page_tiers": {name: a["needle_page_tiers"] for name, a in accuracy.items()},
             "screening": screening["sha256"],
             "entries": [e["sha256"] for name in EVICTION_NAMES for e in runs[name]]}
 

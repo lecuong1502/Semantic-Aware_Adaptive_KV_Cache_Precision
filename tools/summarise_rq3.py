@@ -26,7 +26,7 @@ McNemar's test and its effective bits.
 With --evictions, eviction at each level instead (#160,
 rq3_summary.summarise_evictions), logged as an "rq3-eviction-summary"
 entry: eviction against the semantic source at each level, by McNemar's
-test, at the same bytes.
+test, at the same bytes, and each condition by depth.
 
     .venv/bin/python tools/summarise_rq3.py --issue 160 --evictions
 """
@@ -192,6 +192,12 @@ def eviction_summary(parser: argparse.ArgumentParser, args: argparse.Namespace) 
                     results=summary, log=args.log)
     print(f"\n### Eviction on the needle set, {summary['experiment']}\n")
     print(rq3_summary.eviction_table(summary["levels"]))
+    depths = list(next(iter(summary["by_depth"].values())))
+    print()
+    table(["Condition", *depths, "Needle pages evicted"],
+          [[name, *(f"{d['correct']}/{d['n']}" for d in by_depth.values()),
+            f"{summary['needle_page_tiers'][name].get(benchlog.EVICTED, 0):.0%}"]
+           for name, by_depth in summary["by_depth"].items()])
     return 0
 
 
