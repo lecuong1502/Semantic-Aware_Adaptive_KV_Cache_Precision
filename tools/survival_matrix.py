@@ -44,21 +44,21 @@ from microinfer import benchlog, survival_matrix as matrix  # noqa: E402
 EXPERIMENT = REPO / "tools" / "survival_experiment.py"
 
 
-def out_for(out_dir: Path, cell: matrix.Cell) -> Path:
-    """The cell's recording, numbered past any a run stopped part way left."""
-    path, k = out_dir / f"{cell.name}.csv.gz", 2
+def out_for(out_dir: Path, run: matrix.MatrixRun) -> Path:
+    """The run's recording, numbered past any a run stopped part way left."""
+    path, k = out_dir / f"{run.name}.csv.gz", 2
     while path.exists():
-        path, k = out_dir / f"{cell.name}.{k}.csv.gz", k + 1
+        path, k = out_dir / f"{run.name}.{k}.csv.gz", k + 1
     return path
 
 
-def command(cell: matrix.Cell, out: Path, args: argparse.Namespace) -> list[str]:
+def command(run: matrix.MatrixRun, out: Path, args: argparse.Namespace) -> list[str]:
     """The survival experiment's command for one run of the matrix."""
-    condition = matrix.CONDITIONS[cell.condition]
+    condition = matrix.CONDITIONS[run.condition]
     engine = (["adaptive", "--score-source", condition.score_source] if condition.adaptive
               else ["static", "--kv-tier", condition.kv_tier])
-    return [sys.executable, str(EXPERIMENT), *engine, "--scenario", cell.scenario,
-            "--run", str(cell.run), "--out", str(out), "--issue", str(args.issue),
+    return [sys.executable, str(EXPERIMENT), *engine, "--scenario", run.scenario,
+            "--run", str(run.run), "--out", str(out), "--issue", str(args.issue),
             "--model", args.model, "--log", str(args.log)]
 
 
@@ -67,7 +67,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--issue", type=int, required=True)
     parser.add_argument("--model", default="qwen2.5-1.5b-instruct")
     parser.add_argument("--runs", type=int, default=matrix.RUNS)
-    parser.add_argument("--scenarios", nargs="+", choices=matrix.SCENARIOS,
+    parser.add_argument("--scenarios", nargs="+", choices=matrix.EVERY_SCENARIO,
                         default=list(matrix.SCHEDULED))
     parser.add_argument("--conditions", nargs="+", choices=list(matrix.CONDITIONS),
                         default=list(matrix.CONDITIONS))
@@ -83,22 +83,22 @@ def main(argv: list[str]) -> int:
         parser.error("tracked files have uncommitted changes; commit first, so that each "
                      "entry names the code that produced it")
 
-    cells = matrix.cells(args.conditions, args.scenarios, args.runs)
+    every = matrix.runs(args.conditions, args.scenarios, args.runs)
     done = matrix.logged(environment["git_commit"], args.model, args.log)
-    todo = [c for c in cells if c not in done]
-    print(f"{len(cells) - len(todo)} of {len(cells)} runs logged at this code already; "
+    todo = [run for run in every if run not in done]
+    print(f"{len(every) - len(todo)} of {len(every)} runs logged at this code already; "
           f"{len(todo)} to run", flush=True)
     if args.dry_run:
-        for cell in todo:
-            print(" ".join(command(cell, out_for(args.out_dir, cell), args)))
+        for run in todo:
+            print(" ".join(command(run, out_for(args.out_dir, run), args)))
         return 0
     start = time.perf_counter()
-    for i, cell in enumerate(todo, 1):
-        cmd = command(cell, out_for(args.out_dir, cell), args)
-        print(f"\n{i}/{len(todo)} {cell.name}  ({(time.perf_counter() - start) / 3600:.1f} h)",
+    for i, run in enumerate(todo, 1):
+        cmd = command(run, out_for(args.out_dir, run), args)
+        print(f"\n{i}/{len(todo)} {run.name}  ({(time.perf_counter() - start) / 3600:.1f} h)",
               flush=True)
         if subprocess.run(cmd, cwd=REPO).returncode != 0:
-            print(f"{cell.name} failed; the matrix stops here:\n  {' '.join(cmd)}",
+            print(f"{run.name} failed; the matrix stops here:\n  {' '.join(cmd)}",
                   file=sys.stderr)
             return 1
     print(f"\nthe matrix is logged ({(time.perf_counter() - start) / 3600:.1f} h)")

@@ -289,18 +289,18 @@ def from_rq1(kind: str = "spikes", action: str | None = None,
         return Empirical(values) if values else Fixed(0.0)
 
     amplitudes = measured(s["amplitude_mib"] * MiB for s, _ in chosen)
-    rises = [_ramp(s.get("rise_ms")) for s, _ in chosen]
+    rises = [ramp_s(s.get("rise_ms")) for s, _ in chosen]
     rate = len(chosen) / seconds
     if kind == "drops":
         return ShapeParameters(rate, amplitudes, measured(rises), kept_s, Fixed(0.0))
 
-    falls = [_ramp(s.get("recovery_ms")) for s, _ in chosen]
+    falls = [ramp_s(s.get("recovery_ms")) for s, _ in chosen]
     plateaus = [_plateau(s, threshold, rise, fall)
                 for (s, threshold), rise, fall in zip(chosen, rises, falls)]
     return ShapeParameters(rate, amplitudes, measured(rises), measured(plateaus), measured(falls))
 
 
-def _ramp(ms: float | None) -> float | None:
+def ramp_s(ms: float | None) -> float | None:
     """A ramp's seconds from its measure, from 10% to 90% of the amplitude."""
     return None if ms is None else ms * 1e-3 / MEASURED_SHARE
 
@@ -335,12 +335,12 @@ def rq1_spikes(log: str | Path = benchlog.DEFAULT_LOG, issues=RQ1_ISSUES
         for s in entry["results"]["spikes"]:
             if s["ending"] == "censored":
                 continue
-            rise = _ramp(s.get("rise_ms")) or 0.0
+            rise = ramp_s(s.get("rise_ms")) or 0.0
             amplitude = s["amplitude_mib"] * MiB
             if s["ending"] == "lasting":
                 found.append(Measured(Trapezoid(amplitude, rise, 0.0, 0.0), True))
                 continue
-            fall = _ramp(s.get("recovery_ms")) or 0.0
+            fall = ramp_s(s.get("recovery_ms")) or 0.0
             found.append(Measured(Trapezoid(amplitude, rise, _plateau(s, threshold, rise, fall),
                                             fall), False))
     if not found:

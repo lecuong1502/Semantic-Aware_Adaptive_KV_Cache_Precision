@@ -16,6 +16,7 @@ from microinfer.engine import paged_cache_bytes
 from microinfer.footprint import MIB
 from microinfer.patterns import Measured, Trapezoid
 from microinfer.schedule import Schedule
+from microinfer.spikes import MEASURED_SHARE
 
 NAME = "qwen2.5-0.5b-instruct"
 BASE = 1000 * MIB
@@ -31,12 +32,21 @@ def rq1(**more):
                          "traces": matrix.patterns.TRACES, **more})
 
 
-@pytest.mark.parametrize("scenario", ["S1", "S2", "S3"])
+def recordings_here():
+    return matrix.recording(0, matrix.Rq1.read()).exists()
+
+
+@pytest.mark.parametrize("scenario", matrix.SCHEDULED)
 def test_a_scenario_s_schedule_is_the_same_for_its_seed_and_differs_by_seed(scenario):
-    a = matrix.schedule(scenario, 0, rq1())
-    assert matrix.schedule(scenario, 0, rq1()) == a
-    assert matrix.schedule(scenario, 1, rq1()) != a
-    assert a.points[0] == (0.0, 0) and a.points[-1][1] == 0  # the lead, and all given back
+    """S4's seed chooses the recording, read from RQ1's recordings."""
+    if scenario == "S4" and not recordings_here():
+        pytest.skip("RQ1's recordings are not here")
+    of = rq1(traces=matrix.Rq1.read().traces)
+    make = matrix.SCENARIOS[scenario].schedule
+    a = make(0, of)
+    assert make(0, of) == a
+    assert make(1, of) != a
+    assert a.points[-1][1] == 0  # all it took given back
 
 
 def test_s1_is_64_s_grid_on_the_base():
@@ -64,7 +74,7 @@ def test_s3_draws_rq1_s_spikes_whole_and_keeps_a_lasting_drop_to_the_end():
     """At RQ1's rate, 2 in 600 s, over an hour: about 12 arrivals, each the
     recovered spike or the lasting drop; the drops add up, kept to the end,
     and the recovered spikes come and go above them."""
-    s = matrix.poisson_spikes(3, rq1(), length_s=3600.0)
+    s = matrix.poisson_arrivals(3, rq1(), length_s=3600.0)
     above = np.array([s.at(t) for t in np.arange(0, 3600, 0.25)])
     drops = above[-1] // (300 * MIB)
     assert above[-1] == drops * 300 * MIB and drops >= 1  # only drops, at the end
@@ -85,13 +95,14 @@ def test_s2_and_s3_are_made_from_rq1_s_log_as_it_reports_it():
     r = matrix.Rq1.read()
     assert len(r.spikes) == 48 and sum(s.lasting for s in r.spikes) == 45
     assert r.p90_amplitude_bytes / MIB == pytest.approx(506.35)
-    assert r.median_rise_s * matrix.MEASURED_SHARE == pytest.approx(1.0907, abs=1e-3)
+    assert r.median_rise_s * MEASURED_SHARE == pytest.approx(1.0907, abs=1e-3)
     assert r.rate_per_s * 60 == pytest.approx(48 / 132.5, rel=1e-2)
 
 
-def test_a_schedule_on_its_base_is_the_base_higher_and_gives_it_back_at_the_end():
+def test_a_schedule_on_its_base_is_the_base_higher_and_keeps_the_base_after_it():
+    """The base is kept to the end of the run, after the schedule ends."""
     s = matrix.raised(Schedule([(0.0, 0), (1.0, 4 * MIB), (2.0, 0)]), BASE)
-    assert s.points == [(0.0, BASE), (1.0, BASE + 4 * MIB), (2.0, 0)]
+    assert s.points == [(0.0, BASE), (1.0, BASE + 4 * MIB), (2.0, BASE)]
     with pytest.raises(ValueError):
         matrix.raised(Schedule([(0.0, 4 * MIB)]), BASE)
 
@@ -99,8 +110,8 @@ def test_a_schedule_on_its_base_is_the_base_higher_and_gives_it_back_at_the_end(
 def test_the_base_leaves_what_the_scenario_starts_from_after_the_simulator_s_context():
     assert matrix.base_bytes(3000 * MIB, leave_bytes=1536 * MIB,
                              simulator_context_bytes=82 * MIB) == 1382 * MIB
-    with pytest.raises(ValueError, match="below"):
-        matrix.base_bytes(1500 * MIB, leave_bytes=1536 * MIB, simulator_context_bytes=0)
+    # headroom already below the start gets no base, rather than no run
+    assert matrix.base_bytes(1500 * MIB, leave_bytes=1536 * MIB, simulator_context_bytes=0) == 0
 
 
 def test_a_static_int4_engine_s_headroom_is_counted_as_an_fp16_engine_s():
@@ -123,10 +134,10 @@ def test_each_condition_is_named_from_its_engine():
 
 
 def test_the_matrix_runs_every_cell_s_first_run_before_any_s_second():
-    cells = matrix.cells()
-    assert len(cells) == 6 * 4 * 3 and len(set(cells)) == len(cells)
-    assert [c.run for c in cells] == sorted(c.run for c in cells)
-    assert cells[0].name == "S1-B1-r0"
+    runs = matrix.runs()
+    assert len(runs) == 6 * 4 * 3 and len(set(runs)) == len(runs)
+    assert [r.run for r in runs] == sorted(r.run for r in runs)
+    assert runs[0].name == "S1-B1-r0"
 
 
 def test_the_runs_logged_at_the_same_code_are_taken_up(tmp_path):
@@ -140,20 +151,23 @@ def test_the_runs_logged_at_the_same_code_are_taken_up(tmp_path):
     logged("other", condition="B6", scenario="S2", run=2)
     logged("m", engine="adaptive")  # the survival experiment's own, before the matrix
     commit = benchlog.read(log)[0]["git_commit"]
-    assert matrix.logged(commit, "m", log) == {matrix.Cell("B6", "S2", 1)}
+    assert matrix.logged(commit, "m", log) == {matrix.MatrixRun("B6", "S2", 1)}
     assert matrix.logged("another commit", "m", log) == set()
 
 
 @pytest.mark.slowest
-@pytest.mark.parametrize("scenario", matrix.SCHEDULED)
-def test_a_short_run_of_each_scenario_is_logged(scenario, tmp_path, monkeypatch):
-    """On Qwen2.5-0.5B, adaptive and semantic: 1024 positions prefilled and
+@pytest.mark.parametrize("scenario, engine", [
+    ("S1", ["adaptive"]), ("S2", ["adaptive"]), ("S3", ["adaptive"]), ("S4", ["adaptive"]),
+    ("S1", ["static", "--kv-tier", "INT4"])])
+def test_a_short_run_of_each_scenario_is_logged(scenario, engine, tmp_path, monkeypatch):
+    """On Qwen2.5-0.5B, adaptive and semantic, and S1 also static at INT4,
+    its headroom counted as an FP16 engine's: 1024 positions prefilled and
     600 decoded, the scenario's base taken at 512 and its schedule played
     past its lead until the generation ends, cutting it there; one
     "survival" entry, naming its condition, scenario and run, with its
     plans, its pressure events' waits and the monitor's detection against
     the trace."""
-    if scenario == "S4" and not matrix.recording(0, matrix.Rq1.read()).exists():
+    if scenario == "S4" and not recordings_here():
         pytest.skip("RQ1's recordings are not here")
     require_model(NAME)
     tool = load_tool("survival_experiment")
@@ -165,16 +179,18 @@ def test_a_short_run_of_each_scenario_is_logged(scenario, tmp_path, monkeypatch)
     monkeypatch.setattr(tool.benchlog, "environment",
                         lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
     out = tmp_path / f"{scenario}.csv.gz"
-    assert tool.main(["adaptive", "--scenario", scenario, "--run", "0", "--out", str(out),
+    assert tool.main([*engine, "--scenario", scenario, "--run", "0", "--out", str(out),
                       "--issue", "190", "--model", NAME, "--prompt-positions", "1024",
                       "--new-tokens", "600", "--contention-at", "512", "--log", str(log)]) == 0
     (entry,) = [e for e in benchlog.read(log) if e["kind"] == "survival"]
-    assert matrix.cell_of(entry) == matrix.Cell("B6", scenario, 0)
+    condition = "B6" if engine == ["adaptive"] else "B2"
+    assert matrix.run_of(entry) == matrix.MatrixRun(condition, scenario, 0)
     r = entry["results"]
     print(f"\n{scenario}: {r['schedule']}, {r['totals']}, RED {r['detection']['red_events']}")
     assert r["survived"] is True and r["ending"]["tokens"] == 600
     assert {"plans", "pressure", "detection", "schedule"} <= set(r)
     assert r["schedule"]["base_mib"] > 0 and r["schedule"]["cut"]
+    assert abs(r["schedule"]["left_mib"] - r["schedule"]["leave_mib"]) <= 1
     assert r["schedule"]["played_s"] > matrix.LEAD_S
     assert entry["config"]["scenario_rule"]["scenario"] == scenario
 
@@ -200,5 +216,5 @@ def test_the_matrix_tool_names_each_run_s_engine_and_takes_up_the_logged(tmp_pat
     assert "adaptive --score-source random --scenario S1 --run 0" in b5
     assert str(out_dir / "S1-B5-r0.2.csv.gz") in b5
     args = tool.argparse.Namespace(issue=191, model="m", log=log)
-    b2 = tool.command(matrix.Cell("B2", "S3", 2), out_dir / "x.csv.gz", args)
+    b2 = tool.command(matrix.MatrixRun("B2", "S3", 2), out_dir / "x.csv.gz", args)
     assert b2[2:7] == ["static", "--kv-tier", "INT4", "--scenario", "S3"]

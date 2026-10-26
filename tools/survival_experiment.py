@@ -107,7 +107,7 @@ def main(argv: list[str]) -> int:
                              "adaptive only")
     parser.add_argument("--kv-tier", choices=("FP16", "INT4", "INT2"), default="FP16",
                         help="a static engine's cache tier: B1, B2 or B3 (#190)")
-    parser.add_argument("--scenario", choices=matrix.SCENARIOS, default="S5",
+    parser.add_argument("--scenario", choices=matrix.EVERY_SCENARIO, default="S5",
                         help="the contention: S5's step, or a scenario of the matrix (#190)")
     parser.add_argument("--run", type=int, default=0,
                         help="the run of its cell, the scenario's seed")
@@ -135,15 +135,16 @@ def main(argv: list[str]) -> int:
     context_bytes = replay.simulator_context_bytes(args.out.parent)
     if scheduled:
         rq1 = matrix.Rq1.read(args.log)
-        above = matrix.schedule(args.scenario, args.run, rq1)
-        leave = matrix.leave_bytes(args.scenario, args.run, rq1)
+        scenario = matrix.SCENARIOS[args.scenario]
+        scenario_schedule = scenario.schedule(args.run, rq1)
+        leave = scenario.leave_bytes(args.run, rq1)
 
-        def played(headroom: int):
+        def on_base(headroom: int):
             base = matrix.base_bytes(headroom, leave_bytes=leave,
                                      simulator_context_bytes=context_bytes)
-            return matrix.raised(above, base)
+            return matrix.raised(scenario_schedule, base)
 
-        contention = {"schedule": played}
+        contention = {"schedule": on_base}
     else:
         contention = {"shortfall_bytes": int(shortfall * MIB), "pulse_s": args.pulse}
     engine = Engine(REPO / "models" / args.model, kv_tier=args.kv_tier, kv_adaptive=adaptive,
@@ -199,7 +200,13 @@ def main(argv: list[str]) -> int:
     if scheduled:
         played_s = (result.timeline[-1].t - result.took_at_seconds if result.timeline
                     else 0.0)
+        # What the base left, as an FP16 engine would have it: less than the
+        # scenario asks only for headroom already below it (base_bytes).
+        headroom = survival.as_fp16(engine.config, result.headroom_bytes,
+                                    positions=result.contention_position, kv_tier=args.kv_tier)
         results["schedule"] = {"base_mib": result.taken_bytes / MIB,
+                               "leave_mib": leave / MIB,
+                               "left_mib": (headroom - context_bytes - result.taken_bytes) / MIB,
                                "peak_mib": result.schedule.peak_bytes / MIB,
                                "points": len(result.schedule.points),
                                "duration_s": result.schedule.duration_s, "played_s": played_s,

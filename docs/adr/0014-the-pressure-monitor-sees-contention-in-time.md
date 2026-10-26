@@ -183,11 +183,15 @@ decisions, 2026-10-26).
   recording's headroom, as #65's replays did. Headroom is counted as an
   FP16 engine would have it there (`survival.as_fp16`), so that a static
   INT4 or INT2 engine, whose cache holds less, faces the same bytes taken
-  as every other condition. The same holds for S5's shortfall rule.
+  as every other condition. The same holds for S5's shortfall rule. The
+  base is kept to the end of the run, after its schedule ends. Headroom
+  already below what the base leaves, as S4's thin base can find it on a
+  busier desktop, gets no base rather than no run; the entry logs what
+  was left (`results.schedule.left_mib`).
 - **S1, the pulse grid**: #64's 36 cells, 768, 1152 and 1408 MiB, ramps of
   0, 0.25 and 1 s, plateaus of 0.1 to 2 s, 3 repeats, 3 s apart and a
   seeded fraction of a poll more, after a 5 s lead; about 500 s, then the
-  base too is given back.
+  base alone to the end.
 - **S2, a pulse train**: pulses of RQ1's P90 amplitude, 506 MiB, ramping
   up and down over its median rise, 1.09 s as measured, 1.36 s as a ramp.
   Each is kept for the upgrade cooldown, 5 s, and the next comes twice the
@@ -199,7 +203,10 @@ decisions, 2026-10-26).
   them drawn whole, amplitude and ramps together: a recovered spike as it
   was measured, a lasting drop, 45 of the 48, kept to the end, as the
   applications of a desktop accumulate. The 15 to 30 minutes of a run after
-  the take meet about 5 to 11, adding up.
+  the take meet about 5 to 11, adding up: by about 16 minutes the drops of
+  seed 0 hold more than the 1536 MiB the base left, before the cache's own
+  growth, so a static FP16 engine is expected to run out under S3, by the
+  rule rather than by a choice made after.
 - **S4, RQ1's replays**: what the other processes held in a with-engine
   recording, from its first span after the original's prefill. Run k
   replays recording r(k + 1), so the three runs of a cell replay r1 to r3.
@@ -212,4 +219,5 @@ decisions, 2026-10-26).
   event's wait for a step and time to its plan: the monitor's RED events
   scored against the recorder's trace, as RQ2 scored them
   (`survival.detection`), so that detection, the wait for a step, planning
-  and application are each measured under every scenario.
+  and application are each measured under every scenario. The truth runs
+  from the take to the trace's end, a moment after the generation's.

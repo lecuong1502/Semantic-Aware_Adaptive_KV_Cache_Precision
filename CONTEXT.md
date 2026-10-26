@@ -378,20 +378,23 @@ One of the thesis's six kinds of simulated contention a generation faces,
 S1 to S6: the pulse grid, a pulse train, Poisson arrivals of RQ1's spikes,
 RQ1's recordings replayed, a lasting drop (the survival experiment's
 step), and a pulse released (ADR-0014, amendment #190). Its schedule is a
-pure function of a run's seed and RQ1's measures.
-_Avoid_: scenario alone, where RQ1's scripted desktop actions are meant
+pure function of a run's seed and RQ1's measures. In the survival matrix's
+code, `scenario` is this; RQ1's scripted desktop actions are named by their
+recordings there.
+_Avoid_: calling RQ1's scripted desktop actions a contention scenario
 
 **Base**:
-What the contention simulator takes first, and keeps, for a scenario's
-schedule to play on: set from the headroom when contention begins, to
-leave the scenario's start, so that headroom begins in GREEN whatever else
-the desktop holds that day.
+What the contention simulator takes first, and keeps to the end of the
+run, for a scenario's schedule to play on: set from the headroom when
+contention begins, to leave the scenario's start, so that headroom begins
+in GREEN whatever else the desktop holds that day.
 _Avoid_: floor, offset
 
 **Survival matrix**:
 The survival experiment run under each condition B1 to B6 against each
 contention scenario, three runs a cell (#190, #191): whether a 32K
-generation completes, and how its engine reacts.
+generation completes, and how its engine reacts. A cell is a condition
+and a scenario; a matrix run, one of its runs, by its seed.
 
 **Turn**:
 One exchange of a conversation the engine continues over a single cache: a
@@ -426,9 +429,8 @@ level, a controlled plan from semantic, uniform or random scores for 70% or
 80% of the FP16 bytes outside the recency floor; or a static tier, every
 page born at INT4 or INT2; an ablation; or eviction at a level. RQ3's two experiments,
 question-blind and question-aware, are when a condition's plan is made. The
-survival matrix's conditions are the thesis's baselines, B1 to B6: static
-engines at FP16, INT4 and INT2, and the adaptive engine from the uniform,
-random and semantic sources.
+survival matrix's conditions are B1 to B6: static engines at FP16, INT4 and
+INT2, and the adaptive engine from the uniform, random and semantic sources.
 _Avoid_: arm, treatment, setting
 
 **Full policy**:

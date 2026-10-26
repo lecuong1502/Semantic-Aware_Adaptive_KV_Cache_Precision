@@ -98,6 +98,11 @@ def as_fp16(cfg: ModelConfig, headroom_bytes: int, *, positions: int, kv_tier: s
                              - paged_cache_bytes(cfg, positions, kv_tier))
 
 
+def step(nbytes: int, pulse_s: float | None = None) -> Schedule:
+    """S5's step: `nbytes` taken, and kept, or given back `pulse_s` after."""
+    return Schedule([(0.0, nbytes)] + ([] if pulse_s is None else [(pulse_s, 0)]))
+
+
 def summarise(plans: Sequence[PlanRecord], *, ending: Ending | None = None,
               error: str | None = None, positions_reached: int | None = None) -> dict:
     """What a run comes to. An adaptive run, or a static one that finished,
@@ -267,7 +272,7 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
                                       positions=position, context=context,
                                       simulator_context_bytes=simulator_context_bytes,
                                       shortfall_bytes=shortfall_bytes)
-            played = Schedule([(0.0, nbytes)] + ([] if pulse_s is None else [(pulse_s, 0)]))
+            played = step(nbytes, pulse_s)
         else:
             played = schedule(headroom)
         took["schedule"] = played
@@ -409,7 +414,7 @@ class Simulator:
     def take(self, nbytes: int, *, pulse_s: float | None = None) -> None:
         """Take `nbytes` beyond the simulator's own context, waiting until
         it has; with `pulse_s`, give them back that long after."""
-        self.play(Schedule([(0.0, nbytes)] + ([] if pulse_s is None else [(pulse_s, 0)])))
+        self.play(step(nbytes, pulse_s))
 
     def play(self, schedule: Schedule) -> None:
         """Play `schedule`, beyond the simulator's own context, waiting until
