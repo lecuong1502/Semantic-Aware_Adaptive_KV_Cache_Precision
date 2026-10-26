@@ -26,7 +26,8 @@ tree, as the checkpoint recorder does.
 --monitor measures what the VRAM pressure monitor costs decoding (#62)
 instead: decode throughput with the engine's monitor running and without,
 --repeat times each, interleaved and in alternating order so that drift
-falls on both alike. It logs one "monitor-overhead" entry per length, with
+falls on both alike, and each decoded token's time, P50 and P99 over every
+run of each (#187). It logs one "monitor-overhead" entry per length, with
 both distributions and whether the difference of their means is within
 noise: no more than twice its standard error, sqrt(s_on^2/n + s_off^2/n).
 A transition also reads the own/others split, which the timed runs may never
@@ -53,7 +54,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from microinfer import Engine, _microinfer, benchlog, monitor  # noqa: E402
-from microinfer.contention import spread  # noqa: E402
+from microinfer.engine import DECODING  # noqa: E402
+from microinfer.contention import percentiles, spread  # noqa: E402
 
 SEED = 15
 DECODE_STEPS = 32
@@ -83,9 +85,28 @@ def first_token(engine: Engine, prompt: np.ndarray):
     return lambda: engine.generate(prompt, 1, stop_at_eos=False)
 
 
-def with_steps(engine: Engine, prompt: np.ndarray):
-    """The same, and DECODE_STEPS more tokens decoded."""
-    return lambda: engine.generate(prompt, DECODE_STEPS + 1, stop_at_eos=False)
+def with_steps(engine: Engine, prompt: np.ndarray, report=None):
+    """The same, and DECODE_STEPS more tokens decoded, each reported to
+    `report` as generate reports them, if given."""
+    return lambda: engine.generate(prompt, DECODE_STEPS + 1, stop_at_eos=False, report=report)
+
+
+def step_clock(token_s: list[float], now=time.perf_counter):
+    """A report for generate that appends to `token_s` each decoded token's
+    time, from the report of the token before it. The first decoded token's
+    has none: the last prefill chunk's report comes before the prefill's own
+    greedy choice and the decoding workspace, which are not a step's."""
+    last = None
+
+    def report(phase: str, positions: int, token: int | None) -> None:
+        nonlocal last
+        if phase != DECODING:
+            return
+        t = now()
+        if last is not None:
+            token_s.append(t - last)
+        last = t
+    return report
 
 
 def decode_prompt(engine: Engine, ids: np.ndarray) -> np.ndarray:
@@ -94,10 +115,13 @@ def decode_prompt(engine: Engine, ids: np.ndarray) -> np.ndarray:
     return ids[: min(len(ids), engine.config.max_position_embeddings - DECODE_STEPS)]
 
 
-def decode_rate(engine: Engine, prompt: np.ndarray) -> float:
-    """Decode tokens per second after `prompt`, from one timing of each."""
-    steps = seconds(with_steps(engine, prompt)) - seconds(first_token(engine, prompt))
-    return DECODE_STEPS / max(steps, 1e-9)
+def decode_rate(engine: Engine, prompt: np.ndarray,
+                token_s: list[float] | None = None) -> float:
+    """Decode tokens per second after `prompt`, from one timing of each;
+    each decoded token's time appended to `token_s`, if given (step_clock)."""
+    report = None if token_s is None else step_clock(token_s)
+    decoding = seconds(with_steps(engine, prompt, report)) - seconds(first_token(engine, prompt))
+    return DECODE_STEPS / max(decoding, 1e-9)
 
 
 def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: int,
@@ -112,6 +136,7 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
     for _ in range(warmup):
         decode_rate(engine, prompt)
     rates: dict[bool, list[float]] = {False: [], True: []}
+    token_s: dict[bool, list[float]] = {False: [], True: []}
     events, errors = 0, []
     for r in range(repeat):
         for on in ((False, True) if r % 2 == 0 else (True, False)):
@@ -119,7 +144,7 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
                 engine.start_monitor()
                 engine.kv_scoring = scorer
             try:
-                rates[on].append(decode_rate(engine, prompt))
+                rates[on].append(decode_rate(engine, prompt, token_s[on]))
             finally:
                 engine.stop_monitor()
                 engine.kv_scoring = False
@@ -140,10 +165,19 @@ def monitor_overhead(engine: Engine, prompt: np.ndarray, repeat: int, warmup: in
             "difference_percent": 100 * difference / off["mean"], "noise": noise,
             "within_noise": abs(difference) <= noise,
             "events_recorded": events, "monitor_errors": errors,
+            # Each decoded token's time, over every run of each side (#187).
+            "token_ms": {"off": token_ms(token_s[False]), "on": token_ms(token_s[True])},
             # A transition also reads the own/others split: rare, and timed
             # here, since the runs above may see none.
             "split_read_ms": spread([seconds(monitor.nvml_split) * 1e3
                                      for _ in range(SPLIT_READS)])}
+
+
+def token_ms(token_s: list[float]) -> dict:
+    """Decoded tokens' times in ms: the median, P99 and max, how many, and
+    every one, so that another percentile can be drawn later."""
+    ms = [t * 1e3 for t in token_s]
+    return {**percentiles(ms, at=(50, 99)), "runs": ms}
 
 
 def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
@@ -169,7 +203,9 @@ def log_monitor_overhead(engine: Engine, ids: np.ndarray, args, method: dict,
           f"{what}, {results['on']['mean']:8.1f} with "
           f"({results['difference_percent']:+.2f}%, noise +-{results['noise']:.1f}): "
           f"{'within' if results['within_noise'] else 'OUTSIDE'} noise; a split read "
-          f"{results['split_read_ms']['median']:.2f} ms")
+          f"{results['split_read_ms']['median']:.2f} ms; a token's median/P99 "
+          + ", ".join(f"{side} {t['median']:.1f}/{t['p99']:.1f} ms"
+                      for side, t in results["token_ms"].items()))
     benchlog.append("monitor-scorer-overhead" if args.scorer else "monitor-overhead",
                     model=args.model,
                     context_length=len(prompt) + DECODE_STEPS, precision_tiers=tiers,
