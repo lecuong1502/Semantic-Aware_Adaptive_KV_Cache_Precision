@@ -200,8 +200,8 @@ class _Opened:
     question: np.ndarray
 
 
-def _open(engine, chat, dialogue: Dialogue) -> _Opened:
-    """Every turn, each after the last one's reply. A prompt starts where
+def before_plan(engine, chat, dialogue: Dialogue) -> _Opened:
+    """What a run holds before its plan, on `chat`: every turn, each after the last one's reply. A prompt starts where
     the last one's tokens and reply end: the reply's last token, not yet
     fed, takes the position before it."""
     end_of_turn = engine.tokenizer.token_to_id(rq3.END_OF_TURN)
@@ -251,7 +251,7 @@ def run(engine, dialogue: Dialogue, cond: rq3.Condition, *, plan_seed: int = 0) 
     rq3.check_engine(engine)
     with rq3.set_for(engine, cond), engine.conversation() as chat:
         seed = rq3.sample_seed(dialogue.sample_id, plan_seed)
-        return _close(engine, chat, dialogue, cond, seed, _open(engine, chat, dialogue))
+        return _close(engine, chat, dialogue, cond, seed, before_plan(engine, chat, dialogue))
 
 
 def runs(engine, dialogue: Dialogue, conds: Sequence[rq3.Condition], *,
@@ -262,7 +262,7 @@ def runs(engine, dialogue: Dialogue, conds: Sequence[rq3.Condition], *,
     rq3.check_engine(engine)
     seed = rq3.sample_seed(dialogue.sample_id, plan_seed)
     yield from rq3.from_one_opening(
-        engine, conds, lambda chat: _open(engine, chat, dialogue),
+        engine, conds, lambda chat: before_plan(engine, chat, dialogue),
         lambda chat, cond, opened: _close(engine, chat, dialogue, cond, seed, opened),
         lambda cond: run(engine, dialogue, cond, plan_seed=plan_seed))
 
