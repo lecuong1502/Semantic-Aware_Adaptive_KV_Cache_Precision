@@ -65,7 +65,8 @@ positive; and with Qwen2.5-1.5B at 32K positions, a contention that runs the
 static engine out of memory is survived by the adaptive one, which returns
 746\,MiB that the driver sees returned, to a granule, at every plan. At equal
 reclaimed bytes, attention-guided allocation keeps the next-token distribution
-3.6 times closer to full precision than uniform allocation, but answers no more
+3.6 times closer to full precision than uniform allocation when 80\% of the
+bytes are reclaimed, but answers no more
 needles, 48 of 50 against 49, on a task even a 2-bit cache mostly answers; and
 downgrading keeps 48 needles where evicting the same bytes keeps 16.
 \end{abstract}
@@ -577,7 +578,7 @@ Condition & Bits & Needles & Facts & Top-1 & KL \\
 FP16 & 16.00 & 50 & 50 & 100 & 0 \\
 Static INT2, whole cache & 2.63 & 45 & -- & -- & -- \\
 Uniform & 3.40 & 49 & 45 & 86.5 & 0.101 \\
-Random & 3.40 & 50 & 48 & 87.6 & 0.083 \\
+Random & 3.40 & 50 & 48 & 87.6 & 0.082 \\
 Semantic & 3.40 & 48 & 48 & 93.6 & 0.028 \\
 Eviction & 3.40 & 16 & 16 & -- & -- \\
 \bottomrule
@@ -588,9 +589,9 @@ Eviction & 3.40 & 16 & 16 & -- & -- \\
 source answered 48 needles and uniform 49 (Table~\ref{tab:rq3}); one sample was
 answered by uniform alone and none by semantic alone, McNemar's $p = 1$. It
 stays null at 70\%, where all three sources answered all 50; with the question
-seen, 49 against 50; on a 32K subset of ten, all 10 for both; and when real
-contention from the simulator, rather than a controlled plan, forced the
-reclamation, 48 against 49 on the same contention. The needle set sits at its
+seen, 49 against 50; on a 32K subset of ten, all 10 for both; and in an
+end-to-end run, where the simulator's contention rather than a controlled
+plan forced the reclamation, 48 against 49 on the same contention. The needle set sits at its
 ceiling: static INT2 for the whole cache kept 45 of 50. The semantic order did
 work as designed, leaving 43\% of the needles' pages at INT2 against uniform's
 68\%, but the code survived INT2 in most samples whichever source sent it
@@ -608,22 +609,23 @@ uniform held every fact's page at INT2, semantic 38\% of them.
 \textbf{Downgrading keeps what eviction loses.} At the same bytes, eviction
 answered 16 needles and recalled 16 facts at 80\%, and 22 and 21 at 70\%,
 against semantic's 48, 48, 50 and 50; every sample eviction answered, semantic
-did too ($p < 10^{-8}$ throughout). In the dialogue eviction kept the facts of
-the last two turns and lost most stated three or more turns back.
+did too ($p < 10^{-8}$ throughout). In the dialogue at 80\% eviction kept the
+facts of the last two turns and lost most stated three or more turns back.
 
 \textbf{Recovery and ablations.} After pressure passes, restoring every page
 from its shadow took under 0.7\,s at 8K positions; a third turn then answered
 50 of 50 needles under semantic, both of its turn-2 misses recovered. At 32K,
 a 30\,s pulse during prefill was survived by both sources with every page
-restored, about nine minutes after the release, paced by prefill's steps. None
-of ADR-0018's nine quality ablations at 80\% changed needle accuracy
-detectably ($p \ge 0.5$); planning by importance alone, without the tier's
-error, lost the most, two samples.
+restored, about nine minutes after the release, with prefill still under way.
+None of nine quality ablations at 80\% changed needle accuracy detectably
+($p \ge 0.5$); planning by importance alone, without the tier's error, lost
+the most, two samples. Two were not at equal bytes: without INT2, and with a
+512-position recency floor, every plan fell short of its target.
 
 \textbf{Answer.} At equal bytes, attention-guided allocation did not keep needle
 accuracy better than uniform allocation, on a task too easy at this length to
 separate them; it kept the model's output distribution markedly closer to full
-precision, and reversible degradation kept three times the answers of
+precision, and at 80\% reversible degradation kept three times the answers of
 eviction.
 
 % =====================================================================

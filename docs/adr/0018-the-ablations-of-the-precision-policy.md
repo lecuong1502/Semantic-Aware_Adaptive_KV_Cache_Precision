@@ -85,7 +85,7 @@ against the semantic source at 70% on the same samples, where the bytes
 can be met. The owner chose this after the review of #158, before any
 ablation was run.
 
-## As measured (#161)
+## As measured (#161): no element changed accuracy detectably
 
 From `rq3-ablation-summary` `dcf68122…`, at 6c4a7ea. The full policy
 answered 48 of 50 at 80% at 3.40 bits, and 50 of 50 at 70% at 4.98 bits.
@@ -113,7 +113,7 @@ answered 48 of 50 at 80% at 3.40 bits, and 50 of 50 at 70% at 4.98 bits.
   ties the full policy.
 - **Importance alone lost the most,** two samples, and gained none.
 - **K** was measured on the monitor (ADR-0014's amendment): K = 1 caught
-  every episode at a median of 28 ms with no false positive, K = 5 took
+  every detectable episode at a median of 28 ms with no false positive, K = 5 took
   215 ms with three false negatives, and K stays 3.
 - **The policy is unchanged.** No variant beat the full policy detectably,
   so nothing here calls for the new ADR this one's consequences require.

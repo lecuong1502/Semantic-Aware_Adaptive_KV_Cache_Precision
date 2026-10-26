@@ -172,7 +172,7 @@ both levels, against the semantic source there.
   again beside it at the same code (`tools/rq3.py --evictions`,
   `tools/anchors.py --evictions`).
 
-## As measured (#161)
+## As measured (#161): the closing answer is no
 
 Every figure is from a summary entry in the benchmark log, named by its
 hash. Qwen2.5-1.5B, the screened set of 50, question-blind unless said.
@@ -189,7 +189,7 @@ needs six discordant samples or more, all one way.
 | Uniform | 4.98 / 3.40 | 50 / 49 |
 | Random | 4.98 / 3.40 | 50 / 50 |
 | Semantic | 4.98 / 3.40 | 50 / 48 |
-| Eviction (`cad86bf3…`) | 4.98 / 3.40 | 22 / 16 |
+| Eviction (`71cbc603…`) | 4.98 / 3.40 | 22 / 16 |
 | Static INT4 / INT2, whole session | 4.63 / 2.63 | 50 (INT4) / 45 (INT2) |
 
 - **The needle set sits at its ceiling.** Static INT2 for the whole cache
@@ -207,7 +207,7 @@ needs six discordant samples or more, all one way.
   the question: 157 and 161 MiB of a 172 MiB target, met in 0 and 19 runs.
 - **Continuation fidelity** (`continuation-summary` `19ad5127…`, 50
   passages, 2048-token prefix, 128 tokens teacher-forced): at 80% mean KL
-  0.028 semantic, 0.101 uniform, 0.083 random. Semantic's paired
+  0.028 semantic, 0.101 uniform, 0.082 random. Semantic's paired
   difference from uniform is −0.073 [−0.082, −0.065], lower on all 50
   passages, and its top-1 agreement 93.6% against 86.5%. At 70%, KL 0.0023
   against 0.0031, the difference within its interval, but top-1 still
@@ -216,16 +216,16 @@ needs six discordant samples or more, all one way.
   recalled 48 of 50, uniform 45 and random 48. Semantic against uniform
   is three to none, p = 0.25. Uniform held every fact's page at INT2,
   semantic 38% of them. Every source recalled all 50 at 70%.
-- **Eviction** (`rq3-eviction-summary` `cad86bf3…` and `e01276d7…`): 16 of
+- **Eviction** (`rq3-eviction-summary` `71cbc603…` and `e01276d7…`): 16 of
   50 needles and 16 facts at 80%, 22 and 21 at 70%. Every sample eviction
-  answered, semantic answered too, so p < 1e-8 at each. Eviction kept the
-  facts of the last two turns, and few from three or more turns back.
+  answered, semantic answered too, so p < 1e-8 at each. At 80% eviction kept
+  the facts of the last two turns, and few from three or more turns back.
 - **Recovery** (`recovery-summary` `a206569e…`): after every page is
   restored, in under 0.7 s at 8K, a third turn answered 50 of 50 under
   semantic, both its turn-2 misses recovered; uniform's one miss stayed. At
   32K, a 30 s pulse during prefill was survived under both sources, every
   page restored 532 s (semantic) and 541 s (uniform) after the pressure
-  ended, paced by prefill's steps (`pulse-release`, #155).
+  ended, with prefill still under way (`pulse-release`, #155).
 
 **What it means.** At equal bytes, allocation by attention did not keep
 needle accuracy better than uniform allocation, on a task too easy at this
