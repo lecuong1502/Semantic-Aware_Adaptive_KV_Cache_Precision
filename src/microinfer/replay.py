@@ -261,13 +261,16 @@ def from_recording(path: str | Path, **window) -> Schedule:
 
 
 def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
-           tail_s: float = TAIL_S, stop: threading.Event | None = None) -> int:
+           tail_s: float = TAIL_S, stop: threading.Event | None = None,
+           cut_by_stop: bool = False) -> int:
     """Record the device to `out`, as RQ1 did, while the simulator, a process
     of its own, takes `schedule` after `lead_s` of taking nothing; stop
-    `tail_s` after its last point. The schedule, the simulator's events, and
-    when the schedule began with the simulator's pid (.replay.json) are
-    written beside `out`. Returns when the schedule began, on the
-    recorder's clock."""
+    `tail_s` after its last point. A `stop` set before the schedule has
+    ended raises, or, with `cut_by_stop`, cuts it short there, as a run
+    that ends before its contention does (#190). The schedule, the
+    simulator's events, and when the schedule began with the simulator's
+    pid (.replay.json) are written beside `out`. Returns when the schedule
+    began, on the recorder's clock."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     shifted = Schedule([(0.0, 0)] + [(t + lead_s, b) for t, b in schedule.points])
@@ -297,8 +300,10 @@ def replay(schedule: Schedule, out: str | Path, *, lead_s: float = LEAD_S,
             raise RuntimeError(f"the simulator did not start: {proc.stderr.read()}")
         deadline = time.monotonic() + shifted.duration_s + REPLAY_SLACK_S
         while not _applied(events_path, len(shifted.points)):
-            if failure or proc.poll() is not None or time.monotonic() > deadline or (
-                    stop is not None and stop.is_set()):
+            stopped = stop is not None and stop.is_set()
+            if stopped and cut_by_stop and not failure:
+                break
+            if failure or proc.poll() is not None or time.monotonic() > deadline or stopped:
                 raise RuntimeError("the replay stopped before its schedule ended" +
                                    (f": {failure[0]}" if failure else ""))
             time.sleep(POLL_S)

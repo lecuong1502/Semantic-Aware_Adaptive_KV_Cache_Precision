@@ -163,3 +163,61 @@ Regenerate with `tools/evaluate_monitor.py grid --out data/monitor/grid-k1.csv.g
 does not show what K = 1 does on noisier contention, since RQ1's replays
 were not run at it. On this evidence a smaller K costs nothing on the grid,
 and a larger one costs detection.
+
+## Amendment (#190): the contention scenarios of the survival matrix
+
+The survival experiment (#108) met one kind of contention, S5's step. The
+survival matrix runs it against S1 to S4 as well, under each of B1 to B6,
+three runs a cell (`microinfer.survival_matrix`, `tools/survival_matrix.py`).
+The rules were set before any run, from RQ1's log and the upgrade cooldown,
+so that no parameter is chosen after its result is seen (the owner's
+decisions, 2026-10-26).
+
+- **When.** A 32K generation of Qwen2.5-1.5B, 32704 positions prefilled and
+  64 decoded, meets its scenario when its cache reaches 16384 positions,
+  where S5's step comes. The generation waits there until the simulator has
+  taken its base. The cache grows on after it, about 448 MiB at FP16 to its
+  full 32K.
+- **The base.** S1 to S3 play on a base that leaves 1536 MiB of headroom
+  then, in GREEN, as #159's grid began; S4's leaves the original
+  recording's headroom, as #65's replays did. Headroom is counted as an
+  FP16 engine would have it there (`survival.as_fp16`), so that a static
+  INT4 or INT2 engine, whose cache holds less, faces the same bytes taken
+  as every other condition. The same holds for S5's shortfall rule. The
+  base is kept to the end of the run, after its schedule ends. Headroom
+  already below what the base leaves, as S4's thin base can find it on a
+  busier desktop, gets no base rather than no run; the entry logs what
+  was left (`results.schedule.left_mib`).
+- **S1, the pulse grid**: #64's 36 cells, 768, 1152 and 1408 MiB, ramps of
+  0, 0.25 and 1 s, plateaus of 0.1 to 2 s, 3 repeats, 3 s apart and a
+  seeded fraction of a poll more, after a 5 s lead; about 500 s, then the
+  base alone to the end.
+- **S2, a pulse train**: pulses of RQ1's P90 amplitude, 506 MiB, ramping
+  up and down over its median rise, 1.09 s as measured, 1.36 s as a ramp.
+  Each is kept for the upgrade cooldown, 5 s, and the next comes twice the
+  cooldown, 10 s, after it has fallen: each gap lets the cooldown run out
+  and the upgrades begin before the next pulse, so the train tests repeated
+  plans and thrash.
+- **S3, Poisson arrivals** at RQ1's rate, its 48 spikes that recovered or
+  lasted over 132.5 minutes recorded, 0.36 a minute. Each arrival is one of
+  them drawn whole, amplitude and ramps together: a recovered spike as it
+  was measured, a lasting drop, 45 of the 48, kept to the end, as the
+  applications of a desktop accumulate. The 15 to 30 minutes of a run after
+  the take meet about 5 to 11, adding up: by about 16 minutes the drops of
+  seed 0 hold more than the 1536 MiB the base left, before the cache's own
+  growth, so a static FP16 engine is expected to run out under S3, by the
+  rule rather than by a choice made after.
+- **S4, RQ1's replays**: what the other processes held in a with-engine
+  recording, from its first span after the original's prefill. Run k
+  replays recording r(k + 1), so the three runs of a cell replay r1 to r3.
+- **The end.** A run ends with its generation, and the simulator gives
+  back what it holds then, cutting its schedule (`replay(cut_by_stop=)`).
+  S2's and S3's schedules are made two hours long, longer than any run.
+  An engine slowed by its own adaptation meets more of a schedule than a
+  faster one; each entry logs how much it met (`results.schedule`).
+- **What a run logs**, beside #108's ending, plans and every pressure
+  event's wait for a step and time to its plan: the monitor's RED events
+  scored against the recorder's trace, as RQ2 scored them
+  (`survival.detection`), so that detection, the wait for a step, planning
+  and application are each measured under every scenario. The truth runs
+  from the take to the trace's end, a moment after the generation's.

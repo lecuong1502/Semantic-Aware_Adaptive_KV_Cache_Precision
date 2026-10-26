@@ -146,6 +146,13 @@ def score(episodes: list[Episode], events: list[PressureEvent], thresholds: Thre
                  missed_detectable, missed_below_k, already, false_positives, len(reds))
 
 
+def summary(s: Score) -> dict:
+    """What a log entry holds of a score: its counts, its false negatives,
+    and its latencies' median, P90 and max, in ms and in polls."""
+    return {**asdict(s), "false_negatives": s.false_negatives,
+            "latency_ms": spread(s.latencies_ms), "latency_polls": spread(s.latencies_polls)}
+
+
 # -- the grid ------------------------------------------------------------------------------
 
 
