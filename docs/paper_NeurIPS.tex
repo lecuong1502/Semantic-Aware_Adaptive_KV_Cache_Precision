@@ -305,9 +305,10 @@ the codes back up was rejected, since it would give FP16's size at the lower
 tier's error. A move of one page of one layer takes 8 to 39\,$\mu$s at the
 median on Qwen2.5-1.5B (Appendix~\ref{app:moves}), and the shadows of a whole
 32K cache take about 0.9\,GiB of host memory. The tier a cache is held at
-changes its decoding speed: at 32K positions a cache at INT8 decoded 13\%
-faster than at FP16, but one at INT4 34\% slower and one at INT2 55\% slower,
-one run each (Appendix~\ref{app:moves}).
+changes its decoding speed: at 32K positions, against FP16 at the same code, a
+cache at INT8 decoded 31\% faster, one at INT4 24\% slower and one at INT2 48\%
+slower, one run each (Appendix~\ref{app:moves}); two FP16 runs at different
+commits differed by 16\%.
 
 \subsection{The importance scorer}
 \label{sec:scorer}
@@ -760,7 +761,7 @@ INT2 & 150 & 2.63 & 11.541 \\
 \caption{The time to move one page of one layer on Qwen2.5-1.5B, median of 256
 moves. Copying the shadow on a first downgrade takes about 7\,$\mu$s of the
 move. Below, decode throughput at 32K positions with the whole cache at each
-tier, one run of 32 steps each, the FP16 run from an earlier commit.}
+tier, one run of 32 steps each, all at the same commit.}
 \label{tab:moves}
 \centering
 \small
@@ -775,7 +776,7 @@ INT4 to INT8 / INT2, from the shadow & 21 / 37 \\
 INT2 to INT8 / INT4, from the shadow & 21 / 26 \\
 Any tier to FP16, from the shadow & 8 \\
 \midrule
-Decode at 32K, FP16 / INT8 / INT4 / INT2 (tokens/s) & 0.673 / 0.760 / 0.441 / 0.301 \\
+Decode at 32K, FP16 / INT8 / INT4 / INT2 (tokens/s) & 0.580 / 0.760 / 0.441 / 0.301 \\
 \bottomrule
 \end{tabular}
 \end{table}
