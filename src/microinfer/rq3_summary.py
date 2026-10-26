@@ -152,23 +152,35 @@ def _pool(entries: Sequence[dict], model: str, needle_seed: int, haystack_tokens
 
 def _accuracy(runs: list[dict], right: np.ndarray, interval: np.ndarray,
               rng: np.random.Generator) -> dict:
-    """One condition's accuracy, overall and at each depth, its effective
-    bits and its needle's pages' tiers."""
-    depths = np.array([e["config"]["depth"] for e in runs])
-    by_depth = {}
-    for depth in needles.DEPTHS:
-        at = right[np.isclose(depths, depth)]
-        by_depth[_depth_name(depth)] = {
-            "correct": int(at.sum()), "n": len(at),
-            "accuracy": float(at.mean()),
-            "bootstrap_95": [float(v) for v in bootstrap(at[None, :], rng)[0]],
-            "wilson_95": list(wilson(int(at.sum()), len(at)))}
+    """One condition's accuracy, overall and at each depth (by_depth), its
+    effective bits and its needle's pages' tiers."""
     correct = int(right.sum())
     return {"correct": correct, "n": len(right), "accuracy": correct / len(right),
             "bootstrap_95": [float(v) for v in interval],
-            "wilson_95": list(wilson(correct, len(right))), "by_depth": by_depth,
+            "wilson_95": list(wilson(correct, len(right))),
+            "by_depth": by_depth(runs, right, rng),
             "effective_bits": _mean(runs, "effective_bits"),
             "needle_page_tiers": pooled_tiers(runs, "needle_page_tiers")}
+
+
+def by_depth(runs: list[dict], right: np.ndarray, rng: np.random.Generator) -> dict:
+    """At each depth the runs hold, the needles `right` holds as right, of
+    how many, with the bootstrap and Wilson 95% intervals of their share."""
+    depths = np.array([e["config"]["depth"] for e in runs])
+    out = {}
+    for depth in needles.DEPTHS:
+        at = right[np.isclose(depths, depth)]
+        if len(at):
+            out[_depth_name(depth)] = {
+                "correct": int(at.sum()), "n": len(at), "accuracy": float(at.mean()),
+                "bootstrap_95": [float(v) for v in bootstrap(at[None, :], rng)[0]],
+                "wilson_95": list(wilson(int(at.sum()), len(at)))}
+    return out
+
+
+def outcomes(runs: list[dict]) -> np.ndarray:
+    """Whether each run was right, in the runs' order."""
+    return np.array([e["results"]["correct"] for e in runs])
 
 
 def pooled_tiers(runs: list[dict], key: str) -> dict[str, float]:
@@ -246,16 +258,15 @@ def summarise(entries: Sequence[dict], model: str, needle_seed: int, haystack_to
         names = _conditions(experiment)
         runs = {name: [latest[(s, experiment, name)] for s in kept] for name in names}
         pooled += [e["sha256"] for name in names for e in runs[name]]
-        outcomes = {name: np.array([e["results"]["correct"] for e in runs[name]])
-                    for name in names}
-        intervals = bootstrap(np.stack([outcomes[name] for name in names]), rng)
+        right = {name: outcomes(runs[name]) for name in names}
+        intervals = bootstrap(np.stack([right[name] for name in names]), rng)
         accuracy[experiment] = {
-            name: _accuracy(runs[name], outcomes[name], interval, rng)
+            name: _accuracy(runs[name], right[name], interval, rng)
             for name, interval in zip(names, intervals)}
         pairs[experiment] = {
             level_name(share): {
-                f"semantic-{other}": paired(outcomes[_source_condition("semantic", share)],
-                                             outcomes[_source_condition(other, share)], rng)
+                f"semantic-{other}": paired(right[_source_condition("semantic", share)],
+                                             right[_source_condition(other, share)], rng)
                 for other in OTHER_SOURCES}
             for share in LEVELS}
     return {"model": model, "needle_seed": needle_seed, "haystack_tokens": haystack_tokens,
@@ -285,7 +296,7 @@ def summarise_long(entries: Sequence[dict], model: str, needle_seed: int, *,
                          f"{missing[:3]}; run tools/rq3.py --long for them")
     runs = {name: [latest[(s, CLOSING_EXPERIMENT, name)] for s in kept]
             for name in LONG_CONDITIONS}
-    right = {name: np.array([e["results"]["correct"] for e in runs[name]])
+    right = {name: outcomes(runs[name])
              for name in LONG_CONDITIONS}
     rng = np.random.default_rng(SEED)
     accuracy = {}
@@ -347,7 +358,7 @@ def summarise_ablations(entries: Sequence[dict], model: str, needle_seed: int,
     if len(weights) > 1:
         raise ValueError(f"the layer weights' runs were made with {len(weights)} sets of "
                          f"weights; run them again with the last logged")
-    right = {name: np.array([e["results"]["correct"] for e in runs[name]]) for name in names}
+    right = {name: outcomes(runs[name]) for name in names}
     rng = np.random.default_rng(SEED)
 
     def held(name: str) -> dict:
@@ -400,8 +411,7 @@ def evictions(runs: dict[str, list[dict]], rng: np.random.Generator) -> dict:
     held (held_at), the samples only each answered, McNemar's exact test
     on them, and eviction's change in accuracy from semantic, with the
     paired difference's bootstrap interval."""
-    right = {name: np.array([e["results"]["correct"] for e in runs[name]])
-             for name in EVICTION_NAMES}
+    right = {name: outcomes(runs[name]) for name in EVICTION_NAMES}
     out = {}
     for cond in rq3.EVICTIONS:
         against = rq3.source_condition("semantic", cond.share).name
@@ -437,7 +447,9 @@ def summarise_evictions(entries: Sequence[dict], model: str, needle_seed: int,
                         haystack_tokens: int, *, plan_seed: int = 0) -> dict:
     """Eviction on the screened needle set (#160), question-blind, against
     the semantic source at each level (evictions): the latest run of each
-    sample under each. A ValueError names what is missing."""
+    sample under each, with each condition's accuracy by depth and where its
+    needles' pages were held, or whether they were evicted. A ValueError
+    names what is missing."""
     screening = rq3.last_screening(entries, model, needle_seed, haystack_tokens)
     kept = screening["results"]["kept"]
     latest = _pool(entries, model, needle_seed, haystack_tokens, plan_seed, kept)
@@ -448,11 +460,17 @@ def summarise_evictions(entries: Sequence[dict], model: str, needle_seed: int,
                          f"{missing[:3]}; run tools/rq3.py --evictions for them")
     runs = {name: [latest[(s, CLOSING_EXPERIMENT, name)] for s in kept]
             for name in EVICTION_NAMES}
+    rng = np.random.default_rng(SEED)
+    levels = evictions(runs, rng)
     return {"model": model, "needle_seed": needle_seed, "haystack_tokens": haystack_tokens,
             "plan_seed": plan_seed, "experiment": CLOSING_EXPERIMENT,
             "samples": len(kept), "significance": SIGNIFICANCE,
-            "bootstrap": {"resamples": RESAMPLES, "seed": SEED},
-            "levels": evictions(runs, np.random.default_rng(SEED)),
+            "bootstrap": {"resamples": RESAMPLES, "seed": SEED}, "levels": levels,
+            "depths": [_depth_name(d) for d in needles.DEPTHS],
+            "by_depth": {name: by_depth(runs[name], outcomes(runs[name]), rng)
+                         for name in EVICTION_NAMES},
+            "needle_page_tiers": {name: pooled_tiers(runs[name], "needle_page_tiers")
+                                  for name in EVICTION_NAMES},
             "screening": screening["sha256"],
             "entries": [e["sha256"] for name in EVICTION_NAMES for e in runs[name]]}
 

@@ -63,7 +63,12 @@ laptop GPU, everyday applications take hundreds of MiB and mostly keep them;
 the monitor detects every catchable episode within 236\,ms with no false
 positive; and with Qwen2.5-1.5B at 32K positions, a contention that runs the
 static engine out of memory is survived by the adaptive one, which returns
-746\,MiB that the driver sees returned, to a granule, at every plan.
+746\,MiB that the driver sees returned, to a granule, at every plan. At equal
+reclaimed bytes, attention-guided allocation keeps the next-token distribution
+3.6 times closer to full precision than uniform allocation when 80\% of the
+bytes are reclaimed, but answers no more
+needles, 48 of 50 against 49, on a task even a 2-bit cache mostly answers; and
+downgrading keeps 48 needles where evicting the same bytes keeps 16.
 \end{abstract}
 
 % =====================================================================
@@ -139,7 +144,10 @@ the driver, and a marginal-cost planner over attention-derived importance. It
 survives, at 32K positions, a contention that ends the static engine.
 \item \textbf{An evaluation design that isolates allocation from compression},
 holding the reclaimed bytes equal between semantic, uniform and random
-allocation.
+allocation and eviction. At 80\% of the bytes reclaimed, semantic allocation
+kept the output distribution closer to full precision (mean KL 0.028 against
+0.101) but answered no more needles, and downgrading kept three times the
+answers of evicting the same bytes.
 \end{itemize}
 
 % =====================================================================
@@ -536,8 +544,6 @@ From the take to the end & 668\,s & 1617\,s & 1588\,s \\
 \subsection{RQ3: quality at equal compression}
 \label{sec:rq3}
 
-% TODO: RQ3's results, once measured. Nothing below may be stated as a result
-% until the benchmark log holds it.
 RQ3 compares the semantic, uniform and random score sources at equal reclaimed
 bytes. Compression is imposed by a \textit{controlled plan} between two turns of
 a conversation: the engine is given a byte target, 70\% or 80\% of the FP16
@@ -549,10 +555,78 @@ code planted at one of ten depths; whether attention paid before the question
 predicts what is consulted after it is the premise under test. A
 question-aware experiment, compressing after the question, bounds what a
 query-aware allocation could do. Fifty samples, screened at FP16, are compared
-by McNemar's test, with static INT4 and INT2 as the uniform-quantisation
-baseline, eviction of the pages the semantic plan would degrade most at the
-same bytes as H2O's family, a 32K subset, continuation fidelity and anchor-fact
-dialogue as secondary measures. These measurements are in progress.
+by McNemar's exact test. Static INT4 and INT2 stand for uniform quantisation,
+and eviction of the pages the semantic plan would degrade most, at the same
+bytes, for H2O's family: attention over a cache with pages evicted equals, to
+the bit, attention with them masked. Continuation fidelity teacher-forces 128
+tokens of 50 WikiText-2 passages after a 2K-token prefix, and the anchor-fact
+dialogue asks, after ten turns, for a code stated in one of them.
+
+\begin{table}[t]
+\caption{RQ3 at 80\% of the bytes reclaimed, question-blind, on Qwen2.5-1.5B.
+Needles and facts are of 50, continuation fidelity is top-1 agreement (\%) and
+mean KL from FP16 over 50 passages. Effective bits are the needle set's; on
+each task every condition held the same bits, and no needle-set plan fell
+short.}
+\label{tab:rq3}
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Condition & Bits & Needles & Facts & Top-1 & KL \\
+\midrule
+FP16 & 16.00 & 50 & 50 & 100 & 0 \\
+Static INT2, whole cache & 2.63 & 45 & -- & -- & -- \\
+Uniform & 3.40 & 49 & 45 & 86.5 & 0.101 \\
+Random & 3.40 & 50 & 48 & 87.6 & 0.082 \\
+Semantic & 3.40 & 48 & 48 & 93.6 & 0.028 \\
+Eviction & 3.40 & 16 & 16 & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The closing comparison is null.} At 80\%, question-blind, the semantic
+source answered 48 needles and uniform 49 (Table~\ref{tab:rq3}); one sample was
+answered by uniform alone and none by semantic alone, McNemar's $p = 1$. It
+stays null at 70\%, where all three sources answered all 50; with the question
+seen, 49 against 50; on a 32K subset of ten, all 10 for both; and in an
+end-to-end run, where the simulator's contention rather than a controlled
+plan forced the reclamation, 48 against 49 on the same contention. The needle set sits at its
+ceiling: static INT2 for the whole cache kept 45 of 50. The semantic order did
+work as designed, leaving 43\% of the needles' pages at INT2 against uniform's
+68\%, but the code survived INT2 in most samples whichever source sent it
+there.
+
+\textbf{Graded measures part the sources.} In continuation fidelity at 80\%,
+semantic allocation kept the next-token distribution 3.6 times closer to FP16
+than uniform, a paired difference in mean KL of $-0.073$ [$-0.082$,
+$-0.065$], lower on all 50 passages, and top-1 agreement 7.1 points higher.
+At 70\% its KL against uniform's was within the interval, at 0.0023 against
+0.0031. In the dialogue, semantic recalled 48 facts against uniform's 45, three
+dialogues answered by semantic alone and none the other way ($p = 0.25$);
+uniform held every fact's page at INT2, semantic 38\% of them.
+
+\textbf{Downgrading keeps what eviction loses.} At the same bytes, eviction
+answered 16 needles and recalled 16 facts at 80\%, and 22 and 21 at 70\%,
+against semantic's 48, 48, 50 and 50; every sample eviction answered, semantic
+did too ($p < 10^{-8}$ throughout). In the dialogue at 80\% eviction kept the
+facts of the last two turns and lost most stated three or more turns back.
+
+\textbf{Recovery and ablations.} After pressure passes, restoring every page
+from its shadow took under 0.7\,s at 8K positions; a third turn then answered
+50 of 50 needles under semantic, both of its turn-2 misses recovered. At 32K,
+a 30\,s pulse during prefill was survived by both sources with every page
+restored, about nine minutes after the release, with prefill still under way.
+None of nine quality ablations at 80\% changed needle accuracy detectably
+($p \ge 0.5$); planning by importance alone, without the tier's error, lost
+the most, two samples. Two were not at equal bytes: without INT2, and with a
+512-position recency floor, every plan fell short of its target.
+
+\textbf{Answer.} At equal bytes, attention-guided allocation did not keep needle
+accuracy better than uniform allocation, on a task too easy at this length to
+separate them; it kept the model's output distribution markedly closer to full
+precision, and at 80\% reversible degradation kept three times the answers of
+eviction.
 
 % =====================================================================
 \section{Limitations}
@@ -570,7 +644,11 @@ boundaries.} The first event of an episode waits for the step in progress, and
 at long contexts a step's fixed part exceeds a second, so no chunk size meets a
 1\,s target there. \textbf{Attention as a signal.} We use attention mass as a
 predictor of which pages will be consulted again, not as an explanation of the
-model; RQ3 tests that use.
+model; RQ3 tests that use by its outcome, and the correlation between a page's
+score and the damage its downgrade causes was not measured. \textbf{A task at
+its ceiling.} At 8K positions on Qwen2.5-1.5B the needle's code survives INT2
+in most samples, so the needle task cannot separate the sources; a harder task,
+a longer context or more samples might.
 
 % =====================================================================
 \section{Conclusion}
@@ -581,7 +659,10 @@ reasons it neither causes nor sees. We showed that this contention is large,
 rises over seconds and mostly persists; that a monitor consulting no scheduler
 detects it within a quarter of a second; and that an engine which reallocates
 cache precision at runtime, page by page, and returns the memory to the driver,
-survives a contention that ends a static engine. Local inference keeps user
+survives a contention that ends a static engine. At equal bytes, allocating
+that precision by attention kept the model's output closer to full precision
+than allocating it uniformly, though not more needle answers, and degrading
+pages reversibly kept far more than evicting them. Local inference keeps user
 data on the user's machine; we see no negative impact particular to this work
 beyond those of the language models it serves.
 

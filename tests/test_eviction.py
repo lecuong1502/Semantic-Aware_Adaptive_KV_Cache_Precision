@@ -312,13 +312,15 @@ KEPT = ["d00-0", "d10-0", "d20-0", "d30-0"]
 SET = ("m", 140, 7936)
 
 
-def logged_run(log, sample_id, name, correct, *, bits=3.4, reclaimed=1000):
+def logged_run(log, sample_id, name, correct, *, bits=3.4, reclaimed=1000,
+               needle_pages=None):
     benchlog.append(
         "rq3-needle", model="m", context_length=8000, precision_tiers=None,
         config={"sample_id": sample_id, "condition": asdict(rq3.condition(name)),
                 "experiment": "question-blind", "needle_seed": 140, "plan_seed": 0,
-                "haystack_tokens": 7936},
+                "haystack_tokens": 7936, "depth": int(sample_id[1:3]) / 100},
         results={"correct": correct, "effective_bits": bits, "candidate_effective_bits": bits,
+                 "needle_page_tiers": needle_pages or {"INT2": 2},
                  "plan": {"short": False, "target_met": True, "reclaimed_bytes": reclaimed}},
         log=log)
 
@@ -327,7 +329,8 @@ def test_eviction_is_given_against_the_semantic_source_at_each_level(tmp_path):
     """At 80%, semantic answers all four and eviction one, at the same bytes;
     at 70%, eviction answers the one semantic misses. Each pair is by
     sample, with McNemar's test, the change and its interval, and each
-    condition's bits and bytes."""
+    condition's bits and bytes; and each condition's accuracy by depth, with
+    where its needles' pages were held or whether they were evicted."""
     log = tmp_path / "benchmark.jsonl"
     benchlog.append("needle-screening", model="m", context_length=None,
                     precision_tiers={"FP16": 1.0},
@@ -335,7 +338,8 @@ def test_eviction_is_given_against_the_semantic_source_at_each_level(tmp_path):
                     results={"kept": KEPT, "rejected": [], "complete": True}, log=log)
     for i, s in enumerate(KEPT):
         logged_run(log, s, "semantic-80", True)
-        logged_run(log, s, "evict-80", i == 0, bits=3.2, reclaimed=1010)
+        logged_run(log, s, "evict-80", i == 0, bits=3.2, reclaimed=1010,
+                   needle_pages={"FP16": 1} if i == 0 else {"evicted": 1})
         logged_run(log, s, "semantic-70", i != 0, bits=5.0)
         logged_run(log, s, "evict-70", True, bits=4.8)
     with pytest.raises(ValueError, match=r"no run of 4 .*--evictions"):
@@ -352,6 +356,9 @@ def test_eviction_is_given_against_the_semantic_source_at_each_level(tmp_path):
     at_70 = summary["levels"]["70%"]
     assert (at_70["eviction_only"], at_70["semantic_only"], at_70["change"]) == (1, 0, 0.25)
     assert len(summary["entries"]) == 16
+    by_depth = summary["by_depth"]["evict-80"]
+    assert [(d["correct"], d["n"]) for d in by_depth.values()] == [(1, 1), *[(0, 1)] * 3]
+    assert summary["needle_page_tiers"]["evict-80"] == {"FP16": 0.25, "evicted": 0.75}
 
 
 @pytest.mark.slowest

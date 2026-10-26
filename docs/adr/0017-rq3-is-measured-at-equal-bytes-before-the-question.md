@@ -171,3 +171,65 @@ both levels, against the semantic source there.
   dialogue, question-blind, with the semantic source at both levels run
   again beside it at the same code (`tools/rq3.py --evictions`,
   `tools/anchors.py --evictions`).
+
+## As measured (#161): the closing answer is no
+
+Every figure is from a summary entry in the benchmark log, named by its
+hash. Qwen2.5-1.5B, the screened set of 50, question-blind unless said.
+
+**The closing answer is no.** At 80%, the semantic source answered 48 of
+50 needles and uniform 49 (`rq3-summary` `291c718f…`, on the screening
+`7dafc4ea…`). One sample was answered by uniform alone and
+none by semantic alone: McNemar's exact p = 1, where rejecting at 0.05
+needs six discordant samples or more, all one way.
+
+| Condition | Bits, 70% / 80% | Needles, 70% / 80% |
+|---|---|---|
+| FP16 | 16.00 | 50 / 50 |
+| Uniform | 4.98 / 3.40 | 50 / 49 |
+| Random | 4.98 / 3.40 | 50 / 50 |
+| Semantic | 4.98 / 3.40 | 50 / 48 |
+| Eviction (`71cbc603…`) | 4.98 / 3.40 | 22 / 16 |
+| Static INT4 / INT2, whole session | 4.63 / 2.63 | 50 (INT4) / 45 (INT2) |
+
+- **The needle set sits at its ceiling.** Static INT2 for the whole cache
+  answered 45 of 50. The semantic source left 43% of the needles' (layer,
+  page) pairs at INT2 at 80%, uniform 68% and random 73%: the order worked,
+  but the code survived INT2 in most samples whichever source sent it
+  there. No depth shows a gap.
+- **Question-aware:** semantic 49 of 50 at 80%, uniform and random 50; p = 1.
+  The upper bound shows no gap for the blind experiment to keep.
+- **The 32K subset** (`rq3-long-summary` `c75bdd05…`): 10 of 10 under FP16,
+  semantic and uniform, at 3.25 bits. No direction.
+- **End to end** (`end-to-end-summary` `b856c0ab…`): under the simulator's
+  contention, the same in all 50 samples, semantic 48 and uniform 49,
+  p = 1. The 20 ms a step plans give had not finished the reclamation by
+  the question: 157 and 161 MiB of a 172 MiB target, met in 0 and 19 runs.
+- **Continuation fidelity** (`continuation-summary` `19ad5127…`, 50
+  passages, 2048-token prefix, 128 tokens teacher-forced): at 80% mean KL
+  0.028 semantic, 0.101 uniform, 0.082 random. Semantic's paired
+  difference from uniform is −0.073 [−0.082, −0.065], lower on all 50
+  passages, and its top-1 agreement 93.6% against 86.5%. At 70%, KL 0.0023
+  against 0.0031, the difference within its interval, but top-1 still
+  1.3 points higher [0.8, 1.8].
+- **Anchor-fact dialogue** (`anchor-summary` `794253c8…`): at 80% semantic
+  recalled 48 of 50, uniform 45 and random 48. Semantic against uniform
+  is three to none, p = 0.25. Uniform held every fact's page at INT2,
+  semantic 38% of them. Every source recalled all 50 at 70%.
+- **Eviction** (`rq3-eviction-summary` `71cbc603…` and `e01276d7…`): 16 of
+  50 needles and 16 facts at 80%, 22 and 21 at 70%. Every sample eviction
+  answered, semantic answered too, so p < 1e-8 at each. At 80% eviction kept
+  the facts of the last two turns, and few from three or more turns back.
+- **Recovery** (`recovery-summary` `a206569e…`): after every page is
+  restored, in under 0.7 s at 8K, a third turn answered 50 of 50 under
+  semantic, both its turn-2 misses recovered; uniform's one miss stayed. At
+  32K, a 30 s pulse during prefill was survived under both sources, every
+  page restored 532 s (semantic) and 541 s (uniform) after the pressure
+  ended, with prefill still under way (`pulse-release`, #155).
+
+**What it means.** At equal bytes, allocation by attention did not keep
+needle accuracy better than uniform allocation, on a task too easy at this
+length to separate them. It kept the output distribution closer to FP16,
+where the measure is graded. The thesis's premise was tested by these
+outcomes only. The correlation between a page's score and the damage its
+downgrade causes, by single-page downgrades, was not measured.
