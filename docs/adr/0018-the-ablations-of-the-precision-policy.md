@@ -84,3 +84,36 @@ the floor at INT4, and is not at equal bytes. The variant is still run at
 against the semantic source at 70% on the same samples, where the bytes
 can be met. The owner chose this after the review of #158, before any
 ablation was run.
+
+## As measured (#161)
+
+From `rq3-ablation-summary` `dcf68122…`, at 6c4a7ea. The full policy
+answered 48 of 50 at 80% at 3.40 bits, and 50 of 50 at 70% at 4.98 bits.
+
+| Variant | Bits | Correct | Change, points [95%] | McNemar p | Short plans |
+|---|---|---|---|---|---|
+| W = 0 | 3.40 | 49 | +2 [0, +6] | 1.0 | 0 |
+| W = 512 | 3.48 | 48 | 0 | 1.0 | 50 |
+| Every step | 3.40 | 48 | 0 | 1.0 | 0 |
+| α = 0.05 | 3.40 | 49 | +2 [0, +6] | 1.0 | 0 |
+| α = 0.5 | 3.40 | 48 | 0 | 1.0 | 0 |
+| Importance alone | 3.40 | 46 | −4 [−10, 0] | 0.5 | 0 |
+| No INT2, 80% | 4.81 | 50 | +4 [0, +10] | 0.5 | 50 |
+| No INT2, 70% | 4.98 | 50 | 0 | 1.0 | 0 |
+| Layer weights | 3.40 | 49 | +2 [0, +6] | 1.0 | 0 |
+| First page protected | 3.40 | 48 | 0 | 1.0 | 0 |
+
+- **No element's removal changed accuracy detectably.** No variant
+  differed from the full policy on more than two samples. The needle set's
+  ceiling, which holds RQ3's sources together (ADR-0017, as measured),
+  holds the variants together too.
+- **Two variants were not at equal bytes.** No INT2 at 80% and W = 512 fell
+  short on every plan. No INT2's two extra answers are bought with the
+  bytes it did not give back; at 70%, where INT4 can meet the target, it
+  ties the full policy.
+- **Importance alone lost the most,** two samples, and gained none.
+- **K** was measured on the monitor (ADR-0014's amendment): K = 1 caught
+  every episode at a median of 28 ms with no false positive, K = 5 took
+  215 ms with three false negatives, and K stays 3.
+- **The policy is unchanged.** No variant beat the full policy detectably,
+  so nothing here calls for the new ADR this one's consequences require.
