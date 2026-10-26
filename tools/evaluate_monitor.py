@@ -88,11 +88,6 @@ SEED = 64
 SETTLE_S = 2.0
 
 
-def summary(s: evaluation.Score) -> dict:
-    return {**asdict(s), "false_negatives": s.false_negatives,
-            "latency_ms": spread(s.latencies_ms), "latency_polls": spread(s.latencies_polls)}
-
-
 class GridWorkload:
     """A grid of pulses on a base that leaves --start-headroom (#64)."""
 
@@ -135,7 +130,8 @@ class GridWorkload:
             self.args.out, ".events.jsonl").read_text().splitlines()]
         starts = evaluation.pulse_starts(self.grid, started, changes)
         per_cell = evaluation.score_cells(self.grid, starts, end, episodes, events, thresholds)
-        return {"cells": [{**asdict(c), "amplitude_mib": c.amplitude_bytes / MIB, **summary(s)}
+        return {"cells": [{**asdict(c), "amplitude_mib": c.amplitude_bytes / MIB,
+                           **evaluation.summary(s)}
                           for c, s in zip(self.cells, per_cell)]}
 
 
@@ -276,7 +272,7 @@ def main(argv: list[str]) -> int:
     events = [r.event for r in engine.pressure_events]
     end = started + int(schedule.duration_s * 1e9)
     overall, scores = score_against_trace(workload, started, end, events, thresholds)
-    results = {"overall": summary(overall), "events_recorded": len(events),
+    results = {"overall": evaluation.summary(overall), "events_recorded": len(events),
                "monitor_error": None if engine.monitor_error is None
                else str(engine.monitor_error),
                "missed_polls": watching.missed, **scores}
@@ -360,7 +356,7 @@ def rescore(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                     context_length=entry["context_length"],
                     precision_tiers=entry["precision_tiers"],
                     config={**config, "issue": args.issue, "rescores": entry["sha256"]},
-                    results={**entry["results"], "overall": summary(overall), **scores},
+                    results={**entry["results"], "overall": evaluation.summary(overall), **scores},
                     log=args.log)
     print(json.dumps({"rescores": entry["sha256"][:8], "episodes": overall.episodes,
                       "false_negatives_detectable": overall.missed_detectable,

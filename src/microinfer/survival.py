@@ -30,24 +30,33 @@ cache holds, its effective bits and its pages below FP16, and `recovery`
 gives what that comes to: the time from the end of pressure to every page
 back at FP16, the effective bits over time, and any thrash, downgrades and
 upgrades alternating.
+
+**A scheduled scenario** (#190) is the run with the simulator playing a
+schedule in S5's step's place, S1 to S4 of the survival matrix
+(survival_matrix): made from the headroom at the take, the run ending with
+the generation and cutting the schedule there. A static INT4 or INT2
+engine's headroom is counted as an FP16 engine's would be, so that every
+condition faces the same bytes taken. A run's monitor is scored against
+the recorder's trace (`detection`), as RQ2 scored it (evaluation).
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 
-from . import _microinfer, nvml, recorder, replay
+from . import _microinfer, evaluation, nvml, recorder, replay
 from .config import ModelConfig
 from .contention import spread
 from .engine import COMPLETE, Ending, Engine, PlanRecord, PressureRecord, paged_cache_bytes
 from .footprint import MIB
+from .monitor import PressureEvent, Thresholds
 from .schedule import Schedule
 
 #: How a static run that ran out ends: generate raises, it does not end.
@@ -79,6 +88,14 @@ def contention_bytes(cfg: ModelConfig, *, headroom_bytes: int, positions: int, c
                          f"taken")
     granule = _microinfer.granule_bytes()
     return -(-(room + shortfall_bytes) // granule) * granule
+
+
+def as_fp16(cfg: ModelConfig, headroom_bytes: int, *, positions: int, kv_tier: str) -> int:
+    """The headroom an FP16 engine would leave where one at `kv_tier`
+    leaves `headroom_bytes`, its cache at `positions`: less by what the
+    FP16 cache would hold beyond it."""
+    return headroom_bytes - (paged_cache_bytes(cfg, positions)
+                             - paged_cache_bytes(cfg, positions, kv_tier))
 
 
 def summarise(plans: Sequence[PlanRecord], *, ending: Ending | None = None,
@@ -189,6 +206,8 @@ class Run:
     pressure_ended_seconds: float | None = None
     #: How long the simulator kept what it took, or None, to the end.
     pulse_s: float | None = None
+    #: What the simulator played: S5's step, or a scenario's schedule.
+    schedule: Schedule | None = None
 
 
 class Step(NamedTuple):
@@ -211,17 +230,24 @@ def sample(engine: Engine, state: str, position: int) -> Step:
 
 
 def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: int,
-        shortfall_bytes: int, out: str | Path, simulator_context_bytes: int,
-        pulse_s: float | None = None) -> Run:
+        out: str | Path, simulator_context_bytes: int, shortfall_bytes: int | None = None,
+        pulse_s: float | None = None,
+        schedule: Callable[[int], Schedule] | None = None) -> Run:
     """Generate `new_tokens` after `prompt` with the engine's monitor on and
     plans measured, while the recorder records the device to `out`. When
     the cache first reports `contention_at` positions or more, the
     simulator takes contention_bytes for `shortfall_bytes` and keeps it
     until the generation ends, or, with `pulse_s`, for that long, and then
-    gives it back; the generation waits there until it has taken it. Every
-    step is sampled into the run's timeline. A static engine that runs out
-    raises OutOfMemory, which is caught and summarised; an adaptive one
-    ends as its `ending` says."""
+    gives it back; or, given a `schedule` in their place, plays what it
+    makes of the headroom then, before the simulator's context, until the
+    generation ends. Either way the headroom is as an FP16 engine's would
+    be (as_fp16), and the generation waits there until the simulator has
+    taken its first level. Every step is sampled into the run's timeline.
+    A static engine that runs out raises OutOfMemory, which is caught and
+    summarised; an adaptive one ends as its `ending` says."""
+    if (schedule is None) == (shortfall_bytes is None) or (
+            schedule is not None and pulse_s is not None):
+        raise ValueError("a run's contention is a shortfall, pulsed or kept, or a schedule")
     context = len(prompt) + new_tokens - 1
     simulator = Simulator(out)
     took: dict = {}
@@ -234,11 +260,18 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
         if took or position < contention_at:
             return
         took["position"], took["headroom"] = position, nvml.memory().free
-        took["bytes"] = contention_bytes(engine.config, headroom_bytes=took["headroom"],
-                                         positions=position, context=context,
-                                         simulator_context_bytes=simulator_context_bytes,
-                                         shortfall_bytes=shortfall_bytes)
-        simulator.take(took["bytes"], pulse_s=pulse_s)
+        headroom = as_fp16(engine.config, took["headroom"], positions=position,
+                           kv_tier=engine.kv_tier)
+        if schedule is None:
+            nbytes = contention_bytes(engine.config, headroom_bytes=headroom,
+                                      positions=position, context=context,
+                                      simulator_context_bytes=simulator_context_bytes,
+                                      shortfall_bytes=shortfall_bytes)
+            played = Schedule([(0.0, nbytes)] + ([] if pulse_s is None else [(pulse_s, 0)]))
+        else:
+            played = schedule(headroom)
+        took["schedule"] = played
+        simulator.play(played)
         took["at_seconds"] = time.monotonic()
 
     engine.measure_plans = True
@@ -257,9 +290,22 @@ def run(engine: Engine, prompt: np.ndarray, new_tokens: int, *, contention_at: i
     if not took:
         raise RuntimeError(f"the cache never reached {contention_at} positions: no contention")
     return Run(summarise(engine.plans, ending=ending, error=error, positions_reached=reached[0]),
-               took["position"], took["headroom"], took["bytes"], simulator.started_ns,
-               list(engine.pressure_events), timeline, took["at_seconds"],
-               engine.pressure_ended_seconds, pulse_s)
+               took["position"], took["headroom"], took["schedule"].points[0][1],
+               simulator.started_ns, list(engine.pressure_events), timeline,
+               took["at_seconds"], engine.pressure_ended_seconds, pulse_s, took["schedule"])
+
+
+def detection(out: str | Path, events: Sequence[PressureEvent], thresholds: Thresholds,
+              started_ns: int) -> dict:
+    """The monitor's RED `events` scored against the true RED episodes of
+    the trace at `out`, from when the simulator began to the trace's end,
+    as RQ2 scored it (evaluation.score): the engine's own growth moves
+    headroom too, and counts as the simulator's does."""
+    _, samples = recorder.read(out)
+    t = samples["t_mono_ns"]
+    episodes = evaluation.true_red(t, samples["free_bytes"], thresholds)
+    return evaluation.summary(evaluation.score(episodes, list(events), thresholds,
+                                               within=(started_ns, int(t[-1]) + 1)))
 
 
 def recovery(run: Run, plans: Sequence[PlanRecord], *, cooldown_seconds: float) -> dict:
@@ -349,7 +395,8 @@ class Simulator:
     """The contention simulator, a process of its own, run on a thread of
     this one while the recorder records the device to `out` (replay):
     `take` starts it and returns once it has taken its memory, which it
-    keeps until `close`, or, with a pulse, gives back that long after."""
+    keeps until `close`, or, with a pulse, gives back that long after;
+    `play` plays a schedule the same way, until it ends or `close`."""
 
     def __init__(self, out: str | Path):
         self.out = Path(out)
@@ -362,14 +409,19 @@ class Simulator:
     def take(self, nbytes: int, *, pulse_s: float | None = None) -> None:
         """Take `nbytes` beyond the simulator's own context, waiting until
         it has; with `pulse_s`, give them back that long after."""
+        self.play(Schedule([(0.0, nbytes)] + ([] if pulse_s is None else [(pulse_s, 0)])))
+
+    def play(self, schedule: Schedule) -> None:
+        """Play `schedule`, beyond the simulator's own context, waiting until
+        it has taken its first level; `close` cuts it short."""
         if self._thread is not None:
             raise RuntimeError("a simulator takes once")
-        points = [(0.0, nbytes)] + ([] if pulse_s is None else [(pulse_s, 0)])
 
         def contend() -> None:
             try:
-                self.started_ns = replay.replay(Schedule(points), self.out, lead_s=LEAD_S,
-                                                tail_s=KEEP_S, stop=self._done)
+                self.started_ns = replay.replay(schedule, self.out, lead_s=LEAD_S,
+                                                tail_s=KEEP_S, stop=self._done,
+                                                cut_by_stop=True)
             except BaseException as exc:  # noqa: BLE001 - raised by the caller's thread
                 self._failure.append(exc)
 

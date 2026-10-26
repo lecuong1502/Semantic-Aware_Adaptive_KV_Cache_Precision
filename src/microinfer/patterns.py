@@ -284,22 +284,65 @@ def from_rq1(kind: str = "spikes", action: str | None = None,
     if not chosen:
         raise ValueError(f"no {kind} of {action or 'any action'} in the recordings of {issues}")
 
-    def ramp(ms):
-        return None if ms is None else ms * 1e-3 / MEASURED_SHARE
-
     def measured(values):
         values = tuple(v for v in values if v is not None)
         return Empirical(values) if values else Fixed(0.0)
 
     amplitudes = measured(s["amplitude_mib"] * MiB for s, _ in chosen)
-    rises = [ramp(s.get("rise_ms")) for s, _ in chosen]
+    rises = [_ramp(s.get("rise_ms")) for s, _ in chosen]
     rate = len(chosen) / seconds
     if kind == "drops":
         return ShapeParameters(rate, amplitudes, measured(rises), kept_s, Fixed(0.0))
 
-    falls = [ramp(s.get("recovery_ms")) for s, _ in chosen]
-    plateaus = []
-    for (s, threshold), rise, fall in zip(chosen, rises, falls):
-        above = 1 - min(threshold / (s["amplitude_mib"] * MiB), 1.0)  # of each ramp
-        plateaus.append(max(s["duration_ms"] * 1e-3 - ((rise or 0) + (fall or 0)) * above, 0.0))
+    falls = [_ramp(s.get("recovery_ms")) for s, _ in chosen]
+    plateaus = [_plateau(s, threshold, rise, fall)
+                for (s, threshold), rise, fall in zip(chosen, rises, falls)]
     return ShapeParameters(rate, amplitudes, measured(rises), measured(plateaus), measured(falls))
+
+
+def _ramp(ms: float | None) -> float | None:
+    """A ramp's seconds from its measure, from 10% to 90% of the amplitude."""
+    return None if ms is None else ms * 1e-3 / MEASURED_SHARE
+
+
+def _plateau(spike: dict, threshold: float, rise: float | None, fall: float | None) -> float:
+    """A recovered spike's plateau: its time at or above the threshold less
+    the part of each ramp above it."""
+    above = 1 - min(threshold / (spike["amplitude_mib"] * MiB), 1.0)  # of each ramp
+    return max(spike["duration_ms"] * 1e-3 - ((rise or 0) + (fall or 0)) * above, 0.0)
+
+
+@dataclass(frozen=True)
+class Measured:
+    """One of RQ1's spikes as a shape: a recovered spike's trapezoid, or a
+    lasting drop's amplitude and rise, its plateau and fall 0, kept as long
+    as the caller says. A ramp not measured is a sheer edge."""
+
+    shape: Trapezoid
+    lasting: bool
+
+
+def rq1_spikes(log: str | Path = benchlog.DEFAULT_LOG, issues=RQ1_ISSUES
+               ) -> tuple[list[Measured], float]:
+    """Every spike of RQ1's recordings that recovered or lasted, each one
+    shape, and the seconds recorded: for draws that keep a spike's measures
+    together, where from_rq1 draws each apart. Censored spikes are left
+    out, as there."""
+    found, seconds = [], 0.0
+    for entry in logged_recordings(log, issues):
+        threshold = entry["config"].get("threshold_mib", 64) * MiB
+        seconds += entry["results"]["recorded_hours"] * 3600
+        for s in entry["results"]["spikes"]:
+            if s["ending"] == "censored":
+                continue
+            rise = _ramp(s.get("rise_ms")) or 0.0
+            amplitude = s["amplitude_mib"] * MiB
+            if s["ending"] == "lasting":
+                found.append(Measured(Trapezoid(amplitude, rise, 0.0, 0.0), True))
+                continue
+            fall = _ramp(s.get("recovery_ms")) or 0.0
+            found.append(Measured(Trapezoid(amplitude, rise, _plateau(s, threshold, rise, fall),
+                                            fall), False))
+    if not found:
+        raise ValueError(f"no spikes in the recordings of {issues}")
+    return found, seconds
