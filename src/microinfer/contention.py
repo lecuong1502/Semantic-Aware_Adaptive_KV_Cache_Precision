@@ -129,11 +129,19 @@ def attribute(spike: spikes.Spike, stream: ProcessStream, *,
 
 def spread(values: list[float]) -> dict | None:
     """Median, P90 and max, or None if there are no values."""
+    p = percentiles(values)
+    return None if p is None else {k: p[k] for k in ("median", "p90", "max")}
+
+
+def percentiles(values: list[float]) -> dict | None:
+    """P10, median, P90 and max, and how many values, or None if there are
+    none."""
     if not values:
         return None
     a = np.array(values, dtype=float)
-    return {"median": float(np.median(a)), "p90": float(np.percentile(a, 90)),
-            "max": float(a.max())}
+    p10, median, p90 = np.percentile(a, [10, 50, 90])
+    return {"p10": float(p10), "median": float(median), "p90": float(p90),
+            "max": float(a.max()), "n": len(a)}
 
 
 def _ms(seconds: list[float | None]) -> dict | None:
@@ -240,17 +248,6 @@ def logged_recordings(log: str | Path = benchlog.DEFAULT_LOG, issues=RQ1_ISSUES)
             yield entry
 
 
-def percentiles(values: list[float]) -> dict | None:
-    """P10, median, P90 and max, and how many values, or None if there are
-    none."""
-    if not values:
-        return None
-    a = np.array(values, dtype=float)
-    p10, median, p90 = np.percentile(a, [10, 50, 90])
-    return {"p10": float(p10), "median": float(median), "p90": float(p90),
-            "max": float(a.max()), "n": len(a)}
-
-
 def pooled(entries) -> dict:
     """The spikes of every recording in `entries`, "contention-trace"
     entries, pooled as RQ1 reports them: censored spikes counted among the
@@ -259,8 +256,9 @@ def pooled(entries) -> dict:
     how many name a process; and each recording, by its entry's hash and
     its trace's (#186)."""
     entries = list(entries)
-    found = [s for e in entries for s in e["results"]["spikes"]]
-    endings = {e: sum(s["ending"] == e for s in found) for e in get_args(spikes.Ending)}
+    found = [s for entry in entries for s in entry["results"]["spikes"]]
+    endings = {ending: sum(s["ending"] == ending for s in found)
+               for ending in get_args(spikes.Ending)}
     kept = [s for s in found if s["ending"] != "censored"]
     return {"count": len(kept), "endings": endings,
             "amplitude_mib": percentiles([s["amplitude_mib"] for s in kept]),
@@ -268,9 +266,9 @@ def pooled(entries) -> dict:
             "duration_ms": percentiles([s["duration_ms"] for s in kept
                                         if s["ending"] == "recovered"]),
             "attributed": sum(s["process"] is not None for s in kept),
-            "recordings": [{"entry": e["sha256"], "trace": e["config"]["trace"],
-                            "sha256": e["config"]["files"][e["config"]["trace"]]}
-                           for e in entries]}
+            "recordings": [{"entry": entry["sha256"], "trace": entry["config"]["trace"],
+                            "sha256": entry["config"]["files"][entry["config"]["trace"]]}
+                           for entry in entries]}
 
 
 def log_recording(path: str | Path, *, issue: int, log: str | Path = benchlog.DEFAULT_LOG,

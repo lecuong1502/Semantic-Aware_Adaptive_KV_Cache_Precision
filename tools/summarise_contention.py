@@ -7,9 +7,10 @@ Pools the spikes of every RQ1 recording in the benchmark log
 (microinfer.contention.pooled): amplitude and rise time at P10, median, P90
 and max, the duration of the recovered, the endings and how many name a
 process. Logs them as a "contention-summary" entry naming each recording by
-its entry's hash and its trace's, beside the host: the CPU, its cores and
-threads, host memory and the CUDA toolkit the engine is built with. The GPU
-and its driver are in every entry's environment already. Prints both as
+its entry's hash and its trace's, and the threshold their spikes were
+found at, beside the host: the CPU, its cores and threads, host memory, the
+CUDA toolkit of the nvcc on the PATH, and the Linux release. The GPU and its
+driver are in every entry's environment already. Prints both as
 tables for the thesis. Refuses a dirty tree.
 """
 
@@ -30,7 +31,8 @@ from microinfer import benchlog, contention  # noqa: E402
 
 def host() -> dict:
     """The CPU's model name, its physical cores and its threads, host memory
-    in bytes, and nvcc's release, None where it is not on the PATH."""
+    in bytes, the release of the nvcc on the PATH, None where there is none,
+    and the Linux release."""
     cpuinfo = Path("/proc/cpuinfo").read_text()
     model = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M).group(1).strip()
     cores = {(m.group(1), m.group(2)) for m in re.finditer(
@@ -44,7 +46,8 @@ def host() -> dict:
     except (OSError, subprocess.CalledProcessError, AttributeError):
         cuda = None
     return {"cpu": model, "cores": len(cores), "threads": os.cpu_count(),
-            "memory_bytes": kib * 1024, "cuda_toolkit": cuda, "kernel": os.uname().release}
+            "memory_bytes": kib * 1024, "cuda_toolkit": cuda,
+            "linux_release": os.uname().release}
 
 
 def main(argv: list[str]) -> int:
@@ -64,7 +67,9 @@ def main(argv: list[str]) -> int:
     machine = host()
     benchlog.append("contention-summary", model=None, context_length=None,
                     precision_tiers=None,
-                    config={"issue": args.issue, "issues": list(contention.RQ1_ISSUES)},
+                    config={"issue": args.issue, "issues": list(contention.RQ1_ISSUES),
+                            "threshold_mib": sorted({e["config"]["threshold_mib"]
+                                                     for e in entries})},
                     results={"spikes": spikes, "host": machine}, log=args.log)
 
     print(f"{spikes['count']} spikes in {len(entries)} recordings; endings "
@@ -78,7 +83,7 @@ def main(argv: list[str]) -> int:
             f"{p[k] * scale:.3g}" for k in ("p10", "median", "p90", "max")) + " |")
     print(f"\nCPU: {machine['cpu']}, {machine['cores']} cores, {machine['threads']} threads; "
           f"host memory {machine['memory_bytes'] / 2**30:.1f} GiB; "
-          f"CUDA toolkit {machine['cuda_toolkit']}; kernel {machine['kernel']}")
+          f"CUDA toolkit {machine['cuda_toolkit']}; Linux {machine['linux_release']}")
     return 0
 
 

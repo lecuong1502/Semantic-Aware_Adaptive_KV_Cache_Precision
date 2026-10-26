@@ -199,13 +199,14 @@ def test_a_recording_is_logged_with_every_spike_and_the_sha256_of_its_files(tmp_
     assert f"UNLOGGED  {unlogged}" in result.stdout and f"ok        {path}" in result.stdout
 
 
-def logged_spikes(sha: str, *spikes_: tuple[str, float, float | None, float]) -> dict:
-    """A "contention-trace" entry of its spikes: ending, amplitude in MiB,
-    rise and duration in ms."""
-    return {"sha256": sha, "config": {"trace": f"{sha}.csv.gz", "files": {f"{sha}.csv.gz": sha}},
+def logged_spikes(sha: str, *rows: tuple[str, float, float | None, float]) -> dict:
+    """A "contention-trace" entry of its spikes, a row each: ending, amplitude
+    in MiB, rise and duration in ms. Its trace's hash is its own, reversed."""
+    return {"sha256": sha, "config": {"trace": f"{sha}.csv.gz", "threshold_mib": 64.0,
+                                      "files": {f"{sha}.csv.gz": sha[::-1]}},
             "results": {"spikes": [
                 {"ending": e, "amplitude_mib": a, "rise_ms": r, "duration_ms": d,
-                 "process": None if a < 100 else "chrome"} for e, a, r, d in spikes_]}}
+                 "process": None if a < 100 else "chrome"} for e, a, r, d in rows]}}
 
 
 def test_rq1s_spikes_are_pooled_over_its_recordings_by_percentile():
@@ -213,8 +214,8 @@ def test_rq1s_spikes_are_pooled_over_its_recordings_by_percentile():
     and rise at P10, median, P90 and max, the duration of the recovered,
     the endings, and how many name a process; each recording by its
     entry's hash and its trace's."""
-    entries = [logged_spikes("aa", ("lasting", 50, 100, 5000), ("recovered", 150, 200, 300)),
-               logged_spikes("bb", ("lasting", 250, None, 5000), ("recovered", 350, 400, 700),
+    entries = [logged_spikes("ab", ("lasting", 50, 100, 5000), ("recovered", 150, 200, 300)),
+               logged_spikes("cd", ("lasting", 250, None, 5000), ("recovered", 350, 400, 700),
                              ("censored", 1000, 50, 10))]
     pooled = contention.pooled(entries)
     assert pooled["count"] == 4
@@ -225,8 +226,8 @@ def test_rq1s_spikes_are_pooled_over_its_recordings_by_percentile():
     assert pooled["duration_ms"] == {"p10": pytest.approx(340), "median": 500,
                                      "p90": pytest.approx(660), "max": 700, "n": 2}
     assert pooled["attributed"] == 3
-    assert pooled["recordings"] == [{"entry": "aa", "trace": "aa.csv.gz", "sha256": "aa"},
-                                    {"entry": "bb", "trace": "bb.csv.gz", "sha256": "bb"}]
+    assert pooled["recordings"] == [{"entry": "ab", "trace": "ab.csv.gz", "sha256": "ba"},
+                                    {"entry": "cd", "trace": "cd.csv.gz", "sha256": "dc"}]
 
 
 def test_the_summary_tool_logs_the_pooled_spikes_and_the_host(tmp_path, monkeypatch, capsys):
@@ -249,7 +250,8 @@ def test_the_summary_tool_logs_the_pooled_spikes_and_the_host(tmp_path, monkeypa
     summary = benchlog.read(log)[-1]
     assert summary["kind"] == "contention-summary"
     assert summary["results"]["spikes"]["count"] == 2
+    assert summary["config"]["threshold_mib"] == [64.0]
     machine = summary["results"]["host"]
     assert machine["cpu"] and machine["threads"] >= machine["cores"] >= 1
-    assert machine["memory_bytes"] > 2**30
+    assert machine["memory_bytes"] > 2**30 and machine["linux_release"]
     assert "Duration, recovered spikes" in capsys.readouterr().out
