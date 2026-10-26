@@ -631,11 +631,25 @@ None of nine quality ablations at 80\% changed needle accuracy detectably
 the most, two samples. Two were not at equal bytes: without INT2, and with a
 512-position recency floor, every plan fell short of its target.
 
+\textbf{Does a page's score predict its damage?} At each task's plan point
+we drew 64 pages a sample among those a plan may move, moved each alone to
+INT4 on a conversation started from the plan point's snapshot, and
+teacher-forced the measured tokens: the question and FP16's answer for the
+needle and the dialogue, the 128 tokens for continuation. A page's damage is
+the mean KL from FP16 over them; with no page moved the logits are FP16's to the
+bit. Over 3{,}200 pages a task, Spearman's $\rho$ between score and damage was
+$0.350$ [$0.303$, $0.394$] for continuation, positive in 49 passages of 50, but
+$0.006$ [$-0.039$, $0.051$] on the needles and $0.082$ [$0.047$, $0.116$] in the
+dialogue (95\% bootstrap over samples). The score ranks pages by the damage
+their downgrade does to the continuation of the text it watched, not by the
+damage to the answer of a question asked after it, which agrees with the null
+closing comparison.
+
 \textbf{Answer.} At equal bytes, attention-guided allocation did not keep needle
 accuracy better than uniform allocation, on a task too easy at this length to
 separate them; it kept the model's output distribution markedly closer to full
-precision, and at 80\% reversible degradation kept three times the answers of
-eviction.
+precision, as a page's score predicts its damage there, and at 80\%
+reversible degradation kept three times the answers of eviction.
 
 % =====================================================================
 \section{Limitations}
@@ -653,8 +667,9 @@ boundaries.} The first event of an episode waits for the step in progress, and
 at long contexts a step's fixed part exceeds a second, so no chunk size meets a
 1\,s target there. \textbf{Attention as a signal.} We use attention mass as a
 predictor of which pages will be consulted again, not as an explanation of the
-model; RQ3 tests that use by its outcome, and the correlation between a page's
-score and the damage its downgrade causes was not measured. \textbf{A task at
+model; RQ3 tests that use by its outcome and page by page, one page moved to
+INT4 at a time, which shows the ranking a plan relies on but not how many
+pages' damages combine, nor the correlation at INT2 or at 32K positions. \textbf{A task at
 its ceiling.} At 8K positions on Qwen2.5-1.5B the needle's code survives INT2
 in most samples, so the needle task cannot separate the sources; a harder task,
 a longer context or more samples might.

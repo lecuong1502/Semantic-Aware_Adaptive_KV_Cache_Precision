@@ -232,7 +232,8 @@ needle accuracy better than uniform allocation, on a task too easy at this
 length to separate them. It kept the output distribution closer to FP16,
 where the measure is graded. The thesis's premise was tested by these
 outcomes only. The correlation between a page's score and the damage its
-downgrade causes, by single-page downgrades, was not measured.
+downgrade causes, by single-page downgrades, was not measured then; the
+amendment below measures it.
 
 ## Amendment (#188): a page's score against its own downgrade's damage
 
@@ -269,3 +270,24 @@ The premise behind RQ3 is tested page by page, on all three tasks
   pooled over every sample's pairs and per sample, their mean, each with a
   95% bootstrap interval over samples, since a sample's pages share its
   text and its answer.
+
+### As measured (#189)
+
+On Qwen2.5-1.5B at commit `bc429ad`, 64 pages in each of 50 samples a task,
+3,200 pages a task; intervals are 95% bootstrap over samples.
+
+| Task | Pooled rho | Mean rho per sample | Samples rho > 0 | Median KL | Summary |
+|---|---|---|---|---|---|
+| Continuation | +0.350 [0.303, 0.394] | +0.355 [0.306, 0.400] | 49/50 | 1.1e-6 | `8fd16470…` |
+| Needle, question-blind | +0.006 [-0.039, 0.051] | +0.006 [-0.036, 0.049] | 26/50 | 6.0e-8 | `6a417b1a…` |
+| Anchor-fact dialogue | +0.082 [0.047, 0.116] | +0.075 [0.044, 0.107] | 37/50 | 5.0e-8 | `03dcd478…` |
+
+**What it means.** A page's score ranks pages by the damage their downgrade
+does to the continuation of the text the scorer watched, the task on which
+the semantic order kept the distribution 3.6 times closer to FP16. It does
+not rank them, or barely, by the damage to the answer of a question asked
+after the plan point, which agrees with the null closing comparison: the
+premise holds for what follows the text, not for what a later question
+will need. One page alone does little harm, the largest damage
+7.7e-4; the test shows the ranking a plan relies on, not how many pages'
+damages combine.
