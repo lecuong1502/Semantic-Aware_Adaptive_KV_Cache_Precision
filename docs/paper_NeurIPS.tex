@@ -63,11 +63,14 @@ laptop GPU, everyday applications take hundreds of MiB and mostly keep them;
 the monitor detects every catchable episode within 236\,ms with no false
 positive; and with Qwen2.5-1.5B at 32K positions, a contention that runs the
 static engine out of memory is survived by the adaptive one, which returns
-746\,MiB that the driver sees returned, to a granule, at every plan. At equal
+746\,MiB that the driver sees returned, to a granule, at every plan; across
+four scenarios, three runs each, the adaptive engines survived every run the
+static engine failed but one that exceeded the device. At equal
 reclaimed bytes, attention-guided allocation keeps the next-token distribution
 3.6 times closer to full precision than uniform allocation when 80\% of the
-bytes are reclaimed, but answers no more
-needles, 48 of 50 against 49, on a task even a 2-bit cache mostly answers; and
+bytes are reclaimed, where a page's score ranks its downgrade's damage
+($\rho = 0.35$), but answers no more needles, 48 of 50 against 49, on a task
+even a 2-bit cache mostly answers and where it does not ($\rho = 0.01$); and
 downgrading keeps 48 needles where evicting the same bytes keeps 16.
 \end{abstract}
 
@@ -728,7 +731,8 @@ reasons it neither causes nor sees. We showed that this contention is large,
 rises over seconds and mostly persists; that a monitor consulting no scheduler
 detects it within a quarter of a second; and that an engine which reallocates
 cache precision at runtime, page by page, and returns the memory to the driver,
-survives a contention that ends a static engine. At equal bytes, allocating
+survives a contention that ends a static engine, in every run of four scenarios
+that ended one but a draw that exceeded the device. At equal bytes, allocating
 that precision by attention kept the model's output closer to full precision
 than allocating it uniformly, though not more needle answers, and degrading
 pages reversibly kept far more than evicting them. Local inference keeps user
@@ -737,7 +741,8 @@ beyond those of the language models it serves.
 
 \begin{ack}
 % Hidden in the anonymised submission.
-TODO.
+The author thanks Ng\^o V\u{a}n Linh for supervising this work, and for
+insisting that a systems claim is only as good as the measurement behind it.
 \end{ack}
 
 {
