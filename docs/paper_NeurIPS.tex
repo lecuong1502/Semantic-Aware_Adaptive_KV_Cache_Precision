@@ -550,6 +550,46 @@ From the take to the end & 668\,s & 1617\,s & 1588\,s \\
 \end{tabular}
 \end{table}
 
+\paragraph{Across scenarios.} The survival matrix runs the same generation under
+static FP16, INT4 and INT2 engines and the adaptive engine from each score
+source, in four scenarios that begin at 16{,}384 positions: a grid of pulses up
+to 1408\,MiB (S1), a train of RQ1's P90 pulse (S2) and RQ1's spikes drawn at
+its rate (S3), each on a base that leaves 1536\,MiB, and its desktop
+recordings replayed from their own headroom (S4), three runs a cell (Table~\ref{tab:matrix}). Only a static FP16 engine
+failed S1, in all three runs. The static INT4 and INT2 engines survive by
+holding a quarter or an eighth of the bytes from the first token; the adaptive
+ones by returning 372--642\,MiB when the pulses came and restoring FP16 after
+them. S3's first draw accumulated more than the device holds, and only the
+uniform source completed it. An adaptive engine runs longer under pressure and
+so meets more of a schedule, up to 1296\,s of S3 against the static engines'
+665\,s. Three runs cannot tell the sources apart, and the monitor missed no
+detectable RED episode and raised no false one in any run. Events during prefill
+still waited for the chunk in progress, 4.5--15.8\,s at the median by
+scenario: chunks are sized by time only while pressure holds, and S1's and S2's
+pulses pass within one.
+
+\begin{table}[t]
+\caption{Runs that completed every token, of three a cell (S1--S4) or of the
+survival experiment's one (S5, and S6, its release, which a static engine has
+no upgrade path to exercise). A Wilson 95\% interval at 3/3 is [44, 100]\%,
+at 2/3 [21, 94]\%.}
+\label{tab:matrix}
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+& S1 grid & S2 train & S3 arrivals & S4 replays & S5 step & S6 release \\
+\midrule
+Static FP16 & 0/3 & 3/3 & 1/3 & 3/3 & 0/1 & -- \\
+Static INT4 & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & -- \\
+Static INT2 & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & -- \\
+Adaptive, uniform & 3/3 & 3/3 & 3/3 & 3/3 & 1/1 & 1/1 \\
+Adaptive, random & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
+Adaptive, semantic & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{RQ3: quality at equal compression}
 \label{sec:rq3}
 
@@ -624,7 +664,7 @@ facts of the last two turns and lost most stated three or more turns back.
 \textbf{Recovery and ablations.} After pressure passes, restoring every page
 from its shadow took under 0.7\,s at 8K positions; a third turn then answered
 50 of 50 needles under semantic, both of its turn-2 misses recovered. At 32K,
-a 30\,s pulse during prefill was survived by both sources with every page
+a 30\,s pulse during prefill was survived by all three sources with every page
 restored, about nine minutes after the release, with prefill still under way.
 None of nine quality ablations at 80\% changed needle accuracy detectably
 ($p \ge 0.5$); planning by importance alone, without the tier's error, lost
@@ -661,8 +701,10 @@ by a rule, so another machine changes their values but not the method.
 \textbf{Simulated contention.} RQ2 uses a simulator that takes memory but no
 compute, isolating the variable studied; replays reproduce their originals to
 within tens of MiB. \textbf{Rate.} RQ1 characterises the size and speed of
-contention, not how often it occurs over a working day. \textbf{Single runs.}
-The survival experiment is one run per condition. \textbf{Reacting at step
+contention, not how often it occurs over a working day. \textbf{Few runs.}
+Survival is three runs a cell in four scenarios and one in the step and the
+release, which bound a rate only loosely and cannot tell the score sources
+apart; an adaptive engine also meets more of a schedule than a static one. \textbf{Reacting at step
 boundaries.} The first event of an episode waits for the step in progress, and
 at long contexts a step's fixed part exceeds a second, so no chunk size meets a
 1\,s target there. \textbf{Attention as a signal.} We use attention mass as a

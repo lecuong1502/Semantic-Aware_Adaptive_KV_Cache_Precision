@@ -221,3 +221,43 @@ decisions, 2026-10-26).
   (`survival.detection`), so that detection, the wait for a step, planning
   and application are each measured under every scenario. The truth runs
   from the take to the trace's end, a moment after the generation's.
+
+### As measured (#191)
+
+The 72 runs were made at one commit (dfc1885), every cell's first run before
+any cell's second, and summarised with S5's and S6's cells by
+`tools/summarise_survival.py` (`microinfer.survival_summary`), whose
+"survival-summary" entry names every run it pools. Runs that completed every
+token:
+
+| Condition | S1 | S2 | S3 | S4 |
+|---|---|---|---|---|
+| B1, static FP16 | 0/3 | 3/3 | 1/3 | 3/3 |
+| B2, static INT4 | 3/3 | 3/3 | 2/3 | 3/3 |
+| B3, static INT2 | 3/3 | 3/3 | 2/3 | 3/3 |
+| B4, adaptive, uniform | 3/3 | 3/3 | 3/3 | 3/3 |
+| B5, adaptive, random | 3/3 | 3/3 | 2/3 | 3/3 |
+| B6, adaptive, semantic | 3/3 | 3/3 | 2/3 | 3/3 |
+
+- **S1** ran B1 out of memory in every run, at 28672 to 30720 positions;
+  the adaptive engines returned 372 to 642 MiB and upgraded again after it.
+- **S3** is its draw. Seed 0 accumulated 1886 MiB above the base, more than
+  the 1536 MiB it left, as this amendment expected: every static engine ran
+  out, B5 and B6 were exhausted, and B4 completed. Seed 1 reached 292 MiB,
+  and every condition completed; seed 2 ended B1 alone.
+- **Exposure.** In S3's seed 2 the adaptive engines played 1039 to 1296 s
+  of the schedule, the static INT4 and INT2 engines 665 and 659 s, and met
+  1786 MiB against 1376 MiB.
+- **Detection.** No detectable RED episode was missed and no RED was false
+  in any run; S1's 73 misses were all shorter than K polls, and S2's pulses
+  reach YELLOW only.
+- **The wait for a step** was 4.5 to 15.8 s at the median under B6 by
+  scenario: chunks are sized by time only while pressure holds at a step
+  boundary, and S1's and S2's pulses pass within one 512-position chunk.
+
+S5's and S6's cells, one run each, were all survived but S5 under B1: B2,
+B3, B4 and B5 completed S5's step, and B5 S6's pulse, restoring every page
+557 s after the release, as B4 and B6 did in 541 and 532 s (#155).
+
+Three runs a cell bound a rate loosely, a Wilson 95% interval of [44, 100]%
+at 3/3, and do not separate B4 to B6.
