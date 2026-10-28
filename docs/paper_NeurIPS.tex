@@ -583,8 +583,8 @@ at 2/3 [21, 94]\%.}
 Static FP16 & 0/3 & 3/3 & 1/3 & 3/3 & 0/1 & -- \\
 Static INT4 & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & -- \\
 Static INT2 & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & -- \\
-Adaptive, uniform & 3/3 & 3/3 & 3/3 & 3/3 & PENDING-S5-B4 & 1/1 \\
-Adaptive, random & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & PENDING-S6-B5 \\
+Adaptive, uniform & 3/3 & 3/3 & 3/3 & 3/3 & 1/1 & 1/1 \\
+Adaptive, random & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
 Adaptive, semantic & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
 \bottomrule
 \end{tabular}
@@ -664,7 +664,7 @@ facts of the last two turns and lost most stated three or more turns back.
 \textbf{Recovery and ablations.} After pressure passes, restoring every page
 from its shadow took under 0.7\,s at 8K positions; a third turn then answered
 50 of 50 needles under semantic, both of its turn-2 misses recovered. At 32K,
-a 30\,s pulse during prefill was survived by both sources with every page
+a 30\,s pulse during prefill was survived by all three sources with every page
 restored, about nine minutes after the release, with prefill still under way.
 None of nine quality ablations at 80\% changed needle accuracy detectably
 ($p \ge 0.5$); planning by importance alone, without the tier's error, lost

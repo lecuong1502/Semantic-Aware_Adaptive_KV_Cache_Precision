@@ -255,5 +255,9 @@ token:
   scenario: chunks are sized by time only while pressure holds at a step
   boundary, and S1's and S2's pulses pass within one 512-position chunk.
 
+S5's and S6's cells, one run each, were all survived but S5 under B1: B2,
+B3, B4 and B5 completed S5's step, and B5 S6's pulse, restoring every page
+557 s after the release, as B4 and B6 did in 541 and 532 s (#155).
+
 Three runs a cell bound a rate loosely, a Wilson 95% interval of [44, 100]%
 at 3/3, and do not separate B4 to B6.
