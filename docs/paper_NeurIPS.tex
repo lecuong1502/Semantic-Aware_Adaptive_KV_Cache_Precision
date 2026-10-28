@@ -713,8 +713,11 @@ model; RQ3 tests that use by its outcome and page by page, one page moved to
 INT4 at a time, which shows the ranking a plan relies on but not how many
 pages' damages combine, nor the correlation at INT2 or at 32K positions. \textbf{A task at
 its ceiling.} At 8K positions on Qwen2.5-1.5B the needle's code survives INT2
-in most samples, so the needle task cannot separate the sources; a harder task,
-a longer context or more samples might.
+in most samples, so the needle task cannot separate the sources. Were a sample
+answered at INT2 answered at any mix of INT2 and INT4, which held for all but
+one sample, at most the five samples static INT2 missed could be discordant at
+80\%, fewer than the six McNemar's
+test needs; a harder task, a longer context or more samples might.
 
 % =====================================================================
 \section{Conclusion}
