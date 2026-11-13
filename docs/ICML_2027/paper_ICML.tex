@@ -16,7 +16,10 @@
 
 % hyperref before icml2027, as in the official example. If a build breaks on a
 % link that spans a page, drop this line and pass [nohyperref] to icml2027.
-\usepackage{hyperref}
+% The style's \printAffiliationsAndNotice sets its footnote with \thefootnote
+% empty, for which a footnote link would have an empty anchor; the paper has
+% no other footnote, so footnotes are not linked.
+\usepackage[hyperfootnotes=false]{hyperref}
 
 % Submission: anonymised. Use [preprint] for arXiv, or [accepted] once
 % accepted; either prints the authors and the acknowledgements.
