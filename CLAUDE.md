@@ -12,8 +12,7 @@ Two documents present the work:
 - **The paper**, `docs/ICML_2027/paper_ICML.tex`, in the ICML 2027 format
   (`icml2027.sty` and `icml2027.bst` beside it), tracked in this repo. The
   folder is self-contained, with its own `references.bib`, so that it compiles
-  as uploaded; the main body stays within eight two-column pages. The NeurIPS
-  2026 version, `docs/paper_NeurIPS.tex`, is no longer submitted.
+  as uploaded; the main body stays within eight two-column pages.
 - **The graduation thesis**, `graduation_thesis/` (`main.tex` and
   `chapter/*.tex`). Git ignores it, so changes there have no commit or PR.
   The owner compiles it on the web, not on this machine, which has no LaTeX
