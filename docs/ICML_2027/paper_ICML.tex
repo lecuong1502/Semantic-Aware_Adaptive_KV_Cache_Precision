@@ -29,9 +29,8 @@
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta}
 
-% Attempt to make hyperref and algorithmic work together better, as in the
-% official example.
-\newcommand{\theHalgorithm}{\arabic{algorithm}}
+% A table no wider than its column is left alone; a wider one is shrunk to fit,
+% by adjustbox's max width.
 
 \icmltitlerunning{Reallocating KV Cache Precision at Runtime under Video Memory
 Contention}
@@ -39,8 +38,8 @@ Contention}
 \begin{document}
 
 \twocolumn[
-  \icmltitle{Keeping Local LLM Inference Alive under Video Memory Contention \\
-    by Reallocating KV Cache Precision at Runtime}
+  \icmltitle{Keeping Local LLM Inference Alive under Video Memory Contention
+    \texorpdfstring{\\}{ }by Reallocating KV Cache Precision at Runtime}
 
   % Printed only with [accepted] or [preprint]; the submission shows
   % "Anonymous Authors" whatever is written here.
