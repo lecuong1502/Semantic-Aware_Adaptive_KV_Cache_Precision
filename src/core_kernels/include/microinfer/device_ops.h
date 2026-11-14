@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 #include "microinfer/paged_kv_cache.h"
 #include "microinfer/rope_table.h"
@@ -63,9 +64,29 @@ namespace microinfer
     // as k + RoPE(k_bias, j) at its position j, with cos and sin read from
     // `rope`, which must cover seq_k positions. Null k_bias means k is whole,
     // and rope is then not read.
+    //
+    // `partials`, if given, is attention_partials_floats(head_dim) fp32 of
+    // the caller's, which a launch with too few blocks to fill the device
+    // splits its keys into (#204): each run of keys gives each row a partial
+    // softmax, and a second kernel folds them. That changes the order in
+    // which a long launch sums, so its output differs in its last bits from
+    // one not split; null splits nothing, and sums as the kernel always did.
+    // Whether a launch splits depends on its shape and the device, never on
+    // the layout its keys are read through.
     void attention(const __half *q, const __half *k, const __half *v,
                    const __half *k_bias, const RopeTable *rope, __half *out,
-                   int seq_q, int seq_k, int heads, int kv_heads, int head_dim);
+                   int seq_q, int seq_k, int heads, int kv_heads, int head_dim,
+                   float *partials = nullptr);
+
+    // The floats a launch's partials need, whatever its shape: bounded by
+    // the blocks a launch is split to, a tile of rows each.
+    std::size_t attention_partials_floats(int head_dim);
+
+    // How a launch given partials splits its keys: into `first` runs of
+    // `second` keys each, the last shorter. One run is no split. For tests,
+    // so that a case can be placed where splitting happens.
+    std::pair<int, int> attention_split(int seq_q, int seq_k, int heads,
+                                        int kv_heads);
 
     // The entry of a page in a causal table of tiers that no query reads
     // (#160): an evicted page, or one masked for the reference evicting is
@@ -83,11 +104,12 @@ namespace microinfer
     // decode step's: each page's share of each query head's softmax mass,
     // pages of page_tokens positions from position 0 (#98). Refused for
     // seq_q other than 1. Asking for it changes no bit of `out`.
+    // `partials` as attention()'s.
     void attention_paged(const __half *q, const unsigned long long *pages,
                          int page_tokens, const __half *k_bias,
                          const RopeTable *rope, __half *out, int seq_q,
                          int seq_k, int heads, int kv_heads, int head_dim,
-                         float *mass = nullptr);
+                         float *mass = nullptr, float *partials = nullptr);
 
     // The same attention over a cache that seals, read causally (#18,
     // ADR-0011): a query reads every page before its own as sealed, and its
@@ -99,22 +121,21 @@ namespace microinfer
     // may be at. Of the query's own page, positions before the first query's,
     // seq_k - seq_q, are read from `open`, an FP16 page; the rest from
     // chunk_k and chunk_v, the seq_q rows the queries brought. page_tokens
-    // must be a multiple of kAttentionTileQ. `mass` as attention_paged's.
+    // must be a multiple of kAttentionTileQ. `mass` and `partials` as
+    // attention_paged's.
     //
     // A sealed page whose entry in `tiers` is kUnreadPage is read by no
     // query (#160): its positions are masked, as a position after a query's
     // is, and its address is never read, so it may be one the allocator has
     // freed. A query's own page is never one.
-    void attention_paged_causal(const __half *q,
-                                const unsigned long long *sealed,
-                                const std::uint8_t *tiers,
-                                const std::array<bool, kTierCount> &may_be_at,
-                                const __half *open, const __half *chunk_k,
-                                const __half *chunk_v, int page_tokens,
-                                const __half *k_bias, const RopeTable *rope,
-                                __half *out, int seq_q, int seq_k, int heads,
-                                int kv_heads, int head_dim,
-                                float *mass = nullptr);
+    void attention_paged_causal(
+        const __half *q, const unsigned long long *sealed,
+        const std::uint8_t *tiers,
+        const std::array<bool, kTierCount> &may_be_at, const __half *open,
+        const __half *chunk_k, const __half *chunk_v, int page_tokens,
+        const __half *k_bias, const RopeTable *rope, __half *out, int seq_q,
+        int seq_k, int heads, int kv_heads, int head_dim, float *mass = nullptr,
+        float *partials = nullptr);
 
     // Writes n tokens' key and value rows into their pages, token t at
     // position start + t. `pages` as for attention_paged.

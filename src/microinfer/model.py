@@ -123,12 +123,13 @@ class ContiguousCache(_Cache):
             device.copy(source, device.view(buffers[layer], start * width, n * width), n * width)
 
     def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int,
-               keys=None, values=None) -> None:
+               keys=None, values=None, partials=None) -> None:
         """Attention for the last seq_q of seq_k positions. `keys` and
         `values` are the rows those queries just stored; a paged cache at a
-        quantised tier reads each query's own page from them (ADR-0011)."""
+        quantised tier reads each query's own page from them (ADR-0011).
+        `partials`, the workspace's, let a long launch split its keys (#204)."""
         device.attention(q, self.keys[layer], self.values[layer], k_bias, self.rope, out,
-                         seq_q, seq_k, self.heads, self.kv_heads, self.head_dim)
+                         seq_q, seq_k, self.heads, self.kv_heads, self.head_dim, partials)
 
 
 def tier_page_bytes(cfg: ModelConfig, page_tokens: int | None = None) -> list[int]:
@@ -270,7 +271,7 @@ class PagedCache(_Cache):
                 tuple(v[:self.length] for _, v in stored))
 
     def attend(self, layer: int, q, k_bias, out, seq_q: int, seq_k: int,
-               keys=None, values=None) -> None:
+               keys=None, values=None, partials=None) -> None:
         # A step of one query's masses go into the scores: a decode step's,
         # or a prefill chunk's of one position, which is the same
         # computation, when the positions it attends number a multiple of
@@ -280,7 +281,7 @@ class PagedCache(_Cache):
                   and seq_k % self.score_every == 0)
         self.pages.attention(layer, q, k_bias, self.rope, out, seq_q, seq_k,
                              self.heads, self.kv_heads, self.head_dim, keys, values,
-                             self._mass if scored else None)
+                             self._mass if scored else None, partials)
         if scored:
             self.scores.fold(layer, self._mass, self.heads, -(-seq_k // device.page_tokens))
 
@@ -309,6 +310,9 @@ class Workspace:
         self.gate = device.empty(rows * intermediate)
         self.up = device.empty(rows * intermediate)
         self.activated = device.empty(rows * intermediate)
+        # Where attention splits a long launch's keys (#204): the same size
+        # for any step, bounded by the blocks a launch is split to.
+        self.partials = device.empty_f32(device.attention_partials(cfg.head_dim))
         self.scratch = device.empty(
             device.scratch_elements(min(rows, LOGIT_CHUNK_ROWS), cfg.vocab_size))
 
@@ -378,7 +382,7 @@ class Model:
             device.rope(ws.k_raw, positions, ws.k, n, kv_heads, head_dim, cfg.rope_theta)
             cache.store(i, ws.k, ws.v, start, n)
             cache.attend(i, ws.q, w.self_attn_k_proj_bias, ws.attended, n, start + n,
-                         ws.k, ws.v)
+                         ws.k, ws.v, ws.partials)
             device.linear_accumulate(ws.attended, w.self_attn_o_proj_weight, ws.residual,
                                      n, q_width, hidden)
 

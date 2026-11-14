@@ -166,11 +166,13 @@ namespace microinfer
     // (#98): (heads, pages) fp32, each page's share of each query head's
     // softmax, for the pages of positions [0, seq_k), the last of them the
     // query's own, open page. Only for one query, seq_q 1. Asking for it
-    // changes no bit of `out`.
+    // changes no bit of `out`. `partials`, if given, are device::attention's:
+    // a long launch splits its keys into them (#204).
     void attention(int layer, const __half *q, const __half *k_bias,
                    const RopeTable *rope, __half *out, int seq_q, int seq_k,
                    int heads, int kv_heads, int head_dim, const __half *keys,
-                   const __half *values, float *mass = nullptr);
+                   const __half *values, float *mass = nullptr,
+                   float *partials = nullptr);
 
     // Moves page `page` of `layer`, a page of positions sealed at FP16, to
     // the lower tier `target` at runtime (#93): allocated at `target`, its

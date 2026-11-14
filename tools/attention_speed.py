@@ -126,19 +126,26 @@ def measure(cfg: ModelConfig, tier: str, length: int, tile: int, repeat: int, ba
     out1, outt = device.empty(heads * hd), device.empty(tile * heads * hd)
     pages = -(-length // device.page_tokens)
     mass = device.empty_f32(heads * pages)
+    # The engine's workspace holds these, and a long launch splits its keys
+    # into them (#204). A build without them has no such argument.
+    partials = (device.empty_f32(device.attention_partials(hd))
+                if hasattr(device, "attention_partials") else None)
+    split = {} if partials is None else {"partials": partials}
 
     def decode(with_mass):
         return lambda: cache.attention(0, q1, bias, rope, out1, 1, length, heads, kv_heads,
-                                       hd, one_k, one_v, mass if with_mass else None)
+                                       hd, one_k, one_v, mass if with_mass else None, **split)
 
     def prefill_tile():
         cache.attention(0, qt, bias, rope, outt, tile, length, heads, kv_heads, hd,
-                        k_last, v_last)
+                        k_last, v_last, **split)
 
     def sync():
         out1.to_numpy()
 
-    result = {}
+    result = {} if partials is None else {"splits": {
+        "decode": list(device.attention_split(1, length, heads, kv_heads)),
+        "prefill_tile": list(device.attention_split(tile, length, heads, kv_heads))}}
     for name, launch in (("decode", decode(False)), ("decode_with_mass", decode(True)),
                          ("prefill_tile", prefill_tile)):
         us = timed(launch, sync, repeat, batch)

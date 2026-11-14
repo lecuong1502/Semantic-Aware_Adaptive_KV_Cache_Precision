@@ -75,6 +75,9 @@ namespace microinfer
   // k_bias, if non-null, is (kv_heads, head_dim): the keys were stored
   // without their projection's bias, and key row j is completed as
   // k + RoPE(k_bias, j) with theta before use (ADR-0009).
+  //
+  // A launch with too few blocks to fill the device splits its keys, as the
+  // engine's do (device::attention, #204).
   void attention(const float *q, const float *k, const float *v,
                  const float *k_bias, float *out, int seq_q, int seq_k,
                  int heads, int kv_heads, int head_dim, double theta);
