@@ -334,3 +334,149 @@ adversarial-00 is excluded, as ADR-0010 explains, and the same entry records
 it apart. It amplifies these differences about a thousand times, to logit
 differences of up to 9.1 and nine changed argmaxes at a chunk of 1. With the
 default chunk of 512 it runs in one chunk, and is unaffected.
+
+---
+
+## Note from #204: a long launch splits its keys, and is gated as a new kernel
+
+#204 made decode attention use the whole GPU. A launch with too few blocks
+to fill the device splits each query's keys into runs, in the manner of
+flash-decoding: each block leaves a partial m, l and unnormalised output, and
+a second kernel folds them. A decode step's block also serves every query
+head of a KV head's group. Splitting changes the order in which the output is
+summed, so a split launch's logits differ from an unsplit one's in their last
+bits.
+
+**When a launch splits.** Only when its caller passes partials, which the
+engine's workspace holds; only when it has fewer blocks than eight a
+multiprocessor; and never into runs shorter than 256 keys. On the RTX 4050
+that is a decode step from 512 positions, and a prefill chunk of a few tiles
+past 512: a step under pressure, or a prompt's last, shorter chunk. A chunk
+of 512 positions never splits, so a prompt whose length is a multiple of 512,
+as perplexity's windows are, is computed exactly as before. How a launch
+splits depends on the launch's shape and the device's multiprocessor count,
+never on the layout its keys are read through: through pages a split launch
+gives the bits it gives over contiguous keys, and asking for the masses
+changes no bit of its output.
+
+**The per-kernel gate is unchanged.** `test_split_attention.py` holds split
+launches to float64 within 4 ulp max and 1 ulp mean, with the floor of the
+amendment of #8, at decode and at prefill tiles, over sealed pages at every
+tier, and with the running maximum in the first run and in the last. The
+masses are held within 32 fp32 ulps of the float64 attention matrix's
+per-page sums, the tolerance the unsplit kernel is held to.
+
+**The merge gate, between builds.** The golden prompts are too short to
+reach a split, so the gate's terms were taken between the build before #204
+and the build after it: WikiText-2's test split, 8192 positions prefilled,
+then 128 forced one by one as decode steps, at every tier and over a map
+cycling the four, on both models (`decode-agreement` entry `45ba5d6f…`, at
+ec1e1c7). Top-1 agreement is over the positions named, and KL is the mean
+over 32 sampled positions, 8 of them before a forced page seals:
+
+| | Before a forced page seals | Every forced position | Control: one build, chunks of 256 |
+|---|---:|---:|---:|
+| 0.5B FP16 | 100%, 1.0e-6 | 100%, 2.1e-6 | 100%, 1.6e-6 |
+| 0.5B INT8 | 100%, 1.6e-6 | 100%, 5.4e-6 | 100%, 2.2e-5 |
+| 0.5B INT4 | 100%, 7.3e-7 | 99.2%, 1.7e-4 | 99.2%, **3.3e-3** |
+| 0.5B INT2 | 100%, 1.4e-6 | **98.4%, 4.7e-3** | **88.3%, 9.7e-2** |
+| 0.5B mixed | 100%, 9.4e-7 | 100%, 3.4e-4 | **96.9%, 2.0e-2** |
+| 1.5B FP16 | 100%, 1.6e-6 | 100%, 1.2e-6 | 100%, 1.1e-6 |
+| 1.5B INT8 | 100%, 9.8e-7 | 100%, 3.2e-6 | 100%, 1.3e-5 |
+| 1.5B INT4 | 100%, 6.9e-7 | 100%, 1.1e-4 | **98.4%, 1.7e-3** |
+| 1.5B INT2 | 100%, 1.3e-6 | **98.4%, 2.8e-3** | **92.2%, 4.5e-2** |
+| 1.5B mixed | 100%, 8.6e-7 | 100%, 1.2e-4 | **94.5%, 9.7e-3** |
+
+- **Until a page of forced positions seals, the two builds agree at every
+  tier as closely as at FP16,** KL near 1e-6. Those positions read the
+  prefill's pages, which both builds compute alike, and their own open page
+  at FP16: the difference is the kernel's alone, and it passes the gate
+  everywhere.
+- **Once a forced page seals at a quantised tier, the difference grows.** A
+  key that moved in its last bit can round to another code, and at INT2
+  the step between codes is a third of a channel's range. The jump comes at
+  the first seal, forced position 32, in every run measured.
+- **INT2 then fails the gate between builds, and that measures INT2.** The
+  control moves the same logits by cuBLAS's rounding alone, prefilling in
+  chunks of 256 rather than 512 (#15's note), and INT2 carries that noise
+  twenty times further than #204's: top-1 88% to 92%. INT4 and the mixed map
+  fail the control as well and pass between builds. So the gate between
+  builds is passed wherever the noise it measures is the kernel's; where a
+  tier amplifies any last-bit noise past the gate, a kernel that sums in a
+  new order cannot be held to it, and is held instead to the positions
+  before a seal.
+
+The gate against HuggingFace, at FP16 over the golden prompts, passes on
+both models at ec1e1c7: top-1 99.74% and KL 1.9e-4 on 0.5B (`gate` entry
+`605dd563…`), 99.97% and 3.5e-6 on 1.5B (`8342d7f1…`).
+
+**Speed, and why INT4 and INT2 are still slower than FP16.** One launch at
+32K positions of Qwen2.5-1.5B's shapes took 62 to 70 ms at every tier before
+#204 (`attention-speed` entries `d2aa5d29…` to `3e028bfa…`, at 51a33ba) and
+takes 0.57 ms at FP16, 0.68 at INT8, 0.75 at INT4 and 0.73 at INT2 after it
+(`1427c496…` to `690f2e84…`, at 45e6d41, the code of 3941be1): about a
+hundredth. A prefill tile of 16 queries there went from 62 ms to 6.2 ms.
+Dequantisation no longer costs what it did, a block reading each page once
+for its group's six heads, but INT4 and INT2 still take 15% to 30% longer a
+launch than FP16; measured interleaved, 14% and 10%. The kernel is still
+bound by the latency of its loads and by issuing instructions, not by the
+device's bandwidth: 32 MB a layer in 0.57 ms is a third of it. A quantised
+element costs three loads, its code and its channel's or token's scale and
+zero, where an FP16 one costs one, and that the fewer bytes do not repay.
+Over a decode step, 28 layers of it are about 5 ms against some 60, the
+weights' reading most of the rest.
+
+**In the engine** (`tools/step_cost.py`, Qwen2.5-1.5B, random token ids; a
+decode step is one position forced as decode runs it, the median of 16; at
+"32K" the conversation is prefilled to 32,352 positions, leaving the window
+room for the steps timed):
+
+| | 16K, after | 32K, before | 32K, after |
+|---|---:|---:|---:|
+| Decode, FP16 | 40.1 tokens/s | 0.58 | 29.5 |
+| Decode, INT8 | 37.0 | 0.76 | 26.5 |
+| Decode, INT4 | 36.4 | 0.44 | 26.0 |
+| Decode, INT2 | 36.9 | 0.30 | 26.7 |
+| A prefill step's fixed part, FP16 | 15 ms | about 1.7 s a step of one tile | 12 ms |
+| A prefill step's part a position, FP16 | 5.8 ms | | 11.4 ms |
+
+The figures before are `decode-throughput` entries at 32K (1034e2c and
+c9cfe2a, through `generate`), and ADR-0016's amendment of #135 for a step of
+one tile from 26K positions. After: `decode-step` and `prefill-step-cost`
+entries at f7ef85d and 74b475e (16K), and 74b475e and baebbdc (32K). At
+16K, INT4 and INT2 decode 9% and 8% slower than FP16, and INT8 8%; at 32K,
+12%, 10% and 10%. That is the kernel's gap above, diluted by the weights,
+against 24% and 48% before.
+
+A step's fixed part, most of a step before, is now a few hundredths of
+`pressure_chunk_seconds`. The chunk sizing of ADR-0016's amendment of #135
+therefore no longer meets the case where the fixed part alone overruns the
+target, and a chunk under pressure holds about as many positions as 0.8 s
+of the part per position buys: some 70 at 32K. Prefill's part per position
+is now what bounds reaction during prefill, which #213 addresses.
+
+**Correction to #15's note.** That note says attention is row-invariant: a
+query's output does not depend on which other queries share its launch. That
+now holds only for launches that do not split. How a launch splits depends
+on its number of queries, so a query decoded alone at a long context and the
+same query inside a chunk of 20 sum in different orders. Chunked prefill's
+bounds (`test_chunked_prefill.py`) still hold.
+
+**What can no longer be repeated to the bit.** RQ3's controlled plans repeat
+exactly on one commit. Every logged result that decodes, or forces a position
+a step, beyond 511 positions, or prefills under pressure in short chunks at
+long contexts, was made with the unsplit kernel and will not repeat to the
+bit on this one:
+
+- `rq3-needle`, `rq3-anchor`, `rq3-continuation`, `rq3-recovery`,
+  `rq3-end-to-end`, `rq3-eviction-summary` and their summaries;
+- `survival` and `survival-summary`, and `page-damage`;
+- `chunked-prefill-agreement`, at a chunk of 1;
+- `generation-sample`, where a prompt and its answer pass 511 positions;
+- every timing: `decode-throughput`, `prefill-throughput`,
+  `monitor-overhead`, `monitor-scorer-overhead`, `requantisation-latency`.
+
+`perplexity`, `layer-sensitivity` and `kv-quantisation-roundtrip` do not
+use a split launch and repeat as they did. The `gate` does where a prompt's
+last chunk splits, and was logged again here. #216 re-runs RQ3 and the
+survival matrix on this engine.

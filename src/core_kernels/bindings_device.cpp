@@ -85,6 +85,25 @@ namespace
   size_t product(int a, int b) { return static_cast<size_t>(a) * b; }
   size_t product(int a, int b, int c) { return product(a, b) * c; }
 
+  // An attention launch's partials (#204), checked for room, or none.
+  float *partials_for(microinfer::DeviceFloats *partials, int head_dim)
+  {
+    if (partials == nullptr)
+    {
+      return nullptr;
+    }
+    const std::size_t floats =
+        microinfer::device::attention_partials_floats(head_dim);
+    if (partials->count() < floats)
+    {
+      throw std::invalid_argument(
+          "attention's partials need " + std::to_string(floats) +
+          " floats at head_dim " + std::to_string(head_dim) + "; got " +
+          std::to_string(partials->count()));
+    }
+    return partials->data();
+  }
+
   // fp32 logits need two fp16 slots each. The engine owns the storage, as
   // a DeviceTensor it sized, rather than this binding allocating it unseen:
   // every byte the engine takes appears in its footprint (Footprint.workspace).
@@ -431,7 +450,7 @@ void bind_device(py::module_ &parent)
       [](const Span &q, const Span &k, const Span &v,
          const std::optional<Span> &k_bias, const microinfer::RopeTable *rope,
          const Span &out, int seq_q, int seq_k, int heads, int kv_heads,
-         int head_dim)
+         int head_dim, DeviceFloats *partials)
       {
         if (seq_q > seq_k)
         {
@@ -449,15 +468,29 @@ void bind_device(py::module_ &parent)
         need(out, product(seq_q, heads, head_dim), "out");
         microinfer::device::attention(
             q.ptr, k.ptr, v.ptr, k_bias ? k_bias->ptr : nullptr, rope, out.ptr,
-            seq_q, seq_k, heads, kv_heads, head_dim);
+            seq_q, seq_k, heads, kv_heads, head_dim,
+            partials_for(partials, head_dim));
       },
       py::call_guard<py::gil_scoped_release>(), py::arg("q"), py::arg("k"),
       py::arg("v"), py::arg("k_bias"), py::arg("rope"), py::arg("out"),
       py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"), py::arg("kv_heads"),
-      py::arg("head_dim"),
+      py::arg("head_dim"), py::arg("partials") = py::none(),
       "Keys may be stored without their bias, which k_bias then completes "
       "with cos and sin from `rope`, a RopeTable covering seq_k positions "
-      "(ADR-0009). rope may be None when k_bias is.");
+      "(ADR-0009). rope may be None when k_bias is. `partials`, a "
+      "FloatTensor of attention_partials(head_dim), lets a long launch split "
+      "its keys (#204); without it none does.");
+
+  m.def("attention_partials", &microinfer::device::attention_partials_floats,
+        py::arg("head_dim"),
+        "The floats an attention launch's partials take, whatever its shape "
+        "(#204).");
+  m.def("attention_split", &microinfer::device::attention_split,
+        py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
+        py::arg("kv_heads"), py::arg("page_tokens") = 0,
+        "(runs, keys a run): how a launch given partials splits its keys "
+        "(#204). One run is no split. With page_tokens, as a causal paged "
+        "launch over pages of that size does.");
 
   py::class_<microinfer::RopeTable>(
       m, "RopeTable",
@@ -704,7 +737,7 @@ void bind_device(py::module_ &parent)
              const microinfer::RopeTable *rope, const Span &out, int seq_q,
              int seq_k, int heads, int kv_heads, int head_dim,
              const std::optional<Span> &keys, const std::optional<Span> &values,
-             DeviceFloats *mass)
+             DeviceFloats *mass, DeviceFloats *partials)
           {
             if (seq_q > seq_k)
             {
@@ -746,18 +779,19 @@ void bind_device(py::module_ &parent)
                         out.ptr, seq_q, seq_k, heads, kv_heads, head_dim,
                         keys ? keys->ptr : nullptr,
                         values ? values->ptr : nullptr,
-                        mass != nullptr ? mass->data() : nullptr);
+                        mass != nullptr ? mass->data() : nullptr,
+                        partials_for(partials, head_dim));
           },
           py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
           py::arg("q"), py::arg("k_bias"), py::arg("rope"), py::arg("out"),
           py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
           py::arg("kv_heads"), py::arg("head_dim"),
           py::arg("keys") = py::none(), py::arg("values") = py::none(),
-          py::arg("mass") = py::none(),
+          py::arg("mass") = py::none(), py::arg("partials") = py::none(),
           "At a quantised tier, keys and values are the rows the queries "
           "stored, from which each query reads its own page. `mass`, an fp32 "
           "tensor of (heads, pages), receives a decode step's per-page "
-          "attention mass (#98).")
+          "attention mass (#98). `partials` as device.attention's (#204).")
       .def(
           "page_tier", [](const KVPages &c, int layer, int page)
           { return c.page_tier({layer, page}); }, py::arg("layer"),

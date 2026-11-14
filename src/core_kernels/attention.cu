@@ -8,6 +8,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <algorithm>
 
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
@@ -22,17 +24,31 @@ namespace microinfer
   namespace
   {
 
-    constexpr int kBlockThreads = 128;
+    // Threads a block. The kernel waits on memory more than it computes, so
+    // more of them in flight is what speeds it: at 32K positions a decode
+    // launch took 1.6 ms with 128 and 0.66 ms with 512 (#204). Where a
+    // thread works changes no arithmetic.
+    constexpr int kBlockThreads = 512;
 
     // Causal scaled dot-product attention with online softmax, one thread
-    // block per (tile of kAttentionTileQ queries, head). The block walks the
+    // block per tile of rows: kAttentionTileQ queries of one head, or, for a
+    // decode step's one query, every head of a GQA group (see
+    // attention_kernel). The block walks the
     // keys in tiles of kAttentionTileK, keeping for each query row a running
     // maximum m, a running denominator l and an unnormalised output o. When a
     // tile raises the maximum, what has been accumulated so far is rescaled by
     // exp(m_old - m_new) before the tile's own contribution is added. The full
-    // (seq_q, seq_k) score matrix never exists; a tile's (kAttentionTileQ,
+    // (seq_q, seq_k) score matrix never exists; a tile's (rows,
     // kAttentionTileK) slice of it does, in shared memory, and is overwritten
     // by the next.
+    //
+    // A launch with too few blocks to fill the device, as a decode step's is
+    // at long contexts, also splits each query's keys into runs, in the
+    // manner of flash-decoding (#204): a block walks one run and leaves its
+    // m, l and o as a partial, and combine_kernel folds the runs, each
+    // weighed by exp(m_run - m). It sums in another order than one block
+    // would, so a split launch's output differs from an unsplit one's in its
+    // last bits; ADR-0006 holds it to float64 within the same gate.
     //
     // Causal masking, and why it costs no divergence:
     //
@@ -59,22 +75,24 @@ namespace microinfer
     //
     // A decode step may also ask for its per-page attention mass (#98): each
     // page's share of each query head's softmax, for the scorer. It is the
-    // same kernel with PageMass compiled in: the one query's thread sums
-    // each page's exp(s - m) from the scores the bookkeeping below already
-    // computes, into shared memory, and once m and l are final every thread
-    // of the block makes pages' shares from those sums. Without it the
-    // kernel is compiled as it always was, and no bit of `out` differs with
-    // it or without.
+    // same kernel with PageMass compiled in: each of the one query's rows'
+    // threads sums each page's exp(s - m) from the scores the bookkeeping
+    // below already computes, into shared memory, and once m and l are final
+    // every thread of the block makes pages' shares from those sums; in a
+    // split launch, shares of the run's own softmax, which combine_kernel
+    // brings to the whole one's. Without it the kernel is compiled as it
+    // always was, and no bit of `out` differs with it or without.
     //
-    // Grouped-query attention is an indexing rule, nothing more: the block for
+    // Grouped-query attention is an indexing rule, nothing more: a row for
     // query head h reads KV head h / group, where group = heads / kv_heads.
     // That is HuggingFace's repeat_kv order — contiguous groups, not
     // interleaved — and the KV heads are never copied out to one per query
     // head. group == 1 is ordinary multi-head attention.
     //
-    // Each query head's block loads its KV tile for itself, so a group's
-    // blocks load the same tile `group` times. Sharing one load across the
-    // group is an optimisation for later; it changes no arithmetic.
+    // A prefill block, of one head's queries, loads its KV tile for itself,
+    // so a group's blocks load the same tile `group` times. A decode block
+    // holds the group's every head, and loads and dequantises each tile once
+    // for all of them (#204). Neither changes a row's arithmetic.
     //
     // Keys may be stored without their projection's bias (ADR-0009). Then
     // k_bias is non-null, and each key is completed as it is loaded:
@@ -165,7 +183,11 @@ namespace microinfer
       QuantisedPageLayout layout;
       size_t row;
       int kv_heads;
-      int head_dim;
+      // ceil(2^32 / head_dim): a value's KV head, at / head_dim, as one
+      // multiply rather than a division by a number known only at run
+      // time, which cost INT4 decode a fifth of its time at 32K (#204).
+      // Exact while at * head_dim < 2^32 (attention_paged_causal).
+      unsigned long long head_dim_reciprocal;
 
       __device__ __half decode(const std::uint8_t *page, size_t codes, size_t e,
                                const __half *scales, const __half *zeros,
@@ -190,7 +212,9 @@ namespace microinfer
             page, layout.value_codes, t * row + at,
             reinterpret_cast<const __half *>(page + layout.value_scales),
             reinterpret_cast<const __half *>(page + layout.value_zeros),
-            static_cast<size_t>(t) * kv_heads + at / head_dim);
+            static_cast<size_t>(t) * kv_heads +
+                ((static_cast<unsigned long long>(at) * head_dim_reciprocal) >>
+                 32));
       }
     };
 
@@ -340,19 +364,20 @@ namespace microinfer
     };
 
     // A decode step's per-page attention mass (#98), kept by the thread of
-    // its one query as the key tiles go by. Pages come in order, so one is
-    // open at a time: its sum of exp(s - m) and that m, rescaled as m rises.
-    // A finished page is left in shared memory, its sum and its m; once m
-    // and l are final, every thread of the block makes pages' shares from
-    // them, sum * exp(m_page - m) / l. The query's thread is the one every
-    // other waits for, so it does as little as it can: a division only on
-    // a new page, no log, nothing global (#100).
+    // each query head's row as the key tiles go by. Pages come in order, so
+    // one is open at a time: its sum of exp(s - m) and that m, rescaled as m
+    // rises. A finished page is left in shared memory, its sum and its m,
+    // indexed from `first`, the first page of the block's keys; once the
+    // block's m and l are final, its threads make pages' shares from them,
+    // sum * exp(m_page - m) / l. A row's thread is the one every other waits
+    // for, so it does as little as it can: a division only on a new page,
+    // no log, nothing global (#100).
     struct PageMass
     {
       float *partial_sum;
       float *partial_max;
       int page_tokens;
-      int pages;
+      int first;
       int open = -1;
       int end = 0; // the position after the open page
       float sum = 0.0f;
@@ -379,106 +404,166 @@ namespace microinfer
       {
         if (open >= 0)
         {
-          partial_sum[open] = sum;
-          partial_max[open] = max;
+          partial_sum[open - first] = sum;
+          partial_max[open - first] = max;
         }
       }
     };
 
+    // Shared memory strides, in elements. A key row and a score row are one
+    // element longer than they hold, so that the 32 lanes of a warp, which
+    // read 32 different rows at the same column, read 32 different banks
+    // rather than one 32 times over. Where an element sits changes no
+    // arithmetic.
+    __host__ __device__ inline int key_stride(int head_dim)
+    {
+      return head_dim + 1;
+    }
+    constexpr int kScoreStride = kAttentionTileK + 1;
+
+    // What one slot of a split launch's partials holds (see `launch`): the
+    // row's m, its l, the mass its first page carries over from the split
+    // before (decode only), and its unnormalised output.
+    constexpr int kPartialM = 0;
+    constexpr int kPartialL = 1;
+    constexpr int kPartialCarry = 2;
+    constexpr int kPartialOut = 3;
+
+    __host__ __device__ inline size_t partial_slot_floats(int head_dim)
+    {
+      return static_cast<size_t>(head_dim) + kPartialOut;
+    }
+
+    // A tile's rows are (query, head) pairs: queries_per_block queries, each
+    // with heads_per_block consecutive query heads of one KV head, row r
+    // being query r / heads_per_block and head r % heads_per_block of them.
+    // Prefill has 16 queries of one head a row, as the kernel always had;
+    // decode has its one query and every head of a GQA group, which then
+    // share each key tile the block loads and dequantises (#204). A row's
+    // arithmetic is its own whichever rows share its tile.
+    //
+    // A launch may also split each query's keys into `splits` runs of
+    // `split_keys` (blockIdx.z), each block making a partial m, l and
+    // unnormalised output over its run alone, for combine_kernel to fold. A
+    // launch of one split writes its output itself, as the kernel always did.
     template <typename KV, bool kMass>
     __global__ void attention_kernel(
         const __half *__restrict__ q, KV kv, const __half *__restrict__ k_bias,
         __half *__restrict__ out, int seq_q, int seq_k, int heads, int kv_heads,
         int head_dim, float scale, const float *__restrict__ rope, int lead,
-        float *__restrict__ mass, int mass_page_tokens)
+        int heads_per_block, int queries_per_block, int split_keys, int splits,
+        float *__restrict__ partials, float *__restrict__ mass,
+        int mass_page_tokens, int mass_local_pages)
     {
+      const int rows = heads_per_block * queries_per_block;
+      const int ks = key_stride(head_dim);
       extern __shared__ float smem[];
-      float *q_s = smem; // kAttentionTileQ x head_dim
-      float *o_s =
-          q_s + kAttentionTileQ * head_dim; // kAttentionTileQ x head_dim
-      float *s_s =
-          o_s + kAttentionTileQ * head_dim; // kAttentionTileQ x kAttentionTileK
-      float *m_s = s_s + kAttentionTileQ * kAttentionTileK; // kAttentionTileQ
-      float *l_s = m_s + kAttentionTileQ;                   // kAttentionTileQ
-      float *rescale_s = l_s + kAttentionTileQ;             // kAttentionTileQ
+      float *q_s = smem;                      // rows x head_dim
+      float *o_s = q_s + rows * head_dim;     // rows x head_dim
+      float *s_s = o_s + rows * head_dim;     // rows x kScoreStride
+      float *m_s = s_s + rows * kScoreStride; // rows
+      float *l_s = m_s + rows;                // rows
+      float *rescale_s = l_s + rows;          // rows
       // Whether the layout reads each key of the tile: 1 or 0.
-      float *reads_s = rescale_s + kAttentionTileQ; // kAttentionTileK
-      float *k_s = reads_s + kAttentionTileK; // kAttentionTileK x head_dim
+      float *reads_s = rescale_s + rows;      // kAttentionTileK
+      float *k_s = reads_s + kAttentionTileK; // kAttentionTileK x ks
       __half *v_s = reinterpret_cast<__half *>(
-          k_s + kAttentionTileK * head_dim); // kAttentionTileK x head_dim
-      // With the masses only: two floats per page, after the rest.
+          k_s + kAttentionTileK * ks); // kAttentionTileK x head_dim
+      // With the masses only: two floats per head and page, after the rest.
       [[maybe_unused]] float *mass_s =
           reinterpret_cast<float *>(v_s + kAttentionTileK * head_dim);
 
-      const int head = blockIdx.y;
+      const int head_first = blockIdx.y * heads_per_block;
+      const int split = blockIdx.z;
       // Tiles start `lead` rows before the first query, so that a layout
       // can align them to absolute positions; rows outside [0, seq_q) are
       // padding, computed on and never stored. Each query's output depends
       // on no other row, so where the tiles fall changes no bit of it.
-      const int q_first = blockIdx.x * kAttentionTileQ - lead;
-      const int q_last = min(q_first + kAttentionTileQ, seq_q) - 1;
+      const int q_first = blockIdx.x * queries_per_block - lead;
+      const int q_last = min(q_first + queries_per_block, seq_q) - 1;
       // Bottom-right alignment: query i is at absolute position i + shift.
       const int shift = seq_k - seq_q;
       const KV view = kv.view_for(q_first + shift);
       const size_t token_stride = static_cast<size_t>(heads) * head_dim;
-      const size_t head_offset = static_cast<size_t>(head) * head_dim;
       const int group = heads / kv_heads;
       const size_t kv_head_offset =
-          static_cast<size_t>(head / group) * head_dim;
+          static_cast<size_t>(head_first / group) * head_dim;
+      const auto query_of = [&](int r)
+      { return q_first + r / heads_per_block; };
+      const auto head_of = [&](int r)
+      { return head_first + r % heads_per_block; };
+      const auto stored = [&](int r)
+      { return query_of(r) >= 0 && query_of(r) <= q_last; };
 
       // The scale is folded into q once, rather than applied to every score.
-      for (int i = threadIdx.x; i < kAttentionTileQ * head_dim; i += blockDim.x)
+      for (int i = threadIdx.x; i < rows * head_dim; i += blockDim.x)
       {
         const int r = i / head_dim;
         const int d = i % head_dim;
-        q_s[i] = q_first + r >= 0 && q_first + r <= q_last
+        q_s[i] = stored(r)
                      ? __half2float(
-                           q[(q_first + r) * token_stride + head_offset + d]) *
+                           q[query_of(r) * token_stride +
+                             static_cast<size_t>(head_of(r)) * head_dim + d]) *
                            scale
                      : 0.0f;
         o_s[i] = 0.0f;
       }
-      for (int r = threadIdx.x; r < kAttentionTileQ; r += blockDim.x)
+      for (int r = threadIdx.x; r < rows; r += blockDim.x)
       {
         m_s[r] = -INFINITY;
         l_s[r] = 0.0f;
       }
-      __syncthreads();
+
+      // This block's keys: its split's run, up to the last key the block's
+      // last query can see. Uniform across the block, so every thread runs
+      // the same number of iterations.
+      const int key_first = split * split_keys;
+      const int key_end = min(key_first + split_keys, q_last + shift + 1);
 
       // The per-page attention mass, compiled only into the kernel that
-      // writes it, so that the one that does not is the kernel it was.
+      // writes it, so that the one that does not is the kernel it was. Each
+      // of the one query's rows keeps its own, in its own thread.
       [[maybe_unused]] PageMass page_mass{};
+      [[maybe_unused]] const int mass_row = -q_first * heads_per_block;
       if constexpr (kMass)
       {
-        const int pages = (seq_k + mass_page_tokens - 1) / mass_page_tokens;
-        page_mass = PageMass{mass_s, mass_s + pages, mass_page_tokens, pages};
+        const int r = threadIdx.x - mass_row;
+        if (r >= 0 && r < heads_per_block)
+        {
+          page_mass =
+              PageMass{mass_s + r * mass_local_pages,
+                       mass_s + (heads_per_block + r) * mass_local_pages,
+                       mass_page_tokens, key_first / mass_page_tokens};
+        }
       }
+      __syncthreads();
 
-      // The last key the block's last query can see. Uniform across the block,
-      // so every thread runs the same number of iterations.
-      const int last_key = q_last + shift;
-      const int key_tiles = last_key / kAttentionTileK + 1;
-
-      for (int tile = 0; tile < key_tiles; ++tile)
+      for (int k_first = key_first; k_first < key_end;
+           k_first += kAttentionTileK)
       {
-        const int k_first = tile * kAttentionTileK;
-
-        for (int i = threadIdx.x; i < kAttentionTileK * head_dim;
-             i += blockDim.x)
+        // Two adjacent channels of a row an iteration, so that what they
+        // share, the page's tier and address and, below 8 bits, the byte
+        // that holds both codes, is read once. head_dim is even.
+        for (int i = 2 * threadIdx.x; i < kAttentionTileK * head_dim;
+             i += 2 * blockDim.x)
         {
           const int c = i / head_dim;
-          const int d = i % head_dim;
           const bool in_range = k_first + c < seq_k;
-          const size_t at = kv_head_offset + d;
-          float key = in_range ? view.key(k_first + c, at) : 0.0f;
-          if (k_bias != nullptr && in_range)
+#pragma unroll
+          for (int d = i % head_dim; d < i % head_dim + 2; ++d)
           {
-            key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
-                                head_dim, rope);
+            const size_t at = kv_head_offset + d;
+            float key = in_range ? view.key(k_first + c, at) : 0.0f;
+            if (k_bias != nullptr && in_range)
+            {
+              key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
+                                  head_dim, rope);
+            }
+            k_s[c * ks + d] = key;
+            v_s[c * head_dim + d] =
+                in_range ? view.value(k_first + c, at) : __float2half(0.0f);
           }
-          k_s[i] = key;
-          v_s[i] = in_range ? view.value(k_first + c, at) : __float2half(0.0f);
-          if (d == 0)
+          if (i % head_dim == 0)
           {
             // A key past seq_k is masked by position already.
             reads_s[c] = !in_range || view.reads(k_first + c) ? 1.0f : 0.0f;
@@ -486,33 +571,32 @@ namespace microinfer
         }
         __syncthreads();
 
-        for (int i = threadIdx.x; i < kAttentionTileQ * kAttentionTileK;
-             i += blockDim.x)
+        for (int i = threadIdx.x; i < rows * kAttentionTileK; i += blockDim.x)
         {
           const int r = i / kAttentionTileK;
           const int c = i % kAttentionTileK;
           float dot = 0.0f;
           for (int d = 0; d < head_dim; ++d)
           {
-            dot += q_s[r * head_dim + d] * k_s[c * head_dim + d];
+            dot += q_s[r * head_dim + d] * k_s[c * ks + d];
           }
           // Keys past seq_k are covered too: a valid query's position is at
           // most seq_k - 1, and a padding row's output is never stored.
           const bool visible =
-              k_first + c <= q_first + r + shift && reads_s[c] != 0.0f;
-          s_s[i] = visible ? dot : -INFINITY;
+              k_first + c <= query_of(r) + shift && reads_s[c] != 0.0f;
+          s_s[r * kScoreStride + c] = visible ? dot : -INFINITY;
         }
         __syncthreads();
 
-        // Per-row bookkeeping, one thread per query row. A row's every score
-        // in a tile can be -inf: a tile of unread keys (#160), or a padding
+        // Per-row bookkeeping, one thread per row. A row's every score in a
+        // tile can be -inf: a tile of unread keys (#160), or a padding
         // row's. m is then -inf still, and exponents are taken from 0
         // instead, so that every p and the rescale are exactly 0, never
         // exp(-inf - -inf). Once m is finite it is used itself, so a row
         // that reads key 0 computes exactly what it always did.
-        for (int r = threadIdx.x; r < kAttentionTileQ; r += blockDim.x)
+        for (int r = threadIdx.x; r < rows; r += blockDim.x)
         {
-          float *row = s_s + r * kAttentionTileK;
+          float *row = s_s + r * kScoreStride;
           const float m_old = m_s[r];
           float m_new = m_old;
           for (int c = 0; c < kAttentionTileK; ++c)
@@ -533,7 +617,7 @@ namespace microinfer
           rescale_s[r] = rescale;
           if constexpr (kMass)
           {
-            if (q_first + r == 0)
+            if (query_of(r) == 0)
             {
               // When P is a multiple of the tile's size, as the default 32
               // is, every tile lies within one page and adds its sum at
@@ -556,12 +640,11 @@ namespace microinfer
         }
         __syncthreads();
 
-        for (int i = threadIdx.x; i < kAttentionTileQ * head_dim;
-             i += blockDim.x)
+        for (int i = threadIdx.x; i < rows * head_dim; i += blockDim.x)
         {
           const int r = i / head_dim;
           const int d = i % head_dim;
-          const float *p = s_s + r * kAttentionTileK;
+          const float *p = s_s + r * kScoreStride;
           float acc = o_s[i] * rescale_s[r];
           for (int c = 0; c < kAttentionTileK; ++c)
           {
@@ -573,47 +656,170 @@ namespace microinfer
         __syncthreads();
       }
 
-      for (int i = threadIdx.x; i < kAttentionTileQ * head_dim; i += blockDim.x)
+      // A slot of the partials: (split, query, head), each partial_slot_floats.
+      const auto slot = [&](int r)
+      {
+        return partials +
+               ((static_cast<size_t>(split) * seq_q + query_of(r)) * heads +
+                head_of(r)) *
+                   partial_slot_floats(head_dim);
+      };
+      for (int i = threadIdx.x; i < rows * head_dim; i += blockDim.x)
       {
         const int r = i / head_dim;
         const int d = i % head_dim;
-        if (q_first + r >= 0 && q_first + r <= q_last)
+        if (!stored(r))
         {
-          out[(q_first + r) * token_stride + head_offset + d] =
+          continue;
+        }
+        if (splits == 1)
+        {
+          out[query_of(r) * token_stride +
+              static_cast<size_t>(head_of(r)) * head_dim + d] =
               __float2half(o_s[i] / l_s[r]);
+        }
+        else
+        {
+          slot(r)[kPartialOut + d] = o_s[i];
+        }
+      }
+      if (splits > 1)
+      {
+        for (int r = threadIdx.x; r < rows; r += blockDim.x)
+        {
+          if (stored(r))
+          {
+            slot(r)[kPartialM] = m_s[r];
+            slot(r)[kPartialL] = l_s[r];
+          }
         }
       }
       if constexpr (kMass)
       {
-        // The query's row, the one with seq_q 1, and the thread that kept
-        // it. With one query there is one block of rows (lead is less than a
-        // tile), the query's row is -q_first, and the bookkeeping gives
-        // thread r row r, there being a thread for every row.
+        // The one query's rows, one a head, and the threads that kept them.
+        // With one query there is one block of rows (lead is less than a
+        // tile), and the bookkeeping gives thread r row r, there being a
+        // thread for every row.
         static_assert(kBlockThreads >= kAttentionTileQ,
                       "a thread keeps each row of a tile");
-        const int row = -q_first;
-        if (threadIdx.x == row)
+        const int r = threadIdx.x - mass_row;
+        if (r >= 0 && r < heads_per_block)
         {
           page_mass.close();
         }
         __syncthreads();
-        const float m = m_s[row];
-        const float l = l_s[row];
-        float *head_mass = mass + static_cast<size_t>(head) * page_mass.pages;
-        for (int page = threadIdx.x; page < page_mass.pages; page += blockDim.x)
+        const int pages = (seq_k + mass_page_tokens - 1) / mass_page_tokens;
+        const int first = key_first / mass_page_tokens;
+        const int local =
+            (min(key_first + split_keys, seq_k) - 1) / mass_page_tokens -
+            first + 1;
+        for (int i = threadIdx.x; i < heads_per_block * local; i += blockDim.x)
         {
-          head_mass[page] = page_mass.partial_sum[page] *
-                            expf(page_mass.partial_max[page] - m) / l;
+          const int h = i / local;
+          const int page = first + i % local;
+          const float m = m_s[mass_row + h];
+          const float l = l_s[mass_row + h];
+          const float sum = mass_s[h * mass_local_pages + i % local];
+          const float max =
+              mass_s[(heads_per_block + h) * mass_local_pages + i % local];
+          float *head_mass = mass + static_cast<size_t>(head_first + h) * pages;
+          if (splits == 1)
+          {
+            head_mass[page] = sum * expf(max - m) / l;
+            continue;
+          }
+          // A split's share, relative to its own m; combine_kernel brings
+          // it to the whole softmax's. A split whose every key is unread
+          // has none. A page begun in the split before is carried, and
+          // that split holds the page's first share.
+          const float share = m == -INFINITY ? 0.0f : sum * expf(max - m);
+          if (page * mass_page_tokens < key_first)
+          {
+            slot(mass_row + h)[kPartialCarry] = share;
+          }
+          else
+          {
+            head_mass[page] = share;
+          }
         }
       }
     }
 
-    size_t shared_bytes(int head_dim)
+    // Folds a split launch's partials into each row's output (#204): with M
+    // the largest of the splits' m, a split weighs w = exp(m - M), and the
+    // output is sum(w o) / sum(w l). With the masses, each page's share
+    // relative to its split's m is weighed by its split's w, and by the next
+    // split's for the part a page carries into it, then divided by the same
+    // sum(w l). Splits are folded in order, one block a (query, head) row.
+    __global__ void combine_kernel(const float *__restrict__ partials,
+                                   __half *__restrict__ out, int seq_q,
+                                   int heads, int head_dim, int splits,
+                                   int split_keys, float *__restrict__ mass,
+                                   int page_tokens, int seq_k)
+    {
+      extern __shared__ float weight_s[]; // splits, then the sum of w l
+      const int query = blockIdx.x / heads;
+      const int head = blockIdx.x % heads;
+      const size_t slot_floats = partial_slot_floats(head_dim);
+      const auto slot = [&](int s)
+      {
+        return partials +
+               ((static_cast<size_t>(s) * seq_q + query) * heads + head) *
+                   slot_floats;
+      };
+      if (threadIdx.x == 0)
+      {
+        float m = -INFINITY;
+        for (int s = 0; s < splits; ++s)
+        {
+          m = fmaxf(m, slot(s)[kPartialM]);
+        }
+        float l = 0.0f;
+        for (int s = 0; s < splits; ++s)
+        {
+          // A split none of whose keys this row reads weighs exactly 0.
+          const float w = expf(slot(s)[kPartialM] - m);
+          weight_s[s] = w;
+          l += slot(s)[kPartialL] * w;
+        }
+        weight_s[splits] = l;
+      }
+      __syncthreads();
+      const float l = weight_s[splits];
+      for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+      {
+        float acc = 0.0f;
+        for (int s = 0; s < splits; ++s)
+        {
+          acc += slot(s)[kPartialOut + d] * weight_s[s];
+        }
+        out[(static_cast<size_t>(query) * heads + head) * head_dim + d] =
+            __float2half(acc / l);
+      }
+      if (mass == nullptr)
+      {
+        return;
+      }
+      const int pages = (seq_k + page_tokens - 1) / page_tokens;
+      float *head_mass = mass + static_cast<size_t>(head) * pages;
+      for (int page = threadIdx.x; page < pages; page += blockDim.x)
+      {
+        const int s = page * page_tokens / split_keys;
+        float share = head_mass[page] * weight_s[s];
+        if (s + 1 < splits && (page + 1) * page_tokens > (s + 1) * split_keys)
+        {
+          share += slot(s + 1)[kPartialCarry] * weight_s[s + 1];
+        }
+        head_mass[page] = share / l;
+      }
+    }
+
+    size_t shared_bytes(int head_dim, int rows)
     {
       const size_t floats =
-          2 * static_cast<size_t>(kAttentionTileQ) * head_dim +
-          kAttentionTileQ * kAttentionTileK + 3 * kAttentionTileQ +
-          kAttentionTileK + static_cast<size_t>(kAttentionTileK) * head_dim;
+          2 * static_cast<size_t>(rows) * head_dim + rows * kScoreStride +
+          3 * rows + kAttentionTileK +
+          static_cast<size_t>(kAttentionTileK) * key_stride(head_dim);
       const size_t halves = static_cast<size_t>(kAttentionTileK) * head_dim;
       return floats * sizeof(float) + halves * sizeof(__half);
     }
@@ -658,11 +864,96 @@ namespace microinfer
       int page_tokens;
     };
 
+    // How a launch lays out its rows and its keys (attention_kernel): not
+    // to be confused with a requantisation plan.
+    struct LaunchShape
+    {
+      int heads_per_block;
+      int queries_per_block;
+      int lead;
+      int splits;
+      int split_keys;
+    };
+
+    // A launch splits its keys until it has about this many blocks for each
+    // multiprocessor, and never into runs shorter than kMinSplitKeys: what
+    // a split saves is a block's walk over its keys, and what it costs is a
+    // partial written and folded once.
+    constexpr int kSplitBlocksPerMultiprocessor = 8;
+    constexpr int kMinSplitKeys = 256;
+
+    int ceil_div(int a, int b) { return (a + b - 1) / b; }
+    int round_up(int a, int b) { return ceil_div(a, b) * b; }
+
+    int split_blocks()
+    {
+      static const int blocks = []
+      {
+        int device = 0;
+        int count = 0;
+        cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+        cuda_check(cudaDeviceGetAttribute(
+                       &count, cudaDevAttrMultiProcessorCount, device),
+                   "cudaDeviceGetAttribute multiprocessor count");
+        return kSplitBlocksPerMultiprocessor * count;
+      }();
+      return blocks;
+    }
+
+    // A decode step's one query takes every head of its KV head's group in
+    // one block, or as many of them as divide the group and fit a tile; a
+    // launch of more queries takes a tile of queries of one head. Keys are
+    // split only where partials are given to hold the splits, and only
+    // where the launch has too few blocks to fill the device. A run of keys
+    // is a whole number of key tiles, and at least a page, so that a page
+    // spans at most two runs.
+    LaunchShape shape_for(int seq_q, int seq_k, int heads, int kv_heads,
+                          bool aligned, int page_tokens, bool may_split)
+    {
+      LaunchShape p{1, kAttentionTileQ, 0, 1, round_up(seq_k, kAttentionTileK)};
+      if (seq_q == 1)
+      {
+        const int group = heads / kv_heads;
+        p.queries_per_block = 1;
+        for (int h = std::min(group, kAttentionTileQ); h >= 1; --h)
+        {
+          if (group % h == 0)
+          {
+            p.heads_per_block = h;
+            break;
+          }
+        }
+      }
+      p.lead = aligned ? (seq_k - seq_q) % p.queries_per_block : 0;
+      if (!may_split)
+      {
+        return p;
+      }
+      const long blocks =
+          static_cast<long>(ceil_div(p.lead + seq_q, p.queries_per_block)) *
+          (heads / p.heads_per_block);
+      const int splits = static_cast<int>(
+          std::min<long>(split_blocks() / blocks, seq_k / kMinSplitKeys));
+      if (splits <= 1)
+      {
+        return p;
+      }
+      p.split_keys =
+          std::max(round_up(ceil_div(seq_k, splits), kAttentionTileK),
+                   round_up(page_tokens, kAttentionTileK));
+      p.splits = ceil_div(seq_k, p.split_keys);
+      if (p.splits == 1)
+      {
+        p.split_keys = round_up(seq_k, kAttentionTileK);
+      }
+      return p;
+    }
+
     template <typename KV>
     void launch(const __half *q, KV kv, const __half *k_bias,
                 const RopeTable *rope, __half *out, int seq_q, int seq_k,
-                int heads, int kv_heads, int head_dim, int lead = 0,
-                MassOutput mass = {})
+                int heads, int kv_heads, int head_dim, bool aligned,
+                int page_tokens, MassOutput mass, float *partials)
     {
       check_grouping(heads, kv_heads);
       if (mass.mass != nullptr && seq_q != 1)
@@ -687,6 +978,21 @@ namespace microinfer
             " positions");
       }
 
+      // A block loads two adjacent channels of a row at a time.
+      if (head_dim % 2 != 0)
+      {
+        throw std::invalid_argument("attention loads channels in pairs, so "
+                                    "head_dim must be even; got " +
+                                    std::to_string(head_dim));
+      }
+      const LaunchShape p = shape_for(seq_q, seq_k, heads, kv_heads, aligned,
+                                      page_tokens, partials != nullptr);
+      // The masses take two floats per head and page of the block's keys
+      // in shared memory besides: all of them with one split.
+      const int mass_local_pages =
+          mass.mass != nullptr ? std::min(ceil_div(seq_k, mass.page_tokens),
+                                          p.split_keys / mass.page_tokens + 2)
+                               : 0;
       // Past 48 KiB of dynamic shared memory a kernel must opt in. head_dim
       // 128 stays under it; 256 does not, and head_dim is a parameter. The
       // opt-in is a driver call, so it is made only when a launch needs more
@@ -694,17 +1000,12 @@ namespace microinfer
       // layout, since each is its own kernel. Atomic because the NumPy binding
       // releases the GIL: two threads may both make the call, which is
       // harmless, but not race on the variable.
-      // The masses take two floats per page of shared memory besides.
       const size_t smem =
-          shared_bytes(head_dim) +
-          (mass.mass != nullptr
-               ? 2 *
-                     static_cast<size_t>((seq_k + mass.page_tokens - 1) /
-                                         mass.page_tokens) *
-                     sizeof(float)
-               : 0);
-      const dim3 grid((lead + seq_q + kAttentionTileQ - 1) / kAttentionTileQ,
-                      heads);
+          shared_bytes(head_dim, p.heads_per_block * p.queries_per_block) +
+          2 * static_cast<size_t>(p.heads_per_block) * mass_local_pages *
+              sizeof(float);
+      const dim3 grid(ceil_div(p.lead + seq_q, p.queries_per_block),
+                      heads / p.heads_per_block, p.splits);
       const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
       const auto run = [&](auto kernel, std::atomic<size_t> &opted_in)
       {
@@ -718,8 +1019,9 @@ namespace microinfer
         }
         kernel<<<grid, kBlockThreads, smem>>>(
             q, kv, k_bias, out, seq_q, seq_k, heads, kv_heads, head_dim, scale,
-            k_bias != nullptr ? rope->data() : nullptr, lead, mass.mass,
-            mass.page_tokens);
+            k_bias != nullptr ? rope->data() : nullptr, p.lead,
+            p.heads_per_block, p.queries_per_block, p.split_keys, p.splits,
+            partials, mass.mass, mass.page_tokens, mass_local_pages);
       };
       static std::atomic<size_t> opted_in{0};
       static std::atomic<size_t> opted_in_with_mass{0};
@@ -732,25 +1034,48 @@ namespace microinfer
         run(attention_kernel<KV, false>, opted_in);
       }
       cuda_check(cudaGetLastError(), "attention kernel launch");
+      if (p.splits > 1)
+      {
+        combine_kernel<<<seq_q * heads, kBlockThreads,
+                         (p.splits + 1) * sizeof(float)>>>(
+            partials, out, seq_q, heads, head_dim, p.splits, p.split_keys,
+            mass.mass, mass.page_tokens, seq_k);
+        cuda_check(cudaGetLastError(), "attention combine kernel launch");
+      }
     }
 
   } // namespace
 
+  size_t device::attention_partials_floats(int head_dim)
+  {
+    return static_cast<size_t>(split_blocks()) * kAttentionTileQ *
+           partial_slot_floats(head_dim);
+  }
+
+  std::pair<int, int> device::attention_split(int seq_q, int seq_k, int heads,
+                                              int kv_heads, int page_tokens)
+  {
+    check_grouping(heads, kv_heads);
+    const LaunchShape p = shape_for(seq_q, seq_k, heads, kv_heads,
+                                    page_tokens > 0, page_tokens, true);
+    return {p.splits, p.split_keys};
+  }
+
   void device::attention(const __half *q, const __half *k, const __half *v,
                          const __half *k_bias, const RopeTable *rope,
                          __half *out, int seq_q, int seq_k, int heads,
-                         int kv_heads, int head_dim)
+                         int kv_heads, int head_dim, float *partials)
   {
     const size_t row = static_cast<size_t>(kv_heads) * head_dim;
     launch(q, ContiguousKV{k, v, row}, k_bias, rope, out, seq_q, seq_k, heads,
-           kv_heads, head_dim);
+           kv_heads, head_dim, false, 0, MassOutput{}, partials);
   }
 
   void device::attention_paged(const __half *q, const unsigned long long *pages,
                                int page_tokens, const __half *k_bias,
                                const RopeTable *rope, __half *out, int seq_q,
                                int seq_k, int heads, int kv_heads, int head_dim,
-                               float *mass)
+                               float *mass, float *partials)
   {
     if (page_tokens <= 0)
     {
@@ -759,7 +1084,8 @@ namespace microinfer
     }
     const size_t row = static_cast<size_t>(kv_heads) * head_dim;
     launch(q, PagedKV{pages, page_tokens, row}, k_bias, rope, out, seq_q, seq_k,
-           heads, kv_heads, head_dim, 0, MassOutput{mass, page_tokens});
+           heads, kv_heads, head_dim, false, page_tokens,
+           MassOutput{mass, page_tokens}, partials);
   }
 
   void device::attention_paged_causal(
@@ -767,7 +1093,8 @@ namespace microinfer
       const std::uint8_t *tiers, const std::array<bool, kTierCount> &may_be_at,
       const __half *open, const __half *chunk_k, const __half *chunk_v,
       int page_tokens, const __half *k_bias, const RopeTable *rope, __half *out,
-      int seq_q, int seq_k, int heads, int kv_heads, int head_dim, float *mass)
+      int seq_q, int seq_k, int heads, int kv_heads, int head_dim, float *mass,
+      float *partials)
   {
     if (page_tokens <= 0 || page_tokens % kAttentionTileQ != 0)
     {
@@ -779,9 +1106,6 @@ namespace microinfer
     }
     const size_t row = static_cast<size_t>(kv_heads) * head_dim;
     const int start = seq_k - seq_q;
-    // The first tile begins at the last multiple of the tile size at or
-    // before `start`, so every tile lies within one page.
-    const int lead = start % kAttentionTileQ;
     // A layout for each quantised tier a page can be at, and none for the
     // others, whose shape the layout may not hold.
     const auto layout = [&](Tier tier)
@@ -790,16 +1114,31 @@ namespace microinfer
                  ? quantised_page_layout(tier, page_tokens, kv_heads, head_dim)
                  : QuantisedPageLayout{};
     };
+    // floor(at * ceil(2^32 / d) / 2^32) is floor(at / d) while at * d < 2^32:
+    // the reciprocal's excess, under 1 / 2^32 a unit of `at`, then stays
+    // below the 1 / d by which at / d falls short of the next integer.
+    // `at` is below row = kv_heads * head_dim.
+    if (static_cast<unsigned long long>(row) * head_dim >= (1ull << 32))
+    {
+      throw std::invalid_argument(
+          "a row of " + std::to_string(row) + " elements at head_dim " +
+          std::to_string(head_dim) + " is too wide for the KV head's division");
+    }
+    const unsigned long long reciprocal =
+        ((1ull << 32) + head_dim - 1) /
+        static_cast<unsigned long long>(head_dim);
     const TierFormats formats{
         tiers, Fp16Format{row, page_tokens},
-        QuantisedFormat<8>{layout(Tier::INT8), row, kv_heads, head_dim},
-        QuantisedFormat<4>{layout(Tier::INT4), row, kv_heads, head_dim},
-        QuantisedFormat<2>{layout(Tier::INT2), row, kv_heads, head_dim}};
+        QuantisedFormat<8>{layout(Tier::INT8), row, kv_heads, reciprocal},
+        QuantisedFormat<4>{layout(Tier::INT4), row, kv_heads, reciprocal},
+        QuantisedFormat<2>{layout(Tier::INT2), row, kv_heads, reciprocal}};
+    // The first tile begins at the last multiple of its queries at or before
+    // `start`, so every tile lies within one page: `aligned`.
     launch(q,
            CausalPagedKV{sealed, open, chunk_k, chunk_v, page_tokens, start,
                          row, formats},
-           k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim, lead,
-           MassOutput{mass, page_tokens});
+           k_bias, rope, out, seq_q, seq_k, heads, kv_heads, head_dim, true,
+           page_tokens, MassOutput{mass, page_tokens}, partials);
   }
 
   void attention(const float *q, const float *k, const float *v,
@@ -823,6 +1162,10 @@ namespace microinfer
     upload_fp16(dev_q, q, q_count, "cudaMemcpy q host-to-device");
     upload_fp16(dev_k, k, kv_count, "cudaMemcpy k host-to-device");
     upload_fp16(dev_v, v, kv_count, "cudaMemcpy v host-to-device");
+    // This surface splits a long launch's keys as the engine does, into
+    // partials of its own.
+    DeviceBuffer dev_partials(device::attention_partials_floats(head_dim) *
+                              sizeof(float));
     std::optional<DeviceBuffer> dev_bias;
     std::optional<RopeTable> rope;
     if (k_bias != nullptr)
@@ -839,7 +1182,8 @@ namespace microinfer
                       dev_v.as<const __half>(),
                       dev_bias ? dev_bias->as<const __half>() : nullptr,
                       rope ? &*rope : nullptr, dev_out.as<__half>(), seq_q,
-                      seq_k, heads, kv_heads, head_dim);
+                      seq_k, heads, kv_heads, head_dim,
+                      dev_partials.as<float>());
     cuda_check(cudaDeviceSynchronize(), "attention kernel execution");
 
     download_fp16(out, dev_out, q_count, "cudaMemcpy output device-to-host");
