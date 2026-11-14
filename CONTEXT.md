@@ -309,8 +309,8 @@ Pages moved on the device at once, down or up, by one `move_pages` (#205):
 every new page allocated first, so that a failure leaves the cache as it
 was, each target tier quantised in one launch, and the old pages freed
 together. It names each page once, at the tier the plan's moves for it end
-at, and fits the device's free memory and, for a downgrade plan at YELLOW,
-what is left of the step's budget. A plan batch is one or more of them.
+at, and fits the device's free memory and, but for a plan at RED, what
+is left of the step's budget. A plan batch is one or more of them.
 _Avoid_: plan batch (a step's share of a plan), batch alone where the two
 could be confused
 

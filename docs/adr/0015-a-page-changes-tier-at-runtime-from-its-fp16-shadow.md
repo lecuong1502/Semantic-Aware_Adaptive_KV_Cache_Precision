@@ -167,9 +167,13 @@ attention bits. It also checks that a failed allocation mid-batch leaves
 nothing changed.
 
 **How the engine paces batches** (`next_batch`, `Engine._apply`).
-- **At RED, and for an upgrade plan,** the plan goes at once, as memory
-  allows. A release can then restore the whole cache within one step.
-- **A downgrade plan at YELLOW** holds a step to the budget. A batch is taken
+- **At RED** the plan goes at once, as memory allows.
+- **Any other plan** holds a step to the budget: a downgrade plan at YELLOW,
+  and an upgrade plan at GREEN. The ticket asked for a release to restore
+  the whole cache within one step. The owner chose to keep upgrades paced,
+  so that pressure returning while they are under way still cancels those
+  left (#106). Restoring every page at once took 0.14 s for 32K positions;
+  paced, it takes a few steps. A batch is taken
   to cost a fixed part, `BATCH_FIXED_SECONDS`, plus twice the longest part a
   move of the last 64 batches, plus `SHADOW_PIN_SECONDS` for each move that
   pins a shadow. A batch of fewer than 32 moves counts its whole time a
@@ -204,9 +208,9 @@ fixes, agrees within 15%):
   later.
 - **The restore after a pulse** (#155: about 540 s at 32K, paced by steps)
   was bounded by the per-page budget, about 500 moves a step, and by 1.7 s
-  steps. An upgrade plan now goes at once, as memory allows: 0.14 s for a
-  whole 32K cache, in one step. Through the engine it is not yet measured
-  again; `tools/recovery.py` at 32K is the owner's run.
+  steps. A step's budget now holds a few thousand moves from shadows, at
+  3 µs each and the estimate doubling them, and #204's steps take 34 ms.
+  Through the engine it is not yet measured again.
 
 **A race the first version had.** `free_pages` synchronised only where a tail
 moved. Where all the pages a tier lost were at its top, it unmapped their

@@ -1750,10 +1750,11 @@ class Engine:
     def _apply(self, cache: model.PagedCache, started: float, planned: bool,
                own_before: int | None) -> None:
         """Apply what this step may of the plan in hand, in batches of moves
-        on the device (#205), each made by next_batch. A plan at RED, and
-        an upgrade plan, which restores what a release gave back, are
-        applied at once; a downgrade plan at YELLOW takes no more of a step
-        than the budget, each batch sized to what is left of it. A batch
+        on the device (#205), each made by next_batch. A plan at RED is
+        applied at once; any other, a downgrade plan at YELLOW or an
+        upgrade plan at GREEN, takes no more of a step than the budget, each
+        batch sized to what is left of it, so that pressure that returns
+        while upgrades are under way cancels those left (#106). A batch
         also fits the device's free memory, since its new pages are all
         allocated before any old one is freed; one that cannot allocate is
         tried again at half its size, and a single move that cannot is
@@ -1761,7 +1762,7 @@ class Engine:
         entry = self._pending
         plan, pages = entry.plan, cache.pages
         cache_before, start, i = cache.nbytes, self._cursor, self._cursor
-        paced = plan.level != RED and not entry.upgrades
+        paced = plan.level != RED
         bytes_cap = None  # set once a batch could not allocate
         page_bytes = [self.page_bytes[t] for t in controller.TIERS]
         try:

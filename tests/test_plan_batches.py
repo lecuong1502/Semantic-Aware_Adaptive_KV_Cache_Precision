@@ -146,11 +146,12 @@ def test_a_single_move_that_cannot_allocate_stops_the_plan():
     assert pages.batches == []
 
 
-def test_an_upgrade_plan_is_applied_at_once_as_a_release_lets_it():
-    """An upgrade plan at GREEN is not held to a step's budget (#205): with
-    the budget used up before it starts, it still restores every page."""
-    plan = Plan([(layer, p, INT4, FP16) for layer in range(2) for p in range(4)],
-                level=GREEN)
+def test_an_upgrade_plan_is_held_to_the_budget_as_a_downgrade_plan_is():
+    """An upgrade plan at GREEN takes no more of a step than the budget, so
+    that pressure returning while upgrades are under way can cancel those
+    left (#106): with the budget spent, a step moves one page, and the next
+    the rest."""
+    plan = Plan([(layer, p, INT4, FP16) for layer in range(2) for p in range(4)], level=GREEN)
     e = Engine(require_model(NAME))
     pages = Pages(fits=100)
     pages.tiers[:] = INT4
@@ -159,6 +160,10 @@ def test_an_upgrade_plan_is_applied_at_once_as_a_release_lets_it():
     e._pending, e._cursor = entry, 0
     e._recent_moves.append(1.0)  # a move would take the whole budget
     e._apply(cache, time.perf_counter() - 10, False, None)
+    assert int((pages.tiers == FP16).sum()) == 1 and e._pending is entry
+    e._recent_moves.clear()
+    e._recent_moves.append(1e-6)
+    e._apply(cache, time.perf_counter(), False, None)
     assert entry.ended == "applied" and (pages.tiers == FP16).all()
 
 
