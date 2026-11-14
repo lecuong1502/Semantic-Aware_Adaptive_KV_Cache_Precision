@@ -14,7 +14,8 @@ forced, --repeat of each, alternating, each one step. With t(n) the median
 time of a step of n positions, the part per position is
 (t(large) - t(small)) / (large - small), and the fixed part is what t(small)
 leaves. The context grows by the steps as they go, a few hundred positions
-against tens of thousands.
+against tens of thousands; a context the model's window leaves no room for
+them at is prefilled short by that room, and logged as prefilled.
 
 Then --decode-steps positions are forced one by one, a decode step's work
 each but the greedy choice, and timed one at a time: decode's rate at that
@@ -64,8 +65,15 @@ def main(argv: list[str]) -> int:
     engine.load_weights()
     rng = np.random.default_rng(SEED)
     vocab = engine.config.vocab_size
+    # What the steps add after each context, which must stay in the window.
+    room = args.repeat * (args.small + args.large) + args.decode_steps
+    window = engine.config.max_position_embeddings
     with engine.conversation() as conversation:
-        for context in sorted(args.contexts):
+        for asked in sorted(args.contexts):
+            context = min(asked, window - room)
+            if context < conversation.positions:
+                parser.error(f"{asked} positions and the steps after them do not fit "
+                             f"the window of {window} after the context before")
             start = time.perf_counter()
             conversation.force(rng.integers(0, vocab, context - conversation.positions,
                                             dtype=np.int32))
@@ -86,7 +94,8 @@ def main(argv: list[str]) -> int:
             benchlog.append(
                 "prefill-step-cost", model=args.model, context_length=context,
                 precision_tiers={args.kv_tier: 1.0},
-                config={"issue": args.issue, "small": args.small, "large": args.large,
+                config={"issue": args.issue, "asked_context": asked,
+                        "small": args.small, "large": args.large,
                         "repeat": args.repeat, "statistic": "median",
                         "prompt": "random token ids", "seed": SEED,
                         "prefill_chunk": engine.prefill_chunk,
@@ -106,7 +115,8 @@ def main(argv: list[str]) -> int:
             benchlog.append(
                 "decode-step", model=args.model, context_length=context,
                 precision_tiers={args.kv_tier: 1.0},
-                config={"issue": args.issue, "steps": args.decode_steps,
+                config={"issue": args.issue, "asked_context": asked,
+                        "steps": args.decode_steps,
                         "statistic": "median", "prompt": "random token ids", "seed": SEED,
                         "step": "one position forced, as decode runs it, without its "
                                 "greedy choice"},
