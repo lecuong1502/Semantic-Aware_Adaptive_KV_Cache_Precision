@@ -186,25 +186,27 @@ nothing changed.
   end cannot be made, the new pages go back. A shadow taken is kept, as a
   failed downgrade keeps its own.
 
-**What it costs** (`plan-apply-speed` entry `1532d515…`, at 55f8f5c,
-Qwen2.5-1.5B's shapes, Seam B):
+**What it costs** (`plan-apply-speed` entry `867dcd81…`, at 386f2fc,
+Qwen2.5-1.5B's shapes, Seam B; `1532d515…`, at 55f8f5c, before the review's
+fixes, agrees within 15%):
 
 | | Page by page | In batches |
 |---|---:|---:|
-| The first plan's 44,016 downgrades, at 16,896 positions | 1.91 s | 0.28 s |
-| Every page of a 32K cache, INT4 back to FP16 | 0.47 s | 0.15 s |
+| The first plan's 44,016 downgrades, at 16,896 positions | 1.80 s | 0.24 s |
+| Every page of a 32K cache, INT4 back to FP16 | 0.48 s | 0.14 s |
 
-- **Pinning dominates a first downgrade.** A batch costs about 0.3 ms plus
-  16 µs a move when its pages take their shadows. Most of that is
+- **Pinning dominates a first downgrade.** A batch costs about 0.2 to
+  0.3 ms plus 16 to 18 µs a move when its pages take their shadows, and
+  about 3 µs a move when they hold them. Most of that is
   page-locking the shadows' host memory, about 4 GB/s, which the per-page
   path pays too, a 2 MiB allocation at a time. Pinning ahead of need, while
   the engine is at GREEN, would take it off the reaction's path. Left for
   later.
 - **The restore after a pulse** (#155: about 540 s at 32K, paced by steps)
   was bounded by the per-page budget, about 500 moves a step, and by 1.7 s
-  steps. It is now bounded by about two thousand moves a 20 ms budget, a move
-  from its shadow costing 3 to 4 µs and the estimate doubling it, and
-  by #204's 34 ms steps.
+  steps. An upgrade plan now goes at once, as memory allows: 0.14 s for a
+  whole 32K cache, in one step. Through the engine it is not yet measured
+  again; `tools/recovery.py` at 32K is the owner's run.
 
 **A race the first version had.** `free_pages` synchronised only where a tail
 moved. Where all the pages a tier lost were at its top, it unmapped their
