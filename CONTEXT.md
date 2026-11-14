@@ -413,8 +413,8 @@ in GREEN whatever else the desktop holds that day.
 _Avoid_: floor, offset
 
 **Survival matrix**:
-The survival experiment run under each condition B1 to B6 against each
-contention scenario, three runs a cell (#190, #191): whether a 32K
+The survival experiment run under each condition B1 to B6, and B8 (#206),
+against each contention scenario, three runs a cell (#190, #191): whether a 32K
 generation completes, and how its engine reacts. A cell is a condition
 and a scenario; a matrix run, one of its runs, by its seed.
 
@@ -449,10 +449,12 @@ by Spearman's rho, it tests the policy's premise page by page.
 How an RQ3 run holds its cache (ADR-0017, #147): FP16; a score source at a
 level, a controlled plan from semantic, uniform or random scores for 70% or
 80% of the FP16 bytes outside the recency floor; or a static tier, every
-page born at INT4 or INT2; an ablation; or eviction at a level. RQ3's two experiments,
-question-blind and question-aware, are when a condition's plan is made. The
-survival matrix's conditions are B1 to B6: static engines at FP16, INT4 and
-INT2, and the adaptive engine from the uniform, random and semantic sources.
+page born at INT8 (#206), INT4 or INT2; an ablation; or eviction at a level.
+RQ3's two experiments, question-blind and question-aware, are when a
+condition's plan is made. The survival matrix's conditions are B1 to B6 and
+B8: static engines at FP16, INT4 and INT2, the adaptive engine from the
+uniform, random and semantic sources, and a static engine at INT8. B7 is
+RQ3's eviction, which has no session of its own to survive.
 _Avoid_: arm, treatment, setting
 
 **Full policy**:

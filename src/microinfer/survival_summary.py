@@ -1,6 +1,6 @@
 """The survival matrix's summary: its logged runs pooled into one entry (#191).
 
-A run's cell is its condition, B1 to B6, and its scenario, S1 to S6:
+A run's cell is its condition, B1 to B6 or B8, and its scenario, S1 to S6:
 
 - S1 to S4 are the survival matrix's (#190), three runs a cell, each entry
   naming its condition, scenario and run. A cell pools the latest entry of

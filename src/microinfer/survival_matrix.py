@@ -2,8 +2,8 @@
 
 The survival experiment (#108) runs one 32K generation against S5, a step
 kept to the end. The matrix runs it against S1 to S4 in its place, under
-each of the conditions B1 to B6, three runs a cell (ADR-0014, amendment
-#190). Each scenario's schedule is a pure function of its seed and RQ1's
+each of the conditions B1 to B6 and B8 (#206), three runs a cell (ADR-0014,
+amendment #190). Each scenario's schedule is a pure function of its seed and RQ1's
 measures, so that every condition faces the same contention run for run:
 
 - **S1, the pulse grid**: #64's 36 cells, 3 repeats each, its gaps
@@ -70,6 +70,9 @@ CONDITIONS = {
     "B4": Condition("FP16", True, "uniform"),
     "B5": Condition("FP16", True, "random"),
     "B6": Condition("FP16", True, "semantic"),
+    # A static INT8 cache, half the bytes from the start (#206); B7 is
+    # RQ3's eviction, which holds no session to survive.
+    "B8": Condition("INT8", False, None),
 }
 #: The runs of each cell of the matrix.
 RUNS = 3
@@ -95,7 +98,7 @@ RECORDINGS = tuple(f"scenario-with-r{k}.csv.gz" for k in range(1, 6))
 
 
 def condition_of(kv_tier: str, adaptive: bool, score_source: str | None) -> str:
-    """The name of the condition an engine is, B1 to B6."""
+    """The name of the condition an engine is: B1 to B6, or B8."""
     wanted = Condition(kv_tier, adaptive, score_source if adaptive else None)
     for name, condition in CONDITIONS.items():
         if condition == wanted:

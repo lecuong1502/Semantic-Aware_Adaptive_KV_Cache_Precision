@@ -6,8 +6,8 @@ how the cache is held:
 - **a source at a level:** semantic, uniform or random scores, and a
   controlled plan that reclaims 70% or 80% of the FP16 bytes of the pages
   outside the recency floor (#142);
-- **a static tier:** every page born at INT4 or INT2, for the whole
-  session, the uniform-quantisation family;
+- **a static tier:** every page born at INT8 (#206), INT4 or INT2, for
+  the whole session, the uniform-quantisation family;
 - **an ablation** (ADR-0018, #158): the semantic source at 80%, the full
   policy, with one element changed, the recency floor, the scorer's
   cadence or EWMA weight, or an option of the planner, and no INT2 at
@@ -111,12 +111,24 @@ CONDITIONS = (
     Condition("fp16"),
     *(Condition(f"{source}-{round(share * 100)}", source=source, share=share)
       for source in ("semantic", "uniform", "random") for share in (0.7, 0.8)),
+    Condition("static-int8", tier="INT8"),
     Condition("static-int4", tier="INT4"),
     Condition("static-int2", tier="INT2"),
 )
 NO_PLAN = Condition("no-plan", adaptive=True)
 #: The conditions of a score source at a level, question-blind's closing run (#149).
 SOURCE_CONDITIONS = tuple(c.name for c in CONDITIONS if c.source is not None)
+def is_static(cond: Condition) -> bool:
+    """Whether `cond` is a static tier: every page at one tier below FP16
+    for the whole session, no plan, no scorer."""
+    return cond.tier != "FP16" and not cond.adaptive and cond.source is None
+
+
+#: The static tiers, a whole session at one tier (#151, #206).
+STATIC_CONDITIONS = tuple(c.name for c in CONDITIONS if is_static(c))
+#: The static tiers added after RQ3's first runs (#206): a summary of runs
+#: logged before them pools them only once they have runs.
+LATER_STATIC_CONDITIONS = ("static-int8",)
 #: The levels, the shares a controlled plan reclaims.
 LEVELS = sorted({c.share for c in CONDITIONS if c.share is not None})
 #: Eviction at each level (#160), against the semantic source there.

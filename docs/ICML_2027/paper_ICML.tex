@@ -594,7 +594,11 @@ recordings replayed from their own headroom (S4), three runs a cell
 (Table~\ref{tab:matrix}). Only a static FP16 engine failed S1, in all three
 runs. The static INT4 and INT2 engines survive by holding a quarter or an
 eighth of the bytes from the first token; the adaptive ones by returning
-372--642\,MiB when the pulses came and restoring FP16 after them. S3's first
+372--642\,MiB when the pulses came and restoring FP16 after them. A static
+INT8 engine completed every run, but on a later, faster build of the engine,
+which finished the positions after contention in about 150\,s where the other
+static engines took 600--760\,s; it met less of each schedule, at most 998\,MiB of S3's first
+draw against 2205, so its row does not compare with the others'. S3's first
 draw accumulated more than the device holds, and only the uniform source
 completed it. An adaptive engine runs longer under pressure and so meets more
 of a schedule, up to 1296\,s of S3 against the static engines' 665\,s. Three
@@ -609,7 +613,8 @@ one.
 (S1), the pulse train (S2), RQ1's arrivals (S3) and RQ1's replays (S4), or of
 the survival experiment's one (S5, and S6, its release, which a static engine
 has no upgrade path to exercise). A Wilson 95\% interval at 3/3 is
-[44, 100]\%, at 2/3 [21, 94]\%.}
+[44, 100]\%, at 2/3 [21, 94]\%. $^\dagger$Run on a faster build, and so
+against less of each schedule.}
 \label{tab:matrix}
 \centering
 \small
@@ -621,6 +626,7 @@ has no upgrade path to exercise). A Wilson 95\% interval at 3/3 is
 Static FP16 & 0/3 & 3/3 & 1/3 & 3/3 & 0/1 & -- \\
 Static INT4 & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & -- \\
 Static INT2 & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & -- \\
+Static INT8$^\dagger$ & 3/3 & 3/3 & 3/3 & 3/3 & 1/1 & -- \\
 Adaptive, uniform & 3/3 & 3/3 & 3/3 & 3/3 & 1/1 & 1/1 \\
 Adaptive, random & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
 Adaptive, semantic & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
@@ -654,8 +660,8 @@ dialogue asks, after ten turns, for a code stated in one of them.
 \caption{RQ3 at 80\% of the bytes reclaimed, question-blind, on Qwen2.5-1.5B.
 Needles and facts are of 50, continuation fidelity is top-1 agreement (\%) and
 mean KL from FP16 over 50 passages. Effective bits are the needle set's; on
-each task every condition held the same bits, and no needle-set plan fell
-short. Static INT2 holds the whole cache at INT2.}
+each task every adaptive condition held the same bits, and no needle-set plan
+fell short. A static condition holds the whole cache at its tier.}
 \label{tab:rq3}
 \centering
 \small
@@ -665,6 +671,8 @@ short. Static INT2 holds the whole cache at INT2.}
 Condition & Bits & Needles & Facts & Top-1 & KL \\
 \midrule
 FP16 & 16.00 & 50 & 50 & 100 & 0 \\
+Static INT8 & 8.63 & 50 & 50 & 99.7 & $<$0.001 \\
+Static INT4 & 4.63 & 50 & 50 & 96.6 & 0.006 \\
 Static INT2 & 2.63 & 45 & -- & -- & -- \\
 Uniform & 3.40 & 49 & 45 & 86.5 & 0.101 \\
 Random & 3.40 & 50 & 48 & 87.6 & 0.082 \\
@@ -692,7 +700,9 @@ semantic allocation kept the next-token distribution 3.6 times closer to FP16
 than uniform, a paired difference in mean KL of $-0.073$ [$-0.082$,
 $-0.065$], lower on all 50 passages, and top-1 agreement 7.1 points higher.
 At 70\% its KL against uniform's was within the interval, at 0.0023 against
-0.0031. In the dialogue, semantic recalled 48 facts against uniform's 45, three
+0.0031. A whole cache at INT4, at 4.63 bits, between the two levels' 5.48 and
+3.98, kept a KL of 0.0055, between semantic's at them; at INT8 it was
+$2 \times 10^{-5}$. In the dialogue, semantic recalled 48 facts against uniform's 45, three
 dialogues answered by semantic alone and none the other way ($p = 0.25$);
 uniform held every fact's page at INT2, semantic 38\% of them.
 

@@ -29,11 +29,13 @@ NAME = "qwen2.5-0.5b-instruct"
 
 
 def test_adr_0017_s_conditions():
-    """FP16; semantic, uniform and random at 70% and 80%; static INT4 and
-    INT2 for the whole session."""
+    """FP16; semantic, uniform and random at 70% and 80%; static INT8 (#206),
+    INT4 and INT2 for the whole session."""
     names = [c.name for c in rq3.CONDITIONS]
     assert names == ["fp16", "semantic-70", "semantic-80", "uniform-70", "uniform-80",
-                     "random-70", "random-80", "static-int4", "static-int2"]
+                     "random-70", "random-80", "static-int8", "static-int4", "static-int2"]
+    assert rq3.condition("static-int8").tier == "INT8"
+    assert rq3.STATIC_CONDITIONS == ("static-int8", "static-int4", "static-int2")
     assert rq3.condition("uniform-80") == rq3.Condition("uniform-80", source="uniform",
                                                         share=0.8)
     assert rq3.condition("static-int2").tier == "INT2"
@@ -129,6 +131,19 @@ def test_a_controlled_run_records_its_plan_and_what_the_needle_s_pages_hold(engi
     assert set(r["needle_page_tiers"]) <= {"FP16", "INT8", "INT4", "INT2"}
     assert sum(r["needle_page_tiers"].values()) == engine.config.num_hidden_layers * (
         s.needle_pages[1] - s.needle_pages[0] + 1)
+    assert r["correct"] == needles.correct(r["answer"], s.code)
+
+
+@pytest.mark.slow
+def test_a_static_int8_run_holds_the_needle_at_int8_with_no_plan(engine, samples):
+    """Static INT8 (#206), B8 on the needle set: the whole session at INT8,
+    no plan, the needle's pages at INT8, the bits an INT8 cache spends."""
+    s = samples[5]
+    r = rq3.run(engine, s, rq3.condition("static-int8"), "question-blind")
+    assert r["plan"] is None
+    assert r["tier_shares"]["INT8"] > 0.9 and set(r["tier_shares"]) <= {"INT8", "FP16"}
+    assert set(r["needle_page_tiers"]) == {"INT8"}
+    assert 8 < r["effective_bits"] < 9
     assert r["correct"] == needles.correct(r["answer"], s.code)
 
 

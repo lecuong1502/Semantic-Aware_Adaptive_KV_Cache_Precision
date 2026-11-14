@@ -240,6 +240,20 @@ def test_a_run_finds_the_fact_where_it_says_and_records_what_its_pages_hold(engi
                                           for t in r["reply_tokens"])
 
 
+@pytest.mark.slow
+def test_a_static_tier_holds_the_dialogue_at_its_tier_with_no_plan(engine, small):
+    """Static INT8 (#206) runs the dialogue at INT8 from its first turn: no
+    plan, every page of the fact at INT8 but an open one, and the bits an
+    INT8 cache spends."""
+    d = small[5]
+    r = anchors.run(engine, d, rq3.condition("static-int8"))
+    assert r["plan"] is None
+    tiers = r["fact_page_tiers"]
+    assert set(tiers) <= {"INT8", "FP16"} and tiers.get("INT8", 0) > 0
+    assert 8 < r["effective_bits"] < 9
+    assert r["correct"] == needles.correct(r["answer"], d.code)
+
+
 @pytest.mark.slowest
 def test_conditions_that_share_the_turns_give_what_each_gives_alone(engine, small):
     d = small[2]
