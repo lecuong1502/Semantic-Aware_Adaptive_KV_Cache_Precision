@@ -179,11 +179,13 @@ def main(argv: list[str]) -> int:
         tiers = ({t: 0.25 for t in ("FP16", "INT8", "INT4", "INT2")} if tier == "mixed"
                  else {tier: 1.0})
         benchlog.append(
-            "attention-speed", model=args.model, context_length=args.lengths,
+            "attention-speed", model=args.model,
+            context_length={"min": min(args.lengths), "max": max(args.lengths)},
             precision_tiers=tiers,
             config={"issue": args.issue, "layout": "causal paged (ADR-0011)",
                     "tier_map": "four tiers cycled by page" if tier == "mixed" else None,
-                    "page_tokens": device.page_tokens, "prefill_tile_queries": tile,
+                    "lengths": args.lengths, "page_tokens": device.page_tokens,
+                    "prefill_tile_queries": tile,
                     "key_bias": True, "repeat": args.repeat, "batch": args.batch,
                     "statistic": "median", "seed": SEED, "layers": cfg.num_hidden_layers},
             results=results, log=args.log)
