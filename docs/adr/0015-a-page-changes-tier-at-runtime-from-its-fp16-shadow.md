@@ -131,3 +131,78 @@ one layer, median of 256, at 51cb21f):
 **Host memory now holds part of the cache's state.** A shadow lives as long
 as its cache, so the host memory an adaptive engine uses grows with the
 pages it has downgraded.
+
+---
+
+## Amendment (#205): a plan's moves are applied in batches on the device
+
+Before #205, `Engine._apply` moved a plan's pages one at a time from Python:
+an allocation, a quantisation in separate launches, and a free with its own
+synchronise, 8 to 39 µs a move. The survival experiment's first plan took
+1.7 s for 44,016 downgrades.
+
+**A batch of moves** (`KVPages.move_pages`) moves many pages at once, down or
+up, each to the bit as the per-page path moves it alone. The decision above
+holds for every page of a batch:
+- **Every new page is allocated first,** under `(layer, -16 - i)` for the
+  batch's i-th move. If one cannot be, those made are given back, each its
+  tier's tail, and the cache is as it was.
+- **First downgrades copy their FP16 bytes to their shadows in one copy,**
+  into one pinned allocation made for the batch.
+- **Each target tier is quantised in one launch.** The kernels' bodies are
+  the per-page ones, so the arithmetic is the same. Pinned shadows are mapped
+  for the device and read where they lie, so a batch needs no FP16 page to
+  upload a shadow to, and `(layer, -4)` stays the per-page path's. A move up
+  to FP16 copies its shadow.
+- **The old pages are freed together** (`PagedKVCache.free_pages`). Each
+  tier's kept pages move into the slots below its new tail in one copy, the
+  device finishes, and the emptied granules go.
+- **A batch names a page once,** at the tier it ends at. A page moved in
+  steps is one quantised straight from FP16, so a plan's chain of moves for a
+  page is one move in a batch.
+
+`test_batched_moves.py` holds a batch to the per-page path at every tier
+pair, down and up: the same bytes, tiers, shadows, mapped memory and
+attention bits. It also checks that a failed allocation mid-batch leaves
+nothing changed.
+
+**How the engine paces batches.**
+- **At RED** the plan goes at once.
+- **At YELLOW and GREEN** a step's batches fit the budget. A batch is taken
+  to cost a fixed part, `BATCH_FIXED_SECONDS`, plus twice the longest part a
+  move of the last 64 batches. Until a batch is timed, the plan's logged
+  per-page latency stands in.
+- **Memory.** Unlike the per-page path, a batch needs all its new pages'
+  bytes free before it frees any old page. Each batch is therefore cut to
+  the device's free memory less `BATCH_MEMORY_MARGIN_BYTES`.
+- **A batch that cannot allocate** is tried again at half its size. One move
+  that cannot is the emergency of #107, as before.
+
+**What it costs** (`plan-apply-speed` entry `1532d515…`, at 55f8f5c,
+Qwen2.5-1.5B's shapes, Seam B):
+
+| | Page by page | In batches |
+|---|---:|---:|
+| The first plan's 44,016 downgrades, at 16,896 positions | 1.91 s | 0.28 s |
+| Every page of a 32K cache, INT4 back to FP16 | 0.47 s | 0.15 s |
+
+- **Pinning dominates a first downgrade.** A batch costs about 0.3 ms plus
+  16 µs a move when its pages take their shadows. Most of that is
+  page-locking the shadows' host memory, about 4 GB/s, which the per-page
+  path pays too, a 2 MiB allocation at a time. Pinning ahead of need, while
+  the engine is at GREEN, would take it off the reaction's path. Left for
+  later.
+- **The restore after a pulse** (#155: about 540 s at 32K, paced by steps)
+  was bounded by the per-page budget, about 500 moves a step, and by 1.7 s
+  steps. It is now bounded by about two thousand moves a 20 ms budget, a move
+  from its shadow costing 3 to 4 µs and the estimate doubling it, and
+  by #204's 34 ms steps.
+
+**A race the first version had.** `free_pages` synchronised only where a tail
+moved. Where all the pages a tier lost were at its top, it unmapped their
+granules while the batch's quantisation still read them, and the device
+faulted. That happened only once the quantisation's kernels had already been
+loaded, so that the batch's first launch did not itself wait on the device.
+It now synchronises before any granule goes.
+`test_a_batch_that_frees_a_tier_s_top_pages_waits_for_what_reads_them`
+fails without that synchronise.

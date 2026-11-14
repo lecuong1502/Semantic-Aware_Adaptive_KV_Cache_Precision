@@ -299,7 +299,10 @@ _Avoid_: crashed, aborted, OOM-killed
 The downgrades of a requantisation plan, or the upgrades of an upgrade
 plan, applied between two decode steps: at YELLOW and at GREEN, as many as
 fit a per-step time budget, by the time the engine measures, the plan
-having estimated them; at RED, the whole plan.
+having estimated them; at RED, the whole plan. It is moved on the device
+in batches of moves (#205), each naming a page once, at the tier the plan's
+moves for it end at, and fitting the budget's time and the device's free
+memory.
 Not a batch of sequences: there is one sequence.
 _Avoid_: chunk (a prefill chunk is positions)
 
