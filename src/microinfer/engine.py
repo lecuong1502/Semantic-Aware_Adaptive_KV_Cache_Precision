@@ -284,6 +284,14 @@ class StepCost:
 
 #: The least room a YELLOW step keeps in its budget for its next downgrade.
 MOVE_MARGIN_SECONDS = 0.002
+#: A batch of moves' fixed part, whatever its size: its synchronises and its
+#: copy of addresses, about 0.2 ms measured (#205), taken high.
+BATCH_FIXED_SECONDS = 0.0005
+#: The least a move is taken to cost when the budget sizes a batch.
+MIN_MOVE_SECONDS = 1e-6
+#: The device memory a batch leaves free: the granules its tiers' tails may
+#: map beyond its pages' bytes, one a tier, and as much again.
+BATCH_MEMORY_MARGIN_BYTES = 16 << 20
 #: The empty granules an adaptive cache keeps mapped at each quantised tier,
 #: so that an emergency plan's first downgrades have room (#107).
 EMERGENCY_SPARES = 1
@@ -812,8 +820,9 @@ class Engine:
         self._last_pressure: PressureRecord | None = None
         self._planned_pages = 0
         self._upgrades_looked_at: float | None = None
-        #: How long the last downgrades took, the longest of them the guess
-        #: for the next: an outlier passes out of it, as none would of a max.
+        #: What a move took in each of the last batches, past the batch's
+        #: fixed part (#205), the longest of them the guess for the next: an
+        #: outlier passes out of it, as none would of a max.
         self._recent_moves: collections.deque[float] = collections.deque(maxlen=64)
         self._thresholds: Thresholds | None = None
         #: How the last generation ended (#107); None before the first, and
@@ -1358,13 +1367,13 @@ class Engine:
         the events just drained, replacing any not yet done; cancel one at
         GREEN; and apply what this step may of the plan in hand. At RED a
         plan is applied at once. At YELLOW a step takes no more than the
-        budget, planning included: downgrades are applied while the time
-        spent, and twice the longest of the last 64 downgrades, fit it,
-        every one timed, so that a step is held to the budget, not to an
-        estimate of it; never less than MOVE_MARGIN_SECONDS, a downgrade
-        that pins another allocation of shadows taking half a millisecond
-        (#97), a garbage collection more. A step that makes no plan applies
-        one downgrade at least."""
+        budget, planning included: downgrades are applied in batches, each
+        sized to what the budget has left by what a batch takes, its fixed
+        part and twice the longest part a move of the last 64 batches
+        (_apply, #205), every batch timed, so that a step is held to the
+        budget, not to an estimate of it; and MOVE_MARGIN_SECONDS is kept
+        besides, for what a batch that pins shadows or a garbage collection
+        adds. A step that makes no plan applies one downgrade at least."""
         own_before = self._own_bytes()
         started = time.perf_counter()
         planned = False
@@ -1673,29 +1682,53 @@ class Engine:
 
     def _apply(self, cache: model.PagedCache, started: float, planned: bool,
                own_before: int | None) -> None:
+        """Apply what this step may of the plan in hand, in batches on the
+        device (#205): each batch the plan's next moves, a page named once
+        at the tier its moves there end at. At RED the plan is applied at
+        once; at YELLOW and GREEN a step takes no more than the budget, a
+        batch sized to what is left of it by the time a batch takes, a
+        fixed part and a part a move, the longest part a move of the last
+        64 batches doubled. A batch also fits the device's free memory,
+        since its new pages are all allocated before any old one is freed;
+        one that cannot allocate is tried again at half its size, and a
+        single move that cannot is #107's emergency. A plan's move whose
+        page is no longer at the tier the plan expects is skipped."""
         entry = self._pending
         plan, pages = entry.plan, cache.pages
-        tier_of = [getattr(_microinfer.Tier, t) for t in controller.TIERS]
         cache_before, start, i = cache.nbytes, self._cursor, self._cursor
         budget = self.kv_plan_budget_seconds
-        move = pages.upgrade if entry.upgrades else pages.downgrade
+        bytes_cap = None  # set once a batch could not allocate
         try:
             while i < len(plan):
+                size = len(plan) - i
                 if plan.level != RED:
                     spent = time.perf_counter() - started
-                    next_move = max(2 * max(self._recent_moves), MOVE_MARGIN_SECONDS)
-                    if spent + next_move > budget and (i > start or planned):
-                        break
-                layer, page = int(plan.layers[i]), int(plan.pages[i])
-                if pages.page_tier(layer, page) != tier_of[plan.current[i]]:
-                    entry.skipped += 1
-                else:
-                    moving = time.perf_counter()
-                    move(layer, page, tier_of[plan.target[i]])
-                    self._recent_moves.append(time.perf_counter() - moving)
+                    per = max(2 * max(self._recent_moves), MIN_MOVE_SECONDS)
+                    fits = int((budget - spent - BATCH_FIXED_SECONDS - MOVE_MARGIN_SECONDS)
+                               / per)
+                    if fits < 1:
+                        if i > start or planned:
+                            break
+                        fits = 1
+                    size = min(size, fits)
+                free = _microinfer.device_memory_info()["free"] - BATCH_MEMORY_MARGIN_BYTES
+                cap = free if bytes_cap is None else min(free, bytes_cap)
+                moves, end, skipped, needs = self._next_batch(cache, plan, i, size, cap)
+                if moves:
+                    try:
+                        pages.move_pages(moves)
+                    except _microinfer.OutOfMemory:
+                        if len(moves) == 1:
+                            raise
+                        bytes_cap = needs // 2
+                        continue
+                    batch = pages.last_batch
+                    self._recent_moves.append(
+                        max(batch["seconds"] - BATCH_FIXED_SECONDS, 0.0) / len(moves))
                     if not entry.upgrades:
                         self.last_downgrade_seconds = time.monotonic()
-                i += 1
+                entry.skipped += skipped
+                i = end
         except _microinfer.OutOfMemory as exc:  # the emergency is #107's to answer
             entry.ended, self._pending = f"stopped: {exc}", None
         seconds = time.perf_counter() - started
@@ -1705,6 +1738,37 @@ class Engine:
         self._cursor = i
         if self._pending is not None and i == len(plan):
             entry.ended, self._pending = "applied", None
+
+    def _next_batch(self, cache: model.PagedCache, plan, first: int, size: int,
+                    bytes_cap: int):
+        """The batch of the plan's moves from `first`: at most `size` of them,
+        and as many as keep the new pages' bytes within `bytes_cap`, one at
+        least. Each page is named once, at the tier its moves end at; a move
+        whose page the batch's earlier moves, or the cache, do not leave at
+        the tier the plan expects is skipped. The moves, where the batch
+        ends in the plan, the moves skipped, and the bytes its new pages
+        take."""
+        tier_of = [getattr(_microinfer.Tier, t) for t in controller.TIERS]
+        bytes_of = [self.page_bytes[t] for t in controller.TIERS]
+        held = cache.pages.page_tiers()
+        ends: dict[tuple[int, int], int] = {}
+        skipped, needs, k = 0, 0, first
+        while k < len(plan) and k - first < size:
+            key = (int(plan.layers[k]), int(plan.pages[k]))
+            now = ends.get(key, int(held[key]))
+            if now != plan.current[k]:
+                skipped += 1
+                k += 1
+                continue
+            target = int(plan.target[k])
+            more = bytes_of[target] - (bytes_of[ends[key]] if key in ends else 0)
+            if ends and needs + more > bytes_cap:
+                break
+            ends[key], needs = target, needs + more
+            k += 1
+        moves = [(layer, page, tier_of[t]) for (layer, page), t in ends.items()
+                 if t != int(held[layer, page])]
+        return moves, k, skipped, needs
 
     def _own_bytes(self) -> int | None:
         if not self.measure_plans:
