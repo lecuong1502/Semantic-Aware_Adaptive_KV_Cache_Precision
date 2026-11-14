@@ -118,6 +118,15 @@ namespace microinfer
                        std::uint8_t *page, Tier tier, int page_tokens,
                        int filled, int kv_heads, int head_dim);
 
+    // Quantises `count` full pages at `tier` at once (#205), page i from
+    // rows[i], an FP16 page's bytes, keys then values, into pages[i], each
+    // exactly as quantise_page quantises one: two launches for them all.
+    // `rows` and `pages` are arrays in device memory of device-visible
+    // addresses; a row may be pinned host memory mapped for the device.
+    void quantise_pages(const __half *const *rows, std::uint8_t *const *pages,
+                        int count, Tier tier, int page_tokens, int kv_heads,
+                        int head_dim);
+
     // The inverse: an FP16 page's keys and values, each (page_tokens,
     // kv_heads, head_dim), computed as code * scale + zero-point in one fp32
     // fused multiply-add and rounded once to fp16.

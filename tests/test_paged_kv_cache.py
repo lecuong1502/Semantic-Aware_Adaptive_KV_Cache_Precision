@@ -473,3 +473,66 @@ def test_a_spare_the_driver_refuses_is_not_an_error():
         assert cache.mapped_bytes(Tier.INT4) == 0
     finally:
         del filler, cache
+
+
+# -- many pages at once (#205) -------------------------------------------------
+
+
+def test_pages_freed_at_once_keep_every_other_page_and_return_their_granules():
+    """free_pages of pages from the bottom, the middle and the tail of two
+    tiers at once: every page kept holds the bytes it held, wherever the
+    free moved it, the tiers hold the kept pages and no others, and the
+    granules the freed pages emptied go back to the driver, as NVML sees.
+    Freed one by one instead, the same pages return the same memory."""
+    g = granule()
+    page = g // 64
+    held = 3 * 64 + 5
+    rng = np.random.default_rng(205)
+
+    def filled():
+        cache = make_cache([page] * 4, capacity_pages=held)
+        contents = {}
+        for tier in (Tier.FP16, Tier.INT4):
+            for i in range(held):
+                key = (int(tier), i)
+                cache.allocate(*key, tier)
+                contents[key] = rng.integers(0, 256, page, dtype=np.uint8)
+                cache.write(*key, contents[key])
+        return cache, contents
+
+    going = [(int(t), i) for t in (Tier.FP16, Tier.INT4)
+             for i in [*range(0, 40), *range(90, 120), held - 1, held - 3]]
+    cache, contents = filled()
+    before = nvml.free_bytes()
+    cache.free_pages(going)
+    returned = nvml.free_bytes() - before
+    for tier in (Tier.FP16, Tier.INT4):
+        kept = [k for k in contents if k[0] == int(tier) and k not in going]
+        assert sorted(cache.pages(tier)) == sorted(kept)
+        assert cache.mapped_bytes(tier) == -(-len(kept) * page // g) * g
+        for key in kept:
+            np.testing.assert_array_equal(cache.read(*key), contents[key], err_msg=str(key))
+    for key in going:
+        assert key not in cache
+    del cache
+
+    one_by_one, _ = filled()
+    before = nvml.free_bytes()
+    for key in going:
+        one_by_one.free(*key)
+    assert returned >= 2 * g, f"{returned / 2**20:.2f} MiB came back"
+    assert abs(returned - (nvml.free_bytes() - before)) < g / 2
+
+
+def test_what_freeing_pages_at_once_refuses():
+    """A page named twice, or one not held: refused before anything goes."""
+    cache = make_cache([granule() // 64] * 4, capacity_pages=8)
+    for i in range(4):
+        cache.allocate(0, i, Tier.FP16)
+    with pytest.raises(ValueError, match="twice"):
+        cache.free_pages([(0, 1), (0, 1)])
+    with pytest.raises(PageNotFound):
+        cache.free_pages([(0, 1), (0, 7)])
+    assert sorted(cache.pages(Tier.FP16)) == [(0, i) for i in range(4)]
+    cache.free_pages([])
+    assert len(cache.pages(Tier.FP16)) == 4

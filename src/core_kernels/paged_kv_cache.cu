@@ -1,10 +1,13 @@
 #include <cuda.h>
 
 #include <algorithm>
+#include <set>
 #include <stdexcept>
 #include <string>
 
 #include "microinfer/check.h"
+#include "microinfer/device_buffer.h"
+#include "microinfer/device_ops.h"
 #include "microinfer/paged_kv_cache.h"
 
 namespace microinfer
@@ -218,6 +221,144 @@ namespace microinfer
     // The copy must land before the granule it read from can be unmapped.
     driver_check(cuCtxSynchronize(), "cuCtxSynchronize");
     fit_granules(r, false);
+  }
+
+  void PagedKVCache::free_pages(const std::vector<PageKey> &keys)
+  {
+    std::set<PageKey> freeing;
+    for (const PageKey &key : keys)
+    {
+      locate(key); // PageNotFound before anything changes
+      if (!freeing.insert(key).second)
+      {
+        throw std::invalid_argument(describe(key) +
+                                    " is named twice in one free");
+      }
+    }
+    if (keys.empty())
+    {
+      return;
+    }
+    ContextScope scope(ctx_);
+    // Tier by tier: the tier keeps its first `kept` slots. Each freed page
+    // below there is a hole, and each kept page at or above it moves into
+    // one, the copies reading only slots the tier gives up and writing only
+    // slots it keeps, so that none reads what another writes.
+    std::array<bool, kTierCount> touched{};
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      Range &r = ranges_[t];
+      std::vector<std::size_t> holes;
+      std::vector<std::size_t> movers;
+      std::size_t freed = 0;
+      for (std::size_t slot = 0; slot < r.slots.size(); ++slot)
+      {
+        freed += freeing.count(r.slots[slot]);
+      }
+      if (freed == 0)
+      {
+        continue;
+      }
+      touched[t] = true;
+      const std::size_t kept = r.slots.size() - freed;
+      for (std::size_t slot = 0; slot < r.slots.size(); ++slot)
+      {
+        const bool going = freeing.count(r.slots[slot]) != 0;
+        if (slot < kept && going)
+        {
+          holes.push_back(slot);
+        }
+        else if (slot >= kept && !going)
+        {
+          movers.push_back(slot);
+        }
+      }
+      std::vector<const void *> from;
+      std::vector<void *> to;
+      for (std::size_t i = 0; i < holes.size(); ++i)
+      {
+        from.push_back(
+            reinterpret_cast<const void *>(r.base + movers[i] * r.page_bytes));
+        to.push_back(
+            reinterpret_cast<void *>(r.base + holes[i] * r.page_bytes));
+        const PageKey moved = r.slots[movers[i]];
+        r.slots[holes[i]] = moved;
+        table_[moved].slot = holes[i];
+      }
+      if (!holes.empty())
+      {
+        // The two address arrays, on the device for the copy to read.
+        std::vector<const void *> both(from);
+        both.insert(both.end(), to.begin(), to.end());
+        DeviceBuffer addresses(both.size() * sizeof(void *));
+        cuda_check(cudaMemcpy(addresses.raw(), both.data(),
+                              both.size() * sizeof(void *),
+                              cudaMemcpyHostToDevice),
+                   "cudaMemcpy a free's tail moves");
+        const auto *table = addresses.as<const void *const>();
+        // Slots sit at multiples of the page size from a granule-aligned
+        // base.
+        device::copy_pages(table,
+                           const_cast<void *const *>(table + holes.size()),
+                           r.page_bytes, static_cast<int>(holes.size()),
+                           r.page_bytes % 16 == 0);
+        // The copy must land before the granules it read from go.
+        driver_check(cuCtxSynchronize(), "cuCtxSynchronize");
+      }
+      r.slots.resize(kept);
+    }
+    for (const PageKey &key : keys)
+    {
+      table_.erase(key);
+    }
+    ++generation_;
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      if (touched[t])
+      {
+        fit_granules(ranges_[t], false);
+      }
+    }
+  }
+
+  void PagedKVCache::replace_pages(
+      const std::vector<std::pair<PageKey, PageKey>> &pairs)
+  {
+    std::set<PageKey> staged;
+    std::vector<PageKey> keys;
+    for (const auto &[key, stage] : pairs)
+    {
+      if (key.layer == stage.layer && key.page_index == stage.page_index)
+      {
+        throw std::invalid_argument("a page cannot replace itself");
+      }
+      locate(stage); // PageNotFound before anything changes
+      if (!staged.insert(stage).second)
+      {
+        throw std::invalid_argument(describe(stage) +
+                                    " is named twice in one replace");
+      }
+      keys.push_back(key);
+    }
+    for (const PageKey &key : keys)
+    {
+      if (staged.count(key) != 0)
+      {
+        throw std::invalid_argument(describe(key) +
+                                    " is both replaced and staged");
+      }
+    }
+    free_pages(keys);
+    // Looked up after the free, which moves a staged page that sat above
+    // the slots its tier kept.
+    for (const auto &[key, stage] : pairs)
+    {
+      const PageLocation loc = table_.at(stage);
+      table_.erase(stage);
+      table_[key] = loc;
+      range(loc.tier).slots[loc.slot] = key;
+    }
+    ++generation_;
   }
 
   void PagedKVCache::replace(PageKey key, PageKey staged)

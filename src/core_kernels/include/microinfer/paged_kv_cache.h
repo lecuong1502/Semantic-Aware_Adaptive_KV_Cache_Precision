@@ -135,6 +135,15 @@ namespace microinfer
     // of its own until now. Both must be held, and differ.
     void replace(PageKey key, PageKey staged);
 
+    // free() and replace() for many pages at once (#205): every page named
+    // freed together, each tier's kept pages moved into the slots the freed
+    // ones leave below its new tail in one copy, one synchronise, and the
+    // granules emptied released. Every key must be held and named once;
+    // nothing changes otherwise. A replacement's staged page may sit in a
+    // tier that loses pages, and keeps its bytes wherever the free moves it.
+    void free_pages(const std::vector<PageKey> &keys);
+    void replace_pages(const std::vector<std::pair<PageKey, PageKey>> &pairs);
+
     // Copies a page's bytes in from, or out to, host memory. `bytes` must be
     // exactly page_bytes(tier) of the page's tier.
     void write(PageKey key, const void *host, std::size_t bytes);

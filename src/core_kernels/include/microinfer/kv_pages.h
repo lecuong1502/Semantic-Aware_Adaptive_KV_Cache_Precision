@@ -43,6 +43,10 @@ namespace microinfer
   // the move returns.
   constexpr int kShadowUploadPage = -4;
 
+  // The page_index the i-th move of a batch allocates its new page under,
+  // kBatchStagingPage - i, while the page it replaces is still read (#205).
+  constexpr int kBatchStagingPage = -16;
+
   // Which halves of a page a quantised tier quantises. Both is the tier; the
   // other two are a diagnostic (#18): the page is stored at FP16, and when it
   // is sealed only the named half is replaced by what the tier's quantiser
@@ -197,6 +201,40 @@ namespace microinfer
     // the page's place, the old page freed. The shadow is kept. If an
     // allocation fails, the cache is as it was.
     void upgrade(int layer, int page, Tier target);
+
+    // One page of a batch: its layer, its page and the tier it moves to.
+    struct PageMove
+    {
+      int layer;
+      int page;
+      Tier target;
+    };
+
+    // Moves every page of `moves` to its target at once (#205), down or up,
+    // each as downgrade() or upgrade() would move it alone, to the bit:
+    // from the page's FP16 bytes, its own while it is FP16, its shadow once
+    // it is not. Every new page is allocated first, so that if one cannot
+    // be, the cache is as it was; then the first downgrades' FP16 bytes go
+    // to their shadows in one copy, each target tier is quantised in one
+    // launch, reading a shadow where it lies in pinned host memory, a move
+    // up to FP16 copies its shadow, and the old pages are freed together,
+    // their tiers' tails moving into their slots (ADR-0007), with one
+    // synchronise. Refused before anything changes: a page named twice, one
+    // that cannot move, one already at its target, and one below FP16 with
+    // no shadow. A page goes straight to its target, so a batch names a
+    // page once, at the tier it ends at.
+    void move_pages(const std::vector<PageMove> &moves);
+
+    // What the last batch took: its moves, the shadows it took, and its
+    // wall time, from once the device has finished what it was given
+    // before to the end of its frees.
+    struct BatchRecord
+    {
+      std::size_t moves;
+      std::size_t shadows_taken;
+      double seconds;
+    };
+    const std::optional<BatchRecord> &last_batch() const { return last_batch_; }
 
     // Drops page `page` of `layer`, a sealed page of positions, for good
     // (#160), as H2O drops a token: the page is freed, its tier's tail
@@ -361,6 +399,7 @@ namespace microinfer
     std::set<PageKey> evicted_;
     std::set<PageKey> masked_;
     std::optional<MoveRecord> last_move_;
+    std::optional<BatchRecord> last_batch_;
     // For a diagnostic Halves only: a quantised page and its dequantised
     // halves, the scratch a seal goes through.
     std::unique_ptr<DeviceBuffer> scratch_page_;

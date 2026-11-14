@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -707,6 +708,179 @@ namespace microinfer
                    bytes_at(target),
                    std::chrono::duration<double>(Clock::now() - began).count(),
                    shadow_seconds};
+  }
+
+  void KVPages::move_pages(const std::vector<PageMove> &moves)
+  {
+    // Everything is checked before anything changes.
+    std::vector<PageKey> keys;
+    std::vector<Tier> current;
+    std::set<PageKey> named;
+    for (const PageMove &m : moves)
+    {
+      const PageKey key = require_held(m.layer, m.page, "move");
+      if (!named.insert(key).second)
+      {
+        throw std::invalid_argument(
+            page_name(key) + " is named twice in one batch; a batch "
+                             "moves a page once, to the tier it ends at");
+      }
+      const Tier from = page_tier(key);
+      if (from == m.target)
+      {
+        throw std::invalid_argument(page_name(key) + " is already at " +
+                                    tier_name(from));
+      }
+      if (from != Tier::FP16 && !shadows_.contains(key))
+      {
+        throw std::invalid_argument(
+            page_name(key) + " was born at " + tier_name(from) +
+            " and has no FP16 shadow to move from; only a page sealed at "
+            "FP16 moves");
+      }
+      require_page_size(m.target, "a page of positions");
+      keys.push_back(key);
+      current.push_back(from);
+    }
+    cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize before a batch");
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point began = Clock::now();
+    const std::size_t n = moves.size();
+    if (n == 0)
+    {
+      last_batch_ = BatchRecord{0, 0, 0.0};
+      return;
+    }
+
+    // 1. Every new page, under a key of its own, and room for the shadows
+    // the batch takes. If an allocation fails, those made are given back,
+    // each its tier's tail, and nothing else has changed.
+    std::size_t first_downgrades = 0;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      first_downgrades +=
+          current[i] == Tier::FP16 && !shadows_.contains(keys[i]);
+    }
+    std::vector<PageKey> staged;
+    try
+    {
+      for (std::size_t i = 0; i < n; ++i)
+      {
+        const PageKey stage{keys[i].layer,
+                            kBatchStagingPage - static_cast<int>(i)};
+        allocator_.allocate(stage, moves[i].target);
+        staged.push_back(stage);
+      }
+      shadows_.reserve(first_downgrades);
+    }
+    catch (...)
+    {
+      allocator_.free_pages(staged);
+      throw;
+    }
+
+    // 2. The device's work, enqueued in order on the legacy default stream:
+    // the shadows, then each target tier's pages, all of it reading pages
+    // before any is freed. Addresses are resolved here, after the last
+    // allocation, and used at once.
+    std::vector<const void *> shadow_from, restore_from;
+    std::vector<void *> shadow_to, restore_to;
+    std::array<std::vector<const void *>, kTierCount> rows;
+    std::array<std::vector<void *>, kTierCount> pages;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      const PageKey key = keys[i];
+      void *to = reinterpret_cast<void *>(resolve_page(staged[i]).address);
+      const void *fp16 = nullptr;
+      if (current[i] == Tier::FP16)
+      {
+        fp16 = reinterpret_cast<const void *>(resolve_page(key).address);
+        if (!shadows_.contains(key))
+        {
+          shadow_from.push_back(fp16);
+          shadow_to.push_back(shadows_.add(key));
+        }
+      }
+      else
+      {
+        fp16 = shadows_.device_shadow(key);
+      }
+      const Tier target = moves[i].target;
+      if (target == Tier::FP16)
+      {
+        restore_from.push_back(fp16);
+        restore_to.push_back(to);
+      }
+      else
+      {
+        rows[static_cast<int>(target)].push_back(fp16);
+        pages[static_cast<int>(target)].push_back(to);
+      }
+    }
+    // Every array of addresses, on the device in one copy.
+    std::vector<const void *> table;
+    const auto place = [&table](const auto &from, const auto &to)
+    {
+      const std::size_t at = table.size();
+      table.insert(table.end(), from.begin(), from.end());
+      table.insert(table.end(), to.begin(), to.end());
+      return at;
+    };
+    const std::size_t shadow_at = place(shadow_from, shadow_to);
+    const std::size_t restore_at = place(restore_from, restore_to);
+    std::array<std::size_t, kTierCount> tier_at{};
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      tier_at[t] = place(rows[t], pages[t]);
+    }
+    DeviceBuffer addresses(table.size() * sizeof(void *));
+    cuda_check(cudaMemcpy(addresses.raw(), table.data(),
+                          table.size() * sizeof(void *),
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy a batch's page addresses");
+    const auto *on_device = addresses.as<const void *const>();
+    const auto writable = [](const void *const *p)
+    { return const_cast<void *const *>(p); };
+    const std::size_t fp16_bytes = bytes_at(Tier::FP16);
+    // Pages and shadows sit at multiples of their size from aligned bases.
+    const bool aligned = fp16_bytes % 16 == 0;
+    device::copy_pages(on_device + shadow_at,
+                       writable(on_device + shadow_at + shadow_from.size()),
+                       fp16_bytes, static_cast<int>(shadow_from.size()),
+                       aligned);
+    device::copy_pages(on_device + restore_at,
+                       writable(on_device + restore_at + restore_from.size()),
+                       fp16_bytes, static_cast<int>(restore_from.size()),
+                       aligned);
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      if (rows[t].empty())
+      {
+        continue;
+      }
+      device::quantise_pages(
+          reinterpret_cast<const __half *const *>(on_device + tier_at[t]),
+          reinterpret_cast<std::uint8_t *const *>(
+              writable(on_device + tier_at[t] + rows[t].size())),
+          static_cast<int>(rows[t].size()), static_cast<Tier>(t), page_tokens_,
+          kv_heads_, head_dim_);
+    }
+
+    // 3 and 4. The page table names the new pages, and the old ones are
+    // freed together; the frees' copies are ordered after the work above,
+    // and synchronised before any granule goes. The shadows' copies are
+    // complete with them.
+    std::vector<std::pair<PageKey, PageKey>> pairs;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      pairs.emplace_back(keys[i], staged[i]);
+      may_be_at_[static_cast<int>(moves[i].target)] = true;
+    }
+    allocator_.replace_pages(pairs);
+    cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize after a batch");
+    last_batch_ = BatchRecord{
+        n, shadow_from.size(),
+        std::chrono::duration<double>(Clock::now() - began).count()};
   }
 
   void KVPages::attention(int layer, const __half *q, const __half *k_bias,
