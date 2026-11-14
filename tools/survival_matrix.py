@@ -10,8 +10,8 @@ process of its own: Qwen2.5-1.5B prefills 32704 positions and decodes 64,
 and when its cache reaches 16384 positions the simulator plays the
 scenario on its base (microinfer.survival_matrix). B1 to B3 are static
 engines at FP16, INT4 and INT2; B4 to B6 the adaptive engine from the
-uniform, random and semantic sources; B8 a static engine at INT8 (#206). The runs go run by run, every cell's
-first before any cell's second, so that a matrix stopped part way is
+uniform, random and semantic sources; B8 a static engine at INT8 (#206).
+The runs go run by run, every cell's first before any cell's second, so that a matrix stopped part way is
 balanced; a run already logged at the same code is not run again, so the
 same command takes it up. A run stopped part way leaves its recording,
 which is kept; the run again records beside it, numbered.

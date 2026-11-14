@@ -118,8 +118,17 @@ CONDITIONS = (
 NO_PLAN = Condition("no-plan", adaptive=True)
 #: The conditions of a score source at a level, question-blind's closing run (#149).
 SOURCE_CONDITIONS = tuple(c.name for c in CONDITIONS if c.source is not None)
+def is_static(cond: Condition) -> bool:
+    """Whether `cond` is a static tier: every page at one tier below FP16
+    for the whole session, no plan, no scorer."""
+    return cond.tier != "FP16" and not cond.adaptive and cond.source is None
+
+
 #: The static tiers, a whole session at one tier (#151, #206).
-STATIC_CONDITIONS = tuple(c.name for c in CONDITIONS if c.tier != "FP16")
+STATIC_CONDITIONS = tuple(c.name for c in CONDITIONS if is_static(c))
+#: The static tiers added after RQ3's first runs (#206): a summary of runs
+#: logged before them pools them only once they have runs.
+LATER_STATIC_CONDITIONS = ("static-int8",)
 #: The levels, the shares a controlled plan reclaims.
 LEVELS = sorted({c.share for c in CONDITIONS if c.share is not None})
 #: Eviction at each level (#160), against the semantic source there.

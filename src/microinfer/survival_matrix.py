@@ -2,8 +2,8 @@
 
 The survival experiment (#108) runs one 32K generation against S5, a step
 kept to the end. The matrix runs it against S1 to S4 in its place, under
-each of the conditions B1 to B6, three runs a cell (ADR-0014, amendment
-#190). Each scenario's schedule is a pure function of its seed and RQ1's
+each of the conditions B1 to B6 and B8 (#206), three runs a cell (ADR-0014,
+amendment #190). Each scenario's schedule is a pure function of its seed and RQ1's
 measures, so that every condition faces the same contention run for run:
 
 - **S1, the pulse grid**: #64's 36 cells, 3 repeats each, its gaps

@@ -247,17 +247,23 @@ def test_the_tool_logs_the_summary(tmp_path, monkeypatch):
 def test_a_static_tier_is_pooled_once_it_has_runs_and_then_of_every_sample(tmp_path):
     """Runs logged before #206 have no static INT8: question-blind's
     summary pools the conditions they have. Once static INT8 has a run,
-    every sample needs one."""
+    every sample needs one; static INT4 and INT2 are needed always."""
     log = entries(tmp_path, lambda s, x, c: True)
     full = rq3_summary.summarise(log, MODEL, 140, 7936)
     assert "static-int8" in full["accuracy"]["question-blind"]
 
-    def int8(e):
-        return e["kind"] == "rq3-needle" and e["config"]["condition"]["name"] == "static-int8"
+    def run_of(name):
+        return lambda e: e["kind"] == "rq3-needle" and e["config"]["condition"]["name"] == name
 
-    without = rq3_summary.summarise([e for e in log if not int8(e)], MODEL, 140, 7936)
+    is_int8 = run_of("static-int8")
+    without = rq3_summary.summarise([e for e in log if not is_int8(e)], MODEL, 140, 7936)
     assert "static-int8" not in without["accuracy"]["question-blind"]
     assert "static-int4" in without["accuracy"]["question-blind"]
-    some = [e for e in log if not (int8(e) and e["config"]["sample_id"] == SAMPLES[0])]
+    some = [e for e in log if not (is_int8(e) and e["config"]["sample_id"] == SAMPLES[0])]
     with pytest.raises(ValueError, match="static-int8"):
         rq3_summary.summarise(some, MODEL, 140, 7936)
+    # The static tiers of RQ3's first runs are not optional: a set with none
+    # of them, such as a new model's, is missing runs.
+    with pytest.raises(ValueError, match="static-int4"):
+        rq3_summary.summarise([e for e in log if not run_of("static-int4")(e)],
+                              MODEL, 140, 7936)

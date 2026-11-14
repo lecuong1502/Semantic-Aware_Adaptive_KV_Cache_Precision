@@ -261,3 +261,15 @@ B3, B4 and B5 completed S5's step, and B5 S6's pulse, restoring every page
 
 Three runs a cell bound a rate loosely, a Wilson 95% interval of [44, 100]%
 at 3/3, and do not separate B4 to B6.
+
+---
+
+## Amendment (#206): B8, a static INT8 engine, in the survival matrix
+
+The survival matrix gains B8, an engine whose cache is at INT8 for the
+whole session, beside B2 and B3. It runs S1 to S4, three runs a cell, and
+S5, as the other conditions do. It asks whether a cache that starts at half
+an FP16 cache's bytes survives the contention the adaptive engine survives.
+B7 is RQ3's eviction, which holds no session of its own to survive. B8's
+headroom is counted as an FP16 engine's would be, as B2's and B3's is, so
+that it faces the same bytes taken.

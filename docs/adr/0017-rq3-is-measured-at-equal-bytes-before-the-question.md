@@ -291,3 +291,28 @@ premise holds for what follows the text, not for what a later question
 will need. One page alone does little harm, the largest damage
 7.7e-4; the test shows the ranking a plan relies on, not how many pages'
 damages combine.
+
+---
+
+## Amendment (#206): static INT8 joins the static tiers
+
+Static INT4 answered all 50 needles, more than the semantic source's 48. A
+reviewer's first question is then why not a static cache at all, and INT8
+is the one to ask it of: near lossless, at 8.63 effective bits, about half
+an FP16 cache's bytes. RQ3's static tiers are therefore three:
+`static-int8`, `static-int4` and `static-int2`.
+
+- **The needle set:** `static-int8` is a condition of every question-blind
+  run, as the other static tiers are. A summary of runs logged before
+  #206, which have none, pools the conditions they have
+  (`rq3.LATER_STATIC_CONDITIONS`). Once static INT8 has a run, every sample
+  needs one.
+- **Continuation fidelity:** a static tier holds the passage at its tier
+  from its first position, with no plan. It runs alone and is measured
+  against the same FP16 reference as a plan.
+- **The anchor-fact dialogue:** a static tier runs its dialogue alone, as
+  a condition that holds the turns otherwise does.
+
+The comparison the closing question makes is unchanged. The static tiers
+answer a different question: what a session pays when its cache is held
+low throughout, where the adaptive engine pays only under pressure.

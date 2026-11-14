@@ -131,7 +131,7 @@ def runs(engine, passage: Passage, conds: Sequence[rq3.Condition], *,
     the passage at its tier from its first position, so it runs the prefix
     and warm tokens itself, with no plan, and is measured against the same
     reference. Any other way of holding the passage is refused."""
-    elsewhere = [c.name for c in conds if not rq3.shares_turn_1(c) and not _static(c)]
+    elsewhere = [c.name for c in conds if not rq3.shares_turn_1(c) and not rq3.is_static(c)]
     if elsewhere:
         raise ValueError(f"continuation fidelity measures plans made at FP16 and static "
                          f"tiers: {elsewhere} hold the passage otherwise")
@@ -148,20 +148,17 @@ def runs(engine, passage: Passage, conds: Sequence[rq3.Condition], *,
     seed = rq3.sample_seed(passage.passage_id, plan_seed)
     for cond in conds:
         record = None
-        if _static(cond):
-            with rq3.set_for(engine, cond), engine.conversation() as chat:
+        static = rq3.is_static(cond)
+        with rq3.set_for(engine, cond), engine.conversation(
+                start=None if static else snapshot) as chat:
+            if static:
                 chat.force(passage.prefix)
                 chat.force(passage.warm, one_by_one=True)
-                bits = chat.effective_bits()
-                tiers = chat.tiers()
-                logits = chat.force(passage.measured, one_by_one=True, logits=True)
-        else:
-            with rq3.set_for(engine, cond), engine.conversation(start=snapshot) as chat:
-                if cond.source is not None:
-                    record = chat.plan(cond.share, source=cond.source, seed=seed)
-                bits = chat.effective_bits()
-                tiers = chat.tiers()
-                logits = chat.force(passage.measured, one_by_one=True, logits=True)
+            elif cond.source is not None:
+                record = chat.plan(cond.share, source=cond.source, seed=seed)
+            bits = chat.effective_bits()
+            tiers = chat.tiers()
+            logits = chat.force(passage.measured, one_by_one=True, logits=True)
         measured = measures(reference, logits)
         yield cond, {
             "top1": float(np.mean(measured["top1"])), "kl_mean": float(np.mean(measured["kl"])),
@@ -172,12 +169,6 @@ def runs(engine, passage: Passage, conds: Sequence[rq3.Condition], *,
             "candidate_effective_bits": bits["candidate_effective_bits"],
             # every page held at the plan, the open last one among them
             "tier_shares": rq3.tier_shares(tiers[tiers >= 0])}
-
-
-def _static(cond: rq3.Condition) -> bool:
-    """Whether `cond` is a static tier: every page at one tier below FP16,
-    no plan, no scorer."""
-    return cond.tier != "FP16" and not cond.adaptive and cond.source is None
 
 
 def config(passage: Passage, cond: rq3.Condition, **more) -> dict:

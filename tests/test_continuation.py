@@ -57,6 +57,16 @@ def entry(log, passage, name, top1, kl, *, shape=SHAPE):
                              "plan": {"target_met": passage != "p01"}}, log=log)
 
 
+def test_a_way_of_holding_the_passage_it_cannot_measure_is_refused():
+    """Before the engine is touched: an ablation of the scorer holds the
+    passage as neither a plan at FP16 nor a static tier does."""
+    ablation = rq3.Condition("score-every-4", source="semantic", share=0.8, score_every=4)
+    with pytest.raises(ValueError, match=ablation.name):
+        list(continuation.runs(None, continuation.passages(
+            np.arange(1000, dtype=np.int32), 1, continuation.Shape(200, 30, 70))[0],
+            [ablation]))
+
+
 def test_the_summary_pairs_semantic_against_uniform_and_random_by_passage(tmp_path):
     log = tmp_path / "benchmark.jsonl"
     for i in range(10):

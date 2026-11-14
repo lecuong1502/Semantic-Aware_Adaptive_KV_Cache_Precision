@@ -55,11 +55,11 @@ the survival matrix in place of S5's step, the run's seed --run
 (microinfer.survival_matrix): when the cache reaches --contention-at
 positions, a base that leaves the scenario's headroom, and the scenario's
 schedule on it, until the generation ends. `static` runs at --kv-tier,
-B1 to B3; `adaptive` at FP16 from --score-source, B4 to B6. Every entry
-names its condition, scenario and run, and the monitor's detection scored
-against the trace, as RQ2 scored it; a static INT4 or INT2 engine's
-headroom is counted as an FP16 engine's, so that every condition faces the
-same bytes taken. tools/survival_matrix.py runs the matrix.
+B1 to B3, or B8 at INT8 (#206); `adaptive` at FP16 from --score-source, B4
+to B6. Every entry names its condition, scenario and run, and the monitor's
+detection scored against the trace, as RQ2 scored it; a static engine's
+headroom below FP16 is counted as an FP16 engine's, so that every condition
+faces the same bytes taken. tools/survival_matrix.py runs the matrix.
 
 Close every application first: what the desktop takes or gives back during
 a run moves the shortfall. A 32K run takes tens of minutes. Refuses a dirty
@@ -106,7 +106,7 @@ def main(argv: list[str]) -> int:
                         help="give the memory back this long after it was taken (#155); "
                              "adaptive only")
     parser.add_argument("--kv-tier", choices=("FP16", "INT8", "INT4", "INT2"), default="FP16",
-                        help="a static engine's cache tier: B1, B2 or B3 (#190)")
+                        help="a static engine's cache tier: B1, B8, B2 or B3 (#190, #206)")
     parser.add_argument("--scenario", choices=matrix.EVERY_SCENARIO, default="S5",
                         help="the contention: S5's step, or a scenario of the matrix (#190)")
     parser.add_argument("--run", type=int, default=0,

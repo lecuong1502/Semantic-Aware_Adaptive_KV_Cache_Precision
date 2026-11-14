@@ -124,17 +124,19 @@ LONG_CONDITIONS = ("fp16", *(_source_condition(source, CLOSING_SHARE)
                              for source in ("semantic", "uniform")))
 
 
-def _conditions(experiment: str, latest=None, kept=()) -> list[str]:
+def _conditions(experiment: str, latest: dict[tuple[str, str, str], dict],
+                kept: Sequence[str]) -> list[str]:
     """The conditions an experiment's summary pools. Question-aware's are
-    the sources'. Question-blind's are FP16's and the sources', and each
-    static tier that has a run in `latest`, then of every sample: a static
-    tier is a baseline the runs may not yet have (#206), and a run of it
-    that is part done is still missing runs."""
+    the sources'. Question-blind's are every condition, but a static tier
+    added after RQ3's first runs (rq3.LATER_STATIC_CONDITIONS, #206) only
+    once it has a run in `latest`, and then of every sample: runs logged
+    before it still summarise, and a run of it that is part done is still
+    missing runs."""
     if experiment == "question-aware":
         return list(rq3.SOURCE_CONDITIONS)
-    static = [name for name in rq3.STATIC_CONDITIONS
-              if latest is not None and any((s, experiment, name) in latest for s in kept)]
-    return [c.name for c in rq3.CONDITIONS if c.tier == "FP16" or c.name in static]
+    return [c.name for c in rq3.CONDITIONS
+            if c.name not in rq3.LATER_STATIC_CONDITIONS
+            or any((s, experiment, c.name) in latest for s in kept)]
 
 
 def _pool(entries: Sequence[dict], model: str, needle_seed: int, haystack_tokens: int,
