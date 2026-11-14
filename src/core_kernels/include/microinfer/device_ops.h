@@ -139,6 +139,14 @@ namespace microinfer
         int seq_k, int heads, int kv_heads, int head_dim, float *mass = nullptr,
         float *partials = nullptr);
 
+    // Copies `count` pages of `bytes` each, from[i] to to[i], in one launch
+    // (#205): `from` and `to` are arrays in device memory of device-visible
+    // addresses, pinned host memory mapped for the device among them. No
+    // copy may read what another writes. `aligned16`, if every address is a
+    // multiple of 16 bytes, lets the copy move 16 bytes at a time.
+    void copy_pages(const void *const *from, void *const *to, std::size_t bytes,
+                    int count, bool aligned16);
+
     // Writes n tokens' key and value rows into their pages, token t at
     // position start + t. `pages` as for attention_paged.
     void store_pages(const __half *keys, const __half *values,

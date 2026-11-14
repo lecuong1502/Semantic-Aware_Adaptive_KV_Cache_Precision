@@ -604,6 +604,22 @@ PYBIND11_MODULE(_microinfer, m)
           },
           py::arg("layer"), py::arg("page_index"))
       .def(
+          "free_pages",
+          [](PagedKVCache &c, const std::vector<std::pair<int, int>> &keys)
+          {
+            std::vector<microinfer::PageKey> pages;
+            for (const auto &[layer, page] : keys)
+            {
+              pages.push_back({layer, page});
+            }
+            py::gil_scoped_release release;
+            c.free_pages(pages);
+          },
+          py::arg("keys"),
+          "Free every (layer, page_index) of `keys` at once (#205): each "
+          "tier's kept pages moved into the slots below its new tail in one "
+          "copy, and the granules emptied released.")
+      .def(
           "replace",
           [](PagedKVCache &c, std::pair<int, int> key,
              std::pair<int, int> staged)

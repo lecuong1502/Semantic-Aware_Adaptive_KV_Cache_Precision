@@ -38,6 +38,7 @@ pybind11_add_module(_microinfer
   src/core_kernels/importance_scores.cu
   src/core_kernels/kv_pages.cu
   src/core_kernels/linear.cu
+  src/core_kernels/page_copy.cu
   src/core_kernels/paged_kv_cache.cu
   src/core_kernels/quant.cu
   src/core_kernels/residual.cu

@@ -1,6 +1,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -73,14 +74,13 @@ namespace microinfer
     // writes whole bytes; the zero-point, a minimum of fp16 values, is
     // itself fp16 and stored exactly.
     template <int Bits>
-    __global__ void quantise_keys_kernel(const __half *__restrict__ keys,
-                                         std::uint8_t *__restrict__ codes,
-                                         __half *__restrict__ scales,
-                                         __half *__restrict__ zeros,
-                                         int page_tokens, int width)
+    __device__ void quantise_keys(const __half *__restrict__ keys,
+                                  std::uint8_t *__restrict__ codes,
+                                  __half *__restrict__ scales,
+                                  __half *__restrict__ zeros, int page_tokens,
+                                  int width, int column)
     {
       constexpr int kPerByte = 8 / Bits;
-      const int column = blockIdx.x * blockDim.x + threadIdx.x;
       const int columns = width / kPerByte;
       if (column >= columns)
       {
@@ -125,18 +125,27 @@ namespace microinfer
       }
     }
 
+    template <int Bits>
+    __global__ void quantise_keys_kernel(const __half *__restrict__ keys,
+                                         std::uint8_t *__restrict__ codes,
+                                         __half *__restrict__ scales,
+                                         __half *__restrict__ zeros,
+                                         int page_tokens, int width)
+    {
+      quantise_keys<Bits>(keys, codes, scales, zeros, page_tokens, width,
+                          blockIdx.x * blockDim.x + threadIdx.x);
+    }
+
     // Values, per (head, token) across head_dim channels. One warp per group:
     // the lanes reduce its minimum and maximum, then write its bytes.
     template <int Bits>
-    __global__ void quantise_values_kernel(const __half *__restrict__ values,
-                                           std::uint8_t *__restrict__ codes,
-                                           __half *__restrict__ scales,
-                                           __half *__restrict__ zeros,
-                                           int groups, int head_dim)
+    __device__ void quantise_values(const __half *__restrict__ values,
+                                    std::uint8_t *__restrict__ codes,
+                                    __half *__restrict__ scales,
+                                    __half *__restrict__ zeros, int groups,
+                                    int head_dim, int group, int lane)
     {
       constexpr int kPerByte = 8 / Bits;
-      const int group = (blockIdx.x * blockDim.x + threadIdx.x) / kWarp;
-      const int lane = threadIdx.x % kWarp;
       if (group >= groups)
       {
         return;
@@ -175,6 +184,55 @@ namespace microinfer
         }
         out[b] = static_cast<std::uint8_t>(byte);
       }
+    }
+
+    template <int Bits>
+    __global__ void quantise_values_kernel(const __half *__restrict__ values,
+                                           std::uint8_t *__restrict__ codes,
+                                           __half *__restrict__ scales,
+                                           __half *__restrict__ zeros,
+                                           int groups, int head_dim)
+    {
+      quantise_values<Bits>(values, codes, scales, zeros, groups, head_dim,
+                            (blockIdx.x * blockDim.x + threadIdx.x) / kWarp,
+                            threadIdx.x % kWarp);
+    }
+
+    // The same two kernels over many pages at once (#205): page
+    // blockIdx.y + first of `rows` and `pages`, each an FP16 page's bytes,
+    // keys then values, and the page its codes go to. Each page's
+    // arithmetic is quantise_keys' and quantise_values', as one page's.
+    template <int Bits>
+    __global__ void
+    quantise_pages_keys_kernel(const __half *const *__restrict__ rows,
+                               std::uint8_t *const *__restrict__ pages,
+                               int first, QuantisedPageLayout layout,
+                               int page_tokens, int width)
+    {
+      std::uint8_t *page = pages[first + blockIdx.y];
+      quantise_keys<Bits>(rows[first + blockIdx.y], page + layout.key_codes,
+                          reinterpret_cast<__half *>(page + layout.key_scales),
+                          reinterpret_cast<__half *>(page + layout.key_zeros),
+                          page_tokens, width,
+                          blockIdx.x * blockDim.x + threadIdx.x);
+    }
+
+    template <int Bits>
+    __global__ void
+    quantise_pages_values_kernel(const __half *const *__restrict__ rows,
+                                 std::uint8_t *const *__restrict__ pages,
+                                 int first, QuantisedPageLayout layout,
+                                 int page_tokens, int width, int groups,
+                                 int head_dim)
+    {
+      std::uint8_t *page = pages[first + blockIdx.y];
+      quantise_values<Bits>(
+          rows[first + blockIdx.y] + static_cast<size_t>(page_tokens) * width,
+          page + layout.value_codes,
+          reinterpret_cast<__half *>(page + layout.value_scales),
+          reinterpret_cast<__half *>(page + layout.value_zeros), groups,
+          head_dim, (blockIdx.x * blockDim.x + threadIdx.x) / kWarp,
+          threadIdx.x % kWarp);
     }
 
     // One half of the page, keys or values, one thread per byte of codes.
@@ -231,6 +289,34 @@ namespace microinfer
               reinterpret_cast<__half *>(page + layout.value_zeros), groups,
               head_dim);
       cuda_check(cudaGetLastError(), "quantise values kernel launch");
+    }
+
+    // A grid's second dimension holds at most this many pages a launch.
+    constexpr int kMaxGridY = 65535;
+
+    template <int Bits>
+    void launch_quantise_pages(const __half *const *rows,
+                               std::uint8_t *const *pages, int count,
+                               const QuantisedPageLayout &layout,
+                               int page_tokens, int kv_heads, int head_dim)
+    {
+      const int width = kv_heads * head_dim;
+      const int columns = width / (8 / Bits);
+      const int groups = page_tokens * kv_heads;
+      const int warps_per_block = kBlockThreads / kWarp;
+      for (int first = 0; first < count; first += kMaxGridY)
+      {
+        const int n = std::min(kMaxGridY, count - first);
+        quantise_pages_keys_kernel<Bits>
+            <<<dim3((columns + kBlockThreads - 1) / kBlockThreads, n),
+               kBlockThreads>>>(rows, pages, first, layout, page_tokens, width);
+        cuda_check(cudaGetLastError(), "quantise pages' keys kernel launch");
+        quantise_pages_values_kernel<Bits>
+            <<<dim3((groups + warps_per_block - 1) / warps_per_block, n),
+               kBlockThreads>>>(rows, pages, first, layout, page_tokens, width,
+                                groups, head_dim);
+        cuda_check(cudaGetLastError(), "quantise pages' values kernel launch");
+      }
     }
 
     template <int Bits>
@@ -326,6 +412,25 @@ namespace microinfer
                     {
                       launch_quantise<decltype(bits)::value>(
                           keys, values, page, layout, page_tokens, kv_heads,
+                          head_dim);
+                    });
+  }
+
+  void device::quantise_pages(const __half *const *rows,
+                              std::uint8_t *const *pages, int count, Tier tier,
+                              int page_tokens, int kv_heads, int head_dim)
+  {
+    const QuantisedPageLayout layout =
+        quantised_page_layout(tier, page_tokens, kv_heads, head_dim);
+    if (count <= 0)
+    {
+      return;
+    }
+    with_code_width(tier,
+                    [&](auto bits)
+                    {
+                      launch_quantise_pages<decltype(bits)::value>(
+                          rows, pages, count, layout, page_tokens, kv_heads,
                           head_dim);
                     });
   }

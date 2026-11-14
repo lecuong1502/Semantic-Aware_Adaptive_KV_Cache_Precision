@@ -19,6 +19,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <vector>
 
 #include "microinfer/check.h"
 #include "microinfer/device_ops.h"
@@ -876,6 +878,42 @@ void bind_device(py::module_ &parent)
            "put in its place in the page table, and the old page freed, its "
            "tier's tail moving into the slot (ADR-0007). If the allocation "
            "fails, the cache is as it was.")
+      .def(
+          "move_pages",
+          [](KVPages &c,
+             const std::vector<std::tuple<int, int, microinfer::Tier>> &moves)
+          {
+            std::vector<KVPages::PageMove> batch;
+            batch.reserve(moves.size());
+            for (const auto &[layer, page, target] : moves)
+            {
+              batch.push_back({{layer, page}, target});
+            }
+            py::gil_scoped_release release;
+            c.move_pages(batch);
+          },
+          py::arg("moves"),
+          "Move every (layer, page, tier) of `moves` to its tier at once "
+          "(#205), down or up, each as downgrade() or upgrade() would alone, "
+          "to the bit. Every new page is allocated first, so that if one "
+          "cannot be, the cache is as it was. A batch names a page once.")
+      .def_property_readonly(
+          "last_batch",
+          [](const KVPages &c) -> py::object
+          {
+            const auto &last = c.last_batch();
+            if (!last)
+            {
+              return py::none();
+            }
+            py::dict d;
+            d["moves"] = last->moves;
+            d["shadows_taken"] = last->shadows_taken;
+            d["seconds"] = last->seconds;
+            return std::move(d);
+          },
+          "What the last move_pages took (#205), or None: its moves, the "
+          "shadows it took, and its wall time in seconds.")
       .def("evict", &KVPages::evict, py::call_guard<py::gil_scoped_release>(),
            py::arg("layer"), py::arg("page"),
            "Drop a sealed page of positions for good (#160): freed, its "
