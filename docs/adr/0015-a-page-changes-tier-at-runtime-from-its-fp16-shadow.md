@@ -210,7 +210,15 @@ fixes, agrees within 15%):
   was bounded by the per-page budget, about 500 moves a step, and by 1.7 s
   steps. A step's budget now holds a few thousand moves from shadows, at
   3 µs each and the estimate doubling them, and #204's steps take 34 ms.
-  Through the engine it is not yet measured again.
+  Measured through the engine (`pulse-release` entry `520bde50…`, at
+  3c4443b, the same run as #155's semantic one, `94948638…`), the whole
+  32K cache is back at FP16 108.7 s after the release, against 532.2 s.
+  The first upgrade comes 8.5 s after it, against 24.9 s, the cooldown
+  being 5 s. 52,668 upgrades were made, with no thrash.
+  - What is left is not the moves' time: 52,668 moves at a few µs each
+    come to well under a second. It is most likely the upgrade planner's
+    pace, which looks for upgrades every 0.25 s at most, each plan sized to
+    the headroom then. That is not measured here.
 
 **A race the first version had.** `free_pages` synchronised only where a tail
 moved. Where all the pages a tier lost were at its top, it unmapped their
