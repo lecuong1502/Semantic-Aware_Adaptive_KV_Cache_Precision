@@ -124,10 +124,17 @@ LONG_CONDITIONS = ("fp16", *(_source_condition(source, CLOSING_SHARE)
                              for source in ("semantic", "uniform")))
 
 
-def _conditions(experiment: str) -> list[str]:
+def _conditions(experiment: str, latest=None, kept=()) -> list[str]:
+    """The conditions an experiment's summary pools. Question-aware's are
+    the sources'. Question-blind's are FP16's and the sources', and each
+    static tier that has a run in `latest`, then of every sample: a static
+    tier is a baseline the runs may not yet have (#206), and a run of it
+    that is part done is still missing runs."""
     if experiment == "question-aware":
         return list(rq3.SOURCE_CONDITIONS)
-    return [c.name for c in rq3.CONDITIONS]
+    static = [name for name in rq3.STATIC_CONDITIONS
+              if latest is not None and any((s, experiment, name) in latest for s in kept)]
+    return [c.name for c in rq3.CONDITIONS if c.tier == "FP16" or c.name in static]
 
 
 def _pool(entries: Sequence[dict], model: str, needle_seed: int, haystack_tokens: int,
@@ -246,7 +253,7 @@ def summarise(entries: Sequence[dict], model: str, needle_seed: int, haystack_to
     kept = screening["results"]["kept"]
     latest = _pool(entries, model, needle_seed, haystack_tokens, plan_seed, kept)
     missing = [(s, experiment, name) for experiment in experiments
-               for name in _conditions(experiment) for s in kept
+               for name in _conditions(experiment, latest, kept) for s in kept
                if (s, experiment, name) not in latest]
     if missing:
         raise ValueError(f"no run of {len(missing)} samples' conditions, such as "
@@ -255,7 +262,7 @@ def summarise(entries: Sequence[dict], model: str, needle_seed: int, haystack_to
     rng = np.random.default_rng(SEED)
     accuracy, pairs, pooled = {}, {}, []
     for experiment in experiments:
-        names = _conditions(experiment)
+        names = _conditions(experiment, latest, kept)
         runs = {name: [latest[(s, experiment, name)] for s in kept] for name in names}
         pooled += [e["sha256"] for name in names for e in runs[name]]
         right = {name: outcomes(runs[name]) for name in names}

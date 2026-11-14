@@ -128,6 +128,7 @@ def test_a_static_int4_engine_s_headroom_is_counted_as_an_fp16_engine_s():
 def test_each_condition_is_named_from_its_engine():
     assert matrix.condition_of("FP16", False, "semantic") == "B1"
     assert matrix.condition_of("INT2", False, None) == "B3"
+    assert matrix.condition_of("INT8", False, None) == "B8"  # #206
     assert matrix.condition_of("FP16", True, "random") == "B5"
     with pytest.raises(ValueError):
         matrix.condition_of("INT4", True, "semantic")
@@ -135,7 +136,7 @@ def test_each_condition_is_named_from_its_engine():
 
 def test_the_matrix_runs_every_cell_s_first_run_before_any_s_second():
     runs = matrix.runs()
-    assert len(runs) == 6 * 4 * 3 and len(set(runs)) == len(runs)
+    assert len(runs) == 7 * 4 * 3 and len(set(runs)) == len(runs)
     assert [r.run for r in runs] == sorted(r.run for r in runs)
     assert runs[0].name == "S1-B1-r0"
 

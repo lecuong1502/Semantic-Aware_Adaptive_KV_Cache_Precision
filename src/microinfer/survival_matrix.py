@@ -70,6 +70,9 @@ CONDITIONS = {
     "B4": Condition("FP16", True, "uniform"),
     "B5": Condition("FP16", True, "random"),
     "B6": Condition("FP16", True, "semantic"),
+    # A static INT8 cache, half the bytes from the start (#206); B7 is
+    # RQ3's eviction, which holds no session to survive.
+    "B8": Condition("INT8", False, None),
 }
 #: The runs of each cell of the matrix.
 RUNS = 3
@@ -95,7 +98,7 @@ RECORDINGS = tuple(f"scenario-with-r{k}.csv.gz" for k in range(1, 6))
 
 
 def condition_of(kv_tier: str, adaptive: bool, score_source: str | None) -> str:
-    """The name of the condition an engine is, B1 to B6."""
+    """The name of the condition an engine is: B1 to B6, or B8."""
     wanted = Condition(kv_tier, adaptive, score_source if adaptive else None)
     for name, condition in CONDITIONS.items():
         if condition == wanted:

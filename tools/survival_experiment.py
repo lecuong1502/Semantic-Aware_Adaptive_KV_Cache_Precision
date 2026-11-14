@@ -7,7 +7,7 @@
         --issue 108
         [--model qwen2.5-1.5b-instruct] [--prompt-positions 32704] [--new-tokens 64]
         [--contention-at 16384] [--shortfall 256] [--score-source semantic]
-        [--pulse SECONDS] [--kv-tier FP16|INT4|INT2] [--scenario S1|S2|S3|S4|S5] [--run N]
+        [--pulse SECONDS] [--kv-tier FP16|INT8|INT4|INT2] [--scenario S1|S2|S3|S4|S5] [--run N]
 
 Qwen2.5-1.5B prefills a prompt and decodes to 32K positions, its cache at
 FP16, with its pressure monitor on (microinfer.survival.run). When the cache
@@ -105,7 +105,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--pulse", type=float, default=None, metavar="SECONDS",
                         help="give the memory back this long after it was taken (#155); "
                              "adaptive only")
-    parser.add_argument("--kv-tier", choices=("FP16", "INT4", "INT2"), default="FP16",
+    parser.add_argument("--kv-tier", choices=("FP16", "INT8", "INT4", "INT2"), default="FP16",
                         help="a static engine's cache tier: B1, B2 or B3 (#190)")
     parser.add_argument("--scenario", choices=matrix.EVERY_SCENARIO, default="S5",
                         help="the contention: S5's step, or a scenario of the matrix (#190)")

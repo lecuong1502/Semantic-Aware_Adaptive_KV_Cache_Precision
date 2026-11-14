@@ -125,8 +125,27 @@ def test_a_passage_under_no_plan_is_its_reference_and_under_a_plan_departs_from_
     assert uniform["plan"]["target_met"] and uniform["kl_mean"] > 0
     assert len(uniform["kl"]) == len(uniform["top1_by_position"]) == 24
     assert got[rq3.condition("random-80")]["random_seed"] == rq3.sample_seed("p00", 0)
-    with pytest.raises(ValueError, match="static-int2"):
-        list(continuation.runs(engine, passage, [rq3.condition("static-int2")]))
+
+
+@pytest.mark.slow
+def test_a_static_tier_holds_the_whole_passage_and_is_measured_against_fp16(engine):
+    """A static tier holds the passage at its tier from its first position
+    (#206), so it runs alone, and its logits are compared with the same FP16
+    reference as a plan's: INT8 departs from it, and INT4 further, at the
+    bits each tier spends, with no plan."""
+    tokens = np.random.default_rng(206).integers(1000, 100_000, 400).astype(np.int32)
+    (passage,) = continuation.passages(tokens, 1, continuation.Shape(320, 16, 24))
+    conds = [rq3.condition("uniform-80"), rq3.condition("static-int8"),
+             rq3.condition("static-int4")]
+    got = {c.name: r for c, r in continuation.runs(engine, passage, conds)}
+    int8, int4 = got["static-int8"], got["static-int4"]
+    for r in (int8, int4):
+        assert r["plan"] is None and r["random_seed"] is None
+        assert len(r["kl"]) == len(r["top1_by_position"]) == 24
+    assert 0 < int8["kl_mean"] < int4["kl_mean"]
+    assert int8["tier_shares"]["INT8"] > 0.9 and int4["tier_shares"]["INT4"] > 0.9
+    assert int4["effective_bits"] < int8["effective_bits"] < 9
+    assert got["uniform-80"]["plan"]["target_met"]
 
 
 @pytest.mark.slow

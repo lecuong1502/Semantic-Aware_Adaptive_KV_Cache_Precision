@@ -336,6 +336,36 @@ def test_the_static_engine_runs_out_where_the_adaptive_one_survives(tmp_path):
     assert (tmp_path / "adaptive.csv.gz").exists()
 
 
+@pytest.mark.slow
+def test_the_tool_runs_a_static_int8_engine_as_b8(tmp_path, monkeypatch):
+    """B8 (#206) through the survival tool at a small scale: Qwen2.5-0.5B
+    at static INT8 prefills 2048 positions to decode 4 tokens, and at 1024
+    the simulator takes what leaves it a full FP16 cache's bytes. The entry
+    names B8, its tier and S5, and where the run ended. Whether B8 survives
+    is the matrix's question, not this test's: at this scale the driver
+    keeps back tens of MiB of what it reports free, so that an FP16 engine
+    runs out under the same take too, and the outcome measures the driver."""
+    path = Path(__file__).resolve().parent.parent / "tools" / "survival_experiment.py"
+    spec = importlib.util.spec_from_file_location("survival_tool", path)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    real = tool.benchlog.environment  # this test runs on a tree being changed
+    monkeypatch.setattr(tool.benchlog, "environment",
+                        lambda log=tool.benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    log = tmp_path / "benchmark.jsonl"
+    assert tool.main(["static", "--kv-tier", "INT8", "--model", NAME,
+                      "--prompt-positions", "2048", "--new-tokens", "4",
+                      "--contention-at", "1024", "--shortfall", "0",
+                      "--out", str(tmp_path / "b8.csv.gz"), "--issue", "206",
+                      "--log", str(log)]) == 0
+    (entry,) = [e for e in tool.benchlog.read(log) if e["kind"] == "survival"]
+    assert entry["config"]["condition"] == "B8" and entry["config"]["scenario"] == "S5"
+    assert entry["precision_tiers"] == {"INT8": 1.0}
+    ending = entry["results"]["ending"]
+    assert ending["positions"] >= 1024
+    assert entry["results"]["survived"] == (ending["state"] == "complete")
+
+
 @pytest.mark.slowest
 def test_a_pulse_released_is_restored_after_the_cooldown(tmp_path):
     """The pulse at a small scale: at 2048 positions the simulator takes

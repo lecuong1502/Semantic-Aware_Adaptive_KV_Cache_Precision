@@ -62,7 +62,7 @@ def entries(tmp_path, outcome, *, aware=True, extra=(), wrong_extra=False):
     runs, (sample, experiment, condition[, screening]), answered wrongly if
     `wrong_extra`."""
     log = tmp_path / "benchmark.jsonl"
-    # 750 entries of a log thrown away: the machine read once, and no fsync
+    # 800 entries of a log thrown away: the machine read once, and no fsync
     with pytest.MonkeyPatch.context() as patch:
         once = benchlog.environment(log)
         patch.setattr(benchlog, "environment", lambda log=None: dict(once))
@@ -239,4 +239,25 @@ def test_the_tool_logs_the_summary(tmp_path, monkeypatch):
     (summary,) = [e for e in benchlog.read(log) if e["kind"] == "rq3-summary"]
     assert summary["config"]["issue"] == 152
     assert summary["results"]["closing"]["semantic_beats_uniform"] is False
-    assert len(summary["results"]["entries"]) == 50 * 15
+    # question-blind's ten conditions, the static INT8 among them, and
+    # question-aware's six
+    assert len(summary["results"]["entries"]) == 50 * 16
+
+
+def test_a_static_tier_is_pooled_once_it_has_runs_and_then_of_every_sample(tmp_path):
+    """Runs logged before #206 have no static INT8: question-blind's
+    summary pools the conditions they have. Once static INT8 has a run,
+    every sample needs one."""
+    log = entries(tmp_path, lambda s, x, c: True)
+    full = rq3_summary.summarise(log, MODEL, 140, 7936)
+    assert "static-int8" in full["accuracy"]["question-blind"]
+
+    def int8(e):
+        return e["kind"] == "rq3-needle" and e["config"]["condition"]["name"] == "static-int8"
+
+    without = rq3_summary.summarise([e for e in log if not int8(e)], MODEL, 140, 7936)
+    assert "static-int8" not in without["accuracy"]["question-blind"]
+    assert "static-int4" in without["accuracy"]["question-blind"]
+    some = [e for e in log if not (int8(e) and e["config"]["sample_id"] == SAMPLES[0])]
+    with pytest.raises(ValueError, match="static-int8"):
+        rq3_summary.summarise(some, MODEL, 140, 7936)

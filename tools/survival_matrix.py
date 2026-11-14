@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
-"""Run the survival matrix (#190): B1 to B6 against S1 to S4, three runs a cell.
+"""Run the survival matrix (#190): B1 to B6 and B8 against S1 to S4, three runs a cell.
 
     .venv/bin/python tools/survival_matrix.py --issue 191
         [--model qwen2.5-1.5b-instruct] [--runs 3] [--scenarios S1 S2 S3 S4]
-        [--conditions B1 B2 B3 B4 B5 B6] [--out-dir data/survival/matrix] [--dry-run]
+        [--conditions B1 B2 B3 B4 B5 B6 B8] [--out-dir data/survival/matrix] [--dry-run]
 
 Each run of the matrix is one run of tools/survival_experiment.py, a
 process of its own: Qwen2.5-1.5B prefills 32704 positions and decodes 64,
 and when its cache reaches 16384 positions the simulator plays the
 scenario on its base (microinfer.survival_matrix). B1 to B3 are static
 engines at FP16, INT4 and INT2; B4 to B6 the adaptive engine from the
-uniform, random and semantic sources. The runs go run by run, every cell's
+uniform, random and semantic sources; B8 a static engine at INT8 (#206). The runs go run by run, every cell's
 first before any cell's second, so that a matrix stopped part way is
 balanced; a run already logged at the same code is not run again, so the
 same command takes it up. A run stopped part way leaves its recording,
 which is kept; the run again records beside it, numbered.
 
 The S5 cells the survival experiment has not run, B2, B3 and B5, are the
-same command with `--scenarios S5 --runs 1 --conditions B2 B3 B5`.
+same command with `--scenarios S5 --runs 1 --conditions B2 B3 B5`; B8's,
+with `--conditions B8`.
 
 On the RTX 4050 a run takes about 15 to 20 minutes for a static engine and
 about 30 for an adaptive one under pressure, its prefill chunks sized by
-time (#135): the 72 runs of the matrix take about 30 GPU-hours.
+time (#135): the 72 runs of B1 to B6 took about 30 GPU-hours, before the
+engine was made faster (#204, #205).
 
 Close every application first, as for the survival experiment: what the
 desktop takes or gives back moves the headroom the base is set from.
