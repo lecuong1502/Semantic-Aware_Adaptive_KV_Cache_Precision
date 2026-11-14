@@ -23,6 +23,7 @@ from test_quantised_pages import attend, pages_for, snapshot, store_in_runs
 
 from microinfer import _microinfer
 from microinfer._microinfer import PagedKVCache, Tier
+from microinfer.config import ModelConfig
 from microinfer.model import tier_page_bytes
 
 device = _microinfer.device
@@ -201,3 +202,37 @@ def test_what_a_batch_refuses():
         assert cache.shadow_count == 0
     cache.move_pages([])
     assert cache.last_batch["moves"] == 0
+
+
+def test_a_batch_that_frees_a_tier_s_top_pages_waits_for_what_reads_them():
+    """Every page of a cache at Qwen2.5-1.5B's shapes, 28 layers of 64, to
+    INT4, all but one in one batch: the FP16 pages freed are the tier's top, so no tail
+    moves, and their granules go while nothing else would wait for the
+    quantisation reading them. The first version did not wait, and the
+    device faulted whenever the quantisation's kernels had been loaded
+    before (#205). Every page then holds quantise_page's bytes for its
+    rows."""
+    cfg = ModelConfig.from_card("qwen2.5-1.5b-instruct")
+    layers, kv_heads, hd, page_tokens = (cfg.num_hidden_layers, cfg.num_key_value_heads,
+                                         cfg.head_dim, device.page_tokens)
+    pages, seq = 64, 64 * device.page_tokens
+    capacity = [layers * (pages + len(device.open_pages) + 2)] * 4
+    allocator = PagedKVCache(tier_page_bytes(cfg, page_tokens), capacity)
+    cache = device.KVPages(allocator, layers, page_tokens, kv_heads, hd, Tier.FP16,
+                           Halves.Both, [], True)
+    rng = np.random.default_rng(2051)
+    k = [normal(rng, seq, kv_heads, hd) for _ in range(layers)]
+    v = [normal(rng, seq, kv_heads, hd) for _ in range(layers)]
+    for layer in range(layers):
+        store_in_runs(cache, layer, k[layer], v[layer], [seq])
+    # One page alone first: its launches load the quantisation's kernels,
+    # which the batch's would otherwise load, waiting on the device as
+    # they do, and so hide what the batch does not wait for.
+    cache.downgrade(layers - 1, pages - 1, Tier.INT4)
+    cache.move_pages([(layer, page, Tier.INT4) for layer in range(layers)
+                      for page in range(pages) if (layer, page) != (layers - 1, pages - 1)])
+    for layer, page in ((0, 0), (13, 31), (layers - 1, pages - 1)):
+        span = slice(page * page_tokens, (page + 1) * page_tokens)
+        np.testing.assert_array_equal(
+            allocator.read(layer, page),
+            _microinfer.quantise_page(k[layer][span], v[layer][span], Tier.INT4, page_tokens))

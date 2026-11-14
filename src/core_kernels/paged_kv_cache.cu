@@ -312,6 +312,10 @@ namespace microinfer
       table_.erase(key);
     }
     ++generation_;
+    // Whatever the device was given before may read pages whose granules
+    // go now, the freed pages' own among them, whether or not a tail moved
+    // (#205): it finishes first.
+    driver_check(cuCtxSynchronize(), "cuCtxSynchronize");
     for (int t = 0; t < kTierCount; ++t)
     {
       if (touched[t])
