@@ -59,6 +59,10 @@ namespace microinfer
     {
       return std::pair(layer, page_index) < std::pair(o.layer, o.page_index);
     }
+    bool operator==(const PageKey &o) const
+    {
+      return layer == o.layer && page_index == o.page_index;
+    }
   };
 
   // Asked about a page the page table does not hold.
@@ -137,10 +141,12 @@ namespace microinfer
 
     // free() and replace() for many pages at once (#205): every page named
     // freed together, each tier's kept pages moved into the slots the freed
-    // ones leave below its new tail in one copy, one synchronise, and the
-    // granules emptied released. Every key must be held and named once;
-    // nothing changes otherwise. A replacement's staged page may sit in a
-    // tier that loses pages, and keeps its bytes wherever the free moves it.
+    // ones leave below its new tail in one copy, the device synchronised
+    // once, and the granules emptied released. Every key must be held and
+    // named once; nothing changes otherwise, nor if the device memory the
+    // copies' addresses take cannot be had. A replacement's staged page may sit
+    // in a tier that loses pages, and keeps its bytes wherever the free moves
+    // it.
     void free_pages(const std::vector<PageKey> &keys);
     void replace_pages(const std::vector<std::pair<PageKey, PageKey>> &pairs);
 

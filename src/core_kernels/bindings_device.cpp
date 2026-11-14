@@ -887,7 +887,7 @@ void bind_device(py::module_ &parent)
             batch.reserve(moves.size());
             for (const auto &[layer, page, target] : moves)
             {
-              batch.push_back({layer, page, target});
+              batch.push_back({{layer, page}, target});
             }
             py::gil_scoped_release release;
             c.move_pages(batch);

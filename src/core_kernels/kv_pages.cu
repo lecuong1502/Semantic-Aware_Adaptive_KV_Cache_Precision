@@ -718,7 +718,7 @@ namespace microinfer
     std::set<PageKey> named;
     for (const PageMove &m : moves)
     {
-      const PageKey key = require_held(m.layer, m.page, "move");
+      const PageKey key = require_held(m.key.layer, m.key.page_index, "move");
       if (!named.insert(key).second)
       {
         throw std::invalid_argument(
@@ -752,15 +752,18 @@ namespace microinfer
       return;
     }
 
-    // 1. Every new page, under a key of its own, and room for the shadows
-    // the batch takes. If an allocation fails, those made are given back,
-    // each its tier's tail, and nothing else has changed.
+    // 1. The device memory for the work's addresses, every new page under
+    // a key of its own, and room for the shadows the batch takes. If an
+    // allocation fails, those made are given back, each new page its
+    // tier's tail, and nothing else has changed.
     std::size_t first_downgrades = 0;
     for (std::size_t i = 0; i < n; ++i)
     {
       first_downgrades +=
           current[i] == Tier::FP16 && !shadows_.contains(keys[i]);
     }
+    // A shadow's source and destination, and every move's.
+    DeviceBuffer addresses(2 * (first_downgrades + n) * sizeof(void *));
     std::vector<PageKey> staged;
     try
     {
@@ -833,7 +836,6 @@ namespace microinfer
     {
       tier_at[t] = place(rows[t], pages[t]);
     }
-    DeviceBuffer addresses(table.size() * sizeof(void *));
     cuda_check(cudaMemcpy(addresses.raw(), table.data(),
                           table.size() * sizeof(void *),
                           cudaMemcpyHostToDevice),
@@ -876,7 +878,20 @@ namespace microinfer
       pairs.emplace_back(keys[i], staged[i]);
       may_be_at_[static_cast<int>(moves[i].target)] = true;
     }
-    allocator_.replace_pages(pairs);
+    try
+    {
+      allocator_.replace_pages(pairs);
+    }
+    catch (...)
+    {
+      // The old pages are all still held and named: the new ones, their
+      // tiers' tails still, go back. A shadow taken is kept, the page's
+      // FP16 bytes, as a downgrade that fails after taking it keeps its.
+      cuda_check(cudaDeviceSynchronize(),
+                 "cudaDeviceSynchronize after a failed batch");
+      allocator_.free_pages(staged);
+      throw;
+    }
     cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize after a batch");
     last_batch_ = BatchRecord{
         n, shadow_from.size(),

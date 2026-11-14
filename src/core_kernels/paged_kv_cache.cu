@@ -1,6 +1,7 @@
 #include <cuda.h>
 
 #include <algorithm>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -243,78 +244,110 @@ namespace microinfer
     // Tier by tier: the tier keeps its first `kept` slots. Each freed page
     // below there is a hole, and each kept page at or above it moves into
     // one, the copies reading only slots the tier gives up and writing only
-    // slots it keeps, so that none reads what another writes.
-    std::array<bool, kTierCount> touched{};
-    for (int t = 0; t < kTierCount; ++t)
+    // slots it keeps, so that none reads what another writes. Every tier's
+    // moves are worked out, and the device memory their addresses need is
+    // allocated, before anything changes, so that a failure changes nothing.
+    struct TierMoves
     {
-      Range &r = ranges_[t];
+      std::size_t kept = 0;
       std::vector<std::size_t> holes;
       std::vector<std::size_t> movers;
+    };
+    std::array<TierMoves, kTierCount> moves;
+    std::array<bool, kTierCount> touched{};
+    std::size_t copies = 0;
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      const Range &r = ranges_[t];
       std::size_t freed = 0;
-      for (std::size_t slot = 0; slot < r.slots.size(); ++slot)
+      for (const PageKey &slot : r.slots)
       {
-        freed += freeing.count(r.slots[slot]);
+        freed += freeing.count(slot);
       }
       if (freed == 0)
       {
         continue;
       }
       touched[t] = true;
-      const std::size_t kept = r.slots.size() - freed;
+      TierMoves &m = moves[t];
+      m.kept = r.slots.size() - freed;
       for (std::size_t slot = 0; slot < r.slots.size(); ++slot)
       {
         const bool going = freeing.count(r.slots[slot]) != 0;
-        if (slot < kept && going)
+        if (slot < m.kept && going)
         {
-          holes.push_back(slot);
+          m.holes.push_back(slot);
         }
-        else if (slot >= kept && !going)
+        else if (slot >= m.kept && !going)
         {
-          movers.push_back(slot);
+          m.movers.push_back(slot);
         }
       }
-      std::vector<const void *> from;
-      std::vector<void *> to;
-      for (std::size_t i = 0; i < holes.size(); ++i)
+      copies += m.holes.size();
+    }
+    // Each tier's sources, then its destinations, one tier after another.
+    std::vector<const void *> table;
+    table.reserve(2 * copies);
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      const Range &r = ranges_[t];
+      for (const std::size_t slot : moves[t].movers)
       {
-        from.push_back(
-            reinterpret_cast<const void *>(r.base + movers[i] * r.page_bytes));
-        to.push_back(
-            reinterpret_cast<void *>(r.base + holes[i] * r.page_bytes));
-        const PageKey moved = r.slots[movers[i]];
-        r.slots[holes[i]] = moved;
-        table_[moved].slot = holes[i];
+        table.push_back(
+            reinterpret_cast<const void *>(r.base + slot * r.page_bytes));
       }
-      if (!holes.empty())
+      for (const std::size_t slot : moves[t].holes)
       {
-        // The two address arrays, on the device for the copy to read.
-        std::vector<const void *> both(from);
-        both.insert(both.end(), to.begin(), to.end());
-        DeviceBuffer addresses(both.size() * sizeof(void *));
-        cuda_check(cudaMemcpy(addresses.raw(), both.data(),
-                              both.size() * sizeof(void *),
-                              cudaMemcpyHostToDevice),
-                   "cudaMemcpy a free's tail moves");
-        const auto *table = addresses.as<const void *const>();
+        table.push_back(
+            reinterpret_cast<const void *>(r.base + slot * r.page_bytes));
+      }
+    }
+    std::optional<DeviceBuffer> addresses;
+    if (copies > 0)
+    {
+      addresses.emplace(table.size() * sizeof(void *));
+      cuda_check(cudaMemcpy(addresses->raw(), table.data(),
+                            table.size() * sizeof(void *),
+                            cudaMemcpyHostToDevice),
+                 "cudaMemcpy a free's tail moves");
+    }
+
+    // From here on nothing fails but the device.
+    std::size_t at = 0;
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      Range &r = ranges_[t];
+      const TierMoves &m = moves[t];
+      if (!m.holes.empty())
+      {
+        const auto *on_device = addresses->as<const void *const>() + at;
         // Slots sit at multiples of the page size from a granule-aligned
         // base.
-        device::copy_pages(table,
-                           const_cast<void *const *>(table + holes.size()),
-                           r.page_bytes, static_cast<int>(holes.size()),
-                           r.page_bytes % 16 == 0);
-        // The copy must land before the granules it read from go.
-        driver_check(cuCtxSynchronize(), "cuCtxSynchronize");
+        device::copy_pages(
+            on_device, const_cast<void *const *>(on_device + m.holes.size()),
+            r.page_bytes, static_cast<int>(m.holes.size()),
+            r.page_bytes % 16 == 0);
+        at += 2 * m.holes.size();
       }
-      r.slots.resize(kept);
+      for (std::size_t i = 0; i < m.holes.size(); ++i)
+      {
+        const PageKey moved = r.slots[m.movers[i]];
+        r.slots[m.holes[i]] = moved;
+        table_[moved].slot = m.holes[i];
+      }
+      if (touched[t])
+      {
+        r.slots.resize(m.kept);
+      }
     }
     for (const PageKey &key : keys)
     {
       table_.erase(key);
     }
     ++generation_;
-    // Whatever the device was given before may read pages whose granules
-    // go now, the freed pages' own among them, whether or not a tail moved
-    // (#205): it finishes first.
+    // The tail moves land, and whatever the device was given before, which
+    // may read pages whose granules go now, the freed pages' own among
+    // them, finishes, whether or not a tail moved (#205).
     driver_check(cuCtxSynchronize(), "cuCtxSynchronize");
     for (int t = 0; t < kTierCount; ++t)
     {
@@ -332,7 +365,7 @@ namespace microinfer
     std::vector<PageKey> keys;
     for (const auto &[key, stage] : pairs)
     {
-      if (key.layer == stage.layer && key.page_index == stage.page_index)
+      if (key == stage)
       {
         throw std::invalid_argument("a page cannot replace itself");
       }
@@ -367,7 +400,7 @@ namespace microinfer
 
   void PagedKVCache::replace(PageKey key, PageKey staged)
   {
-    if (key.layer == staged.layer && key.page_index == staged.page_index)
+    if (key == staged)
     {
       throw std::invalid_argument("a page cannot replace itself");
     }

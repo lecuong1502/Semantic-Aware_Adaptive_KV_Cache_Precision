@@ -300,11 +300,19 @@ The downgrades of a requantisation plan, or the upgrades of an upgrade
 plan, applied between two decode steps: at YELLOW and at GREEN, as many as
 fit a per-step time budget, by the time the engine measures, the plan
 having estimated them; at RED, the whole plan. It is moved on the device
-in batches of moves (#205), each naming a page once, at the tier the plan's
-moves for it end at, and fitting the budget's time and the device's free
-memory.
+in one or more batches of moves (#205).
 Not a batch of sequences: there is one sequence.
 _Avoid_: chunk (a prefill chunk is positions)
+
+**Batch of moves**:
+Pages moved on the device at once, down or up, by one `move_pages` (#205):
+every new page allocated first, so that a failure leaves the cache as it
+was, each target tier quantised in one launch, and the old pages freed
+together. It names each page once, at the tier the plan's moves for it end
+at, and fits the device's free memory and, for a downgrade plan at YELLOW,
+what is left of the step's budget. A plan batch is one or more of them.
+_Avoid_: plan batch (a step's share of a plan), batch alone where the two
+could be confused
 
 **Downgrade / Upgrade**:
 Moving a page to a lower-precision tier to reclaim bytes, or back toward FP16

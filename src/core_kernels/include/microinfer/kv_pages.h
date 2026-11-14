@@ -202,11 +202,10 @@ namespace microinfer
     // allocation fails, the cache is as it was.
     void upgrade(int layer, int page, Tier target);
 
-    // One page of a batch: its layer, its page and the tier it moves to.
+    // One page of a batch of moves: the page, and the tier it moves to.
     struct PageMove
     {
-      int layer;
-      int page;
+      PageKey key;
       Tier target;
     };
 

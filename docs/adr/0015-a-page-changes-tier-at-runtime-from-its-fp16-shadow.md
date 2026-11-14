@@ -166,17 +166,25 @@ pair, down and up: the same bytes, tiers, shadows, mapped memory and
 attention bits. It also checks that a failed allocation mid-batch leaves
 nothing changed.
 
-**How the engine paces batches.**
-- **At RED** the plan goes at once.
-- **At YELLOW and GREEN** a step's batches fit the budget. A batch is taken
+**How the engine paces batches** (`next_batch`, `Engine._apply`).
+- **At RED, and for an upgrade plan,** the plan goes at once, as memory
+  allows. A release can then restore the whole cache within one step.
+- **A downgrade plan at YELLOW** holds a step to the budget. A batch is taken
   to cost a fixed part, `BATCH_FIXED_SECONDS`, plus twice the longest part a
-  move of the last 64 batches. Until a batch is timed, the plan's logged
-  per-page latency stands in.
+  move of the last 64 batches, plus `SHADOW_PIN_SECONDS` for each move that
+  pins a shadow. A batch of fewer than 32 moves counts its whole time a
+  move, which errs long. Until a batch is timed, the plan's logged per-page
+  latency stands in.
 - **Memory.** Unlike the per-page path, a batch needs all its new pages'
-  bytes free before it frees any old page. Each batch is therefore cut to
-  the device's free memory less `BATCH_MEMORY_MARGIN_BYTES`.
-- **A batch that cannot allocate** is tried again at half its size. One move
+  bytes free before it frees any old page. A batch is therefore cut to the
+  device's free memory less two granules a tier, the granule asked of the
+  driver.
+- **A batch that cannot allocate** is tried again at half its bytes. One move
   that cannot is the emergency of #107, as before.
+- **What a batch allocates comes first,** its addresses' device memory
+  included, so that a failure leaves nothing changed. If the frees at its
+  end cannot be made, the new pages go back. A shadow taken is kept, as a
+  failed downgrade keeps its own.
 
 **What it costs** (`plan-apply-speed` entry `1532d515…`, at 55f8f5c,
 Qwen2.5-1.5B's shapes, Seam B):

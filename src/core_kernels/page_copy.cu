@@ -14,6 +14,9 @@ namespace microinfer
     constexpr int kBlockThreads = 256;
     // A grid's second dimension holds at most this many copies a launch.
     constexpr int kMaxGridY = 65535;
+    // Blocks a copy, at most: a page is tens of KiB, and many pages copy at
+    // once, so a few blocks each keep the device busy.
+    constexpr std::size_t kBlocksPerCopy = 8;
 
     // Copy blockIdx.y + first: bytes from from[i] to to[i], in units of
     // Unit, the blocks of x striding over them. Copies are independent:
@@ -47,7 +50,7 @@ namespace microinfer
       using Unit = decltype(unit);
       const std::size_t units = bytes / sizeof(Unit);
       const int blocks = static_cast<int>(std::min<std::size_t>(
-          (units + kBlockThreads - 1) / kBlockThreads, 8));
+          (units + kBlockThreads - 1) / kBlockThreads, kBlocksPerCopy));
       for (int first = 0; first < count; first += kMaxGridY)
       {
         const int n = std::min(kMaxGridY, count - first);
