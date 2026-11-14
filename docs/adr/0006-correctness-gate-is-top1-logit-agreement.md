@@ -426,6 +426,34 @@ zero, where an FP16 one costs one, and that the fewer bytes do not repay.
 Over a decode step, 28 layers of it are about 5 ms against some 60, the
 weights' reading most of the rest.
 
+**In the engine** (`tools/step_cost.py`, Qwen2.5-1.5B, random token ids; a
+decode step is one position forced as decode runs it, the median of 16; at
+"32K" the conversation is prefilled to 32,352 positions, leaving the window
+room for the steps timed):
+
+| | 16K, after | 32K, before | 32K, after |
+|---|---:|---:|---:|
+| Decode, FP16 | 40.1 tokens/s | 0.58 | 29.5 |
+| Decode, INT8 | 37.0 | 0.76 | 26.5 |
+| Decode, INT4 | 36.4 | 0.44 | not yet measured |
+| Decode, INT2 | 36.9 | 0.30 | not yet measured |
+| A prefill step's fixed part, FP16 | 15 ms | about 1.7 s a step of one tile | 12 ms |
+| A prefill step's part a position, FP16 | 5.8 ms | | 11.4 ms |
+
+The figures before are `decode-throughput` entries at 32K (1034e2c and
+c9cfe2a, through `generate`), and ADR-0016's amendment of #135 for a step of
+one tile from 26K positions. After: `decode-step` and `prefill-step-cost`
+entries at f7ef85d (16K) and 74b475e (32K). At 16K, INT4 and INT2 decode 9%
+and 8% slower than FP16, and INT8 8%: the kernel's gap above, diluted by the
+weights.
+
+A step's fixed part, most of a step before, is now a few hundredths of
+`pressure_chunk_seconds`. The chunk sizing of ADR-0016's amendment of #135
+therefore no longer meets the case where the fixed part alone overruns the
+target, and a chunk under pressure holds about as many positions as 0.8 s
+of the part per position buys: some 70 at 32K. Prefill's part per position
+is now what bounds reaction during prefill, which #213 addresses.
+
 **Correction to #15's note.** That note says attention is row-invariant: a
 query's output does not depend on which other queries share its launch. That
 now holds only for launches that do not split. How a launch splits depends
