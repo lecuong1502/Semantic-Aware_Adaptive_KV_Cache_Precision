@@ -16,7 +16,10 @@
 
 % hyperref before icml2027, as in the official example. If a build breaks on a
 % link that spans a page, drop this line and pass [nohyperref] to icml2027.
-\usepackage{hyperref}
+% The style's \printAffiliationsAndNotice sets its footnote with \thefootnote
+% empty, for which a footnote link would have an empty anchor; the paper has
+% no other footnote, so footnotes are not linked.
+\usepackage[hyperfootnotes=false]{hyperref}
 
 % Submission: anonymised. Use [preprint] for arXiv, or [accepted] once
 % accepted; either prints the authors and the acknowledgements.
@@ -29,9 +32,8 @@
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta}
 
-% Attempt to make hyperref and algorithmic work together better, as in the
-% official example.
-\newcommand{\theHalgorithm}{\arabic{algorithm}}
+% A table no wider than its column is left alone; a wider one is shrunk to fit,
+% by adjustbox's max width.
 
 \icmltitlerunning{Reallocating KV Cache Precision at Runtime under Video Memory
 Contention}
@@ -39,8 +41,8 @@ Contention}
 \begin{document}
 
 \twocolumn[
-  \icmltitle{Keeping Local LLM Inference Alive under Video Memory Contention \\
-    by Reallocating KV Cache Precision at Runtime}
+  \icmltitle{Keeping Local LLM Inference Alive under Video Memory Contention
+    \texorpdfstring{\\}{ }by Reallocating KV Cache Precision at Runtime}
 
   % Printed only with [accepted] or [preprint]; the submission shows
   % "Anonymous Authors" whatever is written here.
@@ -857,10 +859,11 @@ ran 93--267 and 8--28 times slower at 512 rows, the naive kernel bound by its
 load and store queue, the tiled one by shared memory, and cuBLAS by tensor
 cores; they are a study, tested to stay off the inference path.
 
+\clearpage % keep the heading and both tables of this section on one page
 \section{The Cost of a Tier and of a Move}
 \label{app:moves}
 
-\begin{table}[h]
+\begin{table}[!ht]
 \caption{Each tier on Qwen2.5-1.5B: the footprint of a 32K cache, open pages
 included, the effective bits of a sealed page with its metadata counted, and
 WikiText-2 perplexity with the whole cache at the tier. INT2 is too lossy for a
@@ -878,9 +881,8 @@ INT4 & 262 & 4.63 & 9.698 \\
 INT2 & 150 & 2.63 & 11.541 \\
 \bottomrule
 \end{tabular}
-\end{table}
 
-\begin{table}[h]
+\vspace{1.5em}
 \caption{The time to move one page of one layer on Qwen2.5-1.5B, median of 256
 moves. Copying the shadow on a first downgrade takes about 7\,$\mu$s of the
 move. Below, decode throughput at 32K positions with the whole cache at each

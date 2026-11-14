@@ -13,11 +13,11 @@ repos:
     hooks:
       # docs_research/ is the author's own research record, corrected by its
       # author (see issue #4). A hook does not get to rewrite it. Nor the
-      # official NeurIPS style file, which a submission must not alter.
+      # official ICML style package, which a submission must not alter.
       - id: trailing-whitespace
-        exclude: ^(docs_research/|docs/neurips_2026\.sty$)
+        exclude: ^(docs_research/|docs/ICML_2027/.*\.(sty|bst)$)
       - id: end-of-file-fixer
-        exclude: ^(docs_research/|docs/neurips_2026\.sty$)
+        exclude: ^(docs_research/|docs/ICML_2027/.*\.(sty|bst)$)
       - id: check-merge-conflict
       - id: check-toml
       - id: check-yaml
