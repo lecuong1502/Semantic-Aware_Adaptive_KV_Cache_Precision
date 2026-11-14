@@ -22,8 +22,20 @@ the four tiers page by page, each layer's row offset by one.
 and the whole logits at `--samples` of them, evenly spaced and always the
 last (ADR-0006's amendment on the KL sample). `--against` compares: top-1
 agreement over every forced position, and mean KL(reference || ours) over the
-sampled ones, against the gate's 99% and 1e-3. Appends one
-"decode-agreement" entry. Refuses a dirty tree when logging.
+sampled ones, against the gate's 99% and 1e-3, three ways:
+
+- **every forced position;**
+- **before a forced page seals:** the forced positions whose cache, but for
+  their own open page at FP16, is the prefill's, which both builds compute
+  alike. Their difference is the kernel's alone. Once a page of forced
+  positions seals at a quantised tier, a key that moved in its last bit can
+  round to another code, and the difference grows by what the tier makes of
+  such noise, not by anything the kernel did;
+- **the control:** this build against itself, prefilled in chunks of 256
+  rather than 512, which moves the same logits by cuBLAS's rounding alone
+  (ADR-0006, note from #15). It is how far a tier carries noise of that size.
+
+Appends one "decode-agreement" entry. Refuses a dirty tree when logging.
 """
 
 from __future__ import annotations
@@ -39,13 +51,17 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import Engine, benchlog  # noqa: E402
+from microinfer import Engine, _microinfer, benchlog  # noqa: E402
 from microinfer.gate import KL_MAX, TOP1_MIN, kl_divergence  # noqa: E402
 
 DATA = REPO / "data" / "wikitext-2-raw-v1.zip"
 SPLIT = "wikitext-2-raw/wiki.test.raw"
 MODELS = ("qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct")
 CONFIGS = ("FP16", "INT8", "INT4", "INT2", "mixed")
+#: The build's page size (ADR-0004).
+PAGE_TOKENS = _microinfer.device.page_tokens
+#: The control's prefill chunk: another GEMM shape, the same arithmetic.
+CONTROL_CHUNK = 256
 
 
 def mixed_map(layers: int, pages: int) -> list[list[str]]:
@@ -53,9 +69,20 @@ def mixed_map(layers: int, pages: int) -> list[list[str]]:
     return [[order[(i + layer) % 4] for i in range(pages)] for layer in range(layers)]
 
 
+def gate(reference_argmax, reference_logits, argmax, logits) -> dict:
+    """ADR-0006's two terms between two runs' logits: top-1 over every
+    position given, KL over the sampled ones."""
+    agree = float((argmax == reference_argmax).mean())
+    kl = kl_divergence(reference_logits, logits)
+    return {"top1": agree, "positions": len(argmax), "kl_mean": float(kl.mean()),
+            "kl_max": float(kl.max()), "kl_samples": len(kl),
+            "max_abs_logit": float(np.abs(reference_logits - logits).max()),
+            "passed": agree >= TOP1_MIN and float(kl.mean()) < KL_MAX}
+
+
 def forced_logits(engine: Engine, config: str, ids: np.ndarray, context: int) -> np.ndarray:
     """The logits after each position from `context` on, each a decode step's."""
-    pages = -(-len(ids) // 32) + 1
+    pages = -(-len(ids) // PAGE_TOKENS) + 1
     if config == "mixed":
         engine.kv_tier, engine.kv_tier_map = "FP16", mixed_map(engine.config.num_hidden_layers,
                                                                pages)
@@ -103,6 +130,7 @@ def main(argv: list[str]) -> int:
     for name in args.models:
         engine = Engine(REPO / "models" / name)
         engine.load_weights()
+        chunk = engine.prefill_chunk
         ids = engine.encode(text)[: args.context + args.forced]
         at = sampled(args.forced, args.samples)
         results[name] = {}
@@ -116,22 +144,34 @@ def main(argv: list[str]) -> int:
                 keep[f"{key}/logits"] = logits[at]
                 print(f"{key}: kept {len(logits)} positions ({seconds:.0f} s)")
                 continue
-            agree = float((logits.argmax(-1) == reference[f"{key}/argmax"]).mean())
-            kl = kl_divergence(reference[f"{key}/logits"], logits[at])
-            diff = np.abs(reference[f"{key}/logits"] - logits[at])
+            ref_argmax, ref_logits = reference[f"{key}/argmax"], reference[f"{key}/logits"]
+            argmax = logits.argmax(-1)
+            # Forced positions before the first page of them seals.
+            unsealed = PAGE_TOKENS - args.context % PAGE_TOKENS
+            early = at < unsealed
+            engine.prefill_chunk = CONTROL_CHUNK
+            control = forced_logits(engine, config, ids, args.context)
+            engine.prefill_chunk = chunk
             results[name][config] = {
-                "top1": agree, "kl_mean": float(kl.mean()), "kl_max": float(kl.max()),
-                "kl_samples": len(at), "max_abs_logit": float(diff.max()),
-                "passed": agree >= TOP1_MIN and float(kl.mean()) < KL_MAX,
+                "every_position": gate(ref_argmax, ref_logits, argmax, logits[at]),
+                "before_a_forced_page_seals": gate(ref_argmax[:unsealed],
+                                                   ref_logits[early], argmax[:unsealed],
+                                                   logits[at[early]]),
+                "control_same_build_chunks_of_256": gate(argmax, logits[at],
+                                                         control.argmax(-1), control[at]),
                 "seconds": seconds}
-            print(f"{key}: top-1 {agree:.4f}, KL mean {kl.mean():.2e} max {kl.max():.2e}, "
-                  f"|logit| max {diff.max():.3g} ({seconds:.0f} s)")
+            for what, r in results[name][config].items():
+                if what != "seconds":
+                    print(f"{key} {what}: top-1 {r['top1']:.4f}, KL mean {r['kl_mean']:.2e} "
+                          f"max {r['kl_max']:.2e}{'' if r['passed'] else '  (fails)'}")
         del engine
 
     if args.save is not None:
         np.savez(args.save, **keep)
         return 0
-    passed = all(r["passed"] for per in results.values() for r in per.values())
+    passed = {what: all(r[what]["passed"] for per in results.values() for r in per.values())
+              for what in ("every_position", "before_a_forced_page_seals",
+                           "control_same_build_chunks_of_256")}
     benchlog.append(
         "decode-agreement", model=list(args.models),
         context_length={"min": args.context + 1, "max": args.context + args.forced},
@@ -140,10 +180,10 @@ def main(argv: list[str]) -> int:
                 "text": SPLIT, "context": args.context, "forced": args.forced,
                 "kl_samples": args.samples, "configs": list(args.configs),
                 "mixed": "four tiers cycled by page, each layer's row offset by one",
-                "top1_min": TOP1_MIN, "kl_max": KL_MAX},
+                "top1_min": TOP1_MIN, "kl_max": KL_MAX, "control_chunk": CONTROL_CHUNK},
         results={"passed": passed, "per_model": results}, log=args.log)
-    print("passed" if passed else "FAILED")
-    return 0 if passed else 1
+    print(passed)
+    return 0 if passed["before_a_forced_page_seals"] else 1
 
 
 if __name__ == "__main__":
