@@ -487,9 +487,10 @@ void bind_device(py::module_ &parent)
         "(#204).");
   m.def("attention_split", &microinfer::device::attention_split,
         py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
-        py::arg("kv_heads"),
+        py::arg("kv_heads"), py::arg("page_tokens") = 0,
         "(runs, keys a run): how a launch given partials splits its keys "
-        "(#204). One run is no split.");
+        "(#204). One run is no split. With page_tokens, as a causal paged "
+        "launch over pages of that size does.");
 
   py::class_<microinfer::RopeTable>(
       m, "RopeTable",

@@ -76,6 +76,17 @@ the thesis call its manager the *paged mixed-precision cache manager*; the
 two name the same thing.
 _Avoid_: heterogeneous cache
 
+**Split launch**:
+An attention launch that divides each query's keys into **key runs**, one
+thread block a run, in the manner of flash-decoding (#204): each block
+leaves a partial maximum, sum and output, its **partials**, in the engine's
+workspace, and a second kernel folds them. A launch splits only when given
+partials and when it has too few blocks to fill the device: a decode step
+past 511 positions, or a short prefill chunk at a long context. A key run
+is a span of positions of one launch, not a page and not a store's batch.
+_Avoid_: chunk (that is a prefill step's positions), block (CUDA's, not
+the cache's), run alone (RQ3's and the matrix's runs are measurements)
+
 **Birth tier**:
 The tier a page of positions is allocated and sealed at: its tier map's, or
 its cache's. It is where a page starts; a requantisation plan may move it

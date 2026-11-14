@@ -864,8 +864,9 @@ namespace microinfer
       int page_tokens;
     };
 
-    // How a launch lays out its rows and its keys (attention_kernel).
-    struct Plan
+    // How a launch lays out its rows and its keys (attention_kernel): not
+    // to be confused with a requantisation plan.
+    struct LaunchShape
     {
       int heads_per_block;
       int queries_per_block;
@@ -906,10 +907,10 @@ namespace microinfer
     // where the launch has too few blocks to fill the device. A run of keys
     // is a whole number of key tiles, and at least a page, so that a page
     // spans at most two runs.
-    Plan plan_for(int seq_q, int seq_k, int heads, int kv_heads, bool aligned,
-                  int page_tokens, bool may_split)
+    LaunchShape shape_for(int seq_q, int seq_k, int heads, int kv_heads,
+                          bool aligned, int page_tokens, bool may_split)
     {
-      Plan p{1, kAttentionTileQ, 0, 1, round_up(seq_k, kAttentionTileK)};
+      LaunchShape p{1, kAttentionTileQ, 0, 1, round_up(seq_k, kAttentionTileK)};
       if (seq_q == 1)
       {
         const int group = heads / kv_heads;
@@ -977,8 +978,15 @@ namespace microinfer
             " positions");
       }
 
-      const Plan p = plan_for(seq_q, seq_k, heads, kv_heads, aligned,
-                              page_tokens, partials != nullptr);
+      // A block loads two adjacent channels of a row at a time.
+      if (head_dim % 2 != 0)
+      {
+        throw std::invalid_argument("attention loads channels in pairs, so "
+                                    "head_dim must be even; got " +
+                                    std::to_string(head_dim));
+      }
+      const LaunchShape p = shape_for(seq_q, seq_k, heads, kv_heads, aligned,
+                                      page_tokens, partials != nullptr);
       // The masses take two floats per head and page of the block's keys
       // in shared memory besides: all of them with one split.
       const int mass_local_pages =
@@ -1045,10 +1053,11 @@ namespace microinfer
   }
 
   std::pair<int, int> device::attention_split(int seq_q, int seq_k, int heads,
-                                              int kv_heads)
+                                              int kv_heads, int page_tokens)
   {
     check_grouping(heads, kv_heads);
-    const Plan p = plan_for(seq_q, seq_k, heads, kv_heads, false, 0, true);
+    const LaunchShape p = shape_for(seq_q, seq_k, heads, kv_heads,
+                                    page_tokens > 0, page_tokens, true);
     return {p.splits, p.split_keys};
   }
 
