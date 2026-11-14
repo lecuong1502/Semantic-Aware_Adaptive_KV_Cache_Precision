@@ -435,17 +435,18 @@ room for the steps timed):
 |---|---:|---:|---:|
 | Decode, FP16 | 40.1 tokens/s | 0.58 | 29.5 |
 | Decode, INT8 | 37.0 | 0.76 | 26.5 |
-| Decode, INT4 | 36.4 | 0.44 | not yet measured |
-| Decode, INT2 | 36.9 | 0.30 | not yet measured |
+| Decode, INT4 | 36.4 | 0.44 | 26.0 |
+| Decode, INT2 | 36.9 | 0.30 | 26.7 |
 | A prefill step's fixed part, FP16 | 15 ms | about 1.7 s a step of one tile | 12 ms |
 | A prefill step's part a position, FP16 | 5.8 ms | | 11.4 ms |
 
 The figures before are `decode-throughput` entries at 32K (1034e2c and
 c9cfe2a, through `generate`), and ADR-0016's amendment of #135 for a step of
 one tile from 26K positions. After: `decode-step` and `prefill-step-cost`
-entries at f7ef85d (16K) and 74b475e (32K). At 16K, INT4 and INT2 decode 9%
-and 8% slower than FP16, and INT8 8%: the kernel's gap above, diluted by the
-weights.
+entries at f7ef85d and 74b475e (16K), and 74b475e and baebbdc (32K). At
+16K, INT4 and INT2 decode 9% and 8% slower than FP16, and INT8 8%; at 32K,
+12%, 10% and 10%. That is the kernel's gap above, diluted by the weights,
+against 24% and 48% before.
 
 A step's fixed part, most of a step before, is now a few hundredths of
 `pressure_chunk_seconds`. The chunk sizing of ADR-0016's amendment of #135
