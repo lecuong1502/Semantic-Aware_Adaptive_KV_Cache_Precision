@@ -24,7 +24,11 @@ namespace microinfer
   namespace
   {
 
-    constexpr int kBlockThreads = 128;
+    // Threads a block. The kernel waits on memory more than it computes, so
+    // more of them in flight is what speeds it: at 32K positions a decode
+    // launch took 1.6 ms with 128 and 0.66 ms with 512 (#204). Where a
+    // thread works changes no arithmetic.
+    constexpr int kBlockThreads = 512;
 
     // Causal scaled dot-product attention with online softmax, one thread
     // block per tile of rows: kAttentionTileQ queries of one head, or, for a
@@ -179,7 +183,11 @@ namespace microinfer
       QuantisedPageLayout layout;
       size_t row;
       int kv_heads;
-      int head_dim;
+      // ceil(2^32 / head_dim): a value's KV head, at / head_dim, as one
+      // multiply rather than a division by a number known only at run
+      // time, which cost INT4 decode a fifth of its time at 32K (#204).
+      // Exact while at * head_dim < 2^32 (attention_paged_causal).
+      unsigned long long head_dim_reciprocal;
 
       __device__ __half decode(const std::uint8_t *page, size_t codes, size_t e,
                                const __half *scales, const __half *zeros,
@@ -204,7 +212,9 @@ namespace microinfer
             page, layout.value_codes, t * row + at,
             reinterpret_cast<const __half *>(page + layout.value_scales),
             reinterpret_cast<const __half *>(page + layout.value_zeros),
-            static_cast<size_t>(t) * kv_heads + at / head_dim);
+            static_cast<size_t>(t) * kv_heads +
+                ((static_cast<unsigned long long>(at) * head_dim_reciprocal) >>
+                 32));
       }
     };
 
@@ -531,22 +541,29 @@ namespace microinfer
       for (int k_first = key_first; k_first < key_end;
            k_first += kAttentionTileK)
       {
-        for (int i = threadIdx.x; i < kAttentionTileK * head_dim;
-             i += blockDim.x)
+        // Two adjacent channels of a row an iteration, so that what they
+        // share, the page's tier and address and, below 8 bits, the byte
+        // that holds both codes, is read once. head_dim is even.
+        for (int i = 2 * threadIdx.x; i < kAttentionTileK * head_dim;
+             i += 2 * blockDim.x)
         {
           const int c = i / head_dim;
-          const int d = i % head_dim;
           const bool in_range = k_first + c < seq_k;
-          const size_t at = kv_head_offset + d;
-          float key = in_range ? view.key(k_first + c, at) : 0.0f;
-          if (k_bias != nullptr && in_range)
+#pragma unroll
+          for (int d = i % head_dim; d < i % head_dim + 2; ++d)
           {
-            key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
-                                head_dim, rope);
+            const size_t at = kv_head_offset + d;
+            float key = in_range ? view.key(k_first + c, at) : 0.0f;
+            if (k_bias != nullptr && in_range)
+            {
+              key += rotated_bias(k_bias + kv_head_offset, k_first + c, d,
+                                  head_dim, rope);
+            }
+            k_s[c * ks + d] = key;
+            v_s[c * head_dim + d] =
+                in_range ? view.value(k_first + c, at) : __float2half(0.0f);
           }
-          k_s[c * ks + d] = key;
-          v_s[i] = in_range ? view.value(k_first + c, at) : __float2half(0.0f);
-          if (d == 0)
+          if (i % head_dim == 0)
           {
             // A key past seq_k is masked by position already.
             reads_s[c] = !in_range || view.reads(k_first + c) ? 1.0f : 0.0f;
@@ -1088,11 +1105,24 @@ namespace microinfer
                  ? quantised_page_layout(tier, page_tokens, kv_heads, head_dim)
                  : QuantisedPageLayout{};
     };
+    // floor(at * ceil(2^32 / d) / 2^32) is floor(at / d) while at * d < 2^32:
+    // the reciprocal's excess, under 1 / 2^32 a unit of `at`, then stays
+    // below the 1 / d by which at / d falls short of the next integer.
+    // `at` is below row = kv_heads * head_dim.
+    if (static_cast<unsigned long long>(row) * head_dim >= (1ull << 32))
+    {
+      throw std::invalid_argument(
+          "a row of " + std::to_string(row) + " elements at head_dim " +
+          std::to_string(head_dim) + " is too wide for the KV head's division");
+    }
+    const unsigned long long reciprocal =
+        ((1ull << 32) + head_dim - 1) /
+        static_cast<unsigned long long>(head_dim);
     const TierFormats formats{
         tiers, Fp16Format{row, page_tokens},
-        QuantisedFormat<8>{layout(Tier::INT8), row, kv_heads, head_dim},
-        QuantisedFormat<4>{layout(Tier::INT4), row, kv_heads, head_dim},
-        QuantisedFormat<2>{layout(Tier::INT2), row, kv_heads, head_dim}};
+        QuantisedFormat<8>{layout(Tier::INT8), row, kv_heads, reciprocal},
+        QuantisedFormat<4>{layout(Tier::INT4), row, kv_heads, reciprocal},
+        QuantisedFormat<2>{layout(Tier::INT2), row, kv_heads, reciprocal}};
     // The first tile begins at the last multiple of its queries at or before
     // `start`, so every tile lies within one page: `aligned`.
     launch(q,
