@@ -71,7 +71,7 @@ from . import benchlog, controller, needles
 
 EXPERIMENTS = ("question-blind", "question-aware")
 SUMMARY_TOKENS = 64
-ANSWER_TOKENS = 32
+ANSWER_TOKENS = needles.ANSWER_TOKENS
 #: The answer's tokens the question-aware experiment decodes before its plan,
 #: and what they are asked to be (needles.question_text).
 AWARE_TOKENS = 4
@@ -214,9 +214,12 @@ def sample_seed(sample_id: str, plan_seed: int) -> int:
     return zlib.crc32(f"{plan_seed}:{sample_id}".encode())
 
 
-def _check(engine, experiment: str) -> None:
+def _check(engine, experiment: str, sample=None) -> None:
     if experiment not in EXPERIMENTS:
         raise ValueError(f"an experiment is one of {EXPERIMENTS}; got {experiment!r}")
+    if experiment == "question-aware" and not isinstance(sample, (needles.Sample, type(None))):
+        raise ValueError("the question-aware experiment opens a needle's answer; RULER's "
+                         "tasks are run question-blind only (#208)")
     check_engine(engine)
 
 
@@ -271,8 +274,11 @@ def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
     effective bits, the tiers' shares and the needle's pages' tiers are what
     the cache holds at the plan, or where it would be: the full pages before
     the question's answer, which adds its own at FP16. With `then`, what it
-    adds after the answer too."""
-    _check(engine, experiment)
+    adds after the answer too. A sample is the needle set's or one of
+    RULER's tasks' (ruler.Sample, #208): it scores its own answer
+    (`scored`), names its pages' tiers (`tiers_at`) and the tokens its
+    answer is decoded in (`answer_tokens`)."""
+    _check(engine, experiment, sample)
     seed = sample_seed(sample.sample_id, plan_seed)
     with set_for(engine, cond), engine.conversation() as chat:
         opened = before_plan(engine, chat, sample, experiment)
@@ -287,7 +293,7 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     question-aware the answer's first tokens, are run once and each shared
     condition starts from their snapshot. Should the snapshot be refused, a
     page having gone below FP16 in an emergency, they run alone too."""
-    _check(engine, experiment)
+    _check(engine, experiment, sample)
     seed = sample_seed(sample.sample_id, plan_seed)
     yield from from_one_opening(
         engine, conds, lambda chat: before_plan(engine, chat, sample, experiment),
@@ -359,13 +365,13 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
     opening, answer = opened.opening, opened.answer
     planned = plan_at(chat, cond, seed)
     if experiment == "question-blind":
-        answer = chat.turn(opened.turn_2, ANSWER_TOKENS)
+        answer = chat.turn(opened.turn_2, sample.answer_tokens)
     elif not opened.answered:
         answer = np.concatenate([answer, chat.turn(np.empty(0, np.int32),
                                                    ANSWER_TOKENS - AWARE_TOKENS)])
     text = engine.decode(answer)
     results = {
-        "answer": text, "correct": needles.correct(text, sample.code),
+        "answer": text, **sample.scored(text),
         "answer_tokens": answer.tolist(), "summary": engine.decode(opened.summary),
         "summary_length": len(opened.summary), "summary_stopped": opened.stopped,
         "aware_opening": opening,
@@ -373,7 +379,7 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         "code_after_plan": None if opening is None else code_after(opening, sample.code),
         "score_every": engine.kv_score_every, "score_alpha": engine.kv_score_alpha,
         **planned.results(cond, seed, sample.page_tokens),
-        "needle_page_tiers": planned.page_tiers(sample.needle_pages),
+        **sample.tiers_at(planned),
     }
     if then is not None:
         results.update(then(engine, chat, sample, cond, seed, results))

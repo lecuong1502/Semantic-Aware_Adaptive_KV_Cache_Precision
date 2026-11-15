@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 
@@ -64,6 +65,8 @@ NAMES = ("Juniper", "Halvard", "Marlow", "Ostrava", "Pellucid", "Quillon", "Rosm
 LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"  # no I or O, to be read as no digit
 #: The token that ends a turn, which closes a turn 1 cut short.
 END_OF_TURN = "<|im_end|>"
+#: The tokens a question's answer is decoded in (ADR-0017).
+ANSWER_TOKENS = 32
 
 
 def needle_text(name: str, code: str) -> str:
@@ -115,6 +118,17 @@ class Sample:
     needle_positions: tuple[int, int]
     needle_pages: tuple[int, int]
     page_tokens: int
+    #: What RQ3's harness decodes the answer in (rq3, #208).
+    answer_tokens: ClassVar[int] = ANSWER_TOKENS
+
+    def scored(self, answer: str) -> dict:
+        """What a run's results hold of its answer: whether it names the code."""
+        return {"correct": correct(answer, self.code)}
+
+    def tiers_at(self, planned) -> dict:
+        """What a run's results hold of the cache at its plan: the tiers of
+        the needle's pages (rq3.Planned)."""
+        return {"needle_page_tiers": planned.page_tiers(self.needle_pages)}
 
     def as_dict(self) -> dict:
         return {"sample_id": self.sample_id, "depth": self.depth, "name": self.name,
