@@ -316,3 +316,95 @@ an FP16 cache's bytes. RQ3's static tiers are therefore three:
 The comparison the closing question makes is unchanged. The static tiers
 answer a different question: what a session pays when its cache is held
 low throughout, where the adaptive engine pays only under pressure.
+
+---
+
+## Amendment (#208): RULER's tasks, a quality task below its ceiling
+
+The needle set sits at its ceiling: static INT2 answered 45 of 50 at 8K,
+so at most five samples could be discordant at 80%, fewer than McNemar's
+test needs (Chapter 4). The owner chose RULER's subsets (2026-11-14), and
+RULER's own essay haystack for the tasks that have one (2026-11-15). This
+amendment fixes how they are generated, adapted to RQ3's turns, screened
+and tested, before any of them is run.
+
+**The tasks.** Five of RULER's (Hsieh et al., 2024), each by its template,
+answer prefix, generation length and arguments in RULER's
+`scripts/synthetic.yaml` and `scripts/data/synthetic/constants.py`:
+
+| Task | Haystack | Keys | Values | Needles | Answer |
+|---|---|---|---|---|---|
+| `niah_multikey_1` | essays | words | 7-digit numbers | 4 keys, one asked | 1 value |
+| `niah_multikey_2` | needles | words | 7-digit numbers | 1, among needle-shaped fillers | 1 value |
+| `niah_multikey_3` | needles | UUIDs | UUIDs | 1, among needle-shaped fillers | 1 value |
+| `niah_multivalue` | essays | words | 7-digit numbers | 1 key, 4 values | 4 values |
+| `vt` | noise | 5 capitals | 5-digit number | 1 chain of 4 hops | 5 names |
+
+A needle reads "One of the special magic numbers for {key} is: {value}."
+Words are wonderwords' adjective-noun pairs. An essay needle goes in at a
+depth drawn without replacement from RULER's 40 evenly spaced depths, at
+the sentence boundary there. A filler or noise needle goes at a random
+sentence index. VT's statements read "VAR {name} = {value}" and
+"VAR {name} = VAR {name} ", one a line, in order, at random positions among
+the noise sentences.
+
+**Where it departs from RULER**, each recorded with the data's hashes:
+- **The essays** are fetched as RULER's script fetches them, from the URL
+  list at a pinned RULER commit, the GitHub copies first, then
+  paulgraham.com's. Their text is extracted with Python's standard library,
+  not html2text, so the haystack is RULER's essays but not RULER's bytes.
+  Sentences are split by a fixed rule of the standard library, not nltk's
+  punkt.
+- **Keys** that a sample already holds are drawn again, so that no filler
+  shares the asked key. RULER does not check.
+- **Seeds.** Each task and length draws from a numpy generator of its own,
+  seeded by the set's seed, the task and the length. Drawing more samples
+  leaves the first ones as they are, as the needle set's do (#146).
+- **Length.** A sample's haystack is cut to a number of tokens, 7936 at 8K
+  and 32256 at 32K, the needle set's, rather than RULER's binary search to
+  a sequence length.
+
+**RQ3's two turns.** RULER asks its question in the same message as its
+context. Here, as for the needle set:
+1. **Turn 1** is the template's opening, the context, and the general
+   request, "Summarize the document above in two sentences", answered in
+   up to 64 tokens.
+2. **The controlled plan** is applied at its end, question-blind.
+3. **Turn 2** is the template's question. The answer prefix opens the
+   assistant's reply, fed rather than decoded. The reply is decoded for
+   RULER's generation length: 128 tokens for the needle tasks, 30 for VT.
+
+Only the question-blind experiment is run.
+
+**Scoring.** RULER's `string_match_all`: a sample's score is the share of
+its references found in the answer, case-insensitive. A sample is
+**answered** if its score is 1, every reference found. McNemar's test pairs
+answered samples; the score's mean is reported beside it.
+
+**Screening.** For each task and length, samples are drawn in order and run
+at FP16. The first 50 answered are kept, and those before them that FP16
+did not answer are replaced, as ADR-0017's screening does.
+
+**The ceiling.** At each length, static INT2 is run on each task's
+screened set. A task is **below its ceiling** if static INT2 answers at
+most 40 of its 50, 80%. Only tasks below their ceiling enter the closing
+test. A task above it is reported and not tested.
+
+**Conditions**, all question-blind on the screened sets:
+- B1, FP16 (its screening runs);
+- B8, B2 and B3: static INT8, INT4 and INT2;
+- B4, B5 and B6: the uniform, random and semantic sources at 70% and 80%;
+- B7: eviction at 70% and 80%.
+
+**The tests, fixed now.**
+- **At 8K, the closing test:** semantic against uniform at 80%, pooled over
+  the tasks below their ceiling at 8K. McNemar's exact test, two-sided at
+  0.05, on the samples only one of the two answered. It is a yes only if
+  semantic also answered more.
+- **At 32K:** the same test over the tasks below their ceiling at 32K,
+  reported as a second test at 0.05, not as a correction of the first.
+- **Descriptive:** each task, each level, random, eviction and the static
+  tiers, with Wilson 95% intervals on accuracy and the paired mean score
+  difference's bootstrap 95% interval.
+
+Both answers are reported, yes or no.
