@@ -13,7 +13,8 @@ html2text (ADR-0017's amendment). A URL that fails is skipped and named,
 as RULER's script skips it.
 
 Writes data/ruler/ (ruler.DATA): PaulGrahamEssays.json, {"text": ...} as
-RULER's, the two word lists, and the URL list; and logs a "ruler-data"
+RULER's, the two word lists, the URL list, and every page as fetched, in
+fetched/; and logs a "ruler-data"
 entry naming each file's sha256, what every RULER run is checked against.
 Refuses a dirty tree, and a data/ruler/ that holds the files already.
 """
@@ -78,6 +79,11 @@ def main(argv: list[str]) -> int:
         time.sleep(PAUSE_S)
     text = ruler.essay_text(fetched)
 
+    # Each page as fetched, so that its text can be extracted again offline.
+    raw = args.out / "fetched"
+    raw.mkdir(exist_ok=True)
+    for url, content in fetched.items():
+        (raw / url.split("/")[-1]).write_text(content)
     (args.out / "PaulGrahamEssays_URLs.txt").write_text(url_list)
     (args.out / ruler.ESSAYS).write_text(json.dumps({"text": text}))
     for name, url in WORD_LISTS.items():

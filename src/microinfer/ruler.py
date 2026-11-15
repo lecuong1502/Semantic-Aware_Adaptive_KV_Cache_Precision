@@ -391,28 +391,33 @@ def sentences(text: str) -> list[str]:
 class _FirstFont(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.depth, self.done, self.text = 0, False, []
+        self.depth, self.done, self.text, self.code = 0, False, [], 0
 
     def handle_starttag(self, tag, attrs):
         if tag == "font" and not self.done:
             self.depth += 1
         elif tag == "br" and self.depth:
             self.text.append("\n")
+        elif tag in ("script", "style"):
+            self.code += 1
 
     def handle_endtag(self, tag):
         if tag == "font" and self.depth:
             self.depth -= 1
             self.done = self.depth == 0
+        elif tag in ("script", "style") and self.code:
+            self.code -= 1
 
     def handle_data(self, data):
-        if self.depth:
+        if self.depth and not self.code:
             self.text.append(data)
 
 
 def font_text(page: str) -> str:
     """The text of a paulgraham.com page's first <font> tag, where its essay
     is, as RULER's script takes it (soup.find('font')): its line breaks as
-    new lines, its other tags dropped."""
+    new lines, its other tags dropped, and a script's or a style's text, as
+    html2text drops them."""
     parser = _FirstFont()
     parser.feed(page)
     return "".join(parser.text).strip()

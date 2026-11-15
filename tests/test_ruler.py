@@ -51,6 +51,9 @@ def test_an_essay_is_the_text_of_its_page_s_first_font_tag():
             "<br><br>Because &amp; so <font color=red>on</font>.</font>"
             "<font>after</font></td></tr></table>")
     assert ruler.font_text(page) == "Why startups fail.\n\nBecause & so on."
+    # a script or a style inside it is no essay's text, as html2text drops it
+    page = "<font>Text.<script>var x = {1};</script><style>p {}</style> More.</font>"
+    assert ruler.font_text(page) == "Text. More."
 
 
 def test_the_essays_are_joined_as_ruler_s_script_joins_them():
