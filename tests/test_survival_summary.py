@@ -108,6 +108,118 @@ def test_a_scenario_with_no_red_episode_has_no_detection():
     assert row["detection_ms"] is None and row["wait_ms"] is None
 
 
+# -- what a session's cache held over time, and what it cost (#207, ADR-0014) --------------
+
+TIER_BITS = {"FP16": 16.0, "INT8": 8.625, "INT4": 4.625, "INT2": 2.625}
+
+
+def continuation(**by_condition):
+    """A continuation summary's conditions, each (effective bits, KL, top-1)."""
+    return {name.replace("_", "-"): {"effective_bits": bits, "kl_mean": kl, "top1": top1}
+            for name, (bits, kl, top1) in by_condition.items()}
+
+
+CONTINUATION = continuation(semantic_70=(5.5, 0.002, 0.99), semantic_80=(4.0, 0.03, 0.94),
+                            uniform_70=(5.5, 0.003, 0.97), uniform_80=(4.0, 0.1, 0.86),
+                            random_70=(5.5, 0.005, 0.97), random_80=(4.0, 0.08, 0.88),
+                            static_int8=(8.625, 2e-5, 0.997), static_int4=(4.625, 0.0055, 0.966))
+
+
+def held_run(condition, scenario, run, steps):
+    """A matrix run that logged its timeline: its steps [seconds, bits]."""
+    seconds = sum(d for d, _ in steps)
+    entry = matrix_run(condition, scenario, run)
+    entry["results"]["held"] = {
+        "seconds": seconds, "effective_bits": sum(d * b for d, b in steps) / seconds,
+        "fp16_fraction": sum(d for d, b in steps if b == 16.0) / seconds,
+        "lowest_bits": min(b for _, b in steps), "steps": [list(s) for s in steps]}
+    return entry
+
+
+def test_quality_is_linear_in_bits_between_the_points_measured_and_held_over_time():
+    """16 bits for 10 s, 8 for 10 s, 6, halfway from 4 to 8, for 10 s, 4
+    for 10 s: each step's quality from the curve, averaged over time."""
+    curve = [summary.Point(4.0, 0.1, 0.8), summary.Point(8.0, 0.02, 0.96), summary.FP16_POINT]
+    q = summary.session_quality([[10.0, 16.0], [10.0, 8.0], [10.0, 6.0], [10.0, 4.0]], curve)
+    assert q["kl"] == pytest.approx((0 + 0.02 + 0.06 + 0.1) / 4)
+    assert q["top1"] == pytest.approx((1 + 0.96 + 0.88 + 0.8) / 4)
+    assert q["below_measured_fraction"] == 0.0
+
+
+def test_below_the_lowest_point_a_step_takes_its_quality_and_the_time_is_reported():
+    curve = [summary.Point(4.0, 0.1, 0.8), summary.FP16_POINT]
+    q = summary.session_quality([[30.0, 16.0], [10.0, 2.7]], curve)
+    assert q["kl"] == pytest.approx(0.1 / 4)  # a lower bound
+    assert q["below_measured_fraction"] == pytest.approx(0.25)
+
+
+def test_each_condition_s_curve_is_its_tier_or_its_source_s_points():
+    curves = summary.quality_curves(CONTINUATION, TIER_BITS)
+    assert curves["B1"] == [(16.0, 0.0, 1.0)]
+    assert curves["B8"] == [(8.625, 2e-5, 0.997)] and curves["B2"] == [(4.625, 0.0055, 0.966)]
+    assert curves["B3"] is None                       # static INT2 has no continuation run
+    assert curves["B6"] == [(4.0, 0.03, 0.94), (5.5, 0.002, 0.99), (16.0, 0.0, 1.0)]
+    assert curves["B4"][0] == (4.0, 0.1, 0.86)
+    # once static INT2 has one, it is every source's lowest point, at INT2's bits
+    curves = summary.quality_curves({**CONTINUATION, **continuation(
+        static_int2=(2.625, 0.3, 0.6))}, TIER_BITS)
+    assert curves["B3"] == [(2.625, 0.3, 0.6)]
+    assert curves["B5"][0] == (2.625, 0.3, 0.6) and len(curves["B5"]) == 4
+
+
+def test_a_static_run_logged_before_its_timeline_holds_its_tier_by_construction():
+    cells = {("B2", "S1"): [matrix_run("B2", "S1", r) for r in range(3)],
+             ("B1", "S1"): [matrix_run("B1", "S1", 0, survived=False)]}
+    table = summary.held_table(cells, TIER_BITS, summary.quality_curves(CONTINUATION, TIER_BITS))
+    b2 = table["S1"]["B2"]
+    assert (b2["runs"], b2["measured"], b2["by_construction"]) == (3, 3, True)
+    assert b2["effective_bits"] == 4.625 and b2["fp16_fraction"] == 0.0
+    assert b2["kl"] == pytest.approx(0.0055) and b2["top1"] == pytest.approx(0.966)
+    b1 = table["S1"]["B1"]                            # over the time it ran, whether or not
+    assert b1["effective_bits"] == 16.0 and b1["fp16_fraction"] == 1.0 and b1["kl"] == 0.0
+
+
+def test_an_adaptive_run_with_no_timeline_has_no_figure():
+    cells = {("B6", "S2"): [matrix_run("B6", "S2", 0)]}
+    cell = summary.held_table(cells, TIER_BITS,
+                              summary.quality_curves(CONTINUATION, TIER_BITS))["S2"]["B6"]
+    assert (cell["runs"], cell["measured"]) == (1, 0)
+    assert cell["effective_bits"] is None and cell["kl"] is None
+
+
+def test_an_adaptive_cell_pools_its_runs_figures_and_a_condition_its_cells_runs():
+    cells = {("B6", "S1"): [held_run("B6", "S1", 0, [[30.0, 16.0], [10.0, 4.0]]),
+                            held_run("B6", "S1", 1, [[40.0, 16.0]])],
+             ("B6", "S2"): [held_run("B6", "S2", 0, [[20.0, 16.0], [20.0, 2.0]])],
+             ("B6", "S3"): [matrix_run("B6", "S3", 0)],          # before its timeline
+             ("B6", "S5"): [held_run("B6", "S5", 0, [[40.0, 4.0]])]}
+    table = summary.held_table(cells, TIER_BITS, summary.quality_curves(CONTINUATION, TIER_BITS))
+    s1 = table["S1"]["B6"]
+    assert s1["measured"] == 2 and s1["by_construction"] is False
+    assert s1["effective_bits"] == pytest.approx((13.0 + 16.0) / 2)
+    assert s1["effective_bits_range"] == [13.0, 16.0]
+    assert s1["fp16_fraction"] == pytest.approx((0.75 + 1.0) / 2)
+    assert s1["kl"] == pytest.approx((0.03 / 4 + 0) / 2) and not s1["kl_lower_bound"]
+    assert table["S2"]["B6"]["kl_lower_bound"] is True   # 2 bits is below 80%'s 4
+    # by condition, the runs of S1 to S4, not S5's
+    pooled = table["S1-S4"]["B6"]
+    assert (pooled["runs"], pooled["measured"]) == (4, 3)
+    assert pooled["effective_bits"] == pytest.approx((13.0 + 16.0 + 9.0) / 3)
+    assert pooled["kl_lower_bound"] is True
+
+
+def test_perplexity_is_given_for_the_static_tiers_only():
+    def ppl(tier, value, halves="both", model=MODEL, window=2048):
+        return {"kind": "perplexity", "model": model, "precision_tiers": {tier: 1.0},
+                "config": {"kv_halves": halves, "window": window}, "results": {"perplexity": value}}
+
+    entries = [ppl("FP16", 9.64), ppl("INT8", 9.641), ppl("INT4", 9.698), ppl("INT2", 11.54),
+               ppl("INT4", 9.5, halves="keys"), ppl("INT4", 14.4, model="qwen2.5-0.5b-instruct"),
+               ppl("INT4", 9.2, window=512)]                 # not #18's windows
+    assert summary.static_perplexity(entries, MODEL) == {"B1": 9.64, "B8": 9.641, "B2": 9.698,
+                                                         "B3": 11.54}
+
+
 def test_the_tool_logs_the_summary_naming_every_run_it_pooled(tmp_path, monkeypatch):
     log = tmp_path / "benchmark.jsonl"
     for e in [experiment_run("static", False, "s"), matrix_run("B6", "S1", 0, plans=[plan()])]:
@@ -122,6 +234,11 @@ def test_the_tool_logs_the_summary_naming_every_run_it_pooled(tmp_path, monkeypa
     pooled = [e["sha256"] for e in benchlog.read(log)[:2]]
     assert sorted(entry["results"]["entries"]) == sorted(pooled)
     assert entry["results"]["survival"]["S5"]["B1"]["survived"] == 0
+    # the held table, the static engine's by construction at the model's tier bits (#207)
+    held = entry["results"]["held"]
+    assert held["S5"]["B1"]["effective_bits"] == 16.0 and held["S5"]["B1"]["by_construction"]
+    assert held["S1"]["B6"]["measured"] == 0
+    assert entry["results"]["quality_source"] is None   # no continuation summary logged
 
 
 def test_the_tool_refuses_a_dirty_tree(tmp_path, monkeypatch):

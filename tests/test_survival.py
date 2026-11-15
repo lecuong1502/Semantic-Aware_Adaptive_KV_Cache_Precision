@@ -20,6 +20,7 @@ from microinfer import Engine, ModelConfig, controller, monitor, replay, surviva
 from microinfer.engine import (COMPLETE, DECODING, EXHAUSTED, PREFILLING, AppliedBatch, Ending,
                                PlanRecord, PressureRecord)
 from microinfer.footprint import MIB
+from microinfer.model import tier_page_bytes
 
 NAME = "qwen2.5-0.5b-instruct"
 
@@ -283,6 +284,49 @@ def test_a_pulse_never_ended_is_never_restored():
     assert r["effective_bits"]["mean_after_pressure"] is None
 
 
+# -- what a session's cache held over time (#207) -----------------------------------------
+
+def test_a_session_s_bits_are_held_from_each_step_to_the_next_over_prefill_and_decode():
+    """16 bits for 10 s, 4 for 10 s over two steps, 16 again for 10 s: 12
+    bits over 30 s, two thirds of it at FP16, the last step held for none."""
+    timeline = [survival.Step(0.0, PREFILLING, 512, 16.0, 0),
+                survival.Step(10.0, PREFILLING, 1024, 4.0, 500),
+                survival.Step(15.0, PREFILLING, 1536, 4.0, 500),
+                survival.Step(20.0, DECODING, 1537, 16.0, 0),
+                survival.Step(30.0, DECODING, 1538, 16.0, 0)]
+    held = survival.held(timeline)
+    assert held["seconds"] == 30.0
+    assert held["effective_bits"] == pytest.approx(12.0)
+    assert held["fp16_fraction"] == pytest.approx(2 / 3)
+    assert held["lowest_bits"] == 4.0
+    # neighbouring steps of equal bits merged
+    assert held["steps"] == [[10.0, 16.0], [10.0, 4.0], [10.0, 16.0]]
+
+
+def test_a_static_cache_holds_its_tier_and_none_of_its_time_at_fp16():
+    timeline = [survival.Step(float(t), PREFILLING, 512 * (t + 1), 4.625, 16 * (t + 1))
+                for t in range(4)]
+    held = survival.held(timeline)
+    assert held["effective_bits"] == 4.625 and held["fp16_fraction"] == 0.0
+    assert held["steps"] == [[3.0, 4.625]]
+
+
+def test_steps_before_a_full_page_are_not_held():
+    """A cache of no full page has no effective bits: the time before its
+    first full page is no part of what it held."""
+    timeline = [survival.Step(0.0, PREFILLING, 16, None, None),
+                survival.Step(5.0, PREFILLING, 512, 16.0, 0),
+                survival.Step(6.0, PREFILLING, 1024, 16.0, 0)]
+    held = survival.held(timeline)
+    assert held["seconds"] == 1.0 and held["fp16_fraction"] == 1.0
+
+
+def test_a_session_of_one_step_held_nothing():
+    held = survival.held([survival.Step(0.0, PREFILLING, 512, 16.0, 0)])
+    assert held == {"seconds": 0.0, "effective_bits": None, "fp16_fraction": None,
+                    "lowest_bits": None, "steps": []}
+
+
 def test_the_tool_releases_a_pulse_for_an_adaptive_engine_only(tmp_path):
     path = Path(__file__).resolve().parent.parent / "tools" / "survival_experiment.py"
     spec = importlib.util.spec_from_file_location("survival_tool", path)
@@ -364,6 +408,12 @@ def test_the_tool_runs_a_static_int8_engine_as_b8(tmp_path, monkeypatch):
     ending = entry["results"]["ending"]
     assert ending["positions"] >= 1024
     assert entry["results"]["survived"] == (ending["state"] == "complete")
+    # every run logs its timeline and what its cache held over time (#207)
+    assert "b8.timeline.jsonl" in entry["config"]["files"]
+    held = entry["results"]["held"]
+    fp16, int8, *_ = tier_page_bytes(ModelConfig.from_card(NAME))
+    assert held["effective_bits"] == pytest.approx(16 * int8 / fp16)  # 0.5B's: 8.75
+    assert held["fp16_fraction"] == 0.0
 
 
 @pytest.mark.slowest

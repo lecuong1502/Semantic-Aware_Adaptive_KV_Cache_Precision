@@ -31,6 +31,12 @@ gives what that comes to: the time from the end of pressure to every page
 back at FP16, the effective bits over time, and any thrash, downgrades and
 upgrades alternating.
 
+**What a session's cache held** (#207) is every run's timeline come to
+(`held`): its effective bits averaged over the time of its prefill and
+decode, each step's held until the next, and the share of that time at
+FP16, with the steps themselves, from which the survival summary reads a
+session's quality (ADR-0014's amendment).
+
 **A scheduled scenario** (#190) is the run with the simulator playing a
 schedule in S5's step's place, S1 to S4 of the survival matrix
 (survival_matrix): made from the headroom at the take, the run ending with
@@ -379,6 +385,42 @@ def recovery(run: Run, plans: Sequence[PlanRecord], *, cooldown_seconds: float) 
                 1 for t, up, _ in applied if not up and t > first_up),
             "upgrade_plans_cancelled_by_pressure": sum(
                 1 for p in plans if p.upgrades and p.ended == "cancelled by pressure")}}
+
+
+#: The decimals a held step's bits are logged to (`held`).
+BITS_DECIMALS = 4
+
+
+def held(timeline: Sequence[Step]) -> dict:
+    """What a run's cache held over its prefill and decode (#207, ADR-0014):
+    each step's effective bits held from its report to the next step's,
+    from the first step with a full page to the last step, which is held
+    for none.
+    - `effective_bits`, averaged over that time, and the `lowest_bits` held;
+    - `fp16_fraction`, the share of it with no page below FP16;
+    - `seconds`, and the `steps` themselves as [seconds held, bits], those
+      of equal bits merged, what a session's quality is read from
+      (survival_summary.session_quality).
+    None, and no steps, for a run that held nothing for any time."""
+    steps = [step for step in timeline if step.effective_bits is not None]
+    spans = [(after.t - step.t, step) for step, after in zip(steps, steps[1:])
+             if after.t > step.t]
+    seconds = sum(d for d, _ in spans)
+    if seconds == 0:
+        return {"seconds": 0.0, "effective_bits": None, "fp16_fraction": None,
+                "lowest_bits": None, "steps": []}
+    merged: list[list[float]] = []
+    for d, step in spans:
+        bits = round(step.effective_bits, BITS_DECIMALS)
+        if merged and merged[-1][1] == bits:
+            merged[-1][0] += d
+        else:
+            merged.append([d, bits])
+    return {"seconds": seconds,
+            "effective_bits": sum(d * step.effective_bits for d, step in spans) / seconds,
+            "fp16_fraction": sum(d for d, step in spans if step.pages_below_fp16 == 0) / seconds,
+            "lowest_bits": min(step.effective_bits for _, step in spans),
+            "steps": [[round(d, 3), bits] for d, bits in merged]}
 
 
 def _mean_over_time(steps: Sequence[Step], start: float, end: float | None) -> float | None:

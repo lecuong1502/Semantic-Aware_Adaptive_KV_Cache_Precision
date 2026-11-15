@@ -34,9 +34,8 @@ that long after it took it, and the generation goes on (#155): pressure
 passes, and after the cooldown the upgrades restore the pages from their
 shadows. The run is one "pulse-release" entry, with what its recovery comes
 to (survival.recovery): the time from the end of pressure to every page back
-at FP16, the effective bits over time, and any downgrade and upgrade thrash;
-its every step's effective bits are in a companion .timeline.jsonl. For
-#155, a prompt of 30720 positions and 2048 new tokens leave minutes of
+at FP16, the effective bits over time, and any downgrade and upgrade thrash.
+For #155, a prompt of 30720 positions and 2048 new tokens leave minutes of
 steps after the pulse for the upgrades. The upgrades come a batch a step,
 so the restore takes as long as its steps: on the RTX 4050, 1.5B's restore
 took about 540 s, its prefill chunks up to 40 s each near 30K positions,
@@ -47,8 +46,11 @@ minute of the restore.
 The rule, not a number, sets what the simulator takes, so that the two runs
 face the same contention whatever else the desktop holds. Each run is one
 "survival" entry in the benchmark log, with the sha256 of the trace, the
-simulator's schedule and events, and the engine's pressure events
-(.pressure.jsonl).
+simulator's schedule and events, the engine's pressure events
+(.pressure.jsonl), and its timeline (.timeline.jsonl), every step's
+effective bits and pages below FP16. What its cache held over time, the
+effective bits and the share of the time at FP16, is logged with it
+(survival.held, #207).
 
 With `--scenario S1` to `S4` (#190), the simulator plays that scenario of
 the survival matrix in place of S5's step, the run's seed --run
@@ -159,11 +161,10 @@ def main(argv: list[str]) -> int:
     pressure.write_text("".join(
         json.dumps({**asdict(r.event), "positions_held": r.positions_held,
                     "drained_ns": r.drained_ns}) + "\n" for r in result.pressure_events))
-    files = replay.files(args.out) + [pressure]
-    if args.pulse is not None:
-        timeline = recorder.companion(args.out, ".timeline.jsonl")
-        timeline.write_text("".join(json.dumps(step._asdict()) + "\n" for step in result.timeline))
-        files.append(timeline)
+    # Every run's timeline, what its cache held step by step (#155, #207).
+    timeline = recorder.companion(args.out, ".timeline.jsonl")
+    timeline.write_text("".join(json.dumps(step._asdict()) + "\n" for step in result.timeline))
+    files = replay.files(args.out) + [pressure, timeline]
     context = args.prompt_positions + args.new_tokens - 1
     config = {"issue": args.issue, "engine": args.engine, "condition": condition,
               "kv_tier": args.kv_tier, "scenario": args.scenario, "run": args.run,
@@ -191,6 +192,7 @@ def main(argv: list[str]) -> int:
     results = {**result.summary, "contention_position": result.contention_position,
                "headroom_at_contention_mib": result.headroom_bytes / MIB,
                "taken_mib": result.taken_bytes / MIB,
+               "held": survival.held(result.timeline),
                "pressure_events": len(result.pressure_events),
                "pressure_levels": [r.event.level.value for r in result.pressure_events],
                "pressure": survival.waits(result.pressure_events, engine.plans),

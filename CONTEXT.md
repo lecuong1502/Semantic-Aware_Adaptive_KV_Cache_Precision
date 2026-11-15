@@ -132,6 +132,21 @@ is counted: 8.63 for INT8 on Qwen2.5-1.5B, not 8. The only figure a
 compression ratio may be quoted from.
 _Avoid_: bit-width (that is the nominal code width)
 
+**Effective bits over time** / **FP16 fraction**:
+What a session's cache held (#207): each step's effective bits, held from
+its report to the next step's, averaged over the run's prefill and decode;
+and the share of that time in which no page was below FP16. A static engine
+holds its tier's throughout, and an adaptive one holds 16 except under
+pressure. Every survival run logs both, with its timeline (ADR-0014).
+_Avoid_: average bits (say over what), compression ratio (that is of bytes)
+
+**Session quality**:
+Continuation fidelity's KL and top-1 at each step's effective bits, on a
+curve through the points measured for the condition, linear in bits between
+them, and averaged over time as the bits are (ADR-0014's amendment, #207). A
+static engine's is its tier's.
+_Avoid_: quality score, session accuracy (no question is asked)
+
 ### Inference
 
 **Prefill chunk**:
