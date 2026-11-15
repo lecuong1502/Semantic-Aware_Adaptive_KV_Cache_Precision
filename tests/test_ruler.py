@@ -53,6 +53,18 @@ def test_an_essay_is_the_text_of_its_page_s_first_font_tag():
     assert ruler.font_text(page) == "Why startups fail.\n\nBecause & so on."
 
 
+def test_the_essays_are_joined_as_ruler_s_script_joins_them():
+    """The GitHub copies first, then paulgraham.com's pages, each sorted by
+    file name, joined with nothing between; a page is its first font's text."""
+    fetched = {
+        "http://www.paulgraham.com/zeta.html": "<font>Zeta.</font>",
+        "http://www.paulgraham.com/alpha.html": "<font>Alpha.</font>",
+        "https://github.com/x/y/raw/main/PaulGrahamEssays/worked.txt": "Worked.",
+        "https://github.com/x/y/raw/main/PaulGrahamEssays/apple.txt": "Apple.",
+    }
+    assert ruler.essay_text(fetched) == "Apple.Worked.Alpha.Zeta."
+
+
 def test_a_score_is_the_share_of_references_found_regardless_of_case():
     assert ruler.score("the numbers are 1234567 and 7654321", ("1234567", "7654321")) == 1.0
     assert ruler.score("ABCDE, fghij", ("abcde", "FGHIJ", "KLMNO")) == pytest.approx(2 / 3)

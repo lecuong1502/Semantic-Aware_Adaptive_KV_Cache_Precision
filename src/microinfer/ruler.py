@@ -418,6 +418,19 @@ def font_text(page: str) -> str:
     return "".join(parser.text).strip()
 
 
+def essay_text(fetched: dict[str, str]) -> str:
+    """RULER's essay text from what its URL list fetched, by URL: as its
+    script joins them, the GitHub copies first, then paulgraham.com's
+    pages, each sorted by file name and joined with nothing between; a
+    page, an .html URL, is its first font's text."""
+    def name(url: str) -> str:
+        return url.split("/")[-1].replace(".html", ".txt")
+
+    copies = sorted((u for u in fetched if ".html" not in u), key=name)
+    pages = sorted((u for u in fetched if ".html" in u), key=name)
+    return "".join([fetched[u] for u in copies] + [font_text(fetched[u]) for u in pages])
+
+
 #: Where tools/fetch_ruler.py puts RULER's data.
 DATA = Path(__file__).resolve().parents[2] / "data" / "ruler"
 ESSAYS = "PaulGrahamEssays.json"
