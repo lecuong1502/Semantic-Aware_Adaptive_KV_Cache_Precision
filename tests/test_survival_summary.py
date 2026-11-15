@@ -139,7 +139,7 @@ def held_run(condition, scenario, run, steps):
 def test_quality_is_linear_in_bits_between_the_points_measured_and_held_over_time():
     """16 bits for 10 s, 8 for 10 s, 6, halfway from 4 to 8, for 10 s, 4
     for 10 s: each step's quality from the curve, averaged over time."""
-    curve = [(4.0, 0.1, 0.8), (8.0, 0.02, 0.96), (16.0, 0.0, 1.0)]
+    curve = [summary.Point(4.0, 0.1, 0.8), summary.Point(8.0, 0.02, 0.96), summary.FP16_POINT]
     q = summary.session_quality([[10.0, 16.0], [10.0, 8.0], [10.0, 6.0], [10.0, 4.0]], curve)
     assert q["kl"] == pytest.approx((0 + 0.02 + 0.06 + 0.1) / 4)
     assert q["top1"] == pytest.approx((1 + 0.96 + 0.88 + 0.8) / 4)
@@ -147,7 +147,7 @@ def test_quality_is_linear_in_bits_between_the_points_measured_and_held_over_tim
 
 
 def test_below_the_lowest_point_a_step_takes_its_quality_and_the_time_is_reported():
-    curve = [(4.0, 0.1, 0.8), (16.0, 0.0, 1.0)]
+    curve = [summary.Point(4.0, 0.1, 0.8), summary.FP16_POINT]
     q = summary.session_quality([[30.0, 16.0], [10.0, 2.7]], curve)
     assert q["kl"] == pytest.approx(0.1 / 4)  # a lower bound
     assert q["below_measured_fraction"] == pytest.approx(0.25)
@@ -209,12 +209,13 @@ def test_an_adaptive_cell_pools_its_runs_figures_and_a_condition_its_cells_runs(
 
 
 def test_perplexity_is_given_for_the_static_tiers_only():
-    def ppl(tier, value, halves="both", model=MODEL):
+    def ppl(tier, value, halves="both", model=MODEL, window=2048):
         return {"kind": "perplexity", "model": model, "precision_tiers": {tier: 1.0},
-                "config": {"kv_halves": halves}, "results": {"perplexity": value}}
+                "config": {"kv_halves": halves, "window": window}, "results": {"perplexity": value}}
 
     entries = [ppl("FP16", 9.64), ppl("INT8", 9.641), ppl("INT4", 9.698), ppl("INT2", 11.54),
-               ppl("INT4", 9.5, halves="keys"), ppl("INT4", 14.4, model="qwen2.5-0.5b-instruct")]
+               ppl("INT4", 9.5, halves="keys"), ppl("INT4", 14.4, model="qwen2.5-0.5b-instruct"),
+               ppl("INT4", 9.2, window=512)]                 # not #18's windows
     assert summary.static_perplexity(entries, MODEL) == {"B1": 9.64, "B8": 9.641, "B2": 9.698,
                                                          "B3": 11.54}
 

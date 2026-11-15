@@ -387,6 +387,10 @@ def recovery(run: Run, plans: Sequence[PlanRecord], *, cooldown_seconds: float) 
                 1 for p in plans if p.upgrades and p.ended == "cancelled by pressure")}}
 
 
+#: The decimals a held step's bits are logged to (`held`).
+BITS_DECIMALS = 4
+
+
 def held(timeline: Sequence[Step]) -> dict:
     """What a run's cache held over its prefill and decode (#207, ADR-0014):
     each step's effective bits held from its report to the next step's,
@@ -407,7 +411,7 @@ def held(timeline: Sequence[Step]) -> dict:
                 "lowest_bits": None, "steps": []}
     merged: list[list[float]] = []
     for d, step in spans:
-        bits = round(step.effective_bits, 4)
+        bits = round(step.effective_bits, BITS_DECIMALS)
         if merged and merged[-1][1] == bits:
             merged[-1][0] += d
         else:

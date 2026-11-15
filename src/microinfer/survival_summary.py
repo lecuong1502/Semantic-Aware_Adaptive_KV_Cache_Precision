@@ -36,8 +36,10 @@ run with no timeline has no figure.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import NamedTuple
 
 from . import contention, pressure_rule, rq3_summary, survival_matrix as matrix
+from .survival import BITS_DECIMALS
 
 SUMMARY_KIND = "survival-summary"
 MODEL = pressure_rule.MODEL
@@ -54,10 +56,23 @@ S6_GENERATION = {"prompt_positions": 30720, "new_tokens": 2048, "contention_at":
                  "shortfall_mib": 256.0}
 
 Cell = tuple[str, str]
-#: A quality curve's point: effective bits, continuation KL from FP16, top-1.
-Point = tuple[float, float, float]
+
+
+class Point(NamedTuple):
+    """A quality curve's point: effective bits, and continuation's KL from
+    FP16 and top-1 agreement there."""
+
+    bits: float
+    kl: float
+    top1: float
+
+
 #: FP16's point: the reference itself.
-FP16_POINT: Point = (16.0, 0.0, 1.0)
+FP16_POINT = Point(16.0, 0.0, 1.0)
+#: A session with no quality: no curve, or no time.
+NO_QUALITY = {"kl": None, "top1": None, "below_measured_fraction": None}
+#: The perplexity the static tiers are given beside their quality: #18's.
+PERPLEXITY_WINDOW = 2048
 #: What the held table pools by condition: the matrix's scenarios.
 POOLED = "S1-S4"
 
@@ -143,20 +158,19 @@ def quality_curves(by_condition: Mapping[str, dict],
     a static tier with no continuation run."""
     def point(name: str, bits: float | None = None) -> Point | None:
         c = by_condition.get(name)
-        return None if c is None else (
+        return None if c is None else Point(
             c["effective_bits"] if bits is None else bits, c["kl_mean"], c["top1"])
 
-    floor = point("static-int2", tier_bits["INT2"])
+    int2_point = point("static-int2", tier_bits["INT2"])
     curves: dict[str, list[Point] | None] = {}
     for name, condition in matrix.CONDITIONS.items():
         if not condition.adaptive:
-            tier = None if condition.kv_tier == "FP16" else point(
+            tier = FP16_POINT if condition.kv_tier == "FP16" else point(
                 f"static-{condition.kv_tier.lower()}")
-            curves[name] = [FP16_POINT] if condition.kv_tier == "FP16" else (
-                None if tier is None else [tier])
+            curves[name] = None if tier is None else [tier]
             continue
         plans = [point(f"{condition.score_source}-{level}") for level in (70, 80)]
-        curves[name] = sorted(p for p in [FP16_POINT, *plans, floor] if p is not None)
+        curves[name] = sorted(p for p in [FP16_POINT, *plans, int2_point] if p is not None)
     return curves
 
 
@@ -164,30 +178,31 @@ def session_quality(steps: Sequence[Sequence[float]], curve: Sequence[Point]) ->
     """A session's quality (ADR-0014, #207): each step's KL and top-1 at its
     bits, linear in bits between the curve's neighbouring points, held for
     the step's seconds and averaged over the time. A step below the lowest
-    point takes that point's quality, a lower bound on its KL, and the
-    share of the time spent there is given."""
+    point takes that point's quality, a lower bound on its KL and an upper
+    bound on its top-1, and the share of the time spent there is given."""
     low = curve[0]
     seconds = kl = top1 = below = 0.0
     for held_s, bits in steps:
-        q = _at(bits, curve)
+        at_kl, at_top1 = _interpolated(bits, curve)
         seconds += held_s
-        kl += held_s * q[0]
-        top1 += held_s * q[1]
-        below += held_s if bits < round(low[0], 4) else 0.0
+        kl += held_s * at_kl
+        top1 += held_s * at_top1
+        below += held_s if bits < round(low.bits, BITS_DECIMALS) else 0.0
     if seconds == 0:
-        return {"kl": None, "top1": None, "below_measured_fraction": None}
+        return dict(NO_QUALITY)
     return {"kl": kl / seconds, "top1": top1 / seconds, "below_measured_fraction": below / seconds}
 
 
-def _at(bits: float, curve: Sequence[Point]) -> tuple[float, float]:
-    """KL and top-1 at `bits` on `curve`, its ends held beyond them."""
-    if bits <= curve[0][0]:
-        return curve[0][1], curve[0][2]
+def _interpolated(bits: float, curve: Sequence[Point]) -> tuple[float, float]:
+    """KL and top-1 at `bits`, linear between `curve`'s neighbouring
+    points, its ends held beyond them."""
+    if bits <= curve[0].bits:
+        return curve[0].kl, curve[0].top1
     for (b0, kl0, t0), (b1, kl1, t1) in zip(curve, curve[1:]):
         if bits <= b1:
             w = (bits - b0) / (b1 - b0)
             return kl0 + w * (kl1 - kl0), t0 + w * (t1 - t0)
-    return curve[-1][1], curve[-1][2]
+    return curve[-1].kl, curve[-1].top1
 
 
 def held_table(cells: dict[Cell, list[dict]], tier_bits: Mapping[str, float],
@@ -216,14 +231,13 @@ def _held_figures(entry: dict, condition: str, tier_bits: Mapping[str, float],
     if not spec.adaptive:
         bits = tier_bits[spec.kv_tier] if held is None else held["effective_bits"]
         fp16 = float(spec.kv_tier == "FP16") if held is None else held["fp16_fraction"]
-        tier = None if curve is None else curve[0]
+        quality = NO_QUALITY if curve is None else {
+            "kl": curve[0].kl, "top1": curve[0].top1, "below_measured_fraction": 0.0}
         return {"effective_bits": bits, "fp16_fraction": fp16, "by_construction": held is None,
-                "kl": None if tier is None else tier[1],
-                "top1": None if tier is None else tier[2], "below_measured_fraction": 0.0}
+                **quality}
     if held is None or held["effective_bits"] is None:
         return None
-    quality = (session_quality(held["steps"], curve) if curve is not None else
-               {"kl": None, "top1": None, "below_measured_fraction": None})
+    quality = NO_QUALITY if curve is None else session_quality(held["steps"], curve)
     return {"effective_bits": held["effective_bits"], "fp16_fraction": held["fp16_fraction"],
             "by_construction": False, **quality}
 
@@ -252,13 +266,15 @@ def _pooled(pairs: list[tuple[dict | None, dict]]) -> dict:
 
 def static_perplexity(entries: Sequence[dict], model: str = MODEL) -> dict[str, float]:
     """Each static condition's WikiText-2 perplexity, its tier's latest
-    entry of both halves at it (#18): beside the session figure, not in it."""
+    entry of both halves at it in #18's windows of 2048: beside the
+    session figure, not in it."""
     tiers = {spec.kv_tier: name for name, spec in matrix.CONDITIONS.items() if not spec.adaptive}
     out: dict[str, float] = {}
     for e in entries:
         tier = next(iter(e.get("precision_tiers") or {}), None)
         if (e["kind"] == "perplexity" and e["model"] == model and tier in tiers
-                and e["config"].get("kv_halves") == "both"):
+                and e["config"].get("kv_halves") == "both"
+                and e["config"].get("window") == PERPLEXITY_WINDOW):
             out[tiers[tier]] = e["results"]["perplexity"]
     return {name: out[name] for name in tiers.values() if name in out}
 

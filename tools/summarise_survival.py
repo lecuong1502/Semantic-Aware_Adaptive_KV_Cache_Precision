@@ -18,7 +18,8 @@ from the latest "continuation-summary" entry; and each static tier's
 perplexity beside them. A static cell logged before its runs' timelines
 holds its tier by construction (*); an adaptive one is not measured (-)
 until its runs log a timeline, #216's. A KL marked >= is a lower bound:
-some of the time was below the lowest bits measured.
+some of the time was below the lowest bits measured, and its top-1,
+marked <=, an upper bound.
 
 Refuses a dirty tree.
 """
@@ -111,8 +112,8 @@ def quality_cell(cell: dict | None) -> str:
     """A cell's session KL and top-1, >= if the KL is a lower bound."""
     if cell is None or cell["kl"] is None:
         return "-"
-    bound = ">=" if cell["kl_lower_bound"] else ""
-    return f"{bound}{cell['kl']:.2g}, {100 * cell['top1']:.1f}%"
+    low, high = (">=", "<=") if cell["kl_lower_bound"] else ("", "")
+    return f"{low}{cell['kl']:.2g}, {high}{100 * cell['top1']:.1f}%"
 
 
 def rate_cell(cell: dict | None) -> str:

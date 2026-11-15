@@ -286,7 +286,7 @@ amendment fixes how that is measured, and what quality is set against it,
 before any adaptive figure is computed.
 
 #207 expected the survival entries to hold every plan's bytes and times.
-They hold each plan's bytes, but not when its batches applied, and the
+They hold each plan's bytes, but not when its plan batches applied, and the
 cache's positions only at pressure events. Bits over time cannot be
 recovered from them. A timeline is logged from #207 on (the owner's
 decision, 2026-11-15), and #216's re-run of the matrix gives the adaptive
@@ -343,8 +343,9 @@ of the matrix's runs before #207 has one.
   figure is each step's quality, weighted by the time its bits are held,
   and averaged as the bits are.
 - **Below the lowest measured point**, a step takes that point's quality,
-  and the run reports the share of its time spent there. Its KL is then a
-  lower bound, and is marked as one. Until static INT2 has a continuation
+  and the summary reports the share of the run's time spent there. Its KL
+  is then a lower bound and its top-1 an upper bound, and both are marked
+  as such. Until static INT2 has a continuation
   run, the lowest point is the 80% plan's.
 - **Pooling.** A cell's figure is the mean of its runs' figures. A
   condition's figure over S1 to S4 is the mean of the cells' runs.
