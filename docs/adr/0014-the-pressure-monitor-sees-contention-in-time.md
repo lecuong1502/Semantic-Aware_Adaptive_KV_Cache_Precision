@@ -363,3 +363,20 @@ Two limits are stated with the figures:
   rise faster as bits fall. If it does, the line lies above the curve in
   KL and overstates the adaptive engine's cost between points. This is
   expected, not measured.
+
+### As measured (#207)
+
+Static INT2 was run on the continuation passages, 50 of them, so that B3
+has a session quality and every adaptive curve has its lowest point:
+top-1 0.806 and KL 0.189, at 2.63 bits. The held table of the
+"survival-summary" entry gives the static conditions by construction:
+
+| Condition | Effective bits | At FP16 | Session KL | Top-1 | Perplexity |
+|---|---|---|---|---|---|
+| B1, static FP16 | 16.00 | 100% | 0 | 100% | 9.640 |
+| B8, static INT8 | 8.63 | 0% | 2e-5 | 99.7% | 9.641 |
+| B2, static INT4 | 4.63 | 0% | 0.0055 | 96.6% | 9.698 |
+| B3, static INT2 | 2.63 | 0% | 0.19 | 80.6% | 11.541 |
+
+B4 to B6 have no figure yet: their runs logged no timeline. #216's re-run
+of the matrix gives them, and the paper and the thesis take the table then.
