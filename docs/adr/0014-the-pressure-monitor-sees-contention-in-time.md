@@ -273,3 +273,92 @@ an FP16 cache's bytes survives the contention the adaptive engine survives.
 B7 is RQ3's eviction, which holds no session of its own to survive. B8's
 headroom is counted as an FP16 engine's would be, as B2's and B3's is, so
 that it faces the same bytes taken.
+
+---
+
+## Amendment (#207): what a session's cache holds over time, and what it costs
+
+The survival table says whether a session completes. It does not say what
+the cache held while it ran, which is what separates the adaptive engine
+from a static one: a static INT4 engine holds 4.63 effective bits for the
+whole session, and the adaptive one holds 16 except under pressure. This
+amendment fixes how that is measured, and what quality is set against it,
+before any adaptive figure is computed.
+
+#207 expected the survival entries to hold every plan's bytes and times.
+They hold each plan's bytes, but not when its batches applied, and the
+cache's positions only at pressure events. Bits over time cannot be
+recovered from them. A timeline is logged from #207 on (the owner's
+decision, 2026-11-15), and #216's re-run of the matrix gives the adaptive
+figures.
+
+**What a run logs.** Every survival run writes its timeline to a
+`.timeline.jsonl` companion, as #155's pulse runs did: at each step it
+reports, each prefill chunk and each decoded token, the cache's effective
+bits over its full pages and its pages below FP16. It logs `results.held`
+(`survival.held`):
+
+- **Effective bits over time.** Each step's bits are held from its report
+  to the next step's. They are averaged over the run's prefill and decode,
+  from its first step with a full page to its last step.
+- **The FP16 fraction.** The share of that time in which no page was below
+  FP16.
+- The lowest bits, the seconds, and the steps themselves as
+  `[seconds held, bits]`, with neighbouring steps of equal bits merged.
+
+A run that ran out of memory, or was exhausted, is measured over the steps
+it ran. The survival table says that it did not finish.
+
+**Static conditions, by construction.** Every page of a static engine is
+born at its tier and never moves (ADR-0011). B1, B8, B2 and B3 therefore
+hold 16, 8.63, 4.63 and 2.63 bits for the whole session, with FP16
+fractions of 1, 0, 0 and 0. Their runs logged before #207, which have no
+timeline, are given these values.
+
+**Adaptive conditions** have figures only from runs with a timeline. None
+of the matrix's runs before #207 has one.
+
+**The rule for session-level quality**, fixed before any is computed:
+
+- **The measure** is continuation fidelity (ADR-0017, #153). KL divergence
+  from FP16 comes first and top-1 agreement second, both from the latest
+  "continuation-summary" entry of Qwen2.5-1.5B. Continuation is the one
+  task measured at each static tier and at each score source's levels, on
+  the same passages. Needle accuracy is at its ceiling for most conditions
+  and does not grade a tier.
+- **Static conditions** take their tier's quality for the whole session.
+  B1 takes FP16's, KL 0 and top-1 1. B8 takes `static-int8`'s, B2
+  `static-int4`'s and B3 `static-int2`'s. B3's is not given until static
+  INT2 has a continuation run.
+- **Adaptive conditions** take, at each step, their source's quality at
+  that step's effective bits. It is read from a curve through the points
+  measured for the source:
+  - FP16, at 16 bits;
+  - the source's controlled plans at 70% and at 80%, at the effective bits
+    their runs logged;
+  - `static-int2`, at INT2's bits. There every page is at INT2, which is
+    where every source's plans end.
+
+  Between two neighbouring points, quality is linear in bits. The session
+  figure is each step's quality, weighted by the time its bits are held,
+  and averaged as the bits are.
+- **Below the lowest measured point**, a step takes that point's quality,
+  and the run reports the share of its time spent there. Its KL is then a
+  lower bound, and is marked as one. Until static INT2 has a continuation
+  run, the lowest point is the 80% plan's.
+- **Pooling.** A cell's figure is the mean of its runs' figures. A
+  condition's figure over S1 to S4 is the mean of the cells' runs.
+- **Perplexity** is given for the static tiers only, from #18's entries
+  (WikiText-2, windows of 2048). It is reported beside the session figure,
+  not in it, because no plan level has a perplexity of its own.
+
+Two limits are stated with the figures:
+
+- **Context.** The curve's points are measured on passages of 2048
+  positions and applied to a cache of up to 32K. The curve maps effective
+  bits to quality, not context to quality.
+- **The straight line.** A straight line between two points is a choice.
+  The planner takes the cheapest downgrades first, so KL is expected to
+  rise faster as bits fall. If it does, the line lies above the curve in
+  KL and overstates the adaptive engine's cost between points. This is
+  expected, not measured.
