@@ -21,7 +21,7 @@ ESSAY = " ".join(f"Sentence {i} of the essay says something about startups, and 
                  for i in range(400))
 WORDS = ruler.Words(adjectives=("amber", "brisk", "calm", "dusky", "eager"),
                     nouns=("anchor", "beacon", "candle", "dagger", "ember", "falcon"))
-TOKENS = 512
+TOKENS = 1024
 
 
 @pytest.fixture(scope="module")
@@ -106,21 +106,21 @@ def test_each_task_s_samples_hold_their_references_where_they_say(tokenizer, bui
         assert len(samples) == 4 and len({s.sample_id for s in samples}) == 4
         for s in samples:
             text = tokenizer.decode(s.turn_1.tolist(), skip_special_tokens=False)
-            assert all(r in text for r in s.references), task
+            assert all(r in text for r in s.expected), task
             for (start, end), (first, last) in zip(s.target_positions, s.target_pages):
                 held = tokenizer.decode(s.turn_1[start:end].tolist())
-                assert any(r in held for r in s.references), (task, held)
+                assert any(r in held for r in s.expected), (task, held)
                 assert (first, last) == (start // 32, (end - 1) // 32)
 
 
 def test_the_tasks_ask_as_ruler_s_arguments_say(tokenizer, built):
     one = built["niah_multikey_1"][0]
-    assert len(one.needle_positions) == 4 and len(one.references) == 1
-    assert len(built["niah_multivalue"][0].references) == 4
+    assert len(one.needle_positions) == 4 and len(one.expected) == 1
+    assert len(built["niah_multivalue"][0].expected) == 4
     assert len(built["niah_multivalue"][0].target_positions) == 4
     vt = built["vt"][0]
-    assert len(vt.references) == 5 and all(len(r) == 5 and r.isupper() for r in vt.references)
-    assert len(built["niah_multikey_3"][0].references[0]) == 36       # a UUID
+    assert len(vt.expected) == 5 and all(len(r) == 5 and r.isupper() for r in vt.expected)
+    assert len(built["niah_multikey_3"][0].expected[0]) == 36       # a UUID
     for task in ("niah_multikey_2", "niah_multikey_3"):
         s = built[task][0]
         # the haystack is needles of other keys, none of them the one asked
@@ -146,7 +146,8 @@ def test_a_haystack_is_cut_to_its_tokens(tokenizer, built):
             assert s.haystack_tokens == TOKENS
             held = len(s.turn_1) - s.document_start - s.closing_tokens - sum(
                 end - start for start, end in s.needle_positions)
-            assert held == TOKENS, task
+            assert held == TOKENS - s.example_tokens, task
+            assert (s.example_tokens > 0) == (task == "vt")
 
 
 def test_the_same_seed_gives_the_same_set_and_more_draws_keep_the_first(tokenizer, built):
@@ -161,8 +162,8 @@ def test_the_same_seed_gives_the_same_set_and_more_draws_keep_the_first(tokenize
 
 def test_a_sample_scores_its_answer_and_is_answered_only_with_every_reference(built):
     s = built["niah_multivalue"][0]
-    assert s.scored(" ".join(s.references)) == {"correct": True, "score": 1.0}
-    half = s.scored(" ".join(s.references[:2]))
+    assert s.scored(" ".join(s.expected)) == {"correct": True, "score": 1.0}
+    half = s.scored(" ".join(s.expected[:2]))
     assert half == {"correct": False, "score": 0.5}
 
 
@@ -178,12 +179,36 @@ def test_essay_needles_sit_at_ruler_s_depths_in_order(tokenizer, built):
 
 def test_variable_tracking_keeps_its_chain_in_order(tokenizer, built):
     for s in built["vt"]:
-        text = tokenizer.decode(s.turn_1.tolist())
+        text = tokenizer.decode(s.turn_1.tolist()).split(ruler.VT_OPENING)[-1]  # past the example
         lines = [line for line in text.split("\n") if line.startswith("VAR ")]
-        first, *hops = s.references
+        first, *hops = s.expected
         assert lines[0] == f"VAR {first} = {s.query}"
-        for (before, name), line in zip(zip(s.references, hops), lines[1:]):
+        for (before, name), line in zip(zip(s.expected, hops), lines[1:]):
             assert line == f"VAR {name} = VAR {before} "
+
+
+def test_variable_tracking_opens_with_ruler_s_one_shot_example(tokenizer, built):
+    """RULER puts a worked example before VT's template: a chain of three-
+    letter names among noise, its question and answer prefix, and its
+    answer; its value and names drawn again for each sample, its layout
+    once, and within RULER's 500 tokens."""
+    examples = []
+    for s in built["vt"]:
+        text = tokenizer.decode(s.turn_1[:s.document_start].tolist())
+        assert text.count("Memorize and track the chain(s)") == 2
+        example = text.split("user\n", 1)[1].rsplit(ruler.VT_OPENING, 1)[0]
+        assert example.endswith("\n\n")
+        *_, answer = example.strip().split("they are: ")
+        names = answer.split()
+        assert len(names) == 5 and all(len(n) == 3 and n.isupper() for n in names)
+        assert s.example_tokens <= ruler.VT_EXAMPLE_TOKENS + 1
+        examples.append(example)
+        lines = [line for line in example.split("\n") if line.startswith(("VAR", "The grass"))]
+        examples[-1] = [line.startswith("VAR") for line in lines]
+    assert all(layout == examples[0] for layout in examples)   # one layout for the task
+    first, second = (tokenizer.decode(s.turn_1[:s.document_start].tolist())
+                     for s in built["vt"][:2])
+    assert first != second                                     # its names and value drawn again
 
 
 def test_a_task_not_ruler_s_is_refused(tokenizer):
@@ -214,7 +239,7 @@ def test_a_ruler_sample_runs_through_rq3_s_turns_scored_as_ruler_scores_it(small
         for name in ("fp16", "semantic-80"):
             r = rq3.run(small_engine, s, rq3.condition(name), "question-blind")
             assert len(r["answer_tokens"]) <= s.answer_tokens
-            assert r["score"] == ruler.score(r["answer"], s.references)
+            assert r["score"] == ruler.score(r["answer"], s.expected)
             assert r["correct"] == (r["score"] == 1.0)
             assert len(r["target_page_tiers"]) == len(s.target_pages)
             assert "needle_page_tiers" not in r

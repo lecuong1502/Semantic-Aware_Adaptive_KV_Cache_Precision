@@ -18,12 +18,15 @@ MODEL = "qwen2.5-1.5b-instruct"
 TOKENS = 7936
 
 
-def run(task, k, condition, score=1.0, *, screening=False, commit="a"):
+DATA = {"PaulGrahamEssays.json": "e"}
+
+
+def run(task, k, condition, score=1.0, *, screening=False, commit="a", data=DATA):
     return {"kind": "rq3-ruler", "model": MODEL, "git_commit": commit,
             "sha256": f"{task}{k}{condition}{screening}{commit}",
             "config": {"task": task, "sample_id": f"{task}-{k}", "haystack_tokens": TOKENS,
                        "ruler_seed": 208, "plan_seed": 0, "screening": screening,
-                       "condition": {"name": condition}},
+                       "condition": {"name": condition}, "data": data},
             "results": {"score": score, "correct": score == 1.0}}
 
 
@@ -70,7 +73,12 @@ def test_the_closing_test_pools_the_tasks_below_their_ceiling():
     closing = s["closing"]
     assert closing["tasks"] == ["vt"]
     assert (closing["semantic_only"], closing["uniform_only"]) == (15, 0)
-    assert closing["mcnemar_p"] < 0.05 and closing["answer"] == "yes"
+    assert closing["mcnemar_p"] < 0.05 and closing["semantic_beats_uniform"] is True
+    assert closing["answer"].startswith("Yes: the semantic source answers 40/50 and uniform "
+                                        "25/50")
+    # each task's paired score at the level, descriptive
+    score = s["tasks"]["vt"]["score_paired"]["80%"]["semantic-uniform"]
+    assert score["difference"] == pytest.approx((40 - 25) * 0.5 / 50)
 
 
 def test_no_task_below_its_ceiling_has_no_closing_answer():
@@ -84,6 +92,22 @@ def test_a_closing_short_of_its_runs_says_so_and_answers_nothing():
                *task_runs("vt", 4, "semantic-80", 4), *task_runs("vt", 3, "uniform-80", 0)]
     closing = summary.summarise(entries, MODEL, 208, TOKENS)["closing"]
     assert closing["answer"] is None and closing["missing"] == {"vt": ["uniform-80"]}
+
+
+def test_a_screened_task_whose_ceiling_is_unknown_holds_the_closing_back():
+    entries = [screening("vt", range(2)), screening("niah_multikey_2", range(2)),
+               *task_runs("vt", 2, "static-int2", 0), *task_runs("vt", 2, "semantic-80", 2),
+               *task_runs("vt", 2, "uniform-80", 0)]
+    closing = summary.summarise(entries, MODEL, 208, TOKENS)["closing"]
+    assert closing["answer"] is None
+    assert closing["missing"] == {"niah_multikey_2": ["static-int2"]}
+
+
+def test_runs_on_other_data_are_not_pooled():
+    entries = [screening("vt", range(2)), *task_runs("vt", 2, "static-int2", 0),
+               run("vt", 0, "static-int2", 1.0, commit="b", data={"other": "x"})]
+    cell = summary.summarise(entries, MODEL, 208, TOKENS, data=DATA)["tasks"]["vt"]
+    assert cell["by_condition"]["static-int2"]["answered"] == 0
 
 
 def test_a_task_never_screened_is_not_summarised():
@@ -118,6 +142,7 @@ def test_the_tool_logs_a_summary_of_what_it_pooled(tmp_path, monkeypatch, capsys
     tool = load_tool("ruler")
     monkeypatch.setattr(tool.benchlog, "environment",
                         lambda log: {"git_dirty": False, "git_commit": "0" * 40})
+    monkeypatch.setattr(tool, "data_hashes", lambda log: DATA)
     log = tmp_path / "b.jsonl"
     for e in [screening("vt", range(2)), *task_runs("vt", 2, "static-int2", 0)]:
         benchlog.append(e["kind"], model=MODEL, context_length=None, precision_tiers=None,
@@ -128,3 +153,14 @@ def test_the_tool_logs_a_summary_of_what_it_pooled(tmp_path, monkeypatch, capsys
     assert entry["kind"] == summary.SUMMARY_KIND
     assert entry["results"]["tasks"]["vt"]["below_ceiling"] is True
     assert "closing over ['vt']" in capsys.readouterr().out
+
+
+def test_the_conditions_run_on_the_tasks_named_or_else_those_below_their_ceiling():
+    from conftest import load_tool
+    tool = load_tool("ruler")
+    entries = [screening("vt", range(2)), screening("niah_multikey_2", range(2)),
+               *task_runs("vt", 2, "static-int2", 0),
+               *task_runs("niah_multikey_2", 2, "static-int2", 2)]
+    s = summary.summarise(entries, MODEL, 208, TOKENS)
+    assert tool.chosen_tasks(None, s) == ["vt"]
+    assert tool.chosen_tasks(["niah_multikey_2"], s) == ["niah_multikey_2"]

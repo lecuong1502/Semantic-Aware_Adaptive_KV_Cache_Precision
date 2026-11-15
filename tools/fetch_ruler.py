@@ -35,7 +35,7 @@ from microinfer import benchlog, ruler  # noqa: E402
 
 #: RULER's commit whose URL list is fetched (main on 2026-11-15).
 RULER_COMMIT = "db43f92ff634bbce1c33d1fb15858aec4bba509a"
-URL_LIST = (f"https://raw.githubusercontent.com/NVIDIA/RULER/{RULER_COMMIT}/scripts/data/"
+URL_LIST_URL = (f"https://raw.githubusercontent.com/NVIDIA/RULER/{RULER_COMMIT}/scripts/data/"
             f"synthetic/json/PaulGrahamEssays_URLs.txt")
 #: wonderwords' last release, whose lists RULER's niah.py reads.
 WONDERWORDS = "v2.2.0"
@@ -67,7 +67,7 @@ def main(argv: list[str]) -> int:
                      f"hashes are what every run is checked against")
     args.out.mkdir(parents=True, exist_ok=True)
 
-    url_list = get(URL_LIST)
+    url_list = get(URL_LIST_URL)
     urls = [line.strip() for line in url_list.splitlines() if line.strip()]
     fetched, failed = {}, {}
     for i, url in enumerate(urls, 1):
@@ -84,19 +84,19 @@ def main(argv: list[str]) -> int:
     raw.mkdir(exist_ok=True)
     for url, content in fetched.items():
         (raw / url.split("/")[-1]).write_text(content)
-    (args.out / "PaulGrahamEssays_URLs.txt").write_text(url_list)
+    (args.out / ruler.URL_LIST).write_text(url_list)
     (args.out / ruler.ESSAYS).write_text(json.dumps({"text": text}))
     for name, url in WORD_LISTS.items():
         (args.out / name).write_text(get(url))
-    files = [ruler.ESSAYS, ruler.ADJECTIVES, ruler.NOUNS, "PaulGrahamEssays_URLs.txt"]
-    results = {"files": {name: ruler.sha256(args.out / name) for name in files},
+    files = [ruler.ESSAYS, ruler.ADJECTIVES, ruler.NOUNS, ruler.URL_LIST]
+    results = {"files": {name: benchlog.file_sha256(args.out / name) for name in files},
                "urls": len(urls), "fetched": len(fetched), "failed": failed,
                "github_copies": sum(".html" not in u for u in fetched),
                "pages": sum(".html" in u for u in fetched),
                "characters": len(text), "words": len(text.split())}
-    benchlog.append("ruler-data", model=None, context_length=None, precision_tiers=None,
+    benchlog.append(ruler.DATA_KIND, model=None, context_length=None, precision_tiers=None,
                     config={"issue": args.issue, "ruler_commit": RULER_COMMIT,
-                            "url_list": URL_LIST, "wonderwords": WONDERWORDS,
+                            "url_list": URL_LIST_URL, "wonderwords": WONDERWORDS,
                             "word_lists": WORD_LISTS, "extraction": "ruler.font_text"},
                     results=results, log=args.log)
     print(json.dumps({k: v for k, v in results.items() if k != "failed"}, indent=1))

@@ -68,7 +68,7 @@ def data_hashes(log: Path) -> dict[str, str]:
     """The hashes of RULER's data, refused unless they are the last
     "ruler-data" entry's: every run names the data it ran on."""
     _, _, hashes = ruler.load()
-    logged = [e for e in benchlog.read(log) if e["kind"] == "ruler-data"]
+    logged = [e for e in benchlog.read(log) if e["kind"] == ruler.DATA_KIND]
     if not logged:
         raise SystemExit("no ruler-data entry is logged; run tools/fetch_ruler.py")
     expected = {k: v for k, v in logged[-1]["results"]["files"].items() if k in hashes}
@@ -84,9 +84,17 @@ def config(sample: ruler.Sample, cond: rq3.Condition, args, hashes, *, screening
             "ruler_seed": args.seed, "plan_seed": args.plan_seed, "screening": screening,
             "condition": asdict(cond), "experiment": EXPERIMENT,
             "summary_tokens": rq3.SUMMARY_TOKENS, "answer_tokens": sample.answer_tokens,
-            "query": sample.query, "references": list(sample.references),
+            "query": sample.query, "expected": list(sample.expected),
             "target_positions": [list(p) for p in sample.target_positions],
             "target_pages": [list(p) for p in sample.target_pages], "data": hashes}
+
+
+def chosen_tasks(named: list[str] | None, summary: dict) -> list[str]:
+    """The tasks a run of the conditions is of: those `named`, or else those
+    the summary finds below their ceiling (ADR-0017's amendment)."""
+    if named:
+        return named
+    return [t for t, row in summary["tasks"].items() if row["below_ceiling"]]
 
 
 def logged(args, commit: str) -> dict[tuple[str, str], bool]:
@@ -130,7 +138,7 @@ def main(argv: list[str]) -> int:
 
     if args.summarise:
         s = ruler_summary.summarise(entries, args.model, args.seed, tokens,
-                                    plan_seed=args.plan_seed)
+                                    plan_seed=args.plan_seed, data=data_hashes(args.log))
         if not s["tasks"]:
             parser.error(f"no task is screened at {args.length}")
         if not args.dry_run:
@@ -143,18 +151,19 @@ def main(argv: list[str]) -> int:
 
     hashes = data_hashes(args.log)
     done = logged(args, environment["git_commit"])
-    sets = ruler_summary.screened_sets(entries, args.model, args.seed, tokens)
+    screened = ruler_summary.screenings(entries, args.model, args.seed, tokens)
+    sets = {t: e["results"]["kept"] for t, e in screened.items()}
     if args.screen:
         tasks = args.tasks or list(ruler.TASK_NAMES)
         names = [FP16.name]
     else:
         names = ["static-int2"] if args.ceiling else (args.conditions or [
             n for n in ruler_summary.CONDITIONS if n != "static-int2"])
-        if args.ceiling or args.tasks:
+        if args.ceiling:
             tasks = args.tasks or list(ruler.TASK_NAMES)
         else:
-            s = ruler_summary.summarise(entries, args.model, args.seed, tokens)
-            tasks = [t for t, row in s["tasks"].items() if row["below_ceiling"]]
+            tasks = chosen_tasks(args.tasks, ruler_summary.summarise(
+                entries, args.model, args.seed, tokens, plan_seed=args.plan_seed, data=hashes))
             if not tasks:
                 parser.error(f"no task is known below its ceiling at {args.length}; run "
                              f"--ceiling first, or name --tasks")
@@ -165,8 +174,8 @@ def main(argv: list[str]) -> int:
     engine = Engine(REPO / "models" / args.model)
     essays, words, _ = ruler.load()
     drawn = {t: ruler.task_set(t, essays, words, engine.tokenizer, seed=args.seed,
-                               samples=args.draws if args.screen else max(
-                                   int(sid.rsplit("-", 1)[1]) for sid in sets[t]) + 1,
+                               samples=args.draws if args.screen
+                               else screened[t]["config"]["draws"],
                                haystack_tokens=tokens) for t in tasks}
     if args.screen:
         todo = {s.sample_id: [FP16.name] for t in tasks for s in drawn[t][:PER_TASK]
@@ -247,10 +256,7 @@ def print_summary(s: dict) -> None:
             "-" if c is None else f"{c['answered']}/{c['runs']} ({c['score_mean']:.2f})"
             for c in cells) + " |")
     c = s["closing"]
-    print(f"\nclosing over {c['tasks']}: answer {c['answer']}"
-          + ("" if c["answer"] is None else
-             f", semantic only {c['semantic_only']}, uniform only {c['uniform_only']}, "
-             f"p = {c['mcnemar_p']:.3g}")
+    print(f"\nclosing over {c['tasks']}: {c['answer']}"
           + ("" if not c["missing"] else f"; missing {c['missing']}"))
 
 

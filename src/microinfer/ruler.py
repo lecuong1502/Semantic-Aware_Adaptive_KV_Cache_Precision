@@ -10,7 +10,7 @@ prefixes, generation lengths and arguments of RULER's
 - `niah_multikey_3`: the same, its keys and values UUIDs;
 - `niah_multivalue`: one key with four values in the essays, all asked;
 - `vt`: one chain of four hops among noise sentences, every name of the
-  chain asked by its value.
+  chain asked by its value, after RULER's worked example of one.
 
 A needle reads "One of the special magic numbers for {key} is: {value}.".
 An essay's needles go in at depths drawn without replacement from RULER's
@@ -28,9 +28,9 @@ wonderwords' adjective-noun pairs.
 Turn 1 is built from pieces tokenized apart, as the needle set's is, so
 each needle's positions, and the pages that hold them, are known.
 
-**Scoring** is RULER's `string_match_all`: the share of a sample's
-references found in its answer, case-insensitive. A sample is answered if
-every reference is found.
+**Scoring** is RULER's `string_match_all`: the share of the strings a
+sample's answer should name, its `expected`, RULER's outputs, found in it,
+case-insensitive. A sample is answered if every one is found.
 
 **Where it departs from RULER** (ADR-0017's amendment): the essays' text
 is extracted with the standard library (`font_text`) and split into
@@ -47,7 +47,6 @@ tokenizer (ADR-0002).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import string
@@ -59,7 +58,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from . import needles
+from . import benchlog, needles
 
 #: The haystack's tokens at each length, the needle set's (#146, #156).
 LENGTHS = {"8K": needles.DEFAULT_HAYSTACK_TOKENS, "32K": needles.LONG_HAYSTACK_TOKENS}
@@ -85,6 +84,13 @@ VT_ANSWER_TOKENS = 30
 #: VT's chain: its hops, and its names' letters.
 VT_HOPS = 4
 VT_NAME_LETTERS = 5
+#: VT's one-shot example, which RULER puts before every sample's template:
+#: its names' letters, and the tokens it is made to fit, RULER's
+#: max_seq_length for it. Its value and names are drawn again for each
+#: sample, as RULER's randomize_icl does; its noise lines and the places of
+#: its chain's are drawn once for the task.
+VT_EXAMPLE_LETTERS = 3
+VT_EXAMPLE_TOKENS = 500
 
 
 @dataclass(frozen=True)
@@ -161,11 +167,11 @@ def draw(kind: str, rng: np.random.Generator, words: Words) -> str:
     raise ValueError(f"no kind {kind!r}")
 
 
-def score(answer: str, references) -> float:
-    """RULER's string_match_all for one sample: the share of `references`
-    found in `answer`, case-insensitive."""
+def score(answer: str, expected) -> float:
+    """RULER's string_match_all for one sample: the share of the `expected`
+    strings, RULER's outputs, found in `answer`, case-insensitive."""
     answer = answer.lower()
-    return sum(r.lower() in answer for r in references) / len(references)
+    return sum(r.lower() in answer for r in expected) / len(expected)
 
 
 @dataclass(frozen=True, eq=False)
@@ -174,10 +180,12 @@ class Sample:
 
     sample_id: str
     task: str
+    #: The sample's place in its task's draws, from 0.
+    index: int
     haystack_tokens: int
     query: str
     #: What the answer is to hold, RULER's outputs.
-    references: tuple[str, ...]
+    expected: tuple[str, ...]
     prefix: str
     turn_1: np.ndarray
     turn_2: np.ndarray
@@ -191,14 +199,16 @@ class Sample:
     needle_positions: tuple[tuple[int, int], ...]
     target_positions: tuple[tuple[int, int], ...]
     target_pages: tuple[tuple[int, int], ...]
+    page_tokens: int
+    #: VT's one-shot example's tokens in turn 1, before the template (#208).
+    example_tokens: int = 0
     #: An essay's needles' depths, in percent, in their order; none else.
     depths: tuple[int, ...] = field(default=())
-    page_tokens: int = 32
 
     def scored(self, answer: str) -> dict:
         """What a run's results hold of its answer: its score, and whether
         every reference was found."""
-        s = score(answer, self.references)
+        s = score(answer, self.expected)
         return {"correct": s == 1.0, "score": s}
 
     def tiers_at(self, planned) -> dict:
@@ -207,9 +217,9 @@ class Sample:
         return {"target_page_tiers": [planned.page_tiers(p) for p in self.target_pages]}
 
     def as_dict(self) -> dict:
-        return {"sample_id": self.sample_id, "task": self.task,
+        return {"sample_id": self.sample_id, "task": self.task, "index": self.index,
                 "haystack_tokens": self.haystack_tokens, "query": self.query,
-                "references": list(self.references), "prefix": self.prefix,
+                "expected": list(self.expected), "prefix": self.prefix,
                 "turn_1": self.turn_1.tolist(), "turn_2": self.turn_2.tolist(),
                 "turn_2_after_eos": self.turn_2_after_eos.tolist(),
                 "answer_tokens": self.answer_tokens, "document_start": self.document_start,
@@ -217,7 +227,8 @@ class Sample:
                 "needle_positions": [list(p) for p in self.needle_positions],
                 "target_positions": [list(p) for p in self.target_positions],
                 "target_pages": [list(p) for p in self.target_pages],
-                "depths": list(self.depths), "page_tokens": self.page_tokens}
+                "depths": list(self.depths), "page_tokens": self.page_tokens,
+                "example_tokens": self.example_tokens}
 
 
 def dumps(samples: list[Sample]) -> bytes:
@@ -240,7 +251,8 @@ def task_set(task_name: str, essays: str, words: Words, tokenizer, *, seed: int,
     task = TASKS[task_name]
     rng = np.random.default_rng([seed, TASK_NAMES.index(task_name), haystack_tokens])
     build = _Builder(task, tokenizer, words, haystack_tokens, page_tokens,
-                     essays if task.haystack == "essay" else None)
+                     essays if task.haystack == "essay" else None,
+                     np.random.default_rng([seed, TASK_NAMES.index(task_name), haystack_tokens, 1]))
     return [build.sample(k, rng) for k in range(samples)]
 
 
@@ -249,17 +261,56 @@ class _Needle(NamedTuple):
     target: bool
 
 
+def _chain(rng: np.random.Generator, letters: int, value: str) -> tuple[list[str], list[str]]:
+    """VT's chain of VT_HOPS hops from `value`, RULER's: its names, distinct
+    and none of them "VAR", and its statements, in order."""
+    names: list[str] = []
+    while len(names) < VT_HOPS + 1:
+        name = "".join(string.ascii_uppercase[i] for i in rng.integers(26, size=letters))
+        if name not in names and name != "VAR":
+            names.append(name)
+    statements = [f"VAR {names[0]} = {value}"] + [
+        f"VAR {names[j + 1]} = VAR {names[j]} " for j in range(VT_HOPS)]
+    return names, statements
+
+
+def _with_chain(noise_lines: int, places: list[int], statements: list[str]) -> list[str]:
+    """Noise lines with `statements` among them, each before the noise line
+    at its place, in order, as RULER inserts them."""
+    lines = [NOISE] * noise_lines
+    for j, (place, statement) in enumerate(zip(places, statements)):
+        lines.insert(place + j, statement)
+    return lines
+
+
 class _Builder:
     """What a task's samples share: the tokenizer, the template's pieces,
     and an essay haystack's sentences, tokenized once."""
 
     def __init__(self, task: Task, tokenizer, words: Words, haystack_tokens: int,
-                 page_tokens: int, essays: str | None):
+                 page_tokens: int, essays: str | None, example_rng: np.random.Generator):
         self.task, self.tokenizer, self.words = task, tokenizer, words
         self.tokens, self.page_tokens = haystack_tokens, page_tokens
         self.closing = self.ids(needles.TURN_1_CLOSING)
         self.end_of_turn = self.ids(needles.END_OF_TURN)
         self.essay = None if essays is None else self._essay(essays)
+        if task.name == "vt":
+            # As many noise lines as keep the example within its tokens,
+            # and the places of its chain among them, once for the task.
+            empty = len(self.ids(self._example([], ["VAR AAA = 12345"] * (VT_HOPS + 1),
+                                               ["AAA"] * (VT_HOPS + 1), "12345")))
+            self.example_lines = (VT_EXAMPLE_TOKENS - empty) // len(self.ids(f"{NOISE}\n"))
+            self.example_places = sorted(int(i) for i in example_rng.choice(
+                self.example_lines, VT_HOPS + 1, replace=False))
+
+    def _example(self, lines: list[str] | None, statements: list[str], names: list[str],
+                 value: str) -> str:
+        """VT's one-shot example, as RULER writes it: the template, its
+        context, question and answer prefix, then its answer, the names."""
+        context = "\n".join(statements if lines is None or not lines else lines)
+        return (VT_OPENING + context.replace(". \n", ".\n") + "\n" + VT_QUESTION.format(query=value)
+                + VT_PREFIX.format(num_v=VT_HOPS + 1, query=value) + " " + " ".join(names)
+                + "\n")
 
     def ids(self, text: str) -> np.ndarray:
         return np.asarray(self.tokenizer.encode(text).ids, dtype=np.int32)
@@ -280,11 +331,12 @@ class _Builder:
             at += len(batch)
         return pieces
 
-    def _filled(self, line: str | None, rng: np.random.Generator, avoid: set[str]) -> list:
-        """A needle or noise haystack, a line a piece, cut to its tokens: a
+    def _filled(self, line: str | None, rng: np.random.Generator, avoid: set[str],
+                tokens: int) -> list:
+        """A needle or noise haystack, a line a piece, cut to `tokens`: a
         filler needle of a key not in `avoid`, drawn each line, or `line`."""
         pieces, held = [], 0
-        while held < self.tokens:
+        while held < tokens:
             if line is None:
                 key = draw(self.task.key, rng, self.words)
                 while key in avoid:
@@ -293,24 +345,17 @@ class _Builder:
                                      value=draw(self.task.value, rng, self.words))
             else:
                 text = line
-            taken = self.ids(f"{text}\n")[:self.tokens - held]
+            taken = self.ids(f"{text}\n")[:tokens - held]
             pieces.append(taken)
             held += len(taken)
         return pieces
 
     def _needles(self, rng: np.random.Generator) -> tuple[str, tuple[str, ...], list[_Needle]]:
-        """A sample's query, references and needles, in the order they go in."""
+        """A sample's query, expected and needles, in the order they go in."""
         task = self.task
         if task.name == "vt":
-            names: list[str] = []
-            while len(names) < VT_HOPS + 1:
-                name = "".join(string.ascii_uppercase[i]
-                               for i in rng.integers(26, size=VT_NAME_LETTERS))
-                if name not in names:
-                    names.append(name)
             value = str(int(rng.integers(10000, 99999)))
-            chain = [f"VAR {names[0]} = {value}"] + [
-                f"VAR {names[j + 1]} = VAR {names[j]} " for j in range(VT_HOPS)]
+            names, chain = _chain(rng, VT_NAME_LETTERS, value)
             return value, tuple(names), [_Needle(c, True) for c in chain]
         keys: list[str] = []
         while len(keys) < task.keys:
@@ -333,7 +378,18 @@ class _Builder:
 
     def sample(self, k: int, rng: np.random.Generator) -> Sample:
         task = self.task
-        query, references, planted = self._needles(rng)
+        query, expected, planted = self._needles(rng)
+        example = ""
+        if task.name == "vt":  # its names and value drawn again, as randomize_icl does
+            value = str(int(rng.integers(10000, 99999)))
+            names, statements = _chain(rng, VT_EXAMPLE_LETTERS, value)
+            example = self._example(
+                _with_chain(self.example_lines, self.example_places, statements),
+                statements, names, value) + "\n"
+        example_tokens = len(self.ids(example)) if example else 0
+        if example and self.tokens - example_tokens < 4 * VT_EXAMPLE_TOKENS // 10:
+            raise ValueError(f"a haystack of {self.tokens} tokens leaves too little beside "
+                             f"VT's example of {example_tokens}")
         depths: tuple[int, ...] = ()
         if task.haystack == "essay":
             pieces = list(self.essay)
@@ -343,11 +399,14 @@ class _Builder:
             texts_of = [f" {n.text}" for n in planted]
         else:
             avoid = {query} if task.haystack == "needle" else set()
-            pieces = self._filled(NOISE if task.haystack == "noise" else None, rng, avoid)
+            pieces = self._filled(NOISE if task.haystack == "noise" else None, rng, avoid,
+                                  self.tokens - example_tokens)
             at = sorted(int(i) for i in rng.choice(len(pieces), len(planted), replace=False))
             texts_of = [f"{n.text}\n" for n in planted]
         words = texts(task, query)
-        opening = self.ids(needles.TURN_1_OPENING + words.opening)
+        opening = np.concatenate([self.ids(needles.TURN_1_OPENING),
+                                  *([self.ids(example)] if example else []),
+                                  self.ids(words.opening)])
 
         parts, positions, held, last = [opening], [], len(opening), 0
         for index, needle_text in zip(at, texts_of):
@@ -366,14 +425,14 @@ class _Builder:
         after_eos = self.ids(needles.TURN_2_AFTER_EOS.format(question=words.question)
                              + words.prefix)
         return Sample(
-            sample_id=f"{task.name}-{k}", task=task.name, haystack_tokens=self.tokens,
-            query=query, references=references, prefix=words.prefix,
+            sample_id=f"{task.name}-{k}", task=task.name, index=k, haystack_tokens=self.tokens,
+            query=query, expected=expected, prefix=words.prefix,
             turn_1=np.concatenate(parts), turn_2=np.concatenate([self.end_of_turn, after_eos]),
             turn_2_after_eos=after_eos, answer_tokens=task.answer_tokens,
             document_start=len(opening), closing_tokens=len(self.closing),
             needle_positions=tuple(positions), target_positions=targets,
             target_pages=tuple(needles.pages_holding(p, self.page_tokens) for p in targets),
-            depths=depths, page_tokens=self.page_tokens)
+            depths=depths, page_tokens=self.page_tokens, example_tokens=example_tokens)
 
 
 # -- RULER's data -------------------------------------------------------------------------
@@ -391,25 +450,25 @@ def sentences(text: str) -> list[str]:
 class _FirstFont(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.depth, self.done, self.text, self.code = 0, False, [], 0
+        self.nesting, self.done, self.text, self.in_code = 0, False, [], 0
 
     def handle_starttag(self, tag, attrs):
         if tag == "font" and not self.done:
-            self.depth += 1
-        elif tag == "br" and self.depth:
+            self.nesting += 1
+        elif tag == "br" and self.nesting:
             self.text.append("\n")
         elif tag in ("script", "style"):
-            self.code += 1
+            self.in_code += 1
 
     def handle_endtag(self, tag):
-        if tag == "font" and self.depth:
-            self.depth -= 1
-            self.done = self.depth == 0
-        elif tag in ("script", "style") and self.code:
-            self.code -= 1
+        if tag == "font" and self.nesting:
+            self.nesting -= 1
+            self.done = self.nesting == 0
+        elif tag in ("script", "style") and self.in_code:
+            self.in_code -= 1
 
     def handle_data(self, data):
-        if self.depth and not self.code:
+        if self.nesting and not self.in_code:
             self.text.append(data)
 
 
@@ -432,18 +491,17 @@ def essay_text(fetched: dict[str, str]) -> str:
         return url.split("/")[-1].replace(".html", ".txt")
 
     copies = sorted((u for u in fetched if ".html" not in u), key=name)
-    pages = sorted((u for u in fetched if ".html" in u), key=name)
-    return "".join([fetched[u] for u in copies] + [font_text(fetched[u]) for u in pages])
+    html = sorted((u for u in fetched if ".html" in u), key=name)
+    return "".join([fetched[u] for u in copies] + [font_text(fetched[u]) for u in html])
 
 
 #: Where tools/fetch_ruler.py puts RULER's data.
 DATA = Path(__file__).resolve().parents[2] / "data" / "ruler"
 ESSAYS = "PaulGrahamEssays.json"
 NOUNS, ADJECTIVES = "nounlist.txt", "adjectivelist.txt"
-
-
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+URL_LIST = "PaulGrahamEssays_URLs.txt"
+#: The benchmark log's kind for what tools/fetch_ruler.py fetched.
+DATA_KIND = "ruler-data"
 
 
 def load(directory: Path = DATA) -> tuple[str, Words, dict[str, str]]:
@@ -459,4 +517,4 @@ def load(directory: Path = DATA) -> tuple[str, Words, dict[str, str]]:
         return tuple(sorted({w.strip() for w in path.read_text().splitlines() if w.strip()}))
 
     essays = json.loads(files[0].read_text())["text"]
-    return essays, Words(lines(files[1]), lines(files[2])), {f.name: sha256(f) for f in files}
+    return essays, Words(lines(files[1]), lines(files[2])), {f.name: benchlog.file_sha256(f) for f in files}

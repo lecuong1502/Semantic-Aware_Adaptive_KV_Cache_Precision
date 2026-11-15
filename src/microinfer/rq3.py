@@ -63,11 +63,17 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Union
 
 import numpy as np
 
 from . import benchlog, controller, needles
+
+if TYPE_CHECKING:
+    from . import ruler
+
+#: What a run's sample is: the needle set's, or one of RULER's tasks' (#208).
+Sample = Union[needles.Sample, "ruler.Sample"]
 
 EXPERIMENTS = ("question-blind", "question-aware")
 SUMMARY_TOKENS = 64
@@ -268,7 +274,7 @@ def shares_turn_1(cond: Condition) -> bool:
 AfterAnswer = Callable[..., dict]
 
 
-def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
+def run(engine, sample: Sample, cond: Condition, experiment: str, *,
         plan_seed: int = 0, then: AfterAnswer | None = None) -> dict:
     """One sample through its turns: what a log entry's results hold. The
     effective bits, the tiers' shares and the needle's pages' tiers are what
@@ -285,7 +291,7 @@ def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
         return _close(engine, chat, sample, cond, experiment, seed, opened, then)
 
 
-def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment: str, *,
+def runs(engine, sample: Sample, conds: Sequence[Condition], experiment: str, *,
          plan_seed: int = 0, then: AfterAnswer | None = None) -> Iterator[tuple[Condition, dict]]:
     """Each of `conds` on one sample, with what `run` gives it: those that
     share turn 1 (shares_turn_1) first, in their order, from one turn 1,
@@ -346,7 +352,7 @@ class _Opened:
     opening: str | None
 
 
-def before_plan(engine, chat, sample: needles.Sample, experiment: str) -> _Opened:
+def before_plan(engine, chat, sample: Sample, experiment: str) -> _Opened:
     """Turn 1, and question-aware the answer's first tokens: what a run
     holds before its plan, on `chat`."""
     end_of_turn = engine.tokenizer.token_to_id(END_OF_TURN)
@@ -360,7 +366,7 @@ def before_plan(engine, chat, sample: needles.Sample, experiment: str) -> _Opene
     return _Opened(summary, stopped, turn_2, np.empty(0, dtype=np.int32), False, None)
 
 
-def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: str, seed: int,
+def _close(engine, chat, sample: Sample, cond: Condition, experiment: str, seed: int,
            opened: _Opened, then: AfterAnswer | None = None) -> dict:
     opening, answer = opened.opening, opened.answer
     planned = plan_at(chat, cond, seed)

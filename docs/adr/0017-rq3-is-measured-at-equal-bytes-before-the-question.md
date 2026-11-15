@@ -346,23 +346,39 @@ depth drawn without replacement from RULER's 40 evenly spaced depths, at
 the sentence boundary there. A filler or noise needle goes at a random
 sentence index. VT's statements read "VAR {name} = {value}" and
 "VAR {name} = VAR {name} ", one a line, in order, at random positions among
-the noise sentences.
+the noise sentences. As in RULER, VT's turn opens with a worked example: a
+chain of three-letter names among noise, fitted to 500 tokens, with its
+question, answer prefix and answer. Its layout is drawn once for the task,
+and its names and value again for each sample, as RULER's `randomize_icl`
+does. Its tokens count against the haystack's.
 
-**Where it departs from RULER**, each recorded with the data's hashes:
+**Where it departs from RULER**, each recorded with the data's hashes, and
+each for a reason:
 - **The essays** are fetched as RULER's script fetches them, from the URL
   list at a pinned RULER commit, the GitHub copies first, then
   paulgraham.com's. Their text is extracted with Python's standard library,
-  not html2text, so the haystack is RULER's essays but not RULER's bytes.
-  Sentences are split by a fixed rule of the standard library, not nltk's
-  punkt.
+  not html2text: the engine's environment is pinned and minimal
+  (requirements.txt), and a data script should not widen it. A page's
+  scripts and styles are dropped, as html2text drops them. The haystack is
+  RULER's essays, but not RULER's bytes. For the same reason, sentences
+  are split by a fixed rule, a stop before a capital, a digit, a quote or
+  a bracket, not by nltk's punkt, which needs a model of its own.
+- **Words** are wonderwords' lists at its last release, v2.2.0. RULER does
+  not pin a version.
 - **Keys** that a sample already holds are drawn again, so that no filler
-  shares the asked key. RULER does not check.
+  shares the asked key. RULER does not check. A filler with the asked key
+  would make a sample with two answers.
 - **Seeds.** Each task and length draws from a numpy generator of its own,
   seeded by the set's seed, the task and the length. Drawing more samples
-  leaves the first ones as they are, as the needle set's do (#146).
+  leaves the first ones as they are, as the needle set's do (#146), which
+  screening needs. RULER's Python `random` stream does not.
 - **Length.** A sample's haystack is cut to a number of tokens, 7936 at 8K
   and 32256 at 32K, the needle set's, rather than RULER's binary search to
-  a sequence length.
+  a sequence length. This keeps the two sets alike, and every turn of a 32K
+  run within Qwen2.5's 32768 positions.
+- **The answer prefixes** lose the spaces at their ends: they open the
+  assistant's reply in the chat template, where a leading space is not
+  how a reply begins, and the reply goes on after the prefix's last word.
 
 **RQ3's two turns.** RULER asks its question in the same message as its
 context. Here, as for the needle set:
