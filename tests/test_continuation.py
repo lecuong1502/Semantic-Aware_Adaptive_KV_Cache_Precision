@@ -57,6 +57,23 @@ def entry(log, passage, name, top1, kl, *, shape=SHAPE):
                              "plan": {"target_met": passage != "p01"}}, log=log)
 
 
+def test_a_family_with_a_begin_of_text_opens_every_passage_with_it():
+    """Llama-3.2 was trained on contexts that open with <|begin_of_text|>
+    (#209): each passage opens with it, then the split's next tokens, so
+    that passage 3 is as well formed as passage 0. Its tokens, the split's,
+    still follow each other with no overlap, and a passage keeps its length."""
+    tokens = np.arange(1000, dtype=np.int32)
+    shape = continuation.Shape(200, 30, 70)
+    ps = continuation.passages(tokens, 3, shape, bos=7)
+    for i, p in enumerate(ps):
+        whole = np.concatenate([p.prefix, p.warm, p.measured])
+        assert len(whole) == 300 and whole[0] == 7
+        np.testing.assert_array_equal(whole[1:], tokens[i * 299:(i + 1) * 299])
+        assert p.start == i * 299
+    with pytest.raises(ValueError, match="split holds"):
+        continuation.passages(tokens, 4, shape, bos=7)
+
+
 def test_a_way_of_holding_the_passage_it_cannot_measure_is_refused():
     """Before the engine is touched: an ablation of the scorer holds the
     passage as neither a plan at FP16 nor a static tier does."""

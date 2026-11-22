@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 from conftest import load_tool, require_model
-from microinfer import Engine, _microinfer, benchlog, controller, needles, rq3, rq3_summary
+from microinfer import Engine, _microinfer, benchlog, chat, controller, needles, rq3, rq3_summary
 
 SMALL = "qwen2.5-0.5b-instruct"
 LAYERS = 24  # the 0.5B model's
@@ -127,6 +127,7 @@ def test_a_controlled_plan_keeps_the_engine_s_floor_and_chases_the_full_policy_s
 def sample(engine):
     text = load_tool("perplexity").held_out_text()
     return needles.needle_set(text, engine.tokenizer, seed=158, samples_per_depth=1,
+                              template=chat.QWEN,
                               haystack_tokens=1024)[5]
 
 

@@ -519,7 +519,7 @@ class Conversation:
                              f"made as its was, {start.options}; this engine's is "
                              f"{engine._cache_options()}")
         self._engine = engine
-        self._cache = engine._new_cache(capacity=engine.config.max_position_embeddings)
+        self._cache = engine._new_cache(capacity=engine.config.context_window)
         engine._conversations.add(self)
         #: The last token the last turn chose, not yet in the cache.
         self._unfed = np.empty(0, dtype=np.int32)
@@ -1152,6 +1152,13 @@ class Engine:
         return chat.template_for(self.config)
 
     @cached_property
+    def begin_of_text_id(self) -> int | None:
+        """The token the family's contexts open with, <|begin_of_text|> for
+        Llama-3.2; None for Qwen2.5, which has none (#209)."""
+        begin = self.chat_template.begin
+        return None if begin is None else self.tokenizer.token_to_id(begin)
+
+    @cached_property
     def end_of_turn_id(self) -> int:
         """The token that ends a turn in the family's template: <|im_end|>
         for Qwen2.5, <|eot_id|> for Llama-3.2."""
@@ -1344,7 +1351,7 @@ class Engine:
         if self._seals():
             raise ValueError("holding rewrites positions in place, which only FP16 pages allow")
         ids = self.encode(prompt) if isinstance(prompt, str) else self._check_ids(prompt)
-        context = self.config.max_position_embeddings if context is None else context
+        context = self.config.context_window if context is None else context
         if not len(ids) < context:
             raise ValueError(f"the context, {context}, must exceed the prompt's "
                              f"{len(ids)} positions, to leave a span to decode")
@@ -1864,10 +1871,11 @@ class Engine:
         return ids.astype(np.int32)
 
     def _check_window(self, positions: int) -> None:
-        """Refuse, before any work, a sequence the model was not built for: past
-        max_position_embeddings its RoPE angles were never trained, and the
-        paged cache reserves exactly that many positions."""
-        window = self.config.max_position_embeddings
+        """Refuse, before any work, a sequence the engine was not built for:
+        past the model's own window its RoPE angles were never trained, past
+        the engine's 32K no experiment runs (config.CONTEXT_WINDOW), and the
+        paged cache reserves exactly context_window positions."""
+        window = self.config.context_window
         if positions > window:
             raise ValueError(f"{positions} positions exceed the model's context window of "
                              f"{window}: shorten the prompt or ask for fewer new tokens")

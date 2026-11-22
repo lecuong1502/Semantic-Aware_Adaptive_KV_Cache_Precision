@@ -29,7 +29,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import Engine, benchlog  # noqa: E402
+from microinfer import Engine, benchlog, chat  # noqa: E402
 from microinfer.golden import load_prompts  # noqa: E402
 from perplexity import ATTENTION, held_out_text  # noqa: E402
 
@@ -75,6 +75,9 @@ def main(argv: list[str]) -> int:
                      "each entry names the code that produced it")
 
     engine = Engine(REPO / "models" / args.model)
+    if engine.chat_template is not chat.QWEN:
+        parser.error(f"TEMPLATE is Qwen2.5's ChatML; {args.model} is of the "
+                     f"{engine.chat_template.name} family (#209)")
     engine.load_weights()
     texts = {p["id"]: p["text"] for p in load_prompts(REPO / "tools" / "prompts.jsonl")
              if p["group"] == "long"}

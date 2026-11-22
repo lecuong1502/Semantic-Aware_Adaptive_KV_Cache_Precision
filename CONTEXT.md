@@ -439,6 +439,36 @@ prompt appended to what the cache holds, and the tokens decoded after it.
 RQ3's experiments compress the cache between two turns (ADR-0017).
 _Avoid_: round, message (a turn holds both sides of the exchange)
 
+**Family**:
+The architecture a model is of, as the engine knows it beyond its config's
+numbers (#209): Qwen2, whose q, k and v projections always carry a bias,
+or Llama, whose config says whether they do. A family names its chat
+template. Qwen2.5-0.5B and 1.5B are one family; Llama-3.2-1B is the second.
+_Avoid_: model type, architecture (that is config.json's string for it)
+
+**Chat template**:
+How a family's checkpoint frames a conversation's messages, kept as the
+pieces RQ3's turns are built from (`microinfer.chat`): the opening, with
+the default system message, a user message's close, the end of turn, and
+the next user message's header. Each is checked against HuggingFace's own
+rendering of the same conversation.
+_Avoid_: prompt format, chat format
+
+**Piece** (of a turn):
+A span of a turn's text tokenized apart from the rest, the template's, a
+haystack line's, a needle's or the request's, so that a needle's
+positions are where its own tokens were put. Encoded with no special
+token added: the template's opening writes a begin-of-text where its
+family has one, once.
+_Avoid_: chunk (that is a prefill chunk's), segment
+
+**End of turn**:
+The token that closes a turn in a family's template, <|im_end|> for
+Qwen2.5 and <|eot_id|> for Llama-3.2: decoding stops at it, a turn cut
+short of it is closed with it, and a turn that stopped at it goes on with
+the next user message's header.
+_Avoid_: EOS (generation also stops at other end-of-sequence tokens)
+
 **Snapshot**:
 What a conversation's cache held after its turns, copied to the host: every
 layer's keys and values as they were stored, at FP16, the importance

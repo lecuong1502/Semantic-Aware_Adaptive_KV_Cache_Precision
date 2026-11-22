@@ -67,7 +67,7 @@ def main(argv: list[str]) -> int:
     vocab = engine.config.vocab_size
     # What the steps add after each context, which must stay in the window.
     room = args.repeat * (args.small + args.large) + args.decode_steps
-    window = engine.config.max_position_embeddings
+    window = engine.config.context_window
     with engine.conversation() as conversation:
         for asked in sorted(args.contexts):
             context = min(asked, window - room)

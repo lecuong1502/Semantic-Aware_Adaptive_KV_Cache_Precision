@@ -54,6 +54,7 @@ from typing import NamedTuple
 import numpy as np
 
 from . import benchlog, needles, rq3, rq3_summary
+from .chat import QWEN
 
 TURNS = 10
 PASSAGE_TOKENS = 720
@@ -204,7 +205,14 @@ def before_plan(engine, chat, dialogue: Dialogue) -> _Opened:
     """What a run holds before its plan, on `chat`: every turn, each after
     the last one's reply. A prompt starts where the last one's tokens and
     reply end: the reply's last token, not yet fed, takes the position
-    before it."""
+    before it.
+
+    The dialogue's turns are written in Qwen2.5's template, and the anchor
+    task is not in #209's subset: on another family it refuses, rather than
+    mix two templates in one conversation."""
+    if engine.chat_template is not QWEN:
+        raise ValueError(f"the anchor-fact dialogue is written in Qwen2.5's template, not "
+                         f"{engine.chat_template.name}'s (#209)")
     end_of_turn = engine.end_of_turn_id
     replies, stopped, position, fact = [], [], 0, None
 

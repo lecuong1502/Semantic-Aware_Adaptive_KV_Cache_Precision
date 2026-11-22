@@ -221,7 +221,7 @@ class PagedCache(_Cache):
         tier_map = tier_map or []
         page_tokens = device.page_tokens
         layers = cfg.num_hidden_layers
-        pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
+        pages_per_layer = -(-cfg.context_window // page_tokens)
         storage = self.tier if halves == device.Halves.Both else Tier.FP16
         seals = device.KVPages.seals_for(self.tier, tier_map, always_seal)
         held = {storage} | {t for row in tier_map for t in row}

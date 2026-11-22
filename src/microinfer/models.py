@@ -14,7 +14,8 @@ from .config import CARDS
 
 #: Development target and experimental target from ADR-0003. One parameterised
 #: kernel serves both: same family, same RoPE, same two KV heads, same 32K
-#: context — only `hidden_size` and the derived `head_dim` differ.
+#: context — only `hidden_size` and the derived `head_dim` differ. And the
+#: second family, Llama-3.2-1B (ADR-0003's amendment, #209).
 VERIFIED: dict[str, dict] = {
     "qwen2.5-0.5b-instruct": {
         "num_hidden_layers": 24,
@@ -47,6 +48,28 @@ VERIFIED: dict[str, dict] = {
         "hidden_act": "silu",
         "rope_scaling": None,
         "head_dim": 128,
+    },
+    # The second family (#209), read from its config.json on 2026-11-23,
+    # where every value matched what ADR-0003's amendment assumed: eight KV
+    # heads, llama3 RoPE scaling, no projection bias, a 128K window.
+    "llama-3.2-1b-instruct": {
+        "architecture": "LlamaForCausalLM",
+        "attention_bias": False,
+        "num_hidden_layers": 16,
+        "hidden_size": 2048,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "intermediate_size": 8192,
+        "vocab_size": 128256,
+        "max_position_embeddings": 131072,
+        "rope_theta": 500000.0,
+        "rms_norm_eps": 1e-05,
+        "tie_word_embeddings": True,
+        "torch_dtype": "bfloat16",
+        "hidden_act": "silu",
+        "rope_scaling": {"factor": 32.0, "high_freq_factor": 4.0, "low_freq_factor": 1.0,
+                         "original_max_position_embeddings": 8192, "rope_type": "llama3"},
+        "head_dim": 64,
     },
 }
 

@@ -44,6 +44,8 @@ from microinfer.config import ModelConfig
 from microinfer.models import VERIFIED
 
 MODELS = sorted(VERIFIED)
+#: The model a test of one shape uses: the development target (ADR-0003).
+SMALL = "qwen2.5-0.5b-instruct"
 
 #: The kernel's own tile sizes, read from the module so that "below one tile"
 #: and "not a multiple of the tile" track the kernel rather than a guess at it.
@@ -162,7 +164,7 @@ def test_the_precision_contract_is_fp32_scores_and_weights():
     And the floor admits fp32 scores and sums, and no more: holding the
     softmax weights in fp16 for P @ V, as tensor-core kernels do, is
     simulated and fails the gate. That trade would go through ADR-0006."""
-    cfg = ModelConfig.from_card(MODELS[0])
+    cfg = ModelConfig.from_card(SMALL)
     rng = np.random.default_rng(4)
     q, k, v = (rng.standard_normal((50, cfg.num_attention_heads, cfg.head_dim)).astype(np.float32)
                for _ in range(3))
@@ -218,7 +220,7 @@ def test_attention_is_causal():
     mask applied by multiplying by zero or adding a large negative number. And
     position 0 attends to itself: with the diagonal masked by an off-by-one
     its output would be NaN or zero, not exactly v[0]."""
-    cfg = ModelConfig.from_card(MODELS[0])
+    cfg = ModelConfig.from_card(SMALL)
     rng = np.random.default_rng(2)
     for seq in (TILE_K - 3, 2 * TILE_K + 5):
         q, k, v = make_qkv(seq, seq, cfg.num_attention_heads, cfg.head_dim, seed=1)
@@ -293,7 +295,7 @@ def test_runs_at_a_length_whose_mask_alone_would_not_fit():
     seq = int(np.ceil(np.sqrt(total) / TILE_K) + 1) * TILE_K
     assert seq * seq > total
 
-    head_dim = ModelConfig.from_card(MODELS[0]).head_dim
+    head_dim = ModelConfig.from_card(SMALL).head_dim
     rng = np.random.default_rng(9)
     q, k, v = (fp16_exact(rng.standard_normal((seq, 1, head_dim), dtype=np.float32)) for _ in range(3))
 

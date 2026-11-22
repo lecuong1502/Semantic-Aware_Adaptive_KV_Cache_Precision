@@ -262,3 +262,12 @@ def test_the_engine_knows_its_family_s_template_and_end_of_turn():
     assert engine.chat_template is chat.QWEN
     assert engine.end_of_turn_id == engine.tokenizer.token_to_id("<|im_end|>")
     assert engine.end_of_turn_id in engine.eos_token_ids
+
+
+def test_only_a_family_with_a_begin_of_text_names_one():
+    from microinfer import chat
+    assert Engine(require_model("qwen2.5-0.5b-instruct")).begin_of_text_id is None
+    llama = Engine(require_model("llama-3.2-1b-instruct"))
+    assert llama.chat_template is chat.LLAMA3
+    assert llama.begin_of_text_id == llama.tokenizer.token_to_id("<|begin_of_text|>") == 128000
+    assert llama.end_of_turn_id == 128009 and llama.end_of_turn_id in llama.eos_token_ids

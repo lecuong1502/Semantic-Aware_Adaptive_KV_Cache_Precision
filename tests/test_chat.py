@@ -94,3 +94,35 @@ def test_the_generator_renders_the_same_probe_on_the_same_date():
              if isinstance(node, ast.Assign) for t in node.targets
              if getattr(t, "id", None) in ("CHAT_PROBE", "CHAT_DATE")}
     assert found == {"CHAT_PROBE": chat.PROBE, "CHAT_DATE": chat.LLAMA3_DATE}
+
+
+def test_llama_s_template_trims_a_message_s_content_and_qwen_s_does_not():
+    """Llama-3.2's Jinja renders `message['content'] | trim`; Qwen2.5's
+    renders the content as given. So the first piece of a Llama user
+    message loses its leading space, as HuggingFace would render it, and a
+    Qwen one keeps it: the logged Qwen samples are unchanged."""
+    text = " The access code for the Juniper archive is XQT-4827.\n"
+    llama = _tokenizer("llama-3.2-1b-instruct")
+    ids = chat.encode(llama, text)
+    np.testing.assert_array_equal(chat.content_opening(llama, chat.LLAMA3, ids),
+                                  chat.encode(llama, text.lstrip()))
+    qwen = _tokenizer("qwen2.5-0.5b-instruct")
+    ids = chat.encode(qwen, text)
+    assert chat.content_opening(qwen, chat.QWEN, ids) is ids
+    assert chat.LLAMA3.trims and not chat.QWEN.trims
+
+
+def test_the_needle_set_s_llama_turns_open_their_content_as_huggingface_would():
+    """Turn 1's content, after the opening, starts with no space, at every
+    depth, the 0% needle included; the needle's positions are still where
+    its tokens are."""
+    from conftest import load_tool
+    tokenizer = _tokenizer("llama-3.2-1b-instruct")
+    text = load_tool("perplexity").held_out_text()
+    samples = needles.needle_set(text, tokenizer, seed=146, samples_per_depth=1,
+                                 template=chat.LLAMA3)
+    for s in samples:
+        content = tokenizer.decode(s.turn_1[s.document_start:].tolist())
+        assert not content[0].isspace(), s.sample_id
+        start, end = s.needle_positions
+        assert s.needle.lstrip(" ") in tokenizer.decode(s.turn_1[start:end].tolist())

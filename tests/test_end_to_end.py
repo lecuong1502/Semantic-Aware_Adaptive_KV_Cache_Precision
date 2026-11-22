@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 
 from conftest import load_tool, require_model
-from microinfer import Engine, _microinfer, benchlog, end_to_end, monitor, needles, replay, rq3
+from microinfer import (Engine, _microinfer, benchlog, chat, end_to_end, monitor, needles, replay,
+                        rq3)
 from microinfer.footprint import MIB
 
 SMALL = "qwen2.5-0.5b-instruct"
@@ -119,6 +120,7 @@ def engine():
 def sample(engine):
     text = load_tool("perplexity").held_out_text()
     return needles.needle_set(text, engine.tokenizer, seed=157, samples_per_depth=1,
+                              template=chat.QWEN,
                               haystack_tokens=2048)[5]
 
 

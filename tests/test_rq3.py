@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from conftest import require_model
-from microinfer import Engine, benchlog, needles, rq3
+from microinfer import Engine, benchlog, chat, needles, rq3
 from microinfer.engine import Conversation
 
 REPO = Path(__file__).resolve().parent.parent
@@ -86,7 +86,7 @@ def engine():
 
 @pytest.fixture(scope="module")
 def samples(engine):
-    return needles.needle_set(tool.held_out_text(), engine.tokenizer, seed=147,
+    return needles.needle_set(tool.held_out_text(), engine.tokenizer, seed=147, template=chat.QWEN,
                               haystack_tokens=1024)
 
 

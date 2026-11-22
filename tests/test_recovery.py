@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from conftest import require_model
-from microinfer import Engine, benchlog, needles, recovery, rq3
+from microinfer import Engine, benchlog, chat, needles, recovery, rq3
 
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("recovery_tool", REPO / "tools" / "recovery.py")
@@ -109,7 +109,7 @@ def engine():
 
 @pytest.fixture(scope="module")
 def samples(engine):
-    return needles.needle_set(tool.held_out_text(), engine.tokenizer, seed=155,
+    return needles.needle_set(tool.held_out_text(), engine.tokenizer, seed=155, template=chat.QWEN,
                               samples_per_depth=1, haystack_tokens=1024)
 
 

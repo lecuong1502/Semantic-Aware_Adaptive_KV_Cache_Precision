@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from conftest import require_model
-from microinfer import Engine, needles
+from microinfer import Engine, chat, needles
 
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("perplexity", REPO / "tools" / "perplexity.py")
@@ -36,7 +36,7 @@ def text():
 
 @pytest.fixture(scope="module")
 def built(engine, text):
-    return needles.needle_set(text, engine.tokenizer, seed=146)
+    return needles.needle_set(text, engine.tokenizer, seed=146, template=chat.QWEN)
 
 
 def test_ten_depths_of_five_samples(built):
@@ -48,9 +48,9 @@ def test_ten_depths_of_five_samples(built):
 
 
 def test_the_same_seed_gives_the_same_set_byte_for_byte(engine, text, built):
-    again = needles.needle_set(text, engine.tokenizer, seed=146)
+    again = needles.needle_set(text, engine.tokenizer, seed=146, template=chat.QWEN)
     assert needles.dumps(again) == needles.dumps(built)
-    other = needles.needle_set(text, engine.tokenizer, seed=147)
+    other = needles.needle_set(text, engine.tokenizer, seed=147, template=chat.QWEN)
     assert needles.dumps(other) != needles.dumps(built)
 
 
@@ -108,7 +108,8 @@ def test_an_answer_is_correct_iff_it_contains_the_code(answer, right):
 def test_a_small_text_still_gives_a_whole_set(engine):
     """Fewer tokens than a haystack: the articles wrap around."""
     text = " = A = \n The first article , short .\n = B = \n The second , shorter .\n"
-    small = needles.needle_set(text, engine.tokenizer, seed=1, haystack_tokens=300)
+    small = needles.needle_set(text, engine.tokenizer, seed=1, haystack_tokens=300,
+                               template=chat.QWEN)
     assert len(small) == 50 and all(s.haystack_tokens == 300 for s in small)
 
 
@@ -148,7 +149,8 @@ def test_the_samples_of_a_depth_have_their_own_haystacks(built):
 def test_more_samples_a_depth_leave_the_first_ones_as_they_are(engine, text, built):
     """Screening replaces a sample FP16 answers wrongly (#148) with the next
     of its depth: drawing more leaves the first five, byte for byte."""
-    more = needles.needle_set(text, engine.tokenizer, seed=146, samples_per_depth=7)
+    more = needles.needle_set(text, engine.tokenizer, seed=146, samples_per_depth=7,
+                              template=chat.QWEN)
     assert len(more) == 70
     first_five = [s for s in more if int(s.sample_id.split("-")[1]) < 5]
     assert needles.dumps(first_five) == needles.dumps(built)

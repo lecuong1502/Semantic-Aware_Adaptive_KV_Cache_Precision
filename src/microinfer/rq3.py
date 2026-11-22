@@ -85,7 +85,7 @@ ANSWER_TOKENS = needles.ANSWER_TOKENS
 AWARE_TOKENS = 4
 AWARE_OPENING = "The access code is"
 #: Qwen2.5's end of turn; a run reads its engine's, Engine.end_of_turn_id (#209).
-END_OF_TURN = "<|im_end|>"
+END_OF_TURN = needles.END_OF_TURN
 
 
 @dataclass(frozen=True)

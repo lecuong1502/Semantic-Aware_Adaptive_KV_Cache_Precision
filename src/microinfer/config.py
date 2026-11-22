@@ -21,14 +21,30 @@ class ConfigMismatch(ValueError):
     """A model's config.json disagrees with what this repository expects."""
 
 
-#: The architectures the forward pass runs (model.py), each with whether its
-#: query, key and value projections carry a bias: Qwen2's always do, and its
-#: config does not say; Llama's say, in `attention_bias` (#209).
-ARCHITECTURES = {"Qwen2ForCausalLM": True, "LlamaForCausalLM": None}
+@dataclass(frozen=True)
+class Family:
+    """What the engine knows of an architecture beyond its config's numbers
+    (#209): its name, which chat.TEMPLATES keys its template by, and whether
+    its query, key and value projections always carry a bias, as Qwen2's
+    do though its config does not say, or carry one only if its config's
+    `attention_bias` says so, as Llama's."""
+
+    name: str
+    always_biased: bool
+
+
+#: The architectures the forward pass runs (model.py), by config.json's
+#: architectures[0]: the one table a new family is added to.
+FAMILIES = {"Qwen2ForCausalLM": Family("qwen2", always_biased=True),
+            "LlamaForCausalLM": Family("llama3", always_biased=False)}
 
 #: The rope_scaling kinds the kernels implement (rope_scaling.h). Any other
 #: would run as plain RoPE, a silent error, so it is refused.
 ROPE_SCALINGS = ("llama3",)
+
+#: The engine's context window: the experiments' 32K positions (ADR-0003),
+#: and Qwen2.5's own. Llama-3.2's 131072 is not run (#209).
+CONTEXT_WINDOW = 32768
 
 
 @dataclass(frozen=True)
@@ -54,7 +70,7 @@ class ModelConfig:
     torch_dtype: str
     hidden_act: str
     rope_scaling: Any | None
-    #: architectures[0] in config.json: one of ARCHITECTURES.
+    #: architectures[0] in config.json: one of FAMILIES.
     architecture: str = "Qwen2ForCausalLM"
     #: Whether q_proj, k_proj and v_proj carry a bias (ADR-0009's path).
     attention_bias: bool = True
@@ -65,6 +81,16 @@ class ModelConfig:
         1.5B — which is why no kernel may hardcode it (ADR-0003). Llama-3.2's
         states it, and from_dict refuses one that differs from this."""
         return self.hidden_size // self.num_attention_heads
+
+    @property
+    def context_window(self) -> int:
+        """The positions a cache is sized for and a generation may reach:
+        the model's own window, at most CONTEXT_WINDOW."""
+        return min(self.max_position_embeddings, CONTEXT_WINDOW)
+
+    @property
+    def family(self) -> Family:
+        return FAMILIES[self.architecture]
 
     @property
     def kv_bytes_per_token(self) -> int:
@@ -87,13 +113,11 @@ class ModelConfig:
                 f"This is not the model this repository was written against."
             )
         architecture = (raw.get("architectures") or [None])[0]
-        if architecture not in ARCHITECTURES:
+        if architecture not in FAMILIES:
             raise ConfigMismatch(
                 f"{name}: architecture {architecture!r} is not one the engine runs. "
-                f"Known: {', '.join(ARCHITECTURES)}.")
-        bias = ARCHITECTURES[architecture]
-        if bias is None:
-            bias = bool(raw.get("attention_bias", False))
+                f"Known: {', '.join(FAMILIES)}.")
+        bias = FAMILIES[architecture].always_biased or bool(raw.get("attention_bias", False))
         derived = raw["hidden_size"] // raw["num_attention_heads"]
         if raw.get("head_dim", derived) != derived:
             raise ConfigMismatch(

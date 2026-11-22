@@ -14,7 +14,7 @@ screens, runs and summarises.
 import pytest
 
 from conftest import load_tool, require_model
-from microinfer import Engine, anchors, benchlog, controller, needles, rq3
+from microinfer import Engine, anchors, benchlog, chat, controller, needles, rq3
 
 NAME = "qwen2.5-1.5b-instruct"
 SMALL = "qwen2.5-0.5b-instruct"
@@ -290,3 +290,12 @@ def test_the_tool_screens_runs_takes_a_stopped_run_up_and_summarises(tmp_path, m
     (summary,) = [e for e in benchlog.read(log) if e["kind"] == "anchor-summary"]
     assert summary["results"]["dialogues"] == 2
     assert set(summary["results"]["recall"]) == {"fp16", "semantic-80", "uniform-80"}
+
+
+def test_the_dialogue_refuses_a_family_whose_template_it_is_not_written_in():
+    """The anchor-fact dialogue's turns are Qwen2.5's ChatML, and it is not
+    in #209's subset: on another family it refuses, rather than mix two
+    templates in one conversation."""
+    from types import SimpleNamespace
+    with pytest.raises(ValueError, match="Qwen2.5's template"):
+        anchors.before_plan(SimpleNamespace(chat_template=chat.LLAMA3), None, None)

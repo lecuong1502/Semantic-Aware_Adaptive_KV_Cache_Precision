@@ -188,7 +188,7 @@ def needle_set(text: str, tokenizer, *, seed: int,
                samples_per_depth: int = SAMPLES_PER_DEPTH,
                haystack_tokens: int = DEFAULT_HAYSTACK_TOKENS,
                page_tokens: int | None = None,
-               template: chat.Template = chat.QWEN) -> list[Sample]:
+               template: chat.Template) -> list[Sample]:
     """The samples, depth by depth, from `text`, WikiText-2's test split as
     tools/perplexity.py reads it, and `tokenizer`, the checkpoint's: 50 by
     default, five a depth, their turns in `template`, the checkpoint's
@@ -227,14 +227,15 @@ def needle_set(text: str, tokenizer, *, seed: int,
             bounds = np.concatenate([[0], np.cumsum([len(p) for p in pieces])])
             cut = int(np.argmin(np.abs(bounds - depth * haystack_tokens)))
             needle, question = needle_text(name, code), question_text(name)
-            planted = ids(piece(needle))
-            before = np.concatenate([opening, *pieces[:cut]])
+            document = [*pieces[:cut], ids(piece(needle)), *pieces[cut:]]
+            document[0] = chat.content_opening(tokenizer, template, document[0])
+            before = np.concatenate([opening, *document[:cut]])
             after_eos = ids(after_eos_text.format(question=question))
-            start, end = len(before), len(before) + len(planted)
+            start, end = len(before), len(before) + len(document[cut])
             samples.append(Sample(
                 sample_id=sample_id(depth, k), depth=depth, name=name, code=code,
                 needle=needle, question=question,
-                turn_1=np.concatenate([before, planted, *pieces[cut:], closing]),
+                turn_1=np.concatenate([before, *document[cut:], closing]),
                 turn_2=np.concatenate([end_of_turn, after_eos]), turn_2_after_eos=after_eos,
                 document_start=len(opening), haystack_tokens=haystack_tokens,
                 first_article=article, first_title=haystacks.found[article][0],

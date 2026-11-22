@@ -239,7 +239,7 @@ def dumps(samples: list[Sample]) -> bytes:
 
 def task_set(task_name: str, essays: str, words: Words, tokenizer, *, seed: int, samples: int,
              haystack_tokens: int = LENGTHS["8K"], page_tokens: int | None = None,
-             template: chat.Template = chat.QWEN) -> list[Sample]:
+             template: chat.Template) -> list[Sample]:
     """`samples` of `task_name`, in order, from a generator seeded by
     `seed`, the task and `haystack_tokens`: drawing more leaves the first
     ones as they are. `essays` is RULER's essay text, `words` its words,
@@ -292,7 +292,7 @@ class _Builder:
 
     def __init__(self, task: Task, tokenizer, words: Words, haystack_tokens: int,
                  page_tokens: int, essays: str | None, example_rng: np.random.Generator,
-                 template: chat.Template = chat.QWEN):
+                 template: chat.Template):
         self.task, self.tokenizer, self.words = task, tokenizer, words
         self.tokens, self.page_tokens = haystack_tokens, page_tokens
         self.template = template
@@ -409,9 +409,9 @@ class _Builder:
             at = sorted(int(i) for i in rng.choice(len(pieces), len(planted), replace=False))
             texts_of = [f"{n.text}\n" for n in planted]
         words = texts(task, query)
-        opening = np.concatenate([self.ids(self.template.opening),
-                                  *([self.ids(example)] if example else []),
-                                  self.ids(words.opening)])
+        content = [*([self.ids(example)] if example else []), self.ids(words.opening)]
+        content[0] = chat.content_opening(self.tokenizer, self.template, content[0])
+        opening = np.concatenate([self.ids(self.template.opening), *content])
 
         parts, positions, held, last = [opening], [], len(opening), 0
         for index, needle_text in zip(at, texts_of):

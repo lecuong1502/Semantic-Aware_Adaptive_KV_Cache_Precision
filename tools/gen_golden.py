@@ -118,7 +118,7 @@ GREEDY = {"do_sample": False, "num_beams": 1, "repetition_penalty": 1.0,
 #: engine's copy of its pieces to be checked against (microinfer.chat.PROBE,
 #: tests/test_chat.py), and the date Llama-3.2's template is given, or it
 #: writes today's. A template that reads no date ignores it.
-CHAT_PROBE = ("USER-A", "ASSISTANT-B", "USER-C")
+CHAT_PROBE = (" USER-A\n", "ASSISTANT-B", "USER-C")
 CHAT_DATE = "26 Jul 2024"
 
 

@@ -12,7 +12,7 @@ log's entries, pure; and tools/rq3.py --long and tools/summarise_rq3.py
 import pytest
 
 from conftest import load_tool, require_model
-from microinfer import Engine, benchlog, needles, rq3, rq3_summary
+from microinfer import Engine, benchlog, chat, needles, rq3, rq3_summary
 
 MODEL = "qwen2.5-1.5b-instruct"
 SAMPLES = [f"d{d:02d}-0" for d in range(0, 100, 10)]
@@ -25,7 +25,7 @@ def test_the_subset_is_one_sample_a_depth_within_the_model_s_window():
     in Qwen2.5's 32768 positions."""
     engine = Engine(require_model(MODEL))  # the tokenizer alone: no weights
     built = needles.needle_set(load_tool("perplexity").held_out_text(), engine.tokenizer,
-                               seed=140, samples_per_depth=1,
+                               seed=140, template=chat.QWEN, samples_per_depth=1,
                                haystack_tokens=needles.LONG_HAYSTACK_TOKENS)
     assert [s.sample_id for s in built] == SAMPLES
     window = engine.config.max_position_embeddings

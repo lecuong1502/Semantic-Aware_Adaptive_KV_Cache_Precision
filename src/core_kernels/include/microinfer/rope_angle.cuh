@@ -26,16 +26,16 @@ namespace microinfer
       return inv_freq;
     }
     const double wavelength = 2.0 * 3.14159265358979323846 / inv_freq;
-    const double old = scaling.original_max_position_embeddings;
-    if (wavelength < old / scaling.high_freq_factor)
+    const double original = scaling.original_max_position_embeddings;
+    if (wavelength < original / scaling.high_freq_factor)
     {
       return inv_freq; // high frequency: kept
     }
-    if (wavelength > old / scaling.low_freq_factor)
+    if (wavelength > original / scaling.low_freq_factor)
     {
       return inv_freq / scaling.factor; // low frequency: scaled
     }
-    const double smooth = (old / wavelength - scaling.low_freq_factor) /
+    const double smooth = (original / wavelength - scaling.low_freq_factor) /
                           (scaling.high_freq_factor - scaling.low_freq_factor);
     return (1.0 - smooth) * inv_freq / scaling.factor + smooth * inv_freq;
   }

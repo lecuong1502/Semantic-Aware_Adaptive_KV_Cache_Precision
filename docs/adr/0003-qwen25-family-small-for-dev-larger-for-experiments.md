@@ -156,7 +156,37 @@ float64 port of HuggingFace's `_compute_llama3_parameters`.
   whole prompt set, and each narrower tier costs more than the one above
   (`tests/test_llama.py`).
 
-The constants in the table are from prior knowledge, as this ADR's first
-ones were. They are verified against the checkpoint's own `config.json`
-when it is downloaded, and the card committed then; until that is done the
-engine refuses the model (`VERIFIED`).
+- **Trimming.** Llama-3.2's template renders a message's content trimmed
+  (`| trim`); Qwen2.5's renders it as given. A needle set's document opens
+  with a space, a haystack line's, so a Llama turn's first piece is encoded
+  again without it (`chat.content_opening`). The probe's first message
+  opens with a space and ends with a newline, so the check above covers it.
+- **Continuation passages.** They are cut from the split encoded with no
+  special token added. For a family with a begin-of-text, each passage
+  opens with it and takes one fewer of the split's tokens, so every
+  passage, not only the first, opens as its family's contexts do.
+- **The window.** Llama-3.2's own is 131,072 positions. Every experiment
+  runs within 32K, and a cache is sized to the engine's window, at most
+  32,768 (`ModelConfig.context_window`): at 131,072 a contiguous cache alone
+  would be 4 GiB, which 6 GiB cannot hold beside the weights.
+
+### As measured (#209)
+
+The constants in the table were from prior knowledge, as this ADR's first
+ones were. Each matched the checkpoint's own `config.json`, downloaded from
+`meta-llama/Llama-3.2-1B-Instruct` on 2026-11-23; the card is committed
+beside Qwen2.5's.
+
+On ADR-0006's gate, against a float32 HuggingFace reference over the 24
+prompts (5,689 positions):
+
+| | top-1 agreement | mean KL(HF ‖ ours) |
+|---|---:|---:|
+| FP16, every prompt | 99.98% | 9.8e-7 |
+| FP16, the 8-prompt tier subset | 100% | 7.9e-7 |
+| INT8 | 100% | 5.3e-6 |
+| INT4 | 99.72% | 1.2e-3 |
+| INT2 | 98.28% | 7.4e-2 |
+
+FP16 passes the gate. Each narrower tier costs more than the one above,
+KL rising strictly and top-1 never rising, as Qwen2.5's tiers do.
