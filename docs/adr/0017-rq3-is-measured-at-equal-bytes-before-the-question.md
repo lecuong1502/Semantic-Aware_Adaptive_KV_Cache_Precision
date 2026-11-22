@@ -316,3 +316,160 @@ an FP16 cache's bytes. RQ3's static tiers are therefore three:
 The comparison the closing question makes is unchanged. The static tiers
 answer a different question: what a session pays when its cache is held
 low throughout, where the adaptive engine pays only under pressure.
+
+---
+
+## Amendment (#208): RULER's tasks, a quality task below its ceiling
+
+The needle set sits at its ceiling: static INT2 answered 45 of 50 at 8K,
+so at most five samples could be discordant at 80%, fewer than McNemar's
+test needs (Chapter 4). The owner chose RULER's subsets (2026-11-14), and
+RULER's own essay haystack for the tasks that have one (2026-11-15). This
+amendment fixes how they are generated, adapted to RQ3's turns, screened
+and tested, before any of them is run.
+
+**The tasks.** Five of RULER's (Hsieh et al., 2024), each by its template,
+answer prefix, generation length and arguments in RULER's
+`scripts/synthetic.yaml` and `scripts/data/synthetic/constants.py`:
+
+| Task | Haystack | Keys | Values | Needles | Answer |
+|---|---|---|---|---|---|
+| `niah_multikey_1` | essays | words | 7-digit numbers | 4 keys, one asked | 1 value |
+| `niah_multikey_2` | needles | words | 7-digit numbers | 1, among needle-shaped fillers | 1 value |
+| `niah_multikey_3` | needles | UUIDs | UUIDs | 1, among needle-shaped fillers | 1 value |
+| `niah_multivalue` | essays | words | 7-digit numbers | 1 key, 4 values | 4 values |
+| `vt` | noise | 5 capitals | 5-digit number | 1 chain of 4 hops | 5 names |
+
+A needle reads "One of the special magic numbers for {key} is: {value}."
+Words are wonderwords' adjective-noun pairs. An essay needle goes in at a
+depth drawn without replacement from RULER's 40 evenly spaced depths, at
+the sentence boundary there. A filler or noise needle goes at a random
+sentence index. VT's statements read "VAR {name} = {value}" and
+"VAR {name} = VAR {name} ", one a line, in order, at random positions among
+the noise sentences. As in RULER, VT's turn opens with a worked example: a
+chain of three-letter names among noise, fitted to 500 tokens, with its
+question, answer prefix and answer. Its layout is drawn once for the task,
+and its names and value again for each sample, as RULER's `randomize_icl`
+does. Its tokens count against the haystack's.
+
+**Where it departs from RULER**, each recorded with the data's hashes, and
+each for a reason:
+- **The essays** are fetched as RULER's script fetches them, from the URL
+  list at a pinned RULER commit, the GitHub copies first, then
+  paulgraham.com's. Their text is extracted with Python's standard library,
+  not html2text: the engine's environment is pinned and minimal
+  (requirements.txt), and a data script should not widen it. A page's
+  scripts and styles are dropped, as html2text drops them. The haystack is
+  RULER's essays, but not RULER's bytes. For the same reason, sentences
+  are split by a fixed rule, a stop before a capital, a digit, a quote or
+  a bracket, not by nltk's punkt, which needs a model of its own.
+- **Words** are wonderwords' lists at its last release, v2.2.0. RULER does
+  not pin a version.
+- **Keys** that a sample already holds are drawn again, so that no filler
+  shares the asked key. RULER does not check. A filler with the asked key
+  would make a sample with two answers.
+- **Seeds.** Each task and length draws from a numpy generator of its own,
+  seeded by the set's seed, the task and the length. Drawing more samples
+  leaves the first ones as they are, as the needle set's do (#146), which
+  screening needs. RULER's Python `random` stream does not.
+- **Length.** A sample's haystack is cut to a number of tokens, 7936 at 8K
+  and 32256 at 32K, the needle set's, rather than RULER's binary search to
+  a sequence length. This keeps the two sets alike, and every turn of a 32K
+  run within Qwen2.5's 32768 positions.
+- **The answer prefixes** lose the spaces at their ends: they open the
+  assistant's reply in the chat template, where a leading space is not
+  how a reply begins, and the reply goes on after the prefix's last word.
+
+**RQ3's two turns.** RULER asks its question in the same message as its
+context. Here, as for the needle set:
+1. **Turn 1** is the template's opening, the context, and the general
+   request, "Summarize the document above in two sentences", answered in
+   up to 64 tokens.
+2. **The controlled plan** is applied at its end, question-blind.
+3. **Turn 2** is the template's question. The answer prefix opens the
+   assistant's reply, fed rather than decoded. The reply is decoded for
+   RULER's generation length: 128 tokens for the needle tasks, 30 for VT.
+
+Only the question-blind experiment is run.
+
+**Scoring.** RULER's `string_match_all`: a sample's score is the share of
+its references found in the answer, case-insensitive. A sample is
+**answered** if its score is 1, every reference found. McNemar's test pairs
+answered samples; the score's mean is reported beside it.
+
+**Screening.** For each task and length, samples are drawn in order and run
+at FP16. The first 50 answered are kept, and those before them that FP16
+did not answer are replaced, as ADR-0017's screening does.
+
+**The ceiling.** At each length, static INT2 is run on each task's
+screened set. A task is **below its ceiling** if static INT2 answers at
+most 40 of its 50, 80%. Only tasks below their ceiling enter the closing
+test. A task above it is reported and not tested.
+
+**Conditions**, all question-blind on the screened sets:
+- B1, FP16 (its screening runs);
+- B8, B2 and B3: static INT8, INT4 and INT2;
+- B4, B5 and B6: the uniform, random and semantic sources at 70% and 80%;
+- B7: eviction at 70% and 80%.
+
+**The tests, fixed now.**
+- **At 8K, the closing test:** semantic against uniform at 80%, pooled over
+  the tasks below their ceiling at 8K. McNemar's exact test, two-sided at
+  0.05, on the samples only one of the two answered. It is a yes only if
+  semantic also answered more.
+- **At 32K:** the same test over the tasks below their ceiling at 32K,
+  reported as a second test at 0.05, not as a correction of the first.
+- **Descriptive:** each task, each level, random, eviction and the static
+  tiers, with Wilson 95% intervals on accuracy and the paired mean score
+  difference's bootstrap 95% interval.
+
+Both answers are reported, yes or no.
+
+## As measured (#208): RULER's closing answer is yes at both lengths
+
+Qwen2.5-1.5B, question-blind, 50 screened samples a task. Every figure is
+from the summaries `ruler-summary` `2b7db8a7…` (8K) and `7c6ac229…` (32K),
+which also give where each plan left the needle (#208's last code). FP16
+answered 50 of the first 50, 53, 63, 96 and 76 drawn at 8K (MK-1, MK-2,
+MK-3, MV, VT) and of 54, 57, 135, 209 and 68 at 32K.
+
+**Every task is below its ceiling** at both lengths. Static INT2 answered
+21, 5, 0, 2 and 1 of 50 at 8K, and 10, 0, 0, 0 and 0 at 32K.
+
+| Task | INT2 | INT4 | Sem. 70 / 80 | Uni. 70 / 80 | Rand. 70 / 80 |
+|---|---|---|---|---|---|
+| 8K MK-1 | 21 | 50 | 49 / 38 | 50 / 37 | 50 / 38 |
+| 8K MK-2 | 5 | 50 | 50 / 15 | 50 / 19 | 49 / 20 |
+| 8K MK-3 | 0 | 43 | 17 / 1 | 46 / 1 | 44 / 4 |
+| 8K MV | 2 | 29 | 41 / 20 | 31 / 13 | 34 / 9 |
+| 8K VT | 1 | 35 | 49 / 49 | 50 / 30 | 45 / 29 |
+| 32K MK-1 | 10 | 50 | 49 / 35 | 50 / 29 | 50 / 30 |
+| 32K MK-2 | 0 | 41 | 35 / 6 | 46 / 3 | 43 / 4 |
+| 32K MK-3 | 0 | 30 | 0 / 0 | 38 / 0 | 21 / 0 |
+| 32K MV | 0 | 42 | 30 / 13 | 35 / 7 | 33 / 9 |
+| 32K VT | 0 | 43 | 48 / 46 | 48 / 13 | 47 / 15 |
+
+Bits at 70% / 80%: 4.98 / 3.40 at 8K, 4.84 / 3.25 at 32K, the same for
+every source.
+
+- **At 8K the closing answer is yes:** semantic 123 of 250, uniform 100;
+  40 samples answered by semantic alone and 17 by uniform alone, McNemar's
+  exact p = 0.0032, answered share +0.092 [0.032, 0.148]. VT holds the
+  difference: 19 to 0 there, 21 to 17 over the other four tasks.
+- **At 32K the closing answer is yes:** semantic 100 of 250, uniform 52;
+  58 to 10, p = 2.4e-9, +0.192 [0.132, 0.252]. VT gives 33 to 0; the
+  other four give 25 to 10, each task leaning to semantic, none alone
+  significant (p ≥ 0.15).
+- **Where the plans left the needle**, the share of the needle's (layer,
+  page) cells at INT2 at 80%, 8K / 32K, semantic against uniform: VT 3% /
+  3% against 70% / 70%; MK-1 63% / 52% against 74% / 68%; MV 60% / 49%
+  against 73% / 66%; MK-3 63% / 68% against 74% / 71%; MK-2 75% / 70%
+  against 69% / 72%. MK-2's and MK-3's haystack is needle-shaped fillers.
+- **At 70% semantic loses MK-3**, 17 against uniform's 46 at 8K
+  (p = 3e-8) and 0 against 38 at 32K (p = 7e-12), and MK-2 at 32K, 35
+  against 46 (p = 0.0034). Uniform at 70% held no cell at INT2. Semantic
+  held 6% and 9% of MK-3's cache there, 4% and 8% of the needle's cells, and an
+  INT2 cell on the needle in 44 and 47 of 50 runs. At 70% semantic won
+  MV at 8K, 41 against 31 (p = 0.0063).
+- **Eviction** answered at most 11 of 50 on the needle tasks, and 48 and
+  43 of VT at 8K, 43 and 39 at 32K.

@@ -63,15 +63,21 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Union
 
 import numpy as np
 
 from . import benchlog, controller, needles
 
+if TYPE_CHECKING:
+    from . import ruler
+
+#: What a run's sample is: the needle set's, or one of RULER's tasks' (#208).
+Sample = Union[needles.Sample, "ruler.Sample"]
+
 EXPERIMENTS = ("question-blind", "question-aware")
 SUMMARY_TOKENS = 64
-ANSWER_TOKENS = 32
+ANSWER_TOKENS = needles.ANSWER_TOKENS
 #: The answer's tokens the question-aware experiment decodes before its plan,
 #: and what they are asked to be (needles.question_text).
 AWARE_TOKENS = 4
@@ -214,9 +220,12 @@ def sample_seed(sample_id: str, plan_seed: int) -> int:
     return zlib.crc32(f"{plan_seed}:{sample_id}".encode())
 
 
-def _check(engine, experiment: str) -> None:
+def _check(engine, experiment: str, sample=None) -> None:
     if experiment not in EXPERIMENTS:
         raise ValueError(f"an experiment is one of {EXPERIMENTS}; got {experiment!r}")
+    if experiment == "question-aware" and not isinstance(sample, (needles.Sample, type(None))):
+        raise ValueError("the question-aware experiment opens a needle's answer; RULER's "
+                         "tasks are run question-blind only (#208)")
     check_engine(engine)
 
 
@@ -265,21 +274,24 @@ def shares_turn_1(cond: Condition) -> bool:
 AfterAnswer = Callable[..., dict]
 
 
-def run(engine, sample: needles.Sample, cond: Condition, experiment: str, *,
+def run(engine, sample: Sample, cond: Condition, experiment: str, *,
         plan_seed: int = 0, then: AfterAnswer | None = None) -> dict:
     """One sample through its turns: what a log entry's results hold. The
     effective bits, the tiers' shares and the needle's pages' tiers are what
     the cache holds at the plan, or where it would be: the full pages before
     the question's answer, which adds its own at FP16. With `then`, what it
-    adds after the answer too."""
-    _check(engine, experiment)
+    adds after the answer too. A sample is the needle set's or one of
+    RULER's tasks' (ruler.Sample, #208): it scores its own answer
+    (`scored`), names its pages' tiers (`tiers_at`) and the tokens its
+    answer is decoded in (`answer_tokens`)."""
+    _check(engine, experiment, sample)
     seed = sample_seed(sample.sample_id, plan_seed)
     with set_for(engine, cond), engine.conversation() as chat:
         opened = before_plan(engine, chat, sample, experiment)
         return _close(engine, chat, sample, cond, experiment, seed, opened, then)
 
 
-def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment: str, *,
+def runs(engine, sample: Sample, conds: Sequence[Condition], experiment: str, *,
          plan_seed: int = 0, then: AfterAnswer | None = None) -> Iterator[tuple[Condition, dict]]:
     """Each of `conds` on one sample, with what `run` gives it: those that
     share turn 1 (shares_turn_1) first, in their order, from one turn 1,
@@ -287,7 +299,7 @@ def runs(engine, sample: needles.Sample, conds: Sequence[Condition], experiment:
     question-aware the answer's first tokens, are run once and each shared
     condition starts from their snapshot. Should the snapshot be refused, a
     page having gone below FP16 in an emergency, they run alone too."""
-    _check(engine, experiment)
+    _check(engine, experiment, sample)
     seed = sample_seed(sample.sample_id, plan_seed)
     yield from from_one_opening(
         engine, conds, lambda chat: before_plan(engine, chat, sample, experiment),
@@ -340,7 +352,7 @@ class _Opened:
     opening: str | None
 
 
-def before_plan(engine, chat, sample: needles.Sample, experiment: str) -> _Opened:
+def before_plan(engine, chat, sample: Sample, experiment: str) -> _Opened:
     """Turn 1, and question-aware the answer's first tokens: what a run
     holds before its plan, on `chat`."""
     end_of_turn = engine.tokenizer.token_to_id(END_OF_TURN)
@@ -354,18 +366,18 @@ def before_plan(engine, chat, sample: needles.Sample, experiment: str) -> _Opene
     return _Opened(summary, stopped, turn_2, np.empty(0, dtype=np.int32), False, None)
 
 
-def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: str, seed: int,
+def _close(engine, chat, sample: Sample, cond: Condition, experiment: str, seed: int,
            opened: _Opened, then: AfterAnswer | None = None) -> dict:
     opening, answer = opened.opening, opened.answer
     planned = plan_at(chat, cond, seed)
     if experiment == "question-blind":
-        answer = chat.turn(opened.turn_2, ANSWER_TOKENS)
+        answer = chat.turn(opened.turn_2, sample.answer_tokens)
     elif not opened.answered:
         answer = np.concatenate([answer, chat.turn(np.empty(0, np.int32),
                                                    ANSWER_TOKENS - AWARE_TOKENS)])
     text = engine.decode(answer)
     results = {
-        "answer": text, "correct": needles.correct(text, sample.code),
+        "answer": text, **sample.scored(text),
         "answer_tokens": answer.tolist(), "summary": engine.decode(opened.summary),
         "summary_length": len(opened.summary), "summary_stopped": opened.stopped,
         "aware_opening": opening,
@@ -373,7 +385,7 @@ def _close(engine, chat, sample: needles.Sample, cond: Condition, experiment: st
         "code_after_plan": None if opening is None else code_after(opening, sample.code),
         "score_every": engine.kv_score_every, "score_alpha": engine.kv_score_alpha,
         **planned.results(cond, seed, sample.page_tokens),
-        "needle_page_tiers": planned.page_tiers(sample.needle_pages),
+        **sample.tiers_at(planned),
     }
     if then is not None:
         results.update(then(engine, chat, sample, cond, seed, results))

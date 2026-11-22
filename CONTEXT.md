@@ -513,7 +513,9 @@ _Avoid_: forced plan, synthetic pressure
 A synthetic fact the model cannot guess, a named code, planted at a known
 depth in a haystack, articles of WikiText-2's test split joined to the
 context's length. The needle's depth fixes the page that holds it
-(ADR-0017).
+(ADR-0017). RULER's needles are its own sentence, "One of the special
+magic numbers for {key} is: {value}.", and its haystacks Paul Graham's
+essays, fillers or noise (RULER task, #208).
 _Avoid_: probe, distractor (the haystack is not adversarial)
 
 **Screening** / **Screened set**:
@@ -521,8 +523,33 @@ Running every needle sample at FP16 before the comparison, and replacing
 one answered wrongly by the next of its depth from the seed, a
 **replacement**, until each depth has five answered correctly: the
 screened set, so that the model's failures are not counted as the cache's
-(ADR-0017, #148).
+(ADR-0017, #148). A RULER task is screened alike, by task rather than by
+depth, until 50 are answered (#208).
 _Avoid_: filtering, cleaning (nothing is dropped unrecorded)
+
+**RULER task**:
+One of RULER's five synthetic tasks RQ3 runs (#208, ADR-0017's amendment):
+`niah_multikey_1` to `_3`, `niah_multivalue` and `vt`, each by RULER's
+template and arguments, in RQ3's two turns, on RULER's Paul Graham essays.
+A **target** is a needle that holds what the answer should name; a
+**filler** is a needle-shaped sentence of another key, and **noise** RULER's
+repeated sentence, the two haystacks that are not essays.
+_Avoid_: RULER benchmark (five of its tasks are run, not RULER), probe
+
+**Score** (of a RULER sample):
+RULER's `string_match_all`: the share of the strings the answer should
+name, RULER's outputs, `expected` in code, found in it, case-insensitive. A
+sample is **answered** if its score is 1. McNemar's test pairs answered
+samples.
+_Avoid_: accuracy for one sample, reference (that is continuation's FP16
+passage)
+
+**Ceiling**:
+Where a task can no longer separate the score sources: so many samples
+answered under every condition that too few can differ. A RULER task is
+**below its ceiling** at a length if static INT2 answers at most 80% of
+its screened set; only such a task enters RULER's closing test (#208).
+_Avoid_: saturation, too easy
 
 **Question-blind** / **Question-aware**:
 Whether a controlled plan is made before the question is asked, from the
@@ -591,7 +618,9 @@ recency floor reclaimed, question-blind, by McNemar's exact test on the
 samples only one of them answered (ADR-0017). Its significance level, 0.05
 two-sided, and the rule that semantic must also answer more, were set in
 #152, after the runs were logged; ADR-0017 fixed the comparison and the
-test. Its answer, yes or no, is reported whatever it is.
+test. Its answer, yes or no, is reported whatever it is. RULER's tasks have
+a closing test of their own at each length, the same comparison pooled over
+the tasks below their ceiling, fixed before any was run (#208).
 _Avoid_: hypothesis, headline result (the comparison was fixed before the results)
 
 **RQ3 summary**:
