@@ -114,6 +114,22 @@ DENSE_PROMPTS = ("adversarial-00", "long-03")
 GREEDY = {"do_sample": False, "num_beams": 1, "repetition_penalty": 1.0,
           "temperature": None, "top_p": None, "top_k": None}
 
+#: The conversation the checkpoint's chat template is rendered on, for the
+#: engine's copy of its pieces to be checked against (microinfer.chat.PROBE,
+#: tests/test_chat.py), and the date Llama-3.2's template is given, or it
+#: writes today's. A template that reads no date ignores it.
+CHAT_PROBE = ("USER-A", "ASSISTANT-B", "USER-C")
+CHAT_DATE = "26 Jul 2024"
+
+
+def chat_probe(tokenizer) -> str:
+    """CHAT_PROBE as the checkpoint's own template renders it, opened for
+    the assistant's reply."""
+    roles = ("user", "assistant", "user")
+    return tokenizer.apply_chat_template(
+        [{"role": r, "content": c} for r, c in zip(roles, CHAT_PROBE)],
+        tokenize=False, add_generation_prompt=True, date_string=CHAT_DATE)
+
 
 def sample_positions(length: int, count: int) -> np.ndarray:
     """Positions to keep full logits for: deterministic, evenly spaced, and
@@ -161,6 +177,7 @@ def generate(model_dir: Path, prompts_path: Path, out_dir: Path, seed: int) -> N
         "smoke_tokens": SMOKE_TOKENS,
         "greedy": {k: v for k, v in GREEDY.items() if v is not None},
         "dense_prompts": list(DENSE_PROMPTS),
+        "chat_template_probe": chat_probe(tokenizer),
         "prompts": [],
     }
 

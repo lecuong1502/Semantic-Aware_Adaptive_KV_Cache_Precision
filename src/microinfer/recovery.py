@@ -54,7 +54,7 @@ def turn_3(engine, chat, sample: needles.Sample, cond: rq3.Condition, seed: int,
     if cond.source is not None:
         record = chat.restore(source=cond.source, seed=seed)
     bits = chat.effective_bits()
-    end_of_turn = engine.tokenizer.token_to_id(rq3.END_OF_TURN)
+    end_of_turn = engine.end_of_turn_id
     stopped = results["answer_tokens"][-1] == end_of_turn
     answer = chat.turn(sample.turn_2_after_eos if stopped else sample.turn_2,
                        rq3.ANSWER_TOKENS)

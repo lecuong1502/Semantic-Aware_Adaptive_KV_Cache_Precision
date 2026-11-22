@@ -110,3 +110,53 @@ No conclusion changes, and the argument for the 1.5B at 32K gets slightly
 stronger. What does change is the **absolute** headroom, which is 379 MiB
 smaller than this ADR assumed. Every reported figure should say which
 denominator it uses; the engine's own footprint report uses CUDA's.
+
+---
+
+## Amendment (#209): Llama-3.2-1B-Instruct as a second family
+
+The Consequences above oblige the evaluation to a second model with a
+different GQA ratio. The owner chose Llama-3.2-1B-Instruct (2026-11-14):
+Llama-3.2-3B does not fit 6 GiB at FP16 weights, Gemma-2-2B's sliding
+window and soft-capping are more engine work, and Phi-3.5-mini is larger
+and slower here. The objection recorded above, llama3 RoPE scaling as an
+error-prone surface, is met by testing it as the plain RoPE was: against a
+float64 port of HuggingFace's `_compute_llama3_parameters`.
+
+**What differs from Qwen2.5, and where the engine meets it:**
+
+| | Qwen2.5-1.5B | Llama-3.2-1B | where |
+|---|---|---|---|
+| layers, hidden, heads / KV heads, head_dim | 28, 1536, 12 / 2, 128 | 16, 2048, 32 / 8, 64 | parameters already |
+| KV per token, at 32K | 28 KiB, 896 MiB | 32 KiB, 1 GiB | `kv_bytes_per_token` |
+| RoPE | theta 1e6, plain | theta 5e5, llama3 (factor 32, low 1, high 4, original 8192) | `rope_scaling.h` |
+| q, k, v bias | yes (ADR-0009) | none (`attention_bias` false) | `ModelConfig.attention_bias` |
+| vocabulary, tied | 151,936, tied | 128,256, tied | parameters already |
+| context | 32,768 | 131,072 | parameters already |
+| tokenizer | adds nothing | adds `<|begin_of_text|>` | `chat.encode` |
+| chat template | ChatML, `<|im_end|>` | Llama 3 headers, `<|eot_id|>` | `chat.LLAMA3` |
+
+- **RoPE.** `RopeScaling` is a plain struct passed by value into the kernels
+  that form an angle, the rope kernel and the table attention reads. The
+  frequency is scaled in fp64, before the angle, which stays fp64.
+- **No bias.** A layer's biases are None; attention already takes a key
+  with no bias as whole, so ADR-0009's path is simply not entered.
+- **Tokenisation.** RQ3's turns are built from pieces tokenized apart, and
+  Llama's tokenizer would put `<|begin_of_text|>` before each. Pieces are
+  encoded with no special token added; the template's opening writes it
+  once. Qwen2.5's tokenizer adds none, so its needle set and RULER sets are
+  unchanged, byte for byte (checked by their sha256 before and after).
+- **The chat template** is kept as pieces in `microinfer.chat`, since RQ3
+  assembles turns from them. Each family's is checked against HuggingFace's
+  own rendering of a three-message conversation, which `tools/gen_golden.py`
+  records in the reference's manifest. Qwen2.5's matched when it was first
+  checked. Llama's system message is given the template's fallback date,
+  26 Jul 2024, so a sample does not change with the day it is built.
+- **The gate** is ADR-0006's, held as Qwen2.5's is: FP16 passes it over the
+  whole prompt set, and each narrower tier costs more than the one above
+  (`tests/test_llama.py`).
+
+The constants in the table are from prior knowledge, as this ADR's first
+ones were. They are verified against the checkpoint's own `config.json`
+when it is downloaded, and the card committed then; until that is done the
+engine refuses the model (`VERIFIED`).

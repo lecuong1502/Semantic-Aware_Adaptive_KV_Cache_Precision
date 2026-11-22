@@ -7,7 +7,7 @@ The set plants one in each of five haystacks at each of ten depths, 0% to
 90%, 50 samples in all, each with RQ3's two turns:
 
 1. **Turn 1:** the document and a general request, "Summarize the document
-   above in two sentences", in Qwen's chat template. Its decoded tokens are
+   above in two sentences", in the checkpoint's chat template (chat). Its decoded tokens are
    what give the scorer scores (ADR-0017).
 2. **Turn 2:** the question, asking for the code. A turn 1 cut short at its
    tokens needs its message closed, so `turn_2` opens with <|im_end|>; one
@@ -41,6 +41,8 @@ from typing import ClassVar
 
 import numpy as np
 
+from . import chat
+
 #: The haystack's tokens: with the template, the needle and the request, a
 #: turn 1 of about 8K positions (ADR-0017).
 DEFAULT_HAYSTACK_TOKENS = 7936
@@ -50,21 +52,33 @@ LONG_HAYSTACK_TOKENS = 32256
 DEPTHS = tuple(d / 10 for d in range(10))
 SAMPLES_PER_DEPTH = 5
 
-#: Qwen2.5's chat template, with the system message it adds when none is
-#: given.
-SYSTEM = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-TURN_1_OPENING = f"<|im_start|>system\n{SYSTEM}<|im_end|>\n<|im_start|>user\n"
 REQUEST = "Summarize the document above in two sentences."
-TURN_1_CLOSING = f"\n\n{REQUEST}<|im_end|>\n<|im_start|>assistant\n"
-TURN_2_AFTER_EOS = "\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+
+
+def turn_1_closing(template: chat.Template) -> str:
+    """After the document: the request, and the user message's close."""
+    return f"\n\n{REQUEST}{template.user_close}"
+
+
+def turn_2_after_eos(template: chat.Template) -> str:
+    """Turn 2 after an end of turn already fed, with {question} to fill."""
+    return f"{template.next_user}{{question}}{template.user_close}"
+
+
+#: Qwen2.5's pieces, with the system message its template adds when none is
+#: given: what every sample was built from before the templates moved to
+#: chat (#209), and still is for Qwen2.5.
+TURN_1_OPENING = chat.QWEN.opening
+TURN_1_CLOSING = turn_1_closing(chat.QWEN)
+TURN_2_AFTER_EOS = turn_2_after_eos(chat.QWEN)
 
 #: The archives a needle names, none of them a WikiText article's subject.
 NAMES = ("Juniper", "Halvard", "Marlow", "Ostrava", "Pellucid", "Quillon", "Rosmer",
          "Sablewood", "Tamsin", "Umbra", "Verrin", "Wexford", "Yarrow", "Zephyrine",
          "Brackley", "Corwen", "Dunmore", "Elsinore", "Fenwick", "Galloway")
 LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"  # no I or O, to be read as no digit
-#: The token that ends a turn, which closes a turn 1 cut short.
-END_OF_TURN = "<|im_end|>"
+#: The token that ends a turn, which closes a turn 1 cut short: Qwen2.5's.
+END_OF_TURN = chat.QWEN.end_of_turn
 #: The tokens a question's answer is decoded in (ADR-0017).
 ANSWER_TOKENS = 32
 
@@ -173,10 +187,12 @@ def articles(text: str) -> list[tuple[str, list[str]]]:
 def needle_set(text: str, tokenizer, *, seed: int,
                samples_per_depth: int = SAMPLES_PER_DEPTH,
                haystack_tokens: int = DEFAULT_HAYSTACK_TOKENS,
-               page_tokens: int | None = None) -> list[Sample]:
+               page_tokens: int | None = None,
+               template: chat.Template = chat.QWEN) -> list[Sample]:
     """The samples, depth by depth, from `text`, WikiText-2's test split as
     tools/perplexity.py reads it, and `tokenizer`, the checkpoint's: 50 by
-    default, five a depth.
+    default, five a depth, their turns in `template`, the checkpoint's
+    family's (chat.template_for).
 
     A depth draws from a generator seeded with `seed` and the depth's index:
     an order of the articles first, then for each sample in turn the
@@ -189,11 +205,12 @@ def needle_set(text: str, tokenizer, *, seed: int,
         page_tokens = _microinfer.device.page_tokens
 
     def ids(s: str) -> np.ndarray:
-        return np.asarray(tokenizer.encode(s).ids, dtype=np.int32)
+        return chat.encode(tokenizer, s)
 
     haystacks = Haystacks(text, tokenizer, haystack_tokens)
-    opening, closing = ids(TURN_1_OPENING), ids(TURN_1_CLOSING)
-    end_of_turn = ids(END_OF_TURN)
+    opening, closing = ids(template.opening), ids(turn_1_closing(template))
+    end_of_turn = ids(template.end_of_turn)
+    after_eos_text = turn_2_after_eos(template)
     samples, codes = [], set()
     for index, depth in enumerate(DEPTHS):
         rng = np.random.default_rng([seed, index])
@@ -212,7 +229,7 @@ def needle_set(text: str, tokenizer, *, seed: int,
             needle, question = needle_text(name, code), question_text(name)
             planted = ids(piece(needle))
             before = np.concatenate([opening, *pieces[:cut]])
-            after_eos = ids(TURN_2_AFTER_EOS.format(question=question))
+            after_eos = ids(after_eos_text.format(question=question))
             start, end = len(before), len(before) + len(planted)
             samples.append(Sample(
                 sample_id=sample_id(depth, k), depth=depth, name=name, code=code,
@@ -253,8 +270,7 @@ class Haystacks:
         self.tokens = tokens
         lines = [line for _, body in self.found for line in body]
         self.first_line = np.cumsum([0] + [len(body) for _, body in self.found[:-1]])
-        self.line_ids = [np.asarray(e.ids, dtype=np.int32)
-                         for e in tokenizer.encode_batch([piece(line.strip()) for line in lines])]
+        self.line_ids = chat.encode_batch(tokenizer, [piece(line.strip()) for line in lines])
 
     def starting_at(self, article: int) -> list[np.ndarray]:
         pieces, held, line = [], 0, int(self.first_line[article])

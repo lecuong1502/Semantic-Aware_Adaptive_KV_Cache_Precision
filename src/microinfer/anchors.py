@@ -205,7 +205,7 @@ def before_plan(engine, chat, dialogue: Dialogue) -> _Opened:
     the last one's reply. A prompt starts where the last one's tokens and
     reply end: the reply's last token, not yet fed, takes the position
     before it."""
-    end_of_turn = engine.tokenizer.token_to_id(rq3.END_OF_TURN)
+    end_of_turn = engine.end_of_turn_id
     replies, stopped, position, fact = [], [], 0, None
 
     def after_last(body: np.ndarray) -> np.ndarray:

@@ -38,8 +38,9 @@ def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
 
     Derived rather than read, so that a mismatch against the real checkpoint
     is a finding rather than a tautology. Qwen2 puts a bias on the query, key
-    and value projections and none on the output projection; a model that
-    ties its embeddings stores no LM head.
+    and value projections and none on the output projection; Llama-3.2 puts
+    none on any (attention_bias, #209); a model that ties its embeddings
+    stores no LM head.
     """
     h, i, vocab = cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size
     q_dim = cfg.num_attention_heads * cfg.head_dim
@@ -48,14 +49,12 @@ def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
     shapes = {"model.embed_tokens.weight": (vocab, h)}
     for layer in range(cfg.num_hidden_layers):
         p = f"model.layers.{layer}."
+        shapes[p + "input_layernorm.weight"] = (h,)
+        for proj, rows in (("q", q_dim), ("k", kv_dim), ("v", kv_dim)):
+            shapes[p + f"self_attn.{proj}_proj.weight"] = (rows, h)
+            if cfg.attention_bias:
+                shapes[p + f"self_attn.{proj}_proj.bias"] = (rows,)
         shapes.update({
-            p + "input_layernorm.weight": (h,),
-            p + "self_attn.q_proj.weight": (q_dim, h),
-            p + "self_attn.q_proj.bias": (q_dim,),
-            p + "self_attn.k_proj.weight": (kv_dim, h),
-            p + "self_attn.k_proj.bias": (kv_dim,),
-            p + "self_attn.v_proj.weight": (kv_dim, h),
-            p + "self_attn.v_proj.bias": (kv_dim,),
             p + "self_attn.o_proj.weight": (h, q_dim),
             p + "post_attention_layernorm.weight": (h,),
             p + "mlp.gate_proj.weight": (i, h),
@@ -1145,10 +1144,24 @@ class Engine:
     def decode(self, token_ids) -> str:
         return self.tokenizer.decode([int(t) for t in token_ids])
 
+    @property
+    def chat_template(self):
+        """The template RQ3's turns are written in: the family's (chat, #209)."""
+        from . import chat
+
+        return chat.template_for(self.config)
+
+    @cached_property
+    def end_of_turn_id(self) -> int:
+        """The token that ends a turn in the family's template: <|im_end|>
+        for Qwen2.5, <|eot_id|> for Llama-3.2."""
+        return self.tokenizer.token_to_id(self.chat_template.end_of_turn)
+
     @cached_property
     def eos_token_ids(self) -> frozenset[int]:
         """Where generation stops: generation_config.json's eos_token_id, which
-        for the instruct models is both <|im_end|> and <|endoftext|>."""
+        for Qwen2.5's instruct models is both <|im_end|> and <|endoftext|>, and
+        for Llama-3.2's <|end_of_text|>, <|eom_id|> and <|eot_id|>."""
         eos = json.loads((self.model_dir / "generation_config.json").read_text())["eos_token_id"]
         return frozenset(eos if isinstance(eos, list) else [eos])
 

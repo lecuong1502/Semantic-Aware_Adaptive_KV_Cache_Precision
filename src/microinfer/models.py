@@ -52,7 +52,10 @@ VERIFIED: dict[str, dict] = {
 
 #: Upstream repository for each card, so a reader can re-derive it.
 UPSTREAM = {name: f"Qwen/{name.replace('qwen2.5', 'Qwen2.5').replace('b-instruct', 'B-Instruct')}"
-            for name in VERIFIED}
+            for name in VERIFIED if name.startswith("qwen")}
+#: The second family (#209), gated on Hugging Face: its licence is accepted
+#: on the model's page before the files can be fetched.
+UPSTREAM["llama-3.2-1b-instruct"] = "meta-llama/Llama-3.2-1B-Instruct"
 
 
 def verified_card(name: str) -> Path:

@@ -53,6 +53,37 @@ def test_the_arithmetic_is_adr_0003s():
     assert 2.9e9 < expected_weight_bytes(cfg("qwen2.5-1.5b-instruct")) < 3.3e9
 
 
+def test_llama_s_arithmetic_and_its_tensors_have_no_bias():
+    """Llama-3.2-1B, the second family (#209): eight KV heads of 64 make 32 KiB
+    a token, 1 GiB at 32K; its 1.24B parameters, the embedding tied, are
+    2.47 GB at fp16, the checkpoint's own size on Hugging Face. No projection
+    has a bias, so the checkpoint is expected to hold none."""
+    from test_config import LLAMA
+    c = ModelConfig.from_dict("llama-3.2-1b-instruct", LLAMA)
+    assert c.kv_bytes_per_token == 32 * 1024 and kv_cache_bytes(c, 32768) == 1024 * MIB
+    shapes = expected_weight_shapes(c)
+    assert not [n for n in shapes if n.endswith(".bias")]
+    assert "lm_head.weight" not in shapes
+    assert shapes["model.layers.15.self_attn.k_proj.weight"] == (512, 2048)
+    assert 2.46e9 < expected_weight_bytes(c) < 2.48e9
+
+
+def test_a_layer_without_biases_is_built_only_where_the_config_has_none():
+    """A layer's tensors by role: Llama's have no projection bias, and its
+    layer is built with None in their place; a Qwen2 layer missing one is
+    still refused by name, as before (#209)."""
+    from microinfer.model import LayerWeights
+
+    from test_config import LLAMA
+    c = ModelConfig.from_dict("llama-3.2-1b-instruct", LLAMA)
+    tensors = {name: object() for name in expected_weight_shapes(c)}
+    layer = LayerWeights.from_tensors(tensors, 3, bias=False)
+    assert layer.self_attn_k_proj_bias is None and layer.self_attn_q_proj_bias is None
+    assert layer.self_attn_k_proj_weight is tensors["model.layers.3.self_attn.k_proj.weight"]
+    with pytest.raises(KeyError, match="self_attn_k_proj_bias"):
+        LayerWeights.from_tensors(tensors, 3, bias=True)
+
+
 # -- configuration gate ------------------------------------------------------
 
 CARD = Path(__file__).resolve().parent.parent / "src/microinfer/model_cards"
@@ -220,3 +251,14 @@ def test_torch_is_absent_after_loading_a_model():
     engine.load_weights()
     assert "torch" not in sys.modules
     assert "transformers" not in sys.modules
+
+
+def test_the_engine_knows_its_family_s_template_and_end_of_turn():
+    """RQ3's turns are written in the checkpoint's family's template (#209),
+    and a turn that stopped at its end of turn is told from one cut short by
+    that token, which generation also stops at."""
+    from microinfer import chat
+    engine = Engine(require_model("qwen2.5-0.5b-instruct"))
+    assert engine.chat_template is chat.QWEN
+    assert engine.end_of_turn_id == engine.tokenizer.token_to_id("<|im_end|>")
+    assert engine.end_of_turn_id in engine.eos_token_ids

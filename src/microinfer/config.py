@@ -21,6 +21,16 @@ class ConfigMismatch(ValueError):
     """A model's config.json disagrees with what this repository expects."""
 
 
+#: The architectures the forward pass runs (model.py), each with whether its
+#: query, key and value projections carry a bias: Qwen2's always do, and its
+#: config does not say; Llama's say, in `attention_bias` (#209).
+ARCHITECTURES = {"Qwen2ForCausalLM": True, "LlamaForCausalLM": None}
+
+#: The rope_scaling kinds the kernels implement (rope_scaling.h). Any other
+#: would run as plain RoPE, a silent error, so it is refused.
+ROPE_SCALINGS = ("llama3",)
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """The subset of `config.json` the kernels are parameterised by.
@@ -44,11 +54,16 @@ class ModelConfig:
     torch_dtype: str
     hidden_act: str
     rope_scaling: Any | None
+    #: architectures[0] in config.json: one of ARCHITECTURES.
+    architecture: str = "Qwen2ForCausalLM"
+    #: Whether q_proj, k_proj and v_proj carry a bias (ADR-0009's path).
+    attention_bias: bool = True
 
     @property
     def head_dim(self) -> int:
         """Not stored in Qwen2.5's config; derived. 64 for the 0.5B, 128 for the
-        1.5B — which is why no kernel may hardcode it (ADR-0003)."""
+        1.5B — which is why no kernel may hardcode it (ADR-0003). Llama-3.2's
+        states it, and from_dict refuses one that differs from this."""
         return self.hidden_size // self.num_attention_heads
 
     @property
@@ -64,14 +79,37 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, name: str, raw: dict) -> ModelConfig:
         missing = [f.name for f in cls.__dataclass_fields__.values()
-                   if f.name not in ("name", "rope_scaling") and f.name not in raw]
+                   if f.name not in ("name", "rope_scaling", "architecture", "attention_bias")
+                   and f.name not in raw]
         if missing:
             raise ConfigMismatch(
                 f"{name}: config.json is missing {', '.join(missing)}. "
                 f"This is not the model this repository was written against."
             )
+        architecture = (raw.get("architectures") or [None])[0]
+        if architecture not in ARCHITECTURES:
+            raise ConfigMismatch(
+                f"{name}: architecture {architecture!r} is not one the engine runs. "
+                f"Known: {', '.join(ARCHITECTURES)}.")
+        bias = ARCHITECTURES[architecture]
+        if bias is None:
+            bias = bool(raw.get("attention_bias", False))
+        derived = raw["hidden_size"] // raw["num_attention_heads"]
+        if raw.get("head_dim", derived) != derived:
+            raise ConfigMismatch(
+                f"{name}: head_dim is {raw['head_dim']}, but the engine sizes heads as "
+                f"hidden_size / num_attention_heads = {derived}.")
+        scaling = raw.get("rope_scaling")
+        if scaling is not None:
+            kind = scaling.get("rope_type", scaling.get("type"))
+            if kind not in ROPE_SCALINGS:
+                raise ConfigMismatch(
+                    f"{name}: rope_scaling of type {kind!r} is not implemented; the kernels "
+                    f"implement {', '.join(ROPE_SCALINGS)} (rope_scaling.h).")
         return cls(
             name=name,
+            architecture=architecture,
+            attention_bias=bias,
             num_hidden_layers=raw["num_hidden_layers"],
             hidden_size=raw["hidden_size"],
             num_attention_heads=raw["num_attention_heads"],
