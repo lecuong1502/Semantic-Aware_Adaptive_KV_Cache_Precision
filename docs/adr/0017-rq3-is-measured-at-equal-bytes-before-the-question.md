@@ -424,3 +424,52 @@ test. A task above it is reported and not tested.
   difference's bootstrap 95% interval.
 
 Both answers are reported, yes or no.
+
+## As measured (#208): RULER's closing answer is yes at both lengths
+
+Qwen2.5-1.5B, question-blind, 50 screened samples a task. Every figure is
+from the summaries `ruler-summary` `2b7db8a7…` (8K) and `7c6ac229…` (32K),
+which also give where each plan left the needle (#208's last code). FP16
+answered 50 of the first 50, 53, 63, 96 and 76 drawn at 8K (MK-1, MK-2,
+MK-3, MV, VT) and of 54, 57, 135, 209 and 68 at 32K.
+
+**Every task is below its ceiling** at both lengths. Static INT2 answered
+21, 5, 0, 2 and 1 of 50 at 8K, and 10, 0, 0, 0 and 0 at 32K.
+
+| Task | INT2 | INT4 | Sem. 70 / 80 | Uni. 70 / 80 | Rand. 70 / 80 |
+|---|---|---|---|---|---|
+| 8K MK-1 | 21 | 50 | 49 / 38 | 50 / 37 | 50 / 38 |
+| 8K MK-2 | 5 | 50 | 50 / 15 | 50 / 19 | 49 / 20 |
+| 8K MK-3 | 0 | 43 | 17 / 1 | 46 / 1 | 44 / 4 |
+| 8K MV | 2 | 29 | 41 / 20 | 31 / 13 | 34 / 9 |
+| 8K VT | 1 | 35 | 49 / 49 | 50 / 30 | 45 / 29 |
+| 32K MK-1 | 10 | 50 | 49 / 35 | 50 / 29 | 50 / 30 |
+| 32K MK-2 | 0 | 41 | 35 / 6 | 46 / 3 | 43 / 4 |
+| 32K MK-3 | 0 | 30 | 0 / 0 | 38 / 0 | 21 / 0 |
+| 32K MV | 0 | 42 | 30 / 13 | 35 / 7 | 33 / 9 |
+| 32K VT | 0 | 43 | 48 / 46 | 48 / 13 | 47 / 15 |
+
+Bits at 70% / 80%: 4.98 / 3.40 at 8K, 4.84 / 3.25 at 32K, the same for
+every source.
+
+- **At 8K the closing answer is yes:** semantic 123 of 250, uniform 100;
+  40 samples answered by semantic alone and 17 by uniform alone, McNemar's
+  exact p = 0.0032, answered share +0.092 [0.032, 0.148]. VT holds the
+  difference: 19 to 0 there, 21 to 17 over the other four tasks.
+- **At 32K the closing answer is yes:** semantic 100 of 250, uniform 52;
+  58 to 10, p = 2.4e-9, +0.192 [0.132, 0.252]. VT gives 33 to 0; the
+  other four give 25 to 10, each task leaning to semantic, none alone
+  significant (p ≥ 0.15).
+- **Where the plans left the needle**, the share of the needle's (layer,
+  page) cells at INT2 at 80%, 8K / 32K, semantic against uniform: VT 3% /
+  3% against 70% / 70%; MK-1 63% / 52% against 74% / 68%; MV 60% / 49%
+  against 73% / 66%; MK-3 63% / 68% against 74% / 71%; MK-2 75% / 70%
+  against 69% / 72%. MK-2's and MK-3's haystack is needle-shaped fillers.
+- **At 70% semantic loses MK-3**, 17 against uniform's 46 at 8K
+  (p = 3e-8) and 0 against 38 at 32K (p = 7e-12), and MK-2 at 32K, 35
+  against 46 (p = 0.0034). Uniform at 70% held no cell at INT2. Semantic
+  held 6% and 9% of MK-3's cache there, 4% and 8% of the needle's cells, and an
+  INT2 cell on the needle in 44 and 47 of 50 runs. At 70% semantic won
+  MV at 8K, 41 against 31 (p = 0.0063).
+- **Eviction** answered at most 11 of 50 on the needle tasks, and 48 and
+  43 of VT at 8K, 43 and 39 at 32K.

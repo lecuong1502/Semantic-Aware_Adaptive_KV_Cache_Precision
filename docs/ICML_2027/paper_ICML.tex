@@ -84,9 +84,12 @@ survived every run the static engine failed but one that exceeded the device.
 At equal reclaimed bytes and 80\% of them reclaimed, attention-guided
 allocation keeps the next-token distribution 3.6 times closer to full precision
 than uniform allocation, where a page's score ranks its downgrade's damage
-($\rho = 0.35$), but answers no more needles, 48 of 50 against 49, where it
-does not ($\rho = 0.01$); and downgrading keeps 48 needles where evicting the
-same bytes keeps 16.
+($\rho = 0.35$), but answers no more of an easy needle set, 48 of 50 against
+49, where it does not ($\rho = 0.01$). On five RULER tasks below their ceiling
+it answers more at 80\%, 123 of 250 against 100 at 8K and 100 against 52 at
+32K ($p \le 0.0032$), mostly on variable tracking, and fewer at 70\% where
+needle-shaped fillers hide the needle; downgrading keeps 48 needles where
+evicting the same bytes keeps 16.
 \end{abstract}
 
 % =====================================================================
@@ -164,8 +167,9 @@ survives, at 32K positions, a contention that ends the static engine.
 holding the reclaimed bytes equal between semantic, uniform and random
 allocation and eviction. At 80\% of the bytes reclaimed, semantic allocation
 kept the output distribution closer to full precision (mean KL 0.028 against
-0.101) but answered no more needles, and downgrading kept three times the
-answers of evicting the same bytes.
+0.101) and answered more of RULER's tasks below their ceiling (100 of 250
+against 52 at 32K), though no more of an easy needle set, and downgrading kept
+three times the answers of evicting the same bytes.
 \end{itemize}
 
 % =====================================================================
@@ -654,7 +658,13 @@ and eviction of the pages the semantic plan would degrade most, at the same
 bytes, for H2O's family: attention over a cache with pages evicted equals, to
 the bit, attention with them masked. Continuation fidelity teacher-forces 128
 tokens of 50 WikiText-2 passages after a 2K-token prefix, and the anchor-fact
-dialogue asks, after ten turns, for a code stated in one of them.
+dialogue asks, after ten turns, for a code stated in one of them. Five of
+RULER's tasks \citep{hsieh2024ruler} run the same two turns at 8K and 32K
+positions: a key among four in essays (MK-1), one among needle-shaped fillers
+of numbers (MK-2) or UUIDs (MK-3), four values of one key (MV), and variable
+tracking along a chain of assignments (VT). Static INT2 answered at most 21 of
+a task's 50 screened samples, so every task is below its ceiling of 40, and the
+closing test, fixed before the runs, pools the five at each length.
 
 \begin{table}[t]
 \caption{RQ3 at 80\% of the bytes reclaimed, question-blind, on Qwen2.5-1.5B.
@@ -683,7 +693,7 @@ Eviction & 3.40 & 16 & 16 & -- & -- \\
 \end{adjustbox}
 \end{table}
 
-\textbf{The closing comparison is null.} At 80\%, question-blind, the semantic
+\textbf{On the needle set the closing comparison is null.} At 80\%, question-blind, the semantic
 source answered 48 needles and uniform 49 (Table~\ref{tab:rq3}); one sample was
 answered by uniform alone and none by semantic alone, McNemar's $p = 1$. It
 stays null at 70\%, where all three sources answered all 50; with the question
@@ -694,6 +704,56 @@ set sits at its ceiling: static INT2 for the whole cache kept 45 of 50. The
 semantic order did work as designed, leaving 43\% of the needles' pages at INT2
 against uniform's 68\%, but the code survived INT2 in most samples whichever
 source sent it there.
+
+\begin{table}[t]
+\caption{RULER, question-blind, on Qwen2.5-1.5B: samples answered of 50 at
+70\% / 80\% of the bytes reclaimed, every string of the answer found. Bits are
+4.98 / 3.40 at 8K and 4.84 / 3.25 at 32K for every source. The closing test
+pools the five tasks at 80\%.}
+\label{tab:ruler}
+\centering
+\small
+\begin{adjustbox}{max width=\columnwidth}
+\begin{tabular}{llrrrr}
+\toprule
+ & Task & INT2 & Semantic & Uniform & Random \\
+\midrule
+8K & MK-1 & 21 & 49 / 38 & 50 / 37 & 50 / 38 \\
+ & MK-2 & 5 & 50 / 15 & 50 / 19 & 49 / 20 \\
+ & MK-3 & 0 & 17 / 1 & 46 / 1 & 44 / 4 \\
+ & MV & 2 & 41 / 20 & 31 / 13 & 34 / 9 \\
+ & VT & 1 & 49 / 49 & 50 / 30 & 45 / 29 \\
+ & All, 80\% & & 123 & 100 & 100 \\
+\midrule
+32K & MK-1 & 10 & 49 / 35 & 50 / 29 & 50 / 30 \\
+ & MK-2 & 0 & 35 / 6 & 46 / 3 & 43 / 4 \\
+ & MK-3 & 0 & 0 / 0 & 38 / 0 & 21 / 0 \\
+ & MV & 0 & 30 / 13 & 35 / 7 & 33 / 9 \\
+ & VT & 0 & 48 / 46 & 48 / 13 & 47 / 15 \\
+ & All, 80\% & & 100 & 52 & 58 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\end{table}
+
+\textbf{Below its ceiling, semantic allocation answers more.} On RULER at
+80\%, the semantic source answered 123 of 250 samples at 8K against uniform's
+100, 40 samples by semantic alone and 17 by uniform alone ($p = 0.0032$), and
+100 against 52 at 32K, 58 to 10 ($p = 2.4 \times 10^{-9}$): the closing test is
+a yes at both lengths (Table~\ref{tab:ruler}). Variable tracking carries most
+of it, 19 to 0 and 33 to 0; over the other four tasks the count is 21 to 17 at
+8K and 25 to 10 at 32K. Where the plans left the answer shows why. On VT the
+semantic source held 3\% of the answer's (layer, page) cells at INT2, against
+uniform's 70\%; on MK-1 and MV 49--63\% against 66--74\%; on MK-2 and MK-3,
+whose fillers question-blind attention cannot tell from the needle, 63--75\%
+against 69--74\%.
+
+\textbf{At 70\%, concentration costs.} Uniform allocation meets the 70\% target
+without INT2; the semantic source spends the same bytes unevenly,
+holding up to 13\% of the cache at INT2. Where it does not find the needle,
+the INT2 lands on it: on MK-3 in 44 and 47 of 50 runs, and semantic answered
+17 against uniform's 46 at 8K and 0 against 38 at 32K ($p < 10^{-7}$); on MK-2
+at 32K, 35 against 46 ($p = 0.0034$). It won MV at 8K, 41 against 31.
 
 \textbf{Graded measures part the sources.} In continuation fidelity at 80\%,
 semantic allocation kept the next-token distribution 3.6 times closer to FP16
@@ -734,13 +794,15 @@ $0.006$ [$-0.039$, $0.051$] on the needles and $0.082$ [$0.047$, $0.116$] in the
 dialogue (95\% bootstrap over samples). The score ranks pages by the damage
 their downgrade does to the continuation of the text it watched, not by the
 damage to the answer of a question asked after it, which agrees with the null
-closing comparison.
+comparison on the needle set.
 
-\textbf{Answer.} At equal bytes, attention-guided allocation did not keep needle
-accuracy better than uniform allocation, on a task too easy at this length to
-separate them; it kept the model's output distribution markedly closer to full
-precision, as a page's score predicts its damage there, and at 80\%
-reversible degradation kept three times the answers of eviction.
+\textbf{Answer.} At equal bytes, attention-guided allocation kept the model's
+output distribution markedly closer to full precision than uniform allocation,
+as a page's score predicts its damage there. It answered no more of a needle
+set too easy to separate the sources; on RULER's tasks below their ceiling it
+answered more at 80\% at both lengths, chiefly where the answer stands apart
+from its context, and fewer at 70\% where needle-shaped fillers hide it. At
+80\% reversible degradation kept three times the answers of eviction.
 
 % =====================================================================
 \section{Limitations}
@@ -764,11 +826,14 @@ again, not as an explanation of the model; RQ3 tests that use by its outcome
 and page by page, one page moved to INT4 at a time, which shows the ranking a
 plan relies on but not how many pages' damages combine, nor the correlation at
 INT2 or at 32K positions. \textbf{A task at its ceiling.} At 8K positions on
-Qwen2.5-1.5B the needle's code survives INT2 in most samples, so the needle
-task cannot separate the sources. Were a sample answered at INT2 answered at
-any mix of INT2 and INT4, which held for all but one sample, at most the five
-samples static INT2 missed could be discordant at 80\%, fewer than the six
-McNemar's test needs; a harder task, a longer context or more samples might.
+Qwen2.5-1.5B our needle's code survives INT2 in most samples, so at most five
+samples could be discordant at 80\%, fewer than McNemar's test needs; RULER's
+tasks, below their ceiling, are what separate the sources. \textbf{Where the
+score cannot see the answer.} Question-blind attention does not single out a
+needle among needle-shaped fillers, and there the semantic source's uneven
+allocation put INT2 on the needle that uniform allocation spared at 70\%;
+RULER's yes at 8K rests on variable tracking alone, and only the question-blind
+experiment was run on it.
 
 % =====================================================================
 \section{Conclusion}
@@ -782,8 +847,9 @@ cache precision at runtime, page by page, and returns the memory to the driver,
 survives a contention that ends a static engine, in every run of four scenarios
 that ended one but a draw that exceeded the device. At equal bytes, allocating
 that precision by attention kept the model's output closer to full precision
-than allocating it uniformly, though not more needle answers, and degrading
-pages reversibly kept far more than evicting them.
+than allocating it uniformly, and more of RULER's answers at 80\% though fewer
+at 70\% where the score could not find the needle, and degrading pages
+reversibly kept far more than evicting them.
 
 % =====================================================================
 % Unnumbered statements, outside the page limit, before the references.
