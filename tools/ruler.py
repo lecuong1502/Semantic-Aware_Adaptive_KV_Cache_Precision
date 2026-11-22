@@ -39,7 +39,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import Engine, benchlog, rq3, ruler, ruler_summary  # noqa: E402
+from microinfer import Engine, benchlog, rq3, rq3_summary, ruler, ruler_summary  # noqa: E402
 
 EXPERIMENT = "question-blind"
 FP16 = rq3.condition("fp16")
@@ -255,6 +255,23 @@ def print_summary(s: dict) -> None:
         print(f"| {task} | {mark} | " + " | ".join(
             "-" if c is None else f"{c['answered']}/{c['runs']} ({c['score_mean']:.2f})"
             for c in cells) + " |")
+    sources = ("semantic", *rq3_summary.OTHER_SOURCES)
+    placed = [rq3.source_condition(src, share).name
+              for share in rq3_summary.LEVELS for src in sources]
+    placed = [n for n in placed if any("needle_tier_shares" in row["by_condition"].get(n, {})
+                                       for row in s["tasks"].values())]
+    if placed:
+        print("\nINT2's share of the cache / of the needle's cells / of runs with INT2 on "
+              "the needle:")
+        print("| Task | " + " | ".join(placed) + " |")
+        print("|---|" + "---|" * len(placed))
+        for task, row in s["tasks"].items():
+            cells = [row["by_condition"].get(n, {}) for n in placed]
+            print(f"| {task} | " + " | ".join(
+                "-" if "needle_tier_shares" not in c else
+                f"{c['tier_shares'].get('INT2', 0):.2f} / "
+                f"{c['needle_tier_shares'].get('INT2', 0):.2f} / {c['needle_int2_runs']:.2f}"
+                for c in cells) + " |")
     c = s["closing"]
     print(f"\nclosing over {c['tasks']}: {c['answer']}"
           + ("" if not c["missing"] else f"; missing {c['missing']}"))

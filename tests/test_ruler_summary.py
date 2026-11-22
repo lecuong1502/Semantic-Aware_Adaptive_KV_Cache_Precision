@@ -81,6 +81,28 @@ def test_the_closing_test_pools_the_tasks_below_their_ceiling():
     assert score["difference"] == pytest.approx((40 - 25) * 0.5 / 50)
 
 
+def test_a_condition_says_where_its_plans_left_the_needle():
+    """Each run's needle cells pooled into shares, then averaged over runs;
+    the share of runs with an INT2 cell on the needle."""
+    a, b = run("vt", 0, "semantic-70"), run("vt", 1, "semantic-70", 0.0)
+    a["results"].update(tier_shares={"INT4": 0.9, "INT2": 0.1},
+                        target_page_tiers=[{"INT8": 2, "INT4": 1}, {"INT4": 1}])
+    b["results"].update(tier_shares={"INT4": 1.0},
+                        target_page_tiers=[{"INT4": 3, "INT2": 1}])
+    s = summary.summarise([screening("vt", range(2)), a, b], MODEL, 208, TOKENS)
+    cell = s["tasks"]["vt"]["by_condition"]["semantic-70"]
+    assert cell["tier_shares"] == pytest.approx({"INT2": 0.05, "INT4": 0.95})
+    assert cell["needle_tier_shares"] == pytest.approx(
+        {"INT2": 0.125, "INT4": (0.5 + 0.75) / 2, "INT8": 0.25})
+    assert cell["needle_int2_runs"] == 0.5
+
+
+def test_runs_without_needle_tiers_report_none():
+    s = summary.summarise([screening("vt", range(1)), run("vt", 0, "semantic-70")],
+                          MODEL, 208, TOKENS)
+    assert "needle_tier_shares" not in s["tasks"]["vt"]["by_condition"]["semantic-70"]
+
+
 def test_no_task_below_its_ceiling_has_no_closing_answer():
     entries = [screening("vt", range(2)), *task_runs("vt", 2, "static-int2", 2)]
     closing = summary.summarise(entries, MODEL, 208, TOKENS)["closing"]

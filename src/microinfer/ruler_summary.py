@@ -17,7 +17,10 @@ data named, when it is:
   or a task below its ceiling either source's, or no task is below it;
 - **descriptive**: each task's semantic source paired against uniform and
   random at each level, by answered samples (rq3_summary.paired) and by
-  the mean score's paired difference, with its bootstrap interval.
+  the mean score's paired difference, with its bootstrap interval; and,
+  for each condition whose runs record them, where its plan left the
+  needle: the mean share of each tier over the cache and over the needle's
+  pages' cells, and the share of runs with an INT2 cell on the needle.
 """
 
 from __future__ import annotations
@@ -100,13 +103,38 @@ def _interval(values: np.ndarray, rng: np.random.Generator) -> list[float]:
     return [float(v) for v in rq3_summary.bootstrap(values[None, :], rng)[0]]
 
 
+def _mean_shares(shares: list[dict[str, float]]) -> dict[str, float]:
+    names = sorted({t for s in shares for t in s})
+    return {t: float(np.mean([s.get(t, 0.0) for s in shares])) for t in names}
+
+
+def _needle(runs: list[dict]) -> dict:
+    """Where the runs' plans left the needle: each tier's mean share of the
+    cache and of the needle's pages' cells, and the share of runs with an
+    INT2 cell there; empty unless every run records both."""
+    if not all("target_page_tiers" in e["results"] and "tier_shares" in e["results"]
+               for e in runs):
+        return {}
+    needle = []
+    for e in runs:
+        cells: dict[str, int] = {}
+        for page in e["results"]["target_page_tiers"]:
+            for tier, n in page.items():
+                cells[tier] = cells.get(tier, 0) + n
+        total = sum(cells.values())
+        needle.append({t: n / total for t, n in cells.items()})
+    return {"tier_shares": _mean_shares([e["results"]["tier_shares"] for e in runs]),
+            "needle_tier_shares": _mean_shares(needle),
+            "needle_int2_runs": float(np.mean([s.get("INT2", 0.0) > 0 for s in needle]))}
+
+
 def _cell(runs: list[dict], rng: np.random.Generator) -> dict:
     answered, scores = _answered(runs), _scores(runs)
     return {"answered": int(answered.sum()), "runs": len(runs),
             "accuracy": float(answered.mean()),
             "wilson_95": list(rq3_summary.wilson(int(answered.sum()), len(runs))),
             "score_mean": float(scores.mean()), "score_bootstrap_95": _interval(scores, rng),
-            "entries": [e["sha256"] for e in runs]}
+            **_needle(runs), "entries": [e["sha256"] for e in runs]}
 
 
 def _score_paired(runs: dict[str, list[dict]], rng: np.random.Generator) -> dict:
