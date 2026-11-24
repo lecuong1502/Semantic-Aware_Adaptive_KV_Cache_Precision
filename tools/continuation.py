@@ -37,8 +37,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--issue", type=int, required=True)
     parser.add_argument("--model", default="qwen2.5-1.5b-instruct")
     parser.add_argument("--conditions", nargs="+", default=list(rq3.SOURCE_CONDITIONS),
-                        choices=[*rq3.SOURCE_CONDITIONS, *rq3.STATIC_CONDITIONS,
-                                 rq3.NO_PLAN.name])
+                        choices=[*rq3.SOURCE_CONDITIONS, *rq3.ZIPCACHE_CONDITIONS,
+                                 *rq3.STATIC_CONDITIONS, rq3.NO_PLAN.name])
     parser.add_argument("--passages", type=int, default=continuation.PASSAGES)
     parser.add_argument("--prefix-tokens", type=int, default=continuation.PREFIX)
     parser.add_argument("--warm-tokens", type=int, default=continuation.WARM)

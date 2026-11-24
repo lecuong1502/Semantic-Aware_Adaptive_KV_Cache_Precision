@@ -7,7 +7,8 @@
 Each sample of the task's set (microinfer.page_damage), run to its plan
 point; there, --pages-per-sample (layer, page) pairs drawn by --page-seed,
 each moved alone to INT4 and its damage measured, the KL from FP16 over the
-measured tokens. One "page-damage" entry a sample, naming the task, the
+measured tokens, against the scorer's score of the page and ZipCache's
+normalised attention (#210). One "page-damage" entry a sample, naming the task, the
 sample and the code that produced it, with every pair's score and damage
 and the sample's Spearman rho. The sets are RQ3's: the screened needle set
 and the screened anchor-fact set, from the last screening logged for the
@@ -169,9 +170,12 @@ def summarise(parser, args, of: page_damage.Draws, ids: list[str]) -> int:
     print("| Task | Pooled rho | Bootstrap 95% | Mean rho per sample | Bootstrap 95% "
           "| Samples rho > 0 | Median KL |")
     print("|---|---|---|---|---|---|---|")
-    print(f"| {s['task']} | {s['pooled_rho']:+.3f} | {interval(s['pooled_rho_bootstrap_95'], 3)} "
-          f"| {s['mean_sample_rho']:+.3f} | {interval(s['mean_sample_rho_bootstrap_95'], 3)} "
-          f"| {s['positive_samples']}/{s['samples']} | {s['kl_median']:.2e} |")
+    for name, r in (("scorer", s), ("zipcache", s["zipcache"])):
+        if r is not None:
+            print(f"| {s['task']}, {name} | {r['pooled_rho']:+.3f} "
+                  f"| {interval(r['pooled_rho_bootstrap_95'], 3)} | {r['mean_sample_rho']:+.3f} "
+                  f"| {interval(r['mean_sample_rho_bootstrap_95'], 3)} "
+                  f"| {r['positive_samples']}/{s['samples']} | {s['kl_median']:.2e} |")
     print(f"\nlogged {entry['sha256'][:12]}")
     return 0
 

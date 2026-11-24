@@ -144,11 +144,22 @@ LEVELS = sorted({c.share for c in CONDITIONS if c.share is not None})
 EVICTIONS = tuple(Condition(f"evict-{round(share * 100)}", source="semantic", share=share,
                             evicts=True) for share in LEVELS)
 EVICTION_CONDITIONS = tuple(c.name for c in EVICTIONS)
+#: ZipCache's normalised attention as a source at each level (#210), apart
+#: from CONDITIONS, which ADR-0017 fixed: a summary of runs logged before it
+#: pools it only once it has runs.
+ZIPCACHES = tuple(Condition(f"zipcache-{round(share * 100)}", source="zipcache", share=share)
+                  for share in LEVELS)
+ZIPCACHE_CONDITIONS = tuple(c.name for c in ZIPCACHES)
+
+
+def sources_at(share: float) -> dict[str, str]:
+    """Each source's condition at the level `share`, by the source's name."""
+    return {c.source: c.name for c in (*CONDITIONS, *ZIPCACHES) if c.share == share}
 
 
 def source_condition(source: str, share: float) -> Condition:
     """The condition of `source`'s scores at the level `share`."""
-    (cond,) = [c for c in CONDITIONS if c.source == source and c.share == share]
+    (cond,) = [c for c in (*CONDITIONS, *ZIPCACHES) if c.source == source and c.share == share]
     return cond
 
 
@@ -202,11 +213,12 @@ ABLATED_FROM = tuple(dict.fromkeys(measured_against(c).name for c in ablations((
 
 
 def condition(name: str) -> Condition:
-    for c in (*CONDITIONS, *EVICTIONS, NO_PLAN):
+    for c in (*CONDITIONS, *EVICTIONS, *ZIPCACHES, NO_PLAN):
         if c.name == name:
             return c
     raise ValueError(f"no condition {name!r}; ADR-0017's are {[c.name for c in CONDITIONS]}, "
-                     f"eviction's {list(EVICTION_CONDITIONS)}, and {NO_PLAN.name!r} the check")
+                     f"eviction's {list(EVICTION_CONDITIONS)}, ZipCache's "
+                     f"{list(ZIPCACHE_CONDITIONS)}, and {NO_PLAN.name!r} the check")
 
 
 def code_after(opening: str, code: str) -> bool:
@@ -218,8 +230,9 @@ def code_after(opening: str, code: str) -> bool:
 
 
 def sample_seed(sample_id: str, plan_seed: int) -> int:
-    """The random source's seed for one sample: `plan_seed` and the sample's
-    id, so that a sample draws the same scores whatever else is run."""
+    """The random source's seed for one sample, and the zipcache one's
+    probes': `plan_seed` and the sample's id, so that a sample draws the
+    same scores, and probes, whatever else is run."""
     return zlib.crc32(f"{plan_seed}:{sample_id}".encode())
 
 
@@ -408,9 +421,10 @@ class Planned:
 
     def results(self, cond: Condition, seed: int, page_tokens: int) -> dict:
         """What a log entry's results hold of it: the tiers' shares over the
-        full pages, the plan's summary, and the random source's seed."""
+        full pages, the plan's summary, and the seed of the random source's
+        scores or the zipcache one's probes."""
         return {"plan_positions": self.positions, "plan": plan_summary(self.record),
-                "random_seed": seed if cond.source == "random" else None,
+                "random_seed": seed if cond.source in ("random", "zipcache") else None,
                 "effective_bits": self.bits["effective_bits"],
                 "candidate_effective_bits": self.bits["candidate_effective_bits"],
                 "tier_shares": tier_shares(self.tiers[:, :self.positions // page_tokens])}

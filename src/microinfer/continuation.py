@@ -235,7 +235,7 @@ def summarise(entries: Sequence[dict], model: str, shape: Shape, count: int,
                                          if p is not None and not p["target_met"])}
     paired = {}
     for share in rq3_summary.LEVELS:
-        names = {c.source: c.name for c in rq3.CONDITIONS if c.share == share}
+        names = rq3.sources_at(share)
         if names["semantic"] not in conditions:
             continue
         level = rq3_summary.level_name(share)

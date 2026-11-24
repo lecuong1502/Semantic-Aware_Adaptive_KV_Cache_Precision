@@ -206,14 +206,16 @@ class PagedCache(_Cache):
     (#99): each decode step's per-page attention mass, folded on the device
     into an EWMA with weight `alpha` (0.2 by default); or, with
     `score_every` R, every R-th step's, the fallback #88 allows where every
-    step costs decode more than noise (#100). The scores and the
+    step costs decode more than noise (#100). Another `scorer` takes the
+    masses in their place, as ImportanceScores' fold is given them: a probed
+    pass's (microinfer.zipcache). The scores and the
     mass they are folded from are counted in `nbytes`, since they exist only
     for the cache. Nothing is copied to the host until `scores.download()`.
     """
 
     def __init__(self, cfg: ModelConfig, tier=None, halves=None, tier_map=None,
                  always_seal=False, scoring=False,
-                 alpha=device.ImportanceScores.default_alpha, score_every=1):
+                 alpha=device.ImportanceScores.default_alpha, score_every=1, scorer=None):
         super().__init__(cfg)
         Tier = _microinfer.Tier
         self.tier = Tier.FP16 if tier is None else tier
@@ -244,12 +246,16 @@ class PagedCache(_Cache):
         #: The importance scores, if the cache keeps them (#99): every decode
         #: step's per-page attention mass, folded in on the device. None if not.
         self.scores = None
+        #: ZipCache's normalised attention of its pages, for a controlled
+        #: plan that reads it, from a pass of its own (#210). None if none
+        #: has been made.
+        self.probed: np.ndarray | None = None
         if score_every < 1:
             raise ValueError(f"score_every is a count of decode steps, at least 1; "
                              f"got {score_every}")
         self.score_every = score_every
-        if scoring:
-            self.scores = device.ImportanceScores(layers, pages_per_layer, alpha)
+        if scoring or scorer is not None:
+            self.scores = scorer or device.ImportanceScores(layers, pages_per_layer, alpha)
             self._mass = device.empty_f32(self.heads * pages_per_layer)
         #: Every layer's keys and values as stored, fp16 on the host, if the
         #: cache keeps them for a snapshot (#172); None if not.

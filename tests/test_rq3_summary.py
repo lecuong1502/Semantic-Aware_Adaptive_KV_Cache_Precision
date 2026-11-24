@@ -140,6 +140,26 @@ def test_semantic_is_paired_by_sample_against_uniform_and_random(tmp_path):
     assert (closing["semantic_only"], closing["uniform_only"]) == (10, 1)
 
 
+def test_zipcache_is_paired_once_it_has_runs_and_then_of_every_sample(tmp_path):
+    """#210: runs logged before it summarise as they did; with its runs, a
+    row of its own and semantic paired against it at each level; one part
+    done is missing runs. The question-aware experiment holds none."""
+    zipcache = [(s, "question-blind", n) for s in SAMPLES for n in rq3.ZIPCACHE_CONDITIONS]
+    log = entries(tmp_path, lambda s, x, c: not (c == "zipcache-80" and s < "d10"),
+                  extra=zipcache)
+    summary = rq3_summary.summarise(log, MODEL, 140, 7936)
+    blind = summary["accuracy"]["question-blind"]
+    assert list(blind) == [*(c.name for c in rq3.CONDITIONS), *rq3.ZIPCACHE_CONDITIONS]
+    assert blind["zipcache-80"]["correct"] == 45
+    pair = summary["paired"]["question-blind"]["80%"]["semantic-zipcache"]
+    assert (pair["semantic_only"], pair["other_only"]) == (5, 0)
+    assert "semantic-zipcache" not in summary["paired"]["question-aware"]["80%"]
+    part_done = [e for e in log if e["config"].get("condition", {}).get("name") != "zipcache-70"
+                 or e["config"]["sample_id"] != "d90-4"]
+    with pytest.raises(ValueError, match="zipcache-70"):
+        rq3_summary.summarise(part_done, MODEL, 140, 7936)
+
+
 def test_a_null_result_is_the_answer(tmp_path):
     """Semantic no better than uniform, or better by too few samples to
     tell: the answer is no, reported as such."""

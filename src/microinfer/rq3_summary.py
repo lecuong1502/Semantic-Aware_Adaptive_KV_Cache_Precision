@@ -21,7 +21,8 @@ For each experiment and condition:
   tiers, as shares of every (layer, page) of them.
 
 For each experiment and level, the semantic source is paired by sample
-against uniform and against random: the samples only one of them answered,
+against uniform and against random, and against ZipCache's normalised
+attention where it was run (#210), question-blind only: the samples only one of them answered,
 McNemar's exact test on them, two-sided, and the paired difference in
 accuracy with its bootstrap interval.
 
@@ -59,7 +60,8 @@ Z_95 = 1.959964
 CLOSING_EXPERIMENT = "question-blind"
 CLOSING_SHARE = 0.8
 LEVELS = rq3.LEVELS
-OTHER_SOURCES = ("uniform", "random")
+#: What semantic is paired against; zipcache (#210) only where it was run.
+OTHER_SOURCES = ("uniform", "random", "zipcache")
 LONG_SUMMARY_KIND = "rq3-long-summary"
 ABLATION_SUMMARY_KIND = "rq3-ablation-summary"
 #: The needle's eviction summary and the anchor-fact dialogue's, the `task`
@@ -127,16 +129,16 @@ LONG_CONDITIONS = ("fp16", *(_source_condition(source, CLOSING_SHARE)
 def _conditions(experiment: str, latest: dict[tuple[str, str, str], dict],
                 kept: Sequence[str]) -> list[str]:
     """The conditions an experiment's summary pools. Question-aware's are
-    the sources'. Question-blind's are every condition, but a static tier
-    added after RQ3's first runs (rq3.LATER_STATIC_CONDITIONS, #206) only
-    once it has a run in `latest`, and then of every sample: runs logged
-    before it still summarise, and a run of it that is part done is still
-    missing runs."""
+    the sources'. Question-blind's are every condition, but a condition
+    added after RQ3's first runs (rq3.LATER_STATIC_CONDITIONS, #206, and
+    ZipCache's, #210) only once it has a run in `latest`, and then of every
+    sample: runs logged before it still summarise, and a run of it that is
+    part done is still missing runs."""
     if experiment == "question-aware":
         return list(rq3.SOURCE_CONDITIONS)
-    return [c.name for c in rq3.CONDITIONS
-            if c.name not in rq3.LATER_STATIC_CONDITIONS
-            or any((s, experiment, c.name) in latest for s in kept)]
+    later = (*rq3.LATER_STATIC_CONDITIONS, *rq3.ZIPCACHE_CONDITIONS)
+    return [c.name for c in (*rq3.CONDITIONS, *rq3.ZIPCACHES)
+            if c.name not in later or any((s, experiment, c.name) in latest for s in kept)]
 
 
 def _pool(entries: Sequence[dict], model: str, needle_seed: int, haystack_tokens: int,
@@ -228,12 +230,12 @@ def proportion(right: np.ndarray, rng: np.random.Generator) -> dict:
 
 
 def paired_at_levels(right: dict[str, np.ndarray], rng: np.random.Generator) -> dict:
-    """At each level, the semantic source paired against uniform and random
-    (`paired`), from each condition's outcomes in `right`, by name: for the
-    levels and sources it holds."""
+    """At each level, the semantic source paired against uniform, random and
+    zipcache (`paired`), from each condition's outcomes in `right`, by name:
+    for the levels and sources it holds."""
     pairs = {}
     for share in LEVELS:
-        names = {c.source: c.name for c in rq3.CONDITIONS if c.share == share}
+        names = rq3.sources_at(share)
         if names["semantic"] not in right:
             continue
         pairs[level_name(share)] = {
@@ -272,12 +274,7 @@ def summarise(entries: Sequence[dict], model: str, needle_seed: int, haystack_to
         accuracy[experiment] = {
             name: _accuracy(runs[name], right[name], interval, rng)
             for name, interval in zip(names, intervals)}
-        pairs[experiment] = {
-            level_name(share): {
-                f"semantic-{other}": paired(right[_source_condition("semantic", share)],
-                                             right[_source_condition(other, share)], rng)
-                for other in OTHER_SOURCES}
-            for share in LEVELS}
+        pairs[experiment] = paired_at_levels(right, rng)
     return {"model": model, "needle_seed": needle_seed, "haystack_tokens": haystack_tokens,
             "plan_seed": plan_seed, "samples": len(kept), "significance": SIGNIFICANCE,
             "bootstrap": {"resamples": RESAMPLES, "seed": SEED},

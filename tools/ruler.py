@@ -16,7 +16,8 @@ ADR-0017's amendment, in its order, at one length, 8K or 32K:
    its ceiling if INT2 answers at most 40 of the 50.
 3. The conditions, by default every one of B2 to B8 but those --ceiling
    ran (ruler_summary.CONDITIONS), on the tasks below their ceiling; with
-   --tasks, on those named.
+   --tasks, on those named. ZipCache's (#210) are run only when named:
+   `--conditions zipcache-70 zipcache-80`.
 4. `--summarise`: a "ruler-summary" entry, and the tables.
 
 Every run is question-blind (rq3.run), its sample one of microinfer.ruler's,
@@ -49,18 +50,22 @@ PER_TASK = 50
 #: plan and answer. 32K's prefill is the prefill-step-cost entries' 200 s.
 TURN_1_S = {"8K": 12.0, "32K": 205.0}
 CLOSING_S = {"8K": 4.0, "32K": 10.0}
+#: A sample's probed pass, once for its zipcache conditions (#210): 8K's as
+#: measured, 32K's that times the square of the lengths' ratio.
+PROBE_S = {"8K": 43.0, "32K": 690.0}
 
 
 def hours(runs: dict[str, list[str]], length: str) -> float:
     """GPU-hours for `runs`, each sample's condition names: one turn 1 for
     those that share it (rq3.shares_turn_1) and one for each of the rest,
-    and a closing each."""
+    a closing each, and a probed pass for those that read zipcache scores."""
     seconds = 0.0
     for names in runs.values():
         conds = [rq3.condition(n) for n in names]
         shared = sum(rq3.shares_turn_1(c) for c in conds)
         turn_1s = (1 if shared else 0) + len(conds) - shared
         seconds += turn_1s * TURN_1_S[length] + len(conds) * CLOSING_S[length]
+        seconds += PROBE_S[length] * any(c.source == "zipcache" for c in conds)
     return seconds / 3600
 
 
@@ -120,8 +125,8 @@ def main(argv: list[str]) -> int:
                       help="static INT2 on each task's screened set")
     mode.add_argument("--summarise", action="store_true", help="log the summary")
     parser.add_argument("--tasks", nargs="+", choices=ruler.TASK_NAMES, default=None)
-    parser.add_argument("--conditions", nargs="+", choices=ruler_summary.CONDITIONS,
-                        default=None)
+    parser.add_argument("--conditions", nargs="+", default=None,
+                        choices=[*ruler_summary.CONDITIONS, *rq3.ZIPCACHE_CONDITIONS])
     parser.add_argument("--draws", type=int, default=70,
                         help="a task's samples drawn, at most, to screen 50")
     parser.add_argument("--seed", type=int, default=ruler_summary.SEED)
@@ -247,7 +252,7 @@ def main(argv: list[str]) -> int:
 
 
 def print_summary(s: dict) -> None:
-    names = ["fp16", *ruler_summary.CONDITIONS]
+    names = ["fp16", *ruler_summary.CONDITIONS, *rq3.ZIPCACHE_CONDITIONS]
     print("| Task | Ceiling | " + " | ".join(names) + " |")
     print("|---|---|" + "---|" * len(names))
     for task, row in s["tasks"].items():
@@ -273,6 +278,11 @@ def print_summary(s: dict) -> None:
                 f"{c['tier_shares'].get('INT2', 0):.2f} / "
                 f"{c['needle_tier_shares'].get('INT2', 0):.2f} / {c['needle_int2_runs']:.2f}"
                 for c in cells) + " |")
+    for level, pairs in s["pooled"].items():
+        for pair, p in pairs.items():
+            print(f"\npooled {level} {pair}: {p['semantic_answered']}/{p['samples']} against "
+                  f"{p['other_answered']}, {p['semantic_only']} to {p['other_only']}, "
+                  f"p = {p['mcnemar_p']:.3g}")
     c = s["closing"]
     print(f"\nclosing over {c['tasks']}: {c['answer']}"
           + ("" if not c["missing"] else f"; missing {c['missing']}"))

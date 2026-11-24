@@ -66,10 +66,12 @@ NEEDLE_SEED = 140
 
 def conditions_for(chosen: list[str] | None, *, screened: bool) -> list[str]:
     """The conditions to run, each once: those chosen, "sources" for every
-    score source at each level, or every one, but for the screened set fp16,
+    score source of ADR-0017's at each level, "zipcache" for ZipCache's at
+    each (#210), or every one of ADR-0017's, but for the screened set fp16,
     which screening ran (#148)."""
     if chosen is not None:
-        named = (rq3.SOURCE_CONDITIONS if name == "sources" else [name] for name in chosen)
+        groups = {"sources": rq3.SOURCE_CONDITIONS, "zipcache": rq3.ZIPCACHE_CONDITIONS}
+        named = (groups.get(name, [name]) for name in chosen)
         return list(dict.fromkeys(n for names in named for n in names))
     return [c.name for c in rq3.CONDITIONS if not (screened and c.name == "fp16")]
 
@@ -80,11 +82,12 @@ def main(argv: list[str]) -> int:
                         help="the ticket these runs are made for")
     parser.add_argument("--model", default="qwen2.5-1.5b-instruct")
     parser.add_argument("--conditions", nargs="+", default=None,
-                        choices=["sources", *(c.name for c in (*rq3.CONDITIONS, *rq3.EVICTIONS,
-                                                               rq3.NO_PLAN))],
-                        help="sources: every source at each level (#149); default: every "
-                             "condition, but fp16 with --screened, whose FP16 runs screening "
-                             "logged")
+                        choices=["sources", "zipcache",
+                                 *(c.name for c in (*rq3.CONDITIONS, *rq3.EVICTIONS,
+                                                    *rq3.ZIPCACHES, rq3.NO_PLAN))],
+                        help="sources: ADR-0017's at each level (#149); zipcache: ZipCache's "
+                             "at each (#210); default: every one of ADR-0017's, but fp16 with "
+                             "--screened, whose FP16 runs screening logged")
     runs_of_their_own = parser.add_mutually_exclusive_group()
     runs_of_their_own.add_argument(
         "--long", action="store_true",

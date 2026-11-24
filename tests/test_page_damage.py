@@ -68,12 +68,15 @@ def test_pages_are_drawn_from_those_a_plan_may_move_that_were_scored():
     assert len(every[0]) == int(movable.sum())
 
 
-def logged_sample(log, sample_id, scores, kl, task="needle", screened=True):
+def logged_sample(log, sample_id, scores, kl, task="needle", screened=True, zipcache=None):
     of = page_damage.Draws(task, "m", screened=screened)
     benchlog.append(page_damage.KIND, model="m", context_length=None, precision_tiers=None,
                     config=of.config(sample_id),
                     results={"scores": scores, "kl": kl,
-                             "rho": page_damage.spearman(scores, kl)},
+                             "rho": page_damage.spearman(scores, kl),
+                             **({} if zipcache is None else {
+                                 "zipcache_scores": zipcache,
+                                 "zipcache_rho": page_damage.spearman(zipcache, kl)})},
                     log=log)
 
 
@@ -102,6 +105,25 @@ def test_the_summary_gives_rho_pooled_and_per_sample_with_intervals(tmp_path):
     assert page_damage.logged(needle, commit, log) == {"a", "b", "c"}
     assert page_damage.logged(needle._replace(screened=False), commit, log) == {"b"}
     assert page_damage.logged(needle, "another commit", log) == set()
+
+
+def test_zipcache_s_rho_is_of_the_same_pages_and_damages(tmp_path):
+    """Each run since #210 holds both scores of each page; the summary gives
+    zipcache's rho beside the scorer's, on the same resamples of the same
+    samples, and leaves it out for runs logged before."""
+    log = tmp_path / "benchmark.jsonl"
+    logged_sample(log, "a", [1, 2, 3, 4], [1, 2, 3, 4], zipcache=[4, 3, 2, 1])
+    logged_sample(log, "b", [5, 6, 7, 8], [8, 7, 6, 5], zipcache=[5, 6, 7, 8])
+    needle = page_damage.Draws("needle", "m")
+    s = page_damage.summarise(benchlog.read(log), needle, ["a", "b"])
+    assert s["zipcache"]["pooled_rho"] == pytest.approx(
+        page_damage.spearman([4, 3, 2, 1, 5, 6, 7, 8], [1, 2, 3, 4, 8, 7, 6, 5]))
+    assert s["zipcache"]["mean_sample_rho"] == pytest.approx(-1)
+    assert s["zipcache"]["positive_samples"] == 0
+    assert s["zipcache"]["mean_sample_rho_bootstrap_95"] == pytest.approx([-1, -1])
+    assert s["positive_samples"] == 1
+    logged_sample(log, "c", [1, 2, 3, 4], [1, 2, 3, 4])
+    assert page_damage.summarise(benchlog.read(log), needle, ["a", "c"])["zipcache"] is None
 
 
 @pytest.mark.slow
@@ -166,6 +188,7 @@ def test_the_tool_logs_one_sample_of_each_task_and_summarises(tmp_path, monkeypa
         r = e["results"]
         assert len(r["kl"]) == len(r["scores"]) == len(r["layers"]) == 2
         assert all(k > 0 for k in r["kl"])
+        assert len(r["zipcache_scores"]) == 2 and all(z > 0 for z in r["zipcache_scores"])
         assert r["measured_positions"] > 0 and r["candidates"] >= 2
     summaries = [e for e in benchlog.read(log) if e["kind"] == page_damage.SUMMARY_KIND]
     assert [e["config"]["task"] for e in summaries] == list(page_damage.TASKS)

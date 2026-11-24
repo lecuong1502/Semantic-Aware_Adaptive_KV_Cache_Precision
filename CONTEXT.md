@@ -214,11 +214,28 @@ _Avoid_: attention score (a score is a pre-softmax logit), page weight
 
 **Score source**:
 Where a requantisation plan's scores come from: the scorer's importance
-scores (semantic), or one of two baselines that stand in for them, uniform
-(RQ3's main baseline, every page alike, a partial step spread across
-positions) and random (a seeded control). Every source plans to the same
+scores (semantic), or one of three baselines that stand in for them,
+uniform (RQ3's main baseline, every page alike, a partial step spread
+across positions), random (a seeded control) and zipcache (normalised
+attention, #210, a controlled plan's only). Every source plans to the same
 byte target (#104). Only semantic scores are importance scores.
 _Avoid_: policy (a source changes the scores, not the planner), scorer
+
+**Normalised attention** (of a page):
+ZipCache's score (its equation 8): the attention a token receives, summed
+over queries, divided by how many of them could attend to it; here of a
+page, its attention mass summed over a probed pass's probes, divided by the
+(query, token) pairs that could meet there (#210). Accumulated attention is
+the sum undivided, which favours early positions.
+_Avoid_: saliency, normalised mass
+
+**Probed pass**:
+The tokens a conversation's cache holds, fed again into a second cache at
+FP16 to take normalised attention, the conversation's own left as it is
+(#210). Its **probes**, the last twentieth of the positions and a twentieth
+drawn at random, are steps of one position, which give masses; what is
+between them is prefilled in chunks.
+_Avoid_: probe run, scoring pass
 
 **Requantisation plan**:
 The `(layer, page, current_tier, target_tier)` entries the Precision
@@ -492,14 +509,15 @@ by Spearman's rho, it tests the policy's premise page by page.
 
 **Condition**:
 How an RQ3 run holds its cache (ADR-0017, #147): FP16; a score source at a
-level, a controlled plan from semantic, uniform or random scores for 70% or
-80% of the FP16 bytes outside the recency floor; or a static tier, every
+level, a controlled plan from semantic, uniform, random or zipcache scores
+for 70% or 80% of the FP16 bytes outside the recency floor; or a static tier, every
 page born at INT8 (#206), INT4 or INT2; an ablation; or eviction at a level.
 RQ3's two experiments, question-blind and question-aware, are when a
 condition's plan is made. The survival matrix's conditions are B1 to B6 and
 B8: static engines at FP16, INT4 and INT2, the adaptive engine from the
 uniform, random and semantic sources, and a static engine at INT8. B7 is
-RQ3's eviction, which has no session of its own to survive.
+RQ3's eviction, and B9 its zipcache source (#210), which have no session of
+their own to survive.
 _Avoid_: arm, treatment, setting
 
 **Full policy**:

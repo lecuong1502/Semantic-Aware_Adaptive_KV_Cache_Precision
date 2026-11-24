@@ -192,6 +192,11 @@ def test_the_summary_gives_recall_by_gap_and_pairs_semantic_by_dialogue(tmp_path
     pair = s["paired"]["80%"]["semantic-uniform"]
     assert (pair["semantic_only"], pair["other_only"]) == (30, 0) and pair["mcnemar_p"] < 1e-6
     assert "semantic-random" not in s["paired"]["80%"] and "70%" not in s["paired"]
+    for d in kept:
+        entry(log, d, "zipcache-80", int(d[1]) < 5, gap=int(d[1]))
+    z = anchors.summarise(benchlog.read(log), SET, conditions=[*conds, "zipcache-80"])
+    pair = z["paired"]["80%"]["semantic-zipcache"]
+    assert (pair["semantic_only"], pair["other_only"]) == (15, 0)
     # screening's fp16 runs make no plan: they stand at any plan seed
     for name in ("semantic-80", "uniform-80"):
         for d in kept:

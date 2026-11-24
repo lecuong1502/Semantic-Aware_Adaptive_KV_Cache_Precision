@@ -526,3 +526,29 @@ Qwen2.5-1.5B (45). At 70% every source answered 50. Eviction was not run.
 memory at 23,040 positions, 1990 MiB taken. Adaptive (semantic) completed 32,767 in 154
 plans, 1954 MiB taken, 910 MiB returned and seen, every plan to a granule, its
 chunks sized by time under pressure (0.8 s), unlike #108's run on Qwen2.5-1.5B.
+
+## Amendment (#210): ZipCache's source on RQ3's tasks
+
+Fixed before any run. ZipCache's normalised attention (ADR-0016's amendment)
+is a condition, `zipcache-70` and `zipcache-80`, B9, on Qwen2.5-1.5B:
+
+- **question-blind, on the screened sets already fixed:** the needle set, the
+  anchor-fact dialogue, RULER's five tasks at 8K, and continuation fidelity's
+  50 passages. Not at 32K, question-aware, end to end or on Llama-3.2-1B.
+- **The plan's scores** are a probed pass's over what the cache holds at the
+  plan: the prompt and the decoded tokens, never the question.
+- **What it is paired with.** For the needle set, the dialogue and
+  continuation, whose source conditions were logged before #204's and #205's
+  kernels, the semantic, uniform and random sources are run again beside it,
+  at the same code. RULER's were logged since, and are not: run again,
+  unlogged, at #210's code, semantic at 70% and 80%, uniform and random at
+  80% on two samples each of VT and MK-3 gave the logged summary, answer,
+  tier shares and needle tiers, 16 runs of 16.
+- **No new closing test.** RQ3's closing questions stay semantic against
+  uniform. Semantic against zipcache is descriptive: McNemar's exact test and
+  the paired difference on each task and level, pooled over RULER's tasks
+  below their ceiling as the closing test pools them, and the paired mean KL
+  in continuation. Whichever way it points, it is reported.
+- **Page damage.** Each run of #188's correlation now records both scores of
+  each page it damages, so ZipCache's Spearman rho is of the same pages,
+  damages and resamples as the scorer's. The three tasks are run again.

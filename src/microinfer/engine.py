@@ -23,13 +23,13 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from . import _microinfer, controller, model, nvml, weights
+from . import _microinfer, controller, model, nvml, weights, zipcache
 from .config import ConfigMismatch, ModelConfig
 from .footprint import Footprint
 from .models import VERIFIED
 from .monitor import DEFAULT as DEFAULT_THRESHOLDS
 from .monitor import GREEN, RED, YELLOW, Monitor, PressureEvent, Thresholds
-from .score_sources import SOURCES, score_array
+from .score_sources import RUNTIME_SOURCES, score_array
 
 
 def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
@@ -476,14 +476,15 @@ class CacheOptions:
 class Snapshot:
     """What a conversation's cache held after its turns, on the host (#172):
     every layer's keys and values as they were stored, (length, kv_width)
-    fp16, the importance scores, if it kept them, and the token the last
-    turn chose, not yet fed. A conversation started from it holds the same,
+    fp16, the tokens they are of, the importance scores, if it kept them,
+    and the token the last turn chose, not yet fed. A conversation started from it holds the same,
     on an engine whose cache is made as it was (`options`), and goes on as
     the one it was taken from would have, to the bit."""
 
     keys: tuple[np.ndarray, ...]
     values: tuple[np.ndarray, ...]
     scores: np.ndarray | None
+    tokens: np.ndarray
     unfed: np.ndarray
     options: CacheOptions
 
@@ -523,6 +524,8 @@ class Conversation:
         engine._conversations.add(self)
         #: The last token the last turn chose, not yet in the cache.
         self._unfed = np.empty(0, dtype=np.int32)
+        #: The tokens the cache holds, in order (#210).
+        self._tokens = np.empty(0, dtype=np.int32)
         self._ended: str | None = None
         if for_snapshot:
             self._cache.keep_stored()
@@ -544,6 +547,7 @@ class Conversation:
         if snapshot.scores is not None:
             cache.scores.upload(snapshot.scores)
         self._unfed = snapshot.unfed.copy()
+        self._tokens = snapshot.tokens.copy()
 
     def snapshot(self) -> Snapshot:
         """What the cache holds now, for a conversation to start from: once,
@@ -563,7 +567,8 @@ class Conversation:
                              "cache is below it now")
         keys, values = cache.take_stored()
         return Snapshot(keys, values, None if cache.scores is None else cache.scores.download(),
-                        self._unfed.copy(), self._engine._cache_options())
+                        self._tokens.copy(), self._unfed.copy(),
+                        self._engine._cache_options())
 
     def __enter__(self) -> Conversation:
         return self
@@ -613,6 +618,7 @@ class Conversation:
         if ending.state == EXHAUSTED:
             self.close(f"a turn ended exhausted: {ending.reason}")
         else:
+            self._tokens = np.concatenate([self._tokens, fed, ending.tokens[:-1]])
             self._unfed = ending.tokens[-1:]
         return engine._end(ending)
 
@@ -666,6 +672,7 @@ class Conversation:
         except BaseException as exc:
             self.close(f"forcing raised {type(exc).__name__}")
             raise
+        self._tokens = np.concatenate([self._tokens, ids])
         self._unfed = np.empty(0, dtype=np.int32)
         return None if out is None else np.concatenate(out)
 
@@ -697,11 +704,11 @@ class Conversation:
         """Apply a controlled plan between turns (#142, ADR-0017): reclaim
         `share` of the FP16 bytes of the pages outside the recency floor,
         by the planner of a pressure event (ADR-0016), from `source`'s
-        scores, `seed` the random one's, at once. Needs an adaptive
-        engine, whose cache seals and so can downgrade, and, for semantic
-        scores, a cache that keeps them. The plan's record, in the engine's
-        `plans`."""
-        return self._controlled(source)._controlled_plan(self._cache, share, source, seed)
+        scores, `seed` the random one's, or of the zipcache one's probes, at
+        once. Needs an adaptive engine, whose cache seals and so can
+        downgrade, and, for semantic scores, a cache that keeps them. The
+        plan's record, in the engine's `plans`."""
+        return self._controlled(source, seed)._controlled_plan(self._cache, share, source, seed)
 
     def evict(self, share: float, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
         """Evict, between turns, the pages `plan` would downgrade most, for
@@ -709,7 +716,7 @@ class Conversation:
         page is freed, its memory back to the driver, and attended to by no query
         again; none comes back. The same engine and cache as `plan` needs.
         The eviction's record, in the engine's `plans`."""
-        return self._controlled(source)._controlled_eviction(self._cache, share, source, seed)
+        return self._controlled(source, seed)._controlled_eviction(self._cache, share, source, seed)
 
     def restore(self, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
         """Restore, between turns, every page that holds a shadow to FP16,
@@ -718,11 +725,12 @@ class Conversation:
         `seed` the random one's, for headroom enough for every upgrade, with
         no cooldown, at once. The same engine and cache as `plan` needs.
         The plan's record, in the engine's `plans`."""
-        return self._controlled(source)._controlled_restore(self._cache, source, seed)
+        return self._controlled(source, seed)._controlled_restore(self._cache, source, seed)
 
-    def _controlled(self, source: str) -> Engine:
+    def _controlled(self, source: str, seed: int = 0) -> Engine:
         """The engine, once it is known to hold a cache a controlled plan or
-        restore can move, from `source`'s scores."""
+        restore can move, from `source`'s scores: the zipcache source's are
+        then made, by a pass its `seed` draws the probes of."""
         if self._ended is not None:
             raise RuntimeError(f"the conversation has ended: {self._ended}")
         engine = self._engine
@@ -734,7 +742,23 @@ class Conversation:
                              "replace it, add to it, or upgrade its pages back")
         if source == "semantic" and self._cache.scores is None:
             raise ValueError("semantic scores need a cache that keeps them: kv_scoring=True")
+        if source == "zipcache":
+            self._cache.probed = self.probed_scores(seed=seed)
         return engine
+
+    @property
+    def tokens(self) -> np.ndarray:
+        """The tokens the cache holds, one a position, in order."""
+        return self._tokens.copy()
+
+    def probed_scores(self, *, seed: int = 0) -> np.ndarray:
+        """ZipCache's normalised attention of each page of what the cache
+        holds (#210), from a pass over its tokens (Engine.probed_scores):
+        the zipcache source's scores. The conversation's own cache is not
+        read or changed."""
+        if self._ended is not None:
+            raise RuntimeError(f"the conversation has ended: {self._ended}")
+        return self._engine.probed_scores(self._tokens, seed=seed)
 
     def tiers(self) -> np.ndarray:
         """Each page's tier, (layers, pages), as an index into controller.TIERS,
@@ -854,13 +878,17 @@ class Engine:
         self.kv_score_every = (self.DEFAULT_SCORE_EVERY if kv_score_every is None
                                else kv_score_every)
         self.kv_score_alpha = kv_score_alpha
-        if kv_score_source not in SOURCES:
-            raise ValueError(f"kv_score_source is one of {SOURCES}, got {kv_score_source!r}")
+        if kv_score_source not in RUNTIME_SOURCES:
+            raise ValueError(f"kv_score_source is one of {RUNTIME_SOURCES}, got "
+                             f"{kv_score_source!r}: zipcache's scores take a pass, for a "
+                             f"controlled plan only")
         if kv_adaptive and (kv_cache == "contiguous" or kv_halves != "both"):
             raise ValueError("an adaptive cache is paged, and no diagnostic kv_halves")
         #: Whether pressure events make the engine downgrade pages (#105):
         #: on YELLOW or RED, a plan from the scores, applied between steps.
         self.kv_adaptive = kv_adaptive
+        #: The last probed pass, its tokens and seed with its scores (#210).
+        self._probed: tuple[tuple[bytes, int], np.ndarray] | None = None
         #: Where a plan's scores come from (#104), and the random one's seed.
         self.kv_score_source, self.kv_score_seed = kv_score_source, kv_score_seed
         self.kv_plan_options = kv_plan_options
@@ -1691,7 +1719,8 @@ class Engine:
         tiers = cache.pages.page_tiers()
         layers, count = tiers.shape
         semantic = cache.scores.download() if source == "semantic" else None
-        return tiers, score_array(source, layers, count, semantic=semantic, seed=seed)
+        return tiers, score_array(source, layers, count, semantic=semantic,
+                                  zipcache=cache.probed, seed=seed)
 
     def _effective_bits(self, cache: model.PagedCache, page_bytes: dict[str, int],
                         recency_floor: int) -> dict:
@@ -1917,6 +1946,37 @@ class Engine:
                 cost.observe(len(chunk), time.perf_counter() - began)
                 start += len(chunk)
                 yield chunk, ws, captured, start >= n
+
+    def probed_scores(self, ids: np.ndarray, *, seed: int = 0) -> np.ndarray:
+        """ZipCache's normalised attention (microinfer.zipcache) of each page
+        of a cache that holds `ids`, (layers, pages), NaN past its pages: a
+        pass over `ids` into a cache of its own, at FP16, the probes that
+        `seed` draws fed a position at a time, what is between them in
+        prefill chunks. The last pass's scores are kept, so that a sample's
+        plans at both levels make it once."""
+        key = (np.asarray(ids, np.int32).tobytes(), seed)
+        if self._probed is not None and self._probed[0] == key:
+            return self._probed[1].copy()
+        self._check_window(len(ids))
+        page_tokens = _microinfer.device.page_tokens
+        taken = zipcache.ProbedMass(self.config.num_hidden_layers,
+                                    -(-self.config.context_window // page_tokens), page_tokens)
+        cache = model.PagedCache(self.config, scorer=taken)
+        probes = zipcache.probe_positions(len(ids), seed)
+        size = min(self.prefill_chunk or len(ids), len(ids))
+        ws = model.Workspace(self.config, rows=size)
+        with self._holding(cache, ws):
+            start = 0
+            for probe in probes.tolist():
+                # Not _run: no plan answers a pass that does not fit.
+                for at in range(start, probe, size):
+                    self._model.run(ws, cache, ids[at:min(at + size, probe)])
+                with taken.at(probe):
+                    self._model.run(ws, cache, ids[probe:probe + 1])
+                start = probe + 1
+        scores = taken.scores()
+        self._probed = (key, scores)
+        return scores.copy()
 
     def _under_pressure(self, cache) -> bool:
         """Whether this engine adapts and its monitor's level is YELLOW or

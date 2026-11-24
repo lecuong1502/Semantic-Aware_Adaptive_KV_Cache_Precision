@@ -55,8 +55,8 @@ def main(argv: list[str]) -> int:
     step.add_argument("--summarise", action="store_true",
                       help="log the summary of the screened set's runs")
     parser.add_argument("--conditions", nargs="+", default=None,
-                        choices=[*rq3.SOURCE_CONDITIONS, *rq3.EVICTION_CONDITIONS,
-                                 *rq3.STATIC_CONDITIONS],
+                        choices=[*rq3.SOURCE_CONDITIONS, *rq3.ZIPCACHE_CONDITIONS,
+                                 *rq3.EVICTION_CONDITIONS, *rq3.STATIC_CONDITIONS],
                         help="default: every score source at each level; fp16's runs are "
                              "screening's")
     parser.add_argument("--evictions", action="store_true",

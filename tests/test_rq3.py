@@ -43,6 +43,22 @@ def test_adr_0017_s_conditions():
         rq3.condition("semantic-50")
 
 
+def test_zipcache_s_conditions_are_apart_from_adr_0017_s():
+    """#210's, at both levels, named by its source: a controlled plan as the
+    other sources' are, and run from the same turn 1 as they are. The sets
+    ADR-0017 fixed hold none of them, so that nothing logged before them is
+    missing runs."""
+    assert rq3.ZIPCACHE_CONDITIONS == ("zipcache-70", "zipcache-80")
+    assert not set(rq3.ZIPCACHE_CONDITIONS) & {c.name for c in rq3.CONDITIONS}
+    assert not set(rq3.ZIPCACHE_CONDITIONS) & set(rq3.SOURCE_CONDITIONS)
+    cond = rq3.condition("zipcache-80")
+    assert cond == rq3.Condition("zipcache-80", source="zipcache", share=0.8)
+    assert rq3.source_condition("zipcache", 0.8) == cond
+    assert all(rq3.shares_turn_1(rq3.condition(n)) for n in rq3.ZIPCACHE_CONDITIONS)
+    assert rq3.sources_at(0.7) == {"semantic": "semantic-70", "uniform": "uniform-70",
+                                   "random": "random-70", "zipcache": "zipcache-70"}
+
+
 def test_the_question_asks_for_a_sentence_that_names_the_code_last():
     """Question-aware compresses after the answer's first tokens: they open
     the sentence, "The access code is", so the code itself comes after."""
@@ -305,3 +321,5 @@ def test_question_blind_s_closing_run_is_every_source_at_both_levels():
         "semantic-70", "semantic-80", "uniform-70", "uniform-80", "random-70", "random-80"]
     assert tool.conditions_for(["sources", "semantic-70", "fp16", "fp16"], screened=True) == [
         *rq3.SOURCE_CONDITIONS, "fp16"]  # each once
+    assert tool.conditions_for(["sources", "zipcache"], screened=True) == [
+        *rq3.SOURCE_CONDITIONS, "zipcache-70", "zipcache-80"]  # #210

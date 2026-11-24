@@ -12,7 +12,8 @@ FP16, adaptive and scoring (rq3.NO_PLAN), and snapshotted there. At the plan
 point, a seeded draw of PAGES_PER_SAMPLE (layer, page) pairs of the sample,
 among the pages a plan may move (controller.candidates, outside the recency
 floor) that the scorer has observed: each pair's score is the scorer's EWMA
-there. For each pair, a conversation started from the snapshot moves that
+there, and ZipCache's normalised attention of the page, from a probed pass
+over what the cache holds there (#210). For each pair, a conversation started from the snapshot moves that
 page alone to INT4, and the **measured** tokens are teacher-forced, in
 prefill chunks:
 - needle and anchor: the question, then the answer FP16 gives to it, a turn
@@ -31,7 +32,8 @@ bit, as tests/test_page_damage.py checks.
 The summary gives, per task, Spearman's rho between score and damage:
 pooled over every sample's pairs, and per sample, their mean, each with a
 95% bootstrap interval over samples, since the pages are clustered within
-them.
+them; and zipcache's beside the scorer's, on the same pages' damages and
+the same resamples.
 """
 
 from __future__ import annotations
@@ -177,20 +179,24 @@ def _logsumexp(rows: np.ndarray) -> np.ndarray:
 
 def run(engine, point: PlanPoint, count: int, seed: int) -> dict:
     """One sample's pairs at its plan point: what a log entry's results
-    hold, each pair's layer, page, score and damage, the sample's rho."""
+    hold, each pair's layer, page, score, zipcache score (the probes drawn
+    by `seed`, as the pages are) and damage, and the sample's rho by each."""
     rq3.check_engine(engine)
     reference = Reference(forced_logits(engine, point))
     with _held(engine, start=point.snapshot) as chat:
         scores, tiers = chat.scores(), chat.tiers()
+        probed = chat.probed_scores(seed=seed)
     movable = drawable(scores, tiers, point.positions, _microinfer.device.page_tokens)
     layers, pages = draw_pages(movable, count, seed)
     kl = [reference.damage(forced_logits(engine, point, (layer, page)))
           for layer, page in zip(layers.tolist(), pages.tolist())]
     score = scores[layers, pages].astype(float).tolist()
+    zipcache = probed[layers, pages].tolist()
     return {"positions": point.positions, "measured_positions": point.measured,
             "candidates": int(movable.sum()),
             "layers": layers.tolist(), "pages": pages.tolist(), "scores": score,
-            "kl": kl, "rho": spearman(score, kl)}
+            "kl": kl, "rho": spearman(score, kl),
+            "zipcache_scores": zipcache, "zipcache_rho": spearman(zipcache, kl)}
 
 
 def ranks(values: Sequence[float]) -> np.ndarray:
@@ -261,29 +267,35 @@ def summarise(entries: Sequence[dict], of: Draws, sample_ids: Sequence[str]) -> 
         raise ValueError(f"no {of.task} run of {len(missing)} of the {len(sample_ids)} samples, "
                          f"such as {missing[:3]}; run tools/page_damage.py for them")
     runs = [latest[s]["results"] for s in sample_ids]
-    per_sample = np.array([np.nan if r["rho"] is None else r["rho"] for r in runs])
-    rng = np.random.default_rng(SEED)
-    picks = rng.integers(0, len(runs), size=(rq3_summary.RESAMPLES, len(runs)))
-
-    def pooled(chosen) -> float | None:
-        return spearman([s for i in chosen for s in runs[i]["scores"]],
-                        [k for i in chosen for k in runs[i]["kl"]])
-
-    resampled_pooled = np.array([np.nan if (r := pooled(p)) is None else r for p in picks])
-    resampled_mean = np.nanmean(per_sample[picks], axis=1)
-
-    def interval(values: np.ndarray) -> list[float]:
-        return [float(v) for v in np.nanpercentile(values, [2.5, 97.5])]
-
+    picks = np.random.default_rng(SEED).integers(0, len(runs),
+                                                 size=(rq3_summary.RESAMPLES, len(runs)))
+    zipcache = (_rhos(runs, "zipcache_scores", "zipcache_rho", picks)
+                if all("zipcache_scores" in r for r in runs) else None)
     return {**of._asdict(), "samples": len(runs), "pairs": sum(len(r["kl"]) for r in runs),
-            "tier": TIER,
-            "pooled_rho": pooled(range(len(runs))),
-            "pooled_rho_bootstrap_95": interval(resampled_pooled),
-            "mean_sample_rho": float(np.nanmean(per_sample)),
-            "mean_sample_rho_bootstrap_95": interval(resampled_mean),
-            "samples_without_rho": int(np.isnan(per_sample).sum()),
-            "positive_samples": int((per_sample > 0).sum()),
+            "tier": TIER, **_rhos(runs, "scores", "rho", picks), "zipcache": zipcache,
             "kl_median": float(np.median([k for r in runs for k in r["kl"]])),
             "bootstrap": {"resamples": rq3_summary.RESAMPLES, "seed": SEED},
             "commits": sorted({latest[s]["git_commit"] for s in sample_ids}),
             "entries": [latest[s]["sha256"] for s in sample_ids]}
+
+
+def _rhos(runs: Sequence[dict], scores: str, rho: str, picks: np.ndarray) -> dict:
+    """Rho between the runs' `scores` and their damages, pooled over every
+    pair and its mean of each sample's `rho`, each with its 95% interval
+    over the resamples `picks`, (resamples, samples)."""
+    per_sample = np.array([np.nan if r[rho] is None else r[rho] for r in runs])
+
+    def pooled(chosen) -> float | None:
+        return spearman([s for i in chosen for s in runs[i][scores]],
+                        [k for i in chosen for k in runs[i]["kl"]])
+
+    def interval(values: np.ndarray) -> list[float]:
+        return [float(v) for v in np.nanpercentile(values, [2.5, 97.5])]
+
+    resampled = np.array([np.nan if (r := pooled(p)) is None else r for p in picks])
+    return {"pooled_rho": pooled(range(len(runs))),
+            "pooled_rho_bootstrap_95": interval(resampled),
+            "mean_sample_rho": float(np.nanmean(per_sample)),
+            "mean_sample_rho_bootstrap_95": interval(np.nanmean(per_sample[picks], axis=1)),
+            "samples_without_rho": int(np.isnan(per_sample).sum()),
+            "positive_samples": int((per_sample > 0).sum())}
