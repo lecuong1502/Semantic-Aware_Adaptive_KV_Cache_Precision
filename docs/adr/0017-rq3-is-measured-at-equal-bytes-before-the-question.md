@@ -458,8 +458,9 @@ every source.
   difference: 19 to 0 there, 21 to 17 over the other four tasks.
 - **At 32K the closing answer is yes:** semantic 100 of 250, uniform 52;
   58 to 10, p = 2.4e-9, +0.192 [0.132, 0.252]. VT gives 33 to 0; the
-  other four give 25 to 10, each task leaning to semantic, none alone
-  significant (p ≥ 0.15).
+  other four give 25 to 10, MK-1, MK-2 and MV leaning to semantic, none
+  alone significant (p ≥ 0.15), and MK-3 answered by neither (corrected
+  by #209; this said each task leaned to semantic).
 - **Where the plans left the needle**, the share of the needle's (layer,
   page) cells at INT2 at 80%, 8K / 32K, semantic against uniform: VT 3% /
   3% against 70% / 70%; MK-1 63% / 52% against 74% / 68%; MV 60% / 49%
@@ -473,3 +474,55 @@ every source.
   MV at 8K, 41 against 31 (p = 0.0063).
 - **Eviction** answered at most 11 of 50 on the needle tasks, and 48 and
   43 of VT at 8K, 43 and 39 at 32K.
+
+## As measured (#209): on Llama-3.2-1B, at 8K
+
+Llama-3.2-1B-Instruct (ADR-0003's amendment), the same tasks, seeds, conditions
+and tests, each set screened for this model. Every figure is from the summaries
+`continuation-summary` `aae583e9…`, `rq3-summary` `dd008159…` and `ruler-summary`
+`740cdeb2…`, or, where pooled over tasks or against eviction, from the runs
+they name.
+
+**RULER.** FP16 answered 50 of the first 52, 56, 120, 95 and 177 drawn (MK-1,
+MK-2, MK-3, MV, VT). Static INT2 answered 20, 6, 0, 1 and 0, so every task is
+below its ceiling. Bits at 70% / 80% are 4.98 / 3.40 for every source.
+
+| Task | INT2 | INT4 | INT8 | Sem. 70 / 80 | Uni. 70 / 80 | Rand. 70 / 80 | Evict 70 / 80 |
+|---|---|---|---|---|---|---|---|
+| MK-1 | 20 | 50 | 50 | 50 / 43 | 50 / 29 | 49 / 34 | 24 / 22 |
+| MK-2 | 6 | 46 | 50 | 47 / 25 | 48 / 15 | 48 / 22 | 6 / 4 |
+| MK-3 | 0 | 31 | 49 | 32 / 0 | 32 / 0 | 27 / 0 | 1 / 1 |
+| MV | 1 | 41 | 49 | 45 / 36 | 45 / 11 | 41 / 8 | 11 / 4 |
+| VT | 0 | 24 | 41 | 42 / 30 | 31 / 3 | 33 / 3 | 39 / 37 |
+
+- **The closing answer is yes:** semantic 134 of 250, uniform 58; 80 to 4,
+  McNemar's exact p = 2.1e-19, +0.304 [0.244, 0.364]. Without VT 52 to 3,
+  p = 1.5e-12: unlike Qwen2.5's at 8K, it does not rest on VT. Per task 15 to
+  1 (MK-1), 11 to 1 (MK-2), 0 to 0 (MK-3), 26 to 1 (MV), 28 to 1 (VT). Against
+  random 73 to 6.
+- **At 70%** 216 against 206, 20 to 10, p = 0.099. Semantic did not lose MK-3
+  as on Qwen2.5 (32 against 32); VT 14 to 3, p = 0.013.
+- **The needle's cells at INT2 at 80%**, semantic against uniform: MK-1 50%
+  against 84%, MV 41% against 71%, VT 12% against 76%, MK-3 74% against
+  80%, MK-2 76% against 76%. MK-2's 25 against 15 is not explained by them.
+- **Eviction** 68 at 80%, 81 at 70%, against 134 and 216. On VT it was not told
+  apart from semantic: 37 against 30 at 80% (13 to 6, p = 0.17), 39 against
+  42 at 70%.
+- **VT's 30 tokens.** 57 of the 127 VT samples FP16 did not answer ran to
+  RULER's 30-token answer limit, as did 18 of the 50 it did. The limit is kept,
+  and binds every condition alike.
+
+**Continuation, 50 passages.** At 80%, mean KL 0.050 semantic, 0.194 uniform,
+0.158 random, lower than both on all 50 passages, difference from uniform
+-0.144 [-0.159, -0.130], top-1 0.897 / 0.801 / 0.815. At 70%, 0.0017 / 0.0049 /
+0.0089, lower than uniform on 49 passages and than random on 50.
+
+**Needles at 8K.** FP16 answered the first 50. At 80% semantic 50, uniform 41,
+random 46: 9 to 0 against uniform, p = 0.0039, and 4 to 0 against random,
+p = 0.125. Static INT2 26, so the set is not at its ceiling as it is on
+Qwen2.5-1.5B (45). At 70% every source answered 50. Eviction was not run.
+
+**S5, one run each** (`survival` `71a80153…`, `121e14dd…`). Static ran out of
+memory at 23,040 positions, 1990 MiB taken. Adaptive (semantic) completed 32,767 in 154
+plans, 1954 MiB taken, 910 MiB returned and seen, every plan to a granule, its
+chunks sized by time under pressure (0.8 s), unlike #108's run on Qwen2.5-1.5B.

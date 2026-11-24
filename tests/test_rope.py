@@ -207,11 +207,15 @@ def assert_table_rounded_once(table: np.ndarray, angle: np.ndarray) -> None:
     """A RoPE table, (positions, half, {cos, sin}), is the float64 value
     rounded once to fp32: within one fp32 ulp of the value, beyond what the
     float64 angle itself is unsure of. That angle, position * inv_freq, is
-    off by up to a few float64 ulps of itself, in the kernel and in the
+    off by up to about a float64 ulp of itself, in the kernel and in the
     reference alike, and near a zero of cos or sin, far out in a long
     window, that is more than an fp32 ulp of the value: at position 86568 of
-    Llama-3.2's 131072, cos is -5.1e-6 and the angle's 1e-11 is 16 of its
-    ulps, the kernel's value nearer the truth than the reference's."""
+    Llama-3.2's 131072, cos is -5.1e-6, and the two values are 16 of its ulps
+    apart, each within an angle ulp of the exact one (3.8e-12 and 3.3e-12
+    against 8.5e-12). Over that whole window 9 cells differ by more than one
+    ulp, 3 of cos and 6 of sin; the kernel is the nearer in 3 and the
+    reference in 6, and the two errors sum to at most 1.3 angle ulps. The 4
+    is chosen, not derived."""
     unsure = 4 * np.abs(angle) * np.finfo(np.float64).eps
     for value, reference in ((table[..., 0], np.cos(angle)), (table[..., 1], np.sin(angle))):
         rounded = reference.astype(np.float32)
