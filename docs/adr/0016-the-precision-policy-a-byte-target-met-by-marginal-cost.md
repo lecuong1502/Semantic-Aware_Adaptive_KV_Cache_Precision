@@ -285,3 +285,49 @@ experiment, run again with the present design:
 
 Every pressure event's wait, and its time to its plan, is logged by the
 survival experiment.
+
+## Amendment (#210): ZipCache's normalised attention, a fourth score source
+
+Semantic is compared with uniform and random, baselines of our own. ZipCache
+(He et al., 2024, arXiv 2405.14256) is prior work whose rule ranks cached
+tokens by attention, so it is added as a source. It plugs into the planner
+above, at the same byte target: only the scores differ.
+
+**Its rule.** A token's normalised attention is its equation 8,
+`sum_k A[k, i] / nnz(A[:, i])`: the attention the token receives, divided by
+the number of queries that could attend to it. Accumulated attention, H2O's
+and MiKV's, is the sum undivided. ZipCache takes it from probe tokens, a
+tenth of the positions: the most recent 5% and a random 5% (its section 4.3).
+
+**Why not from the scorer's masses.** #210 asked for it from the same
+per-page masses the scorer reads, which are a decode step's. Measured before
+it was built, unlogged, on three needle samples of 8K positions on
+Qwen2.5-1.5B, over the pages a plan may move: from the summary's decode steps
+alone, every page has been attended by the same queries, so normalised and
+accumulated rank them the same (rho = 1.000), and both almost as the scorer's
+EWMA does (rho = 0.96 to 0.98). That source would have been the semantic one
+without its decay, under ZipCache's name. From probes over the prompt, the
+ranking is another (rho = -0.01 to 0.22 with the scorer's). The owner chose
+the probes (2026-11-24).
+
+**As built** (`microinfer.zipcache`, `Engine.probed_scores`).
+- **A pass of its own.** When a controlled plan reads the source, the tokens
+  its conversation holds are fed again into a second cache, at FP16. Each
+  probe is a step of one position, for which the attention kernel already
+  gives per-page masses; the positions between are prefilled in chunks. The
+  cache the plan is made on is untouched, so every source's plan is made on
+  the same cache, to the bit. In ZipCache the probes are in its one prefill:
+  the pass's time, 43 s at 8K positions, is the experiment's, not the method's.
+- **What ZipCache does not say, or does otherwise.** A layer's mass is its
+  heads' mean, as the scorer's is, and each layer's pages are scored by its
+  own. A page's score is its mass over the probes divided by the (query,
+  token) pairs that could meet there: for a page every probe is past, the
+  mean of its tokens' equation 8, exactly. ZipCache gives two bit-widths to
+  tokens by a saliency ratio; here the score is the planner's.
+- **The probes** are drawn by the seed the plan is given, with the sample's
+  id (`rq3.sample_seed`). The last position is always one, so every page has
+  a score.
+- **Not under pressure.** An engine's own plans read scores as they stand
+  (`RUNTIME_SOURCES`); a pass over the cache would cost what it is planning
+  for. The survival matrix has no such condition, and the emergency plan of
+  a run under this source reads the scorer's scores.

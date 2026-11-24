@@ -84,7 +84,7 @@ sys.path.insert(0, str(REPO / "src"))
 from microinfer import Engine, benchlog, monitor, recorder, replay, survival  # noqa: E402
 from microinfer import survival_matrix as matrix  # noqa: E402
 from microinfer.footprint import MIB  # noqa: E402
-from microinfer.score_sources import SOURCES  # noqa: E402
+from microinfer.score_sources import RUNTIME_SOURCES  # noqa: E402
 
 SEED = 108
 
@@ -102,7 +102,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--shortfall", type=float, default=None,
                         help="MiB the engine is left short of its full FP16 cache, S5's; "
                              "256 by default")
-    parser.add_argument("--score-source", choices=SOURCES, default="semantic",
+    parser.add_argument("--score-source", choices=RUNTIME_SOURCES, default="semantic",
                         help="where an adaptive engine's plans take their scores (#104)")
     parser.add_argument("--pulse", type=float, default=None, metavar="SECONDS",
                         help="give the memory back this long after it was taken (#155); "

@@ -81,6 +81,37 @@ def test_the_closing_test_pools_the_tasks_below_their_ceiling():
     assert score["difference"] == pytest.approx((40 - 25) * 0.5 / 50)
 
 
+def test_semantic_is_pooled_against_zipcache_over_the_tasks_below_their_ceiling():
+    """Beside the closing test and after it, descriptive (#210): at each
+    level its runs are whole at, the samples of the tasks below their ceiling
+    that only one of the two answered."""
+    n = 50
+    both = ("vt", "niah_multikey_1")
+    entries = [*(screening(t, range(n)) for t in (*both, "niah_multikey_2")),
+               *(e for t in both for e in (
+                   *task_runs(t, n, "static-int2", 10), *task_runs(t, n, "semantic-80", 40),
+                   *task_runs(t, n, "uniform-80", 25), *task_runs(t, n, "zipcache-80", 30))),
+               *task_runs("vt", n, "semantic-70", 45),  # not of the other task
+               *task_runs("vt", n, "zipcache-70", 45),
+               *task_runs("niah_multikey_2", n, "static-int2", 48),
+               *task_runs("niah_multikey_2", n, "semantic-80", 50),
+               *task_runs("niah_multikey_2", n, "zipcache-80", 0)]
+    s = summary.summarise(entries, MODEL, 208, TOKENS)
+    assert set(s["pooled"]) == {"80%"} and set(s["pooled"]["80%"]) == {"semantic-zipcache"}
+    against = s["pooled"]["80%"]["semantic-zipcache"]
+    assert (against["samples"], against["semantic_answered"],
+            against["other_answered"]) == (100, 80, 60)
+    assert (against["semantic_only"], against["other_only"]) == (20, 0)
+    assert against["mcnemar_p"] < 1e-5
+    # the closing test's counts and answer are what they are without it
+    without = [e for e in entries if not e.get("config", {}).get("condition", {}).get(
+        "name", "").startswith("zipcache")]
+    was = summary.summarise(without, MODEL, 208, TOKENS)
+    assert was["pooled"] == {}
+    for key in ("semantic_only", "uniform_only", "mcnemar_p", "answer"):
+        assert s["closing"][key] == was["closing"][key]
+
+
 def test_a_condition_says_where_its_plans_left_the_needle():
     """Each run's needle cells pooled into shares, then averaged over runs;
     the share of runs with an INT2 cell on the needle."""
@@ -146,6 +177,10 @@ def test_the_estimate_counts_one_turn_1_for_the_conditions_that_share_it():
     alone = ["static-int2", "static-int4"]                     # a turn 1 each
     expected = (3 * tool.TURN_1_S["8K"] + 5 * tool.CLOSING_S["8K"]) / 3600
     assert tool.hours({"vt-0": shared + alone}, "8K") == pytest.approx(expected)
+    # ZipCache's share it too, and make one probed pass a sample (#210)
+    zipcache = tool.hours({"vt-0": ["zipcache-70", "zipcache-80"]}, "8K")
+    assert zipcache == pytest.approx(
+        (tool.TURN_1_S["8K"] + tool.PROBE_S["8K"] + 2 * tool.CLOSING_S["8K"]) / 3600)
 
 
 def test_the_tool_refuses_a_dirty_tree(tmp_path, monkeypatch):

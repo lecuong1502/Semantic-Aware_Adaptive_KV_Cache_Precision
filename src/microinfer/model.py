@@ -209,11 +209,15 @@ class PagedCache(_Cache):
     step costs decode more than noise (#100). The scores and the
     mass they are folded from are counted in `nbytes`, since they exist only
     for the cache. Nothing is copied to the host until `scores.download()`.
+
+    With `masses_to`, each step of one query's masses go there instead, and
+    the cache keeps no scores: a probed pass's (microinfer.zipcache.ProbedMass),
+    which copies them to the host, given by `fold` as ImportanceScores' is.
     """
 
     def __init__(self, cfg: ModelConfig, tier=None, halves=None, tier_map=None,
                  always_seal=False, scoring=False,
-                 alpha=device.ImportanceScores.default_alpha, score_every=1):
+                 alpha=device.ImportanceScores.default_alpha, score_every=1, masses_to=None):
         super().__init__(cfg)
         Tier = _microinfer.Tier
         self.tier = Tier.FP16 if tier is None else tier
@@ -244,20 +248,25 @@ class PagedCache(_Cache):
         #: The importance scores, if the cache keeps them (#99): every decode
         #: step's per-page attention mass, folded in on the device. None if not.
         self.scores = None
+        if scoring and masses_to is not None:
+            raise ValueError("a cache's masses go into its scores or to masses_to, not both")
+        self._masses_to = masses_to
         if score_every < 1:
             raise ValueError(f"score_every is a count of decode steps, at least 1; "
                              f"got {score_every}")
         self.score_every = score_every
         if scoring:
             self.scores = device.ImportanceScores(layers, pages_per_layer, alpha)
-            self._mass = device.empty_f32(self.heads * pages_per_layer)
+        #: A step's masses, as the attention kernel writes them, if taken.
+        self._mass = (device.empty_f32(self.heads * pages_per_layer)
+                      if scoring or masses_to is not None else None)
         #: Every layer's keys and values as stored, fp16 on the host, if the
         #: cache keeps them for a snapshot (#172); None if not.
         self.stored: list[list[np.ndarray]] | None = None
 
     @property
     def nbytes(self) -> int:
-        scoring = self.scores.nbytes + self._mass.nbytes if self.scores is not None else 0
+        scoring = sum(x.nbytes for x in (self.scores, self._mass) if x is not None)
         return (sum(self.allocator.mapped_bytes(t) for t in _microinfer.Tier.__members__.values())
                 + self.rope.nbytes + scoring)
 
@@ -298,13 +307,13 @@ class PagedCache(_Cache):
         # computation, when the positions it attends number a multiple of
         # score_every; every layer of such a step alike. A longer prefill
         # chunk's are not taken.
-        scored = (self.scores is not None and seq_q == 1
-                  and seq_k % self.score_every == 0)
+        into = self.scores if self._masses_to is None else self._masses_to
+        scored = into is not None and seq_q == 1 and seq_k % self.score_every == 0
         self.pages.attention(layer, q, k_bias, self.rope, out, seq_q, seq_k,
                              self.heads, self.kv_heads, self.head_dim, keys, values,
                              self._mass if scored else None, partials)
         if scored:
-            self.scores.fold(layer, self._mass, self.heads, -(-seq_k // device.page_tokens))
+            into.fold(layer, self._mass, self.heads, -(-seq_k // device.page_tokens))
 
 
 class Workspace:

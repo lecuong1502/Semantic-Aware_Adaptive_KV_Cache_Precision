@@ -1,10 +1,10 @@
-"""Three sources of scores for the precision controller (#104).
+"""Four sources of scores for the precision controller (#104, #210).
 
-The controller plans from one of three: the scorer's semantic scores
+The controller plans from one of four: the scorer's semantic scores
 (#99); uniform scores, RQ3's main baseline, every page alike, a partial
-step spread evenly across positions; and random scores from a seed, a
-secondary control. They plug into the same plan(), so each meets the same
-byte target.
+step spread evenly across positions; random scores from a seed, a
+secondary control; and ZipCache's normalised attention, prior work's rule.
+They plug into the same plan(), so each meets the same byte target.
 """
 
 import numpy as np
@@ -33,15 +33,17 @@ def semantic_download(layers, max_pages, rng):
     return scores
 
 
-def test_the_three_sources_plan_to_the_same_bytes():
+def test_the_four_sources_plan_to_the_same_bytes():
     """Each source's plan has the same byte target and meets it, overshooting
     by less than one downgrade: they reclaim the same bytes."""
     tiers = cache(4, 60)
     rng = np.random.default_rng(104)
     download = semantic_download(4, 128, rng)
-    plans = {source: plan_from(scores_for(source, tiers, semantic=download, seed=7), tiers)
+    probed = rng.random((4, 128))
+    plans = {source: plan_from(scores_for(source, tiers, semantic=download, zipcache=probed,
+                                          seed=7), tiers)
              for source in score_sources.SOURCES}
-    assert set(plans) == {"semantic", "uniform", "random"}
+    assert set(plans) == {"semantic", "uniform", "random", "zipcache"}
     largest = max(PAGE_BYTES[a] - PAGE_BYTES[b] for a, b in zip(controller.TIERS,
                                                                controller.TIERS[1:]))
     for source, p in plans.items():
@@ -61,6 +63,21 @@ def test_semantic_scores_are_the_scorers():
         assert (np.isnan(score) and np.isnan(want)) or score == float(want)
     with pytest.raises(ValueError, match="outside"):
         scores_for("semantic", cache(3, 2), semantic=download)
+
+
+def test_zipcache_scores_are_the_probes():
+    """Each page's of the pass's array, as the semantic source's are the
+    scorer's: the array form is the dict form, and it is not the scorer's."""
+    rng = np.random.default_rng(2)
+    semantic, probed = rng.random((2, 16)), rng.random((2, 16))
+    tiers = cache(2, 12) | {(layer, -1): "FP16" for layer in range(2)}
+    got = scores_for("zipcache", tiers, semantic=semantic, zipcache=probed)
+    assert all(np.isnan(v) if page < 0 else v == probed[layer, page]
+               for (layer, page), v in got.items())
+    held = score_sources.score_array("zipcache", 2, 12, semantic=semantic, zipcache=probed)
+    np.testing.assert_array_equal(held, probed[:, :12])
+    with pytest.raises(ValueError, match="outside"):
+        score_sources.score_array("zipcache", 2, 17, zipcache=probed)
 
 
 def discrepancy(taken: list[int], positions: int) -> float:
@@ -168,5 +185,8 @@ def test_what_the_sources_refuse():
         scores_for("entropy", tiers)
     with pytest.raises(ValueError, match="seed"):
         scores_for("random", tiers)
-    with pytest.raises(ValueError, match="semantic"):
-        scores_for("semantic", tiers)
+    for held in ("semantic", "zipcache"):
+        with pytest.raises(ValueError, match=held):
+            scores_for(held, tiers)
+        with pytest.raises(ValueError, match=held):
+            score_sources.score_array(held, 1, 4)

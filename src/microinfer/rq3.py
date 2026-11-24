@@ -3,9 +3,10 @@
 ADR-0017 answers RQ3 on needle retrieval at equal bytes. A **condition** is
 how the cache is held:
 - **fp16:** every page at FP16, no plan;
-- **a source at a level:** semantic, uniform or random scores, and a
-  controlled plan that reclaims 70% or 80% of the FP16 bytes of the pages
-  outside the recency floor (#142);
+- **a source at a level:** semantic, uniform or random scores, or
+  ZipCache's normalised attention (`ZIPCACHES`, #210, question-blind only),
+  and a controlled plan that reclaims 70% or 80% of the FP16 bytes of the
+  pages outside the recency floor (#142);
 - **a static tier:** every page born at INT8 (#206), INT4 or INT2, for
   the whole session, the uniform-quantisation family;
 - **an ablation** (ADR-0018, #158): the semantic source at 80%, the full
@@ -37,7 +38,8 @@ the ... archive is", which is not as asked, but holds no code yet.
 
 One engine serves every condition: a run sets the engine's tier, whether it
 adapts and scores, and its score source, which an emergency plan would use
-too, for its own conversation, and puts them back after. NO_PLAN, the
+too (the scorer's under zipcache, whose scores take a pass), for its own
+conversation, and puts them back after. NO_PLAN, the
 adaptive, scoring engine with no plan applied, is a check rather than a
 condition: its answer is FP16's.
 
@@ -54,7 +56,8 @@ alone.
 
 The random source draws each sample's scores from a seed of its own,
 sample_seed, so that the samples of a depth do not rank the needle's page
-alike, and their outcomes stay unpaired but for the condition.
+alike, and their outcomes stay unpaired but for the condition; the zipcache
+source draws each sample's probes from it.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Union
 import numpy as np
 
 from . import benchlog, controller, needles
+from .score_sources import RUNTIME_SOURCES, SEEDED
 
 if TYPE_CHECKING:
     from . import ruler
@@ -144,11 +148,24 @@ LEVELS = sorted({c.share for c in CONDITIONS if c.share is not None})
 EVICTIONS = tuple(Condition(f"evict-{round(share * 100)}", source="semantic", share=share,
                             evicts=True) for share in LEVELS)
 EVICTION_CONDITIONS = tuple(c.name for c in EVICTIONS)
+#: ZipCache's normalised attention as a source at each level (#210), apart
+#: from CONDITIONS, which ADR-0017 fixed: a summary of runs logged before it
+#: pools it only once it has runs.
+ZIPCACHES = tuple(Condition(f"zipcache-{round(share * 100)}", source="zipcache", share=share)
+                  for share in LEVELS)
+ZIPCACHE_CONDITIONS = tuple(c.name for c in ZIPCACHES)
+#: ADR-0017's conditions, then ZipCache's: what a summary may pool.
+WITH_ZIPCACHE = (*CONDITIONS, *ZIPCACHES)
+
+
+def sources_at(share: float) -> dict[str, str]:
+    """Each source's condition at the level `share`, by the source's name."""
+    return {c.source: c.name for c in WITH_ZIPCACHE if c.share == share}
 
 
 def source_condition(source: str, share: float) -> Condition:
     """The condition of `source`'s scores at the level `share`."""
-    (cond,) = [c for c in CONDITIONS if c.source == source and c.share == share]
+    (cond,) = [c for c in WITH_ZIPCACHE if c.source == source and c.share == share]
     return cond
 
 
@@ -202,11 +219,12 @@ ABLATED_FROM = tuple(dict.fromkeys(measured_against(c).name for c in ablations((
 
 
 def condition(name: str) -> Condition:
-    for c in (*CONDITIONS, *EVICTIONS, NO_PLAN):
+    for c in (*WITH_ZIPCACHE, *EVICTIONS, NO_PLAN):
         if c.name == name:
             return c
     raise ValueError(f"no condition {name!r}; ADR-0017's are {[c.name for c in CONDITIONS]}, "
-                     f"eviction's {list(EVICTION_CONDITIONS)}, and {NO_PLAN.name!r} the check")
+                     f"eviction's {list(EVICTION_CONDITIONS)}, ZipCache's "
+                     f"{list(ZIPCACHE_CONDITIONS)}, and {NO_PLAN.name!r} the check")
 
 
 def code_after(opening: str, code: str) -> bool:
@@ -218,8 +236,9 @@ def code_after(opening: str, code: str) -> bool:
 
 
 def sample_seed(sample_id: str, plan_seed: int) -> int:
-    """The random source's seed for one sample: `plan_seed` and the sample's
-    id, so that a sample draws the same scores whatever else is run."""
+    """The random source's seed for one sample, and the zipcache one's
+    probes': `plan_seed` and the sample's id, so that a sample draws the
+    same scores, and probes, whatever else is run."""
     return zlib.crc32(f"{plan_seed}:{sample_id}".encode())
 
 
@@ -248,12 +267,16 @@ _SETS = {"tier": "kv_tier", "adaptive": "kv_adaptive", "source": "kv_score_sourc
 @contextmanager
 def set_for(engine, cond: Condition):
     """The engine set for `cond`: its tier, whether it adapts and scores,
-    its score source, and what an ablation changes, put back after."""
+    its score source, the scorer for a source no plan of its own can read,
+    and what an ablation changes, put back after."""
     kept = {name: getattr(engine, name) for name in (*_SETS.values(), "kv_scoring")}
     try:
         for field, name in _SETS.items():
-            if getattr(cond, field) is not None:
-                setattr(engine, name, getattr(cond, field))
+            value = getattr(cond, field)
+            if field == "source" and value is not None and value not in RUNTIME_SOURCES:
+                value = "semantic"
+            if value is not None:
+                setattr(engine, name, value)
         engine.kv_scoring = cond.adaptive
         yield
     finally:
@@ -408,9 +431,10 @@ class Planned:
 
     def results(self, cond: Condition, seed: int, page_tokens: int) -> dict:
         """What a log entry's results hold of it: the tiers' shares over the
-        full pages, the plan's summary, and the random source's seed."""
+        full pages, the plan's summary, and the seed of the random source's
+        scores or the zipcache one's probes."""
         return {"plan_positions": self.positions, "plan": plan_summary(self.record),
-                "random_seed": seed if cond.source == "random" else None,
+                "random_seed": seed if cond.source in SEEDED else None,
                 "effective_bits": self.bits["effective_bits"],
                 "candidate_effective_bits": self.bits["candidate_effective_bits"],
                 "tier_shares": tier_shares(self.tiers[:, :self.positions // page_tokens])}

@@ -29,8 +29,9 @@ A passage's result under a condition is the mean of each over its measured
 positions. The summary pools the passages of a run: each condition's mean
 top-1 agreement and mean KL with bootstrap 95% intervals over passages, and,
 at each level, the paired difference in mean KL of the semantic source
-against uniform and against random, passage by passage, with its bootstrap
-interval, as ADR-0017 fixes; and the same of top-1 agreement beside it.
+against uniform, against random and, where it was run, against zipcache
+(#210), passage by passage, with its bootstrap interval, as ADR-0017 fixes;
+and the same of top-1 agreement beside it.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from typing import NamedTuple
 import numpy as np
 
 from . import benchlog, controller, rq3, rq3_summary
+from .score_sources import SEEDED
 
 PREFIX, WARM, MEASURED = 2048, 64, 128
 PASSAGES = 50
@@ -56,7 +58,7 @@ _ROWS = 32
 
 class Shape(NamedTuple):
     """What makes two runs' passages alike: their parts' lengths, and the
-    random source's plan seed."""
+    plan seed, the random source's and the zipcache one's probes'."""
 
     prefix: int = PREFIX
     warm: int = WARM
@@ -171,7 +173,7 @@ def runs(engine, passage: Passage, conds: Sequence[rq3.Condition], *,
             "top1": float(np.mean(measured["top1"])), "kl_mean": float(np.mean(measured["kl"])),
             "kl": measured["kl"], "top1_by_position": measured["top1"],
             "plan": rq3.plan_summary(record),
-            "random_seed": seed if cond.source == "random" else None,
+            "random_seed": seed if cond.source in SEEDED else None,
             "effective_bits": bits["effective_bits"],
             "candidate_effective_bits": bits["candidate_effective_bits"],
             # every page held at the plan, the open last one among them
@@ -235,7 +237,7 @@ def summarise(entries: Sequence[dict], model: str, shape: Shape, count: int,
                                          if p is not None and not p["target_met"])}
     paired = {}
     for share in rq3_summary.LEVELS:
-        names = {c.source: c.name for c in rq3.CONDITIONS if c.share == share}
+        names = rq3.sources_at(share)
         if names["semantic"] not in conditions:
             continue
         level = rq3_summary.level_name(share)

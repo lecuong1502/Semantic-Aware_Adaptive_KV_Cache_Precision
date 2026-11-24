@@ -15,9 +15,12 @@ data named, when it is:
   one of the two answered; semantic beats uniform if p < 0.05 and it
   answered more. No answer while a screened task lacks static INT2's runs,
   or a task below its ceiling either source's, or no task is below it;
-- **descriptive**: each task's semantic source paired against uniform and
-  random at each level, by answered samples (rq3_summary.paired) and by
-  the mean score's paired difference, with its bootstrap interval; and,
+- **descriptive**: each task's semantic source paired against uniform,
+  random and, where it was run, zipcache (#210) at each level, by answered
+  samples (rq3_summary.paired) and by the mean score's paired difference,
+  with its bootstrap interval; semantic against zipcache by answered
+  samples pooled over the tasks below their ceiling, as the closing test
+  pools them (`pooled`, empty where zipcache was not run); and,
   for each condition whose runs record them, where its plan left the
   needle: the mean share of each tier over the cache and over the needle's
   pages' cells, and the share of runs with an INT2 cell on the needle.
@@ -138,8 +141,8 @@ def _cell(runs: list[dict], rng: np.random.Generator) -> dict:
 
 
 def _score_paired(runs: dict[str, list[dict]], rng: np.random.Generator) -> dict:
-    """At each level, the semantic source's mean score less uniform's and
-    random's, sample by sample, for the conditions `runs` holds."""
+    """At each level, the semantic source's mean score less each other
+    source's, sample by sample, for the conditions `runs` holds."""
     out: dict[str, dict] = {}
     for share in rq3_summary.LEVELS:
         semantic = runs.get(rq3.source_condition("semantic", share).name)
@@ -161,10 +164,12 @@ def summarise(entries: Sequence[dict], model: str, seed: int, haystack_tokens: i
     sets = screened_sets(entries, model, seed, haystack_tokens)
     latest = latest_runs(entries, model, seed, haystack_tokens, plan_seed, data)
     tasks, closing_runs, missing = {}, {name: [] for name in CLOSING}, {}
+    whole: dict[str, dict[str, list[dict]]] = {}  # each task's complete conditions
     for task, kept in sets.items():
         names = sorted({name for (sid, name) in latest if sid in kept})
         complete = {n: [latest[(sid, n)] for sid in kept] for n in names
                     if all((sid, n) in latest for sid in kept)}
+        whole[task] = complete
         int2 = complete.get(CEILING_CONDITION)
         below = None if int2 is None else below_ceiling(int(_answered(int2).sum()), len(kept))
         tasks[task] = {
@@ -182,9 +187,27 @@ def summarise(entries: Sequence[dict], model: str, seed: int, haystack_tokens: i
             for n in CLOSING:
                 closing_runs[n].extend(complete[n])
     entered = [t for t, row in tasks.items() if row["below_ceiling"]]
+    closing = _closing(entered, closing_runs, missing, haystack_tokens, rng)
     return {"model": model, "ruler_seed": seed, "haystack_tokens": haystack_tokens,
             "plan_seed": plan_seed, "data": data, "ceiling": CEILING, "tasks": tasks,
-            "closing": _closing(entered, closing_runs, missing, haystack_tokens, rng)}
+            "closing": closing, "pooled": _pooled([whole[t] for t in entered], rng)}
+
+
+def _pooled(tasks: list[dict[str, list[dict]]], rng: np.random.Generator) -> dict:
+    """At each level, the semantic source paired against zipcache over the
+    samples of every one of `tasks`, where both are whole in all of them
+    (ADR-0017's amendment, #210)."""
+    out: dict[str, dict] = {}
+    for share in rq3_summary.LEVELS:
+        names = rq3.sources_at(share)
+        pair = (names["semantic"], names["zipcache"])
+        if tasks and all(n in runs for runs in tasks for n in pair):
+            semantic, other = (_answered([e for runs in tasks for e in runs[n]]) for n in pair)
+            out[rq3_summary.level_name(share)] = {"semantic-zipcache": {
+                "samples": len(semantic), "semantic_answered": int(semantic.sum()),
+                "other_answered": int(other.sum()),
+                **rq3_summary.paired(semantic, other, rng)}}
+    return out
 
 
 def _closing(entered: list[str], runs: dict[str, list[dict]], missing: dict,

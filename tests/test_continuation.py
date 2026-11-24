@@ -109,6 +109,11 @@ def test_the_summary_pairs_semantic_against_uniform_and_random_by_passage(tmp_pa
     assert random["semantic_lower_kl"] == 3
     lo, hi = random["kl_difference_bootstrap_95"]
     assert lo < random["kl_difference"] < hi
+    assert "semantic-zipcache" not in s["paired"]["80%"]
+    for i in range(10):
+        entry(log, f"p{i:02d}", "zipcache-80", 0.85, 0.15 + i * 0.01)
+    z = continuation.summarise(benchlog.read(log), "m", SHAPE, 10, [*conds, "zipcache-80"])
+    assert z["paired"]["80%"]["semantic-zipcache"]["kl_difference"] == pytest.approx(-0.05)
     without_one = [e for e in benchlog.read(log)
                if not (e["config"]["passage_id"] == "p05"
                        and e["config"]["condition"]["name"] == "random-80")]

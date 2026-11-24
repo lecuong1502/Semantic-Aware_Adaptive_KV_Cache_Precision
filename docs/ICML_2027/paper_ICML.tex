@@ -84,13 +84,15 @@ survived every run the static engine failed but one that exceeded the device.
 At equal reclaimed bytes and 80\% of them reclaimed, attention-guided
 allocation keeps the next-token distribution 3.6 times closer to full precision
 than uniform allocation, where a page's score ranks its downgrade's damage
-($\rho = 0.35$), but answers no more of an easy needle set, 48 of 50 against
-49, where it does not ($\rho = 0.01$). On five RULER tasks below their ceiling
+($\rho = 0.36$), but answers no more of an easy needle set, 48 of 50 against
+49, where it does not ($\rho = 0.03$). On five RULER tasks below their ceiling
 it answers more at 80\%, 123 of 250 against 100 at 8K and 100 against 52 at
 32K ($p \le 0.0032$), mostly on variable tracking, and fewer at 70\% where
 needle-shaped fillers hide the needle; on a second family, Llama-3.2-1B, it
-answers 134 against 58 at 8K and 80\%. Downgrading keeps 48 needles where
-evicting the same bytes keeps 16.
+answers 134 against 58 at 8K and 80\%. The planner takes any score: ZipCache's,
+probed over the prompt, answers as many at 8K and 80\% (132, $p = 0.20$) and
+more at 70\% (245 of 250 against 206), ahead of uniform allocation at both.
+Downgrading keeps 48 needles where evicting the same bytes keeps 16.
 \end{abstract}
 
 % =====================================================================
@@ -147,9 +149,9 @@ spikes, and a controller downgrades cache pages to meet a byte target; we score
 the monitor against an independent ground truth and run a session through
 contention that ends the static engine. \textbf{RQ3:} does allocating
 precision by attention preserve task quality better than allocating it
-uniformly, at equal compression? Three score sources plug into the same
-planner, so that they reclaim the same bytes and differ only in which pages they
-degrade.
+uniformly, at equal compression? Four score sources, ours, a published rule's
+and two controls, plug into the same planner, so that they reclaim the same bytes
+and differ only in which pages they degrade.
 
 Our contributions are:
 \begin{itemize}
@@ -162,15 +164,17 @@ episodes within 236\,ms with no false positive.
 \item \textbf{A runtime precision policy and the engine that runs it}: a paged
 cache whose pages change tier between decoding steps, every move quantising
 from an FP16 shadow so that upgrades restore exactly, freed memory returned to
-the driver, and a marginal-cost planner over attention-derived importance. It
-survives, at 32K positions, a contention that ends the static engine.
+the driver, and a marginal-cost planner that takes its page scores from any
+source. It survives, at 32K positions, a contention that ends the static
+engine.
 \item \textbf{An evaluation design that isolates allocation from compression},
-holding the reclaimed bytes equal between semantic, uniform and random
-allocation and eviction. At 80\% of the bytes reclaimed, semantic allocation
-kept the output distribution closer to full precision (mean KL 0.028 against
-0.101) and answered more of RULER's tasks below their ceiling (100 of 250
-against 52 at 32K), though no more of an easy needle set, and downgrading kept
-three times the answers of evicting the same bytes.
+holding the reclaimed bytes equal between score sources and eviction. At 80\%
+of the bytes reclaimed, attention-guided allocation kept the output distribution
+closer to full precision than uniform (mean KL 0.028 against 0.101) and answered
+more of RULER's tasks below their ceiling (100 of 250 against 52 at 32K), though
+no more of an easy needle set, and downgrading kept three times the answers of
+evicting the same bytes. Our score is not the best of them: ZipCache's, on the
+same planner, answered more of RULER at 70\% and no fewer at 80\%.
 \end{itemize}
 
 % =====================================================================
@@ -375,10 +379,10 @@ costs more per byte than the last; a page the model hardly attends to goes deep
 first. The open pages and the last 128 positions are never downgraded.
 Upgrades come at GREEN only, largest gain first, at least 5\,s after the later
 of the last downgrade and the end of pressure, and never below $T_\mathrm{high}
-+ 512$\,MiB of headroom. Three \textit{score sources} plug into the same
-planner and meet the same byte target to within one page's move: the scorer's
-(\textit{semantic}), equal scores spread evenly across positions
-(\textit{uniform}, the baseline), and seeded random scores.
++ 512$\,MiB of headroom. Any \textit{score source} plugs into the same
+planner and meets the same byte target to within one page's move. At runtime it
+is the scorer's (\textit{semantic}), equal scores spread evenly across positions
+(\textit{uniform}, the baseline), or seeded random scores; RQ3 adds ZipCache's.
 
 \paragraph{The engine's reaction.} On YELLOW the engine applies the plan a
 batch per step within 20\,ms; on RED, all at once; while the level persists it
@@ -644,15 +648,19 @@ Adaptive, semantic & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
 \subsection{RQ3: Quality at Equal Compression}
 \label{sec:rq3}
 
-RQ3 compares the semantic, uniform and random score sources at equal reclaimed
-bytes. Compression is imposed by a \textit{controlled plan} between two turns of
+RQ3 compares the semantic, uniform and random score sources, and ZipCache's
+normalised attention \citep{he2024zipcache}, at equal reclaimed bytes. Compression is imposed by a \textit{controlled plan} between two turns of
 a conversation: the engine is given a byte target, 70\% or 80\% of the FP16
 bytes outside the recency floor, and a score source, and the same planner meets
 it with no monitor involved, so that every source reclaims the same bytes and
 runs repeat exactly. In the primary, question-blind experiment, turn~1 asks for
 a summary of an 8K-position document, the plan is applied, and turn~2 asks for a
 code planted at one of ten depths; whether attention paid before the question
-predicts what is consulted after it is the premise under test. A
+predicts what is consulted after it is the premise under test. ZipCache's
+score is each page's attention from probe tokens, a tenth of the positions,
+divided by the probes that could attend to it. We take it by a pass over the
+tokens already cached, before the question, so the same planner and bytes apply
+(Appendix~\ref{app:zipcache}); the closing tests stay semantic against uniform. A
 question-aware experiment, compressing after the question, bounds what a
 query-aware allocation could do. Fifty samples, screened at FP16, are compared
 by McNemar's exact test. Static INT4 and INT2 stand for uniform quantisation,
@@ -673,7 +681,8 @@ closing test, fixed before the runs, pools the five at each length.
 Needles and facts are of 50, continuation fidelity is top-1 agreement (\%) and
 mean KL from FP16 over 50 passages. Effective bits are the needle set's; on
 each task every adaptive condition held the same bits, and no needle-set plan
-fell short. A static condition holds the whole cache at its tier.}
+fell short. A static condition holds the whole cache at its tier. The four score
+sources' rows were run beside each other at one commit, the others earlier.}
 \label{tab:rq3}
 \centering
 \small
@@ -686,9 +695,10 @@ FP16 & 16.00 & 50 & 50 & 100 & 0 \\
 Static INT8 & 8.63 & 50 & 50 & 99.7 & $<$0.001 \\
 Static INT4 & 4.63 & 50 & 50 & 96.6 & 0.006 \\
 Static INT2 & 2.63 & 45 & -- & -- & -- \\
-Uniform & 3.40 & 49 & 45 & 86.5 & 0.101 \\
+Uniform & 3.40 & 49 & 44 & 86.5 & 0.101 \\
 Random & 3.40 & 50 & 48 & 87.6 & 0.082 \\
-Semantic & 3.40 & 48 & 48 & 93.6 & 0.028 \\
+Semantic & 3.40 & 48 & 48 & 93.7 & 0.028 \\
+ZipCache & 3.40 & 48 & 49 & 92.8 & 0.036 \\
 Eviction & 3.40 & 16 & 16 & -- & -- \\
 \bottomrule
 \end{tabular}
@@ -698,7 +708,7 @@ Eviction & 3.40 & 16 & 16 & -- & -- \\
 \textbf{On the needle set the closing comparison is null.} At 80\%, question-blind, the semantic
 source answered 48 needles and uniform 49 (Table~\ref{tab:rq3}); one sample was
 answered by uniform alone and none by semantic alone, McNemar's $p = 1$. It
-stays null at 70\%, where all three sources answered all 50; with the question
+stays null at 70\%, where every source answered all 50; with the question
 seen, 49 against 50; on a 32K subset of ten, all 10 for both; and in an
 end-to-end run, where the simulator's contention rather than a controlled
 plan forced the reclamation, 48 against 49 on the same contention. The needle
@@ -711,28 +721,28 @@ source sent it there.
 \caption{RULER, question-blind, on Qwen2.5-1.5B: samples answered of 50 at
 70\% / 80\% of the bytes reclaimed, every string of the answer found. Bits are
 4.98 / 3.40 at 8K and 4.84 / 3.25 at 32K for every source. The closing test
-pools the five tasks at 80\%.}
+pools the five tasks at 80\%. ZipCache's score was run at 8K only.}
 \label{tab:ruler}
 \centering
 \small
 \begin{adjustbox}{max width=\columnwidth}
-\begin{tabular}{llrrrr}
+\begin{tabular}{llrrrrr}
 \toprule
- & Task & INT2 & Semantic & Uniform & Random \\
+ & Task & INT2 & Semantic & Uniform & Random & ZipCache \\
 \midrule
-8K & MK-1 & 21 & 49 / 38 & 50 / 37 & 50 / 38 \\
- & MK-2 & 5 & 50 / 15 & 50 / 19 & 49 / 20 \\
- & MK-3 & 0 & 17 / 1 & 46 / 1 & 44 / 4 \\
- & MV & 2 & 41 / 20 & 31 / 13 & 34 / 9 \\
- & VT & 1 & 49 / 49 & 50 / 30 & 45 / 29 \\
- & All, 80\% & & 123 & 100 & 100 \\
+8K & MK-1 & 21 & 49 / 38 & 50 / 37 & 50 / 38 & 50 / 40 \\
+ & MK-2 & 5 & 50 / 15 & 50 / 19 & 49 / 20 & 50 / 26 \\
+ & MK-3 & 0 & 17 / 1 & 46 / 1 & 44 / 4 & 48 / 3 \\
+ & MV & 2 & 41 / 20 & 31 / 13 & 34 / 9 & 47 / 15 \\
+ & VT & 1 & 49 / 49 & 50 / 30 & 45 / 29 & 50 / 48 \\
+ & All & 29 & 206 / 123 & 227 / 100 & 222 / 100 & 245 / 132 \\
 \midrule
-32K & MK-1 & 10 & 49 / 35 & 50 / 29 & 50 / 30 \\
- & MK-2 & 0 & 35 / 6 & 46 / 3 & 43 / 4 \\
- & MK-3 & 0 & 0 / 0 & 38 / 0 & 21 / 0 \\
- & MV & 0 & 30 / 13 & 35 / 7 & 33 / 9 \\
- & VT & 0 & 48 / 46 & 48 / 13 & 47 / 15 \\
- & All, 80\% & & 100 & 52 & 58 \\
+32K & MK-1 & 10 & 49 / 35 & 50 / 29 & 50 / 30 & -- \\
+ & MK-2 & 0 & 35 / 6 & 46 / 3 & 43 / 4 & -- \\
+ & MK-3 & 0 & 0 / 0 & 38 / 0 & 21 / 0 & -- \\
+ & MV & 0 & 30 / 13 & 35 / 7 & 33 / 9 & -- \\
+ & VT & 0 & 48 / 46 & 48 / 13 & 47 / 15 & -- \\
+ & All & 10 & 162 / 100 & 217 / 52 & 194 / 58 & -- \\
 \bottomrule
 \end{tabular}
 \end{adjustbox}
@@ -755,17 +765,32 @@ without INT2; the semantic source spends the same bytes unevenly,
 holding up to 13\% of the cache at INT2. Where it does not find the needle,
 the INT2 lands on it: on MK-3 in 44 and 47 of 50 runs, and semantic answered
 17 against uniform's 46 at 8K and 0 against 38 at 32K ($p < 10^{-7}$); on MK-2
-at 32K, 35 against 46 ($p = 0.0034$). It won MV at 8K, 41 against 31.
+at 32K, 35 against 46 ($p = 0.0034$). It won MV at 8K, 41 against 31. Over the
+five tasks it answered 206 against 227 at 8K, 12 samples by semantic alone and 33
+by uniform alone ($p = 0.0025$), and 162 against 217 at 32K, 6 to 61 ($p = 1.5
+\times 10^{-12}$).
+
+\textbf{A better score for 70\%.} That loss is the score's, not the planner's.
+At 8K and 70\% ZipCache's source answered 245 of 250, 40 samples by it alone and 1
+by semantic alone ($p = 4 \times 10^{-11}$), and 18 to 0 against uniform
+($p = 8 \times 10^{-6}$): its scores sent at most 0.2\% of a task's cache to
+INT2, against semantic's 1--9\%, and one MK-3 run in 50 had an INT2 cell on the
+needle, against 44. At 80\% it answered 132 against semantic's 123, 24 to 15
+($p = 0.20$), and 45 to 13 against uniform. It gives up the continuation at 80\%:
+KL 0.036 against 0.028, semantic lower on 48 of 50 passages (paired difference
+$-0.0076$ [$-0.0097$, $-0.0057$]), though at 70\% it is lower, 0.0010 against
+0.0023, mostly by one passage. Needles and facts do not part them, 48 and 49 against 48 and 48. Its
+pass over the prompt took 43\,s at 8K here; the scorer's scores come with decoding.
 
 \textbf{Graded measures part the sources.} In continuation fidelity at 80\%,
 semantic allocation kept the next-token distribution 3.6 times closer to FP16
 than uniform, a paired difference in mean KL of $-0.073$ [$-0.082$,
-$-0.065$], lower on all 50 passages, and top-1 agreement 7.1 points higher.
+$-0.065$], lower on all 50 passages, and top-1 agreement 7.2 points higher.
 At 70\% its KL against uniform's was within the interval, at 0.0023 against
 0.0031. A whole cache at INT4, at 4.63 bits, between the two levels' 5.48 and
 3.98, kept a KL of 0.0055, between semantic's at them; at INT8 it was
-$2 \times 10^{-5}$. In the dialogue, semantic recalled 48 facts against uniform's 45, three
-dialogues answered by semantic alone and none the other way ($p = 0.25$);
+$2 \times 10^{-5}$. In the dialogue, semantic recalled 48 facts against uniform's 44, four
+dialogues answered by semantic alone and none the other way ($p = 0.125$);
 uniform held every fact's page at INT2, semantic 38\% of them.
 
 \textbf{A second family.} On Llama-3.2-1B (Appendix~\ref{app:llama}), semantic
@@ -803,9 +828,10 @@ teacher-forced the measured tokens: the question and FP16's answer for the
 needle and the dialogue, the 128 tokens for continuation. A page's damage is
 the mean KL from FP16 over them; with no page moved the logits are FP16's to the
 bit. Over 3{,}200 pages a task, Spearman's $\rho$ between score and damage was
-$0.350$ [$0.303$, $0.394$] for continuation, positive in 49 passages of 50, but
-$0.006$ [$-0.039$, $0.051$] on the needles and $0.082$ [$0.047$, $0.116$] in the
-dialogue (95\% bootstrap over samples). The score ranks pages by the damage
+$0.356$ [$0.307$, $0.401$] for continuation, positive in 49 passages of 50, but
+$0.031$ [$-0.008$, $0.069$] on the needles and $0.068$ [$0.041$, $0.094$] in the
+dialogue (95\% bootstrap over samples); for ZipCache's scores of the same pages,
+$0.306$, $0.027$ and $0.050$. The score ranks pages by the damage
 their downgrade does to the continuation of the text it watched, not by the
 damage to the answer of a question asked after it, which agrees with the null
 comparison on the needle set.
@@ -815,8 +841,10 @@ output distribution markedly closer to full precision than uniform allocation,
 as a page's score predicts its damage there. It answered no more of a needle
 set too easy to separate the sources; on RULER's tasks below their ceiling it
 answered more at 80\% at both lengths, chiefly where the answer stands apart
-from its context, and fewer at 70\% where needle-shaped fillers hide it. At
-80\% reversible degradation kept three times the answers of eviction.
+from its context, and fewer at 70\% where needle-shaped fillers hide it, a loss
+ZipCache's score, at the cost of a pass over the prompt, did not have. Which score
+orders the pages is a choice the mechanism leaves open. At 80\% reversible
+degradation kept three times the answers of eviction.
 
 % =====================================================================
 \section{Limitations}
@@ -849,7 +877,9 @@ score cannot see the answer.} Question-blind attention does not single out a
 needle among needle-shaped fillers, and there the semantic source's uneven
 allocation put INT2 on the needle that uniform allocation spared at 70\%;
 RULER's yes at 8K rests on variable tracking alone on Qwen2.5-1.5B, and only the
-question-blind experiment was run on it.
+question-blind experiment was run on it. ZipCache's score was run question-blind
+at 8K on Qwen2.5-1.5B only, through a pass of its own into a second FP16 cache,
+so its cost at runtime, or under pressure, is not measured.
 
 % =====================================================================
 \section{Conclusion}
@@ -864,8 +894,9 @@ survives a contention that ends a static engine, in every run of four scenarios
 that ended one but a draw that exceeded the device. At equal bytes, allocating
 that precision by attention kept the model's output closer to full precision
 than allocating it uniformly, and more of RULER's answers at 80\% though fewer
-at 70\% where the score could not find the needle, and degrading pages
-reversibly kept far more than evicting them.
+at 70\% where our score could not find the needle and ZipCache's, on the same
+planner, did not lose it; degrading pages reversibly kept far more than evicting
+them.
 
 % =====================================================================
 % Unnumbered statements, outside the page limit, before the references.
@@ -1011,6 +1042,28 @@ positions and the adaptive engine completed all 32{,}767 in 154 plans, returning
 910\,MiB that the driver saw, every plan to a granule. One run each.
 
 \clearpage % keep the heading and both tables of this section on one page
+\section{ZipCache's Score as a Source}
+\label{app:zipcache}
+
+ZipCache ranks a token by its normalised attention, the attention it receives
+divided by the queries that could attend to it, read from probe tokens, the most
+recent 5\% of positions and a random 5\%. We run that rule as a score source of
+the same planner, with three differences. Its probes are a step of one position
+each in a second FP16 cache fed the conversation's tokens, so the cache a plan is
+made on is the same, to the bit, for every source; in ZipCache the probes are in
+its one prefill, so the pass's 43\,s at 8K positions is the experiment's and not
+the method's. A layer's masses average its heads, and each layer's pages are
+scored by their own layer. And the planner, not a saliency ratio between two
+bit-widths, spends the bytes. Every one of the 1{,}700 plans met its target, by
+less than 8\,KB. On the needle set, the dialogue and continuation the other
+sources were run again at the same code. On RULER they are the runs of an earlier
+commit, of which a check of 16 runs at the later code reproduced every one. Per
+task at 8K and 70\%, ZipCache's source against uniform: 16 to 0 on MV
+($p = 3 \times 10^{-5}$), 2 to 0 on MK-3, no other difference; at 80\%, 18 to 0
+on VT, 9 to 2 on MK-2 ($p = 0.065$), 10 to 8 on MV, 5 to 2 on MK-1 and 3 to 1 on
+MK-3. Against semantic at 80\%, 12 to 1 on MK-2 ($p = 0.0034$) is the only task
+that parts them, and MV leans the other way, 4 to 9 ($p = 0.27$).
+
 \section{The Cost of a Tier and of a Move}
 \label{app:moves}
 
