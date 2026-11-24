@@ -38,7 +38,8 @@ condition holds the turns alike until the plan, so they run once and each
 condition starts from their snapshot (rq3.from_one_opening). The summary
 gives each condition's recall, overall and by gap, with Wilson and
 bootstrap intervals, and at each level the semantic source paired against
-uniform and random by McNemar's exact test, as the needle's summary does;
+uniform, random and, where it was run, zipcache (#210) by McNemar's exact
+test, as the needle's summary does;
 with eviction's conditions among them (#160), eviction against the semantic
 source at each level too (rq3_summary.evictions).
 """

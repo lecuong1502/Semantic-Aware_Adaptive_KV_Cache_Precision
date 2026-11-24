@@ -329,4 +329,5 @@ the probes (2026-11-24).
   a score.
 - **Not under pressure.** An engine's own plans read scores as they stand
   (`RUNTIME_SOURCES`); a pass over the cache would cost what it is planning
-  for. The survival matrix has no such condition.
+  for. The survival matrix has no such condition, and the emergency plan of
+  a run under this source reads the scorer's scores.

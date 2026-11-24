@@ -29,7 +29,7 @@ from .footprint import Footprint
 from .models import VERIFIED
 from .monitor import DEFAULT as DEFAULT_THRESHOLDS
 from .monitor import GREEN, RED, YELLOW, Monitor, PressureEvent, Thresholds
-from .score_sources import RUNTIME_SOURCES, score_array
+from .score_sources import RUNTIME_SOURCES, SEEDED, score_array
 
 
 def expected_weight_shapes(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
@@ -438,11 +438,13 @@ class PlanRecord:
 
 class ShareAsked(NamedTuple):
     """What a controlled plan or eviction is asked for (#142, #160): the
-    share of the bytes, and the score source and its seed."""
+    share of the bytes, the score source and its seed, and the zipcache
+    source's scores (#210), None for another's."""
 
     share: float
     source: str
     seed: int
+    probed: np.ndarray | None = None
 
 
 def _alpha_of(cache, source: str) -> float | None:
@@ -708,29 +710,34 @@ class Conversation:
         once. Needs an adaptive engine, whose cache seals and so can
         downgrade, and, for semantic scores, a cache that keeps them. The
         plan's record, in the engine's `plans`."""
-        return self._controlled(source, seed)._controlled_plan(self._cache, share, source, seed)
+        engine = self._controlled(source)
+        return engine._controlled_plan(self._cache, ShareAsked(
+            share, source, seed, self._probed_for(source, seed)))
 
     def evict(self, share: float, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
         """Evict, between turns, the pages `plan` would downgrade most, for
         the same share's bytes (#160): H2O's family, as a condition. Each
         page is freed, its memory back to the driver, and attended to by no query
-        again; none comes back. The same engine and cache as `plan` needs.
+        again; none comes back. `source` and `seed` are as `plan`'s, and it
+        needs the same engine and cache.
         The eviction's record, in the engine's `plans`."""
-        return self._controlled(source, seed)._controlled_eviction(self._cache, share, source, seed)
+        engine = self._controlled(source)
+        return engine._controlled_eviction(self._cache, ShareAsked(
+            share, source, seed, self._probed_for(source, seed)))
 
     def restore(self, *, source: str = "semantic", seed: int = 0) -> PlanRecord:
         """Restore, between turns, every page that holds a shadow to FP16,
         as upgrades do once pressure has passed (#155, ADR-0017): the
         upgrade policy's plan (#103), in its order from `source`'s scores,
-        `seed` the random one's, for headroom enough for every upgrade, with
+        `seed` as `plan`'s, for headroom enough for every upgrade, with
         no cooldown, at once. The same engine and cache as `plan` needs.
         The plan's record, in the engine's `plans`."""
-        return self._controlled(source, seed)._controlled_restore(self._cache, source, seed)
+        return self._controlled(source)._controlled_restore(
+            self._cache, source, seed, self._probed_for(source, seed))
 
-    def _controlled(self, source: str, seed: int = 0) -> Engine:
+    def _controlled(self, source: str) -> Engine:
         """The engine, once it is known to hold a cache a controlled plan or
-        restore can move, from `source`'s scores: the zipcache source's are
-        then made, by a pass its `seed` draws the probes of."""
+        restore can move, from `source`'s scores."""
         if self._ended is not None:
             raise RuntimeError(f"the conversation has ended: {self._ended}")
         engine = self._engine
@@ -742,9 +749,12 @@ class Conversation:
                              "replace it, add to it, or upgrade its pages back")
         if source == "semantic" and self._cache.scores is None:
             raise ValueError("semantic scores need a cache that keeps them: kv_scoring=True")
-        if source == "zipcache":
-            self._cache.probed = self.probed_scores(seed=seed)
         return engine
+
+    def _probed_for(self, source: str, seed: int) -> np.ndarray | None:
+        """The zipcache source's scores, by a pass its `seed` draws the
+        probes of; None for another source, which needs none."""
+        return self.probed_scores(seed=seed) if source == "zipcache" else None
 
     @property
     def tokens(self) -> np.ndarray:
@@ -878,10 +888,6 @@ class Engine:
         self.kv_score_every = (self.DEFAULT_SCORE_EVERY if kv_score_every is None
                                else kv_score_every)
         self.kv_score_alpha = kv_score_alpha
-        if kv_score_source not in RUNTIME_SOURCES:
-            raise ValueError(f"kv_score_source is one of {RUNTIME_SOURCES}, got "
-                             f"{kv_score_source!r}: zipcache's scores take a pass, for a "
-                             f"controlled plan only")
         if kv_adaptive and (kv_cache == "contiguous" or kv_halves != "both"):
             raise ValueError("an adaptive cache is paged, and no diagnostic kv_halves")
         #: Whether pressure events make the engine downgrade pages (#105):
@@ -1079,6 +1085,20 @@ class Engine:
         if not 0 < alpha <= 1:  # NaN is refused too
             raise ValueError(f"kv_score_alpha is an EWMA weight, in (0, 1]; got {alpha!r}")
         self._kv_score_alpha = alpha
+
+    @property
+    def kv_score_source(self) -> str:
+        """Where the engine's own plans read their scores (#104), one of
+        RUNTIME_SOURCES: not zipcache's, which take a pass, for a controlled
+        plan only (#210). Setting it applies to the next plan."""
+        return self._kv_score_source
+
+    @kv_score_source.setter
+    def kv_score_source(self, source: str) -> None:
+        if source not in RUNTIME_SOURCES:
+            raise ValueError(f"kv_score_source is one of {RUNTIME_SOURCES}, got {source!r}: "
+                             f"zipcache's scores take a pass, for a controlled plan only")
+        self._kv_score_source = source
 
     @property
     def kv_plan_options(self) -> controller.PlanOptions:
@@ -1574,7 +1594,7 @@ class Engine:
         """The cache's tiers, the share's byte target, and a RED plan for it
         from the source's scores, so that it is applied at once."""
         pages, share = cache.pages, asked.share
-        tiers, scores = self._tiers_and_scores(cache, asked.source, asked.seed)
+        tiers, scores = self._tiers_and_scores(cache, asked.source, asked.seed, asked.probed)
         page_bytes, errors, seconds = self._plan_inputs
         # The share is of the pages outside the default floor, whatever floor
         # the plan keeps, so that an ablation of W chases the same bytes.
@@ -1597,22 +1617,20 @@ class Engine:
         reclaimed = controller.bytes_given_back(tiers, cache.pages.page_tiers(), page_bytes)
         target = entry.plan.target_bytes
         source = asked.source
-        return {"source": source, "seed": asked.seed if source == "random" else None,
+        return {"source": source, "seed": asked.seed if source in SEEDED else None,
                 "share": asked.share, "evicts": evicts,
                 "target_bytes": target, "reclaimed_bytes": reclaimed,
                 "target_met": entry.ended == "applied" and reclaimed >= target,
                 **self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)}
 
-    def _controlled_plan(self, cache: model.PagedCache, share: float, source: str,
-                         seed: int) -> PlanRecord:
+    def _controlled_plan(self, cache: model.PagedCache, asked: ShareAsked) -> PlanRecord:
         """Conversation.plan: a RED plan for the share's byte target, so that
         it is applied at once, recorded with no pressure event and with what
         controlled it."""
         own_before = self._own_bytes()
         started = time.perf_counter()
-        asked = ShareAsked(share, source, seed)
         tiers, _, plan = self._share_plan(cache, asked)
-        entry = self._controlled_record(cache, plan, source, started)
+        entry = self._controlled_record(cache, plan, asked.source, started)
         if len(plan):
             self._pending, self._cursor = entry, 0
             self._recent_moves.clear()
@@ -1624,18 +1642,16 @@ class Engine:
         entry.controlled = self._share_controlled(cache, entry, tiers, asked)
         return entry
 
-    def _controlled_eviction(self, cache: model.PagedCache, share: float, source: str,
-                             seed: int) -> PlanRecord:
+    def _controlled_eviction(self, cache: model.PagedCache, asked: ShareAsked) -> PlanRecord:
         """Conversation.evict: the pages the share's controlled plan would
         downgrade most, evicted at once in the plan's stead
         (controller.eviction_plan), recorded as a controlled plan is, its
         eviction in one batch."""
         own_before = self._own_bytes()
         started = time.perf_counter()
-        asked = ShareAsked(share, source, seed)
         tiers, target, plan = self._share_plan(cache, asked)
         eviction = controller.eviction_plan(target, plan, tiers, self.page_bytes)
-        entry = self._controlled_record(cache, eviction, source, started)
+        entry = self._controlled_record(cache, eviction, asked.source, started)
         self._pending = None  # the record replaced any plan in hand
         pages, cache_before = cache.pages, cache.nbytes
         for layer, page in zip(eviction.layers.tolist(), eviction.pages.tolist()):
@@ -1647,8 +1663,8 @@ class Engine:
         entry.controlled = self._share_controlled(cache, entry, tiers, asked, evicts=True)
         return entry
 
-    def _controlled_restore(self, cache: model.PagedCache, source: str,
-                            seed: int) -> PlanRecord:
+    def _controlled_restore(self, cache: model.PagedCache, source: str, seed: int,
+                            probed: np.ndarray | None) -> PlanRecord:
         """Conversation.restore: an upgrade plan at GREEN, for the headroom
         that takes every page holding a shadow back to FP16, applied step by
         step within the budget until it is done, recorded with no pressure
@@ -1656,7 +1672,7 @@ class Engine:
         own_before = self._own_bytes()
         started = time.perf_counter()
         pages = cache.pages
-        tiers, scores = self._tiers_and_scores(cache, source, seed)
+        tiers, scores = self._tiers_and_scores(cache, source, seed, probed)
         shadowed = pages.shadowed()
         page_bytes, errors, seconds = self._plan_inputs
         bytes_at = controller.place_bytes(page_bytes)
@@ -1680,7 +1696,7 @@ class Engine:
                 started, planned, own_before = time.perf_counter(), False, self._own_bytes()
         after = pages.page_tiers()
         entry.controlled = {
-            "restore": True, "source": source, "seed": seed if source == "random" else None,
+            "restore": True, "source": source, "seed": seed if source in SEEDED else None,
             "restored_bytes": -controller.bytes_given_back(tiers, after, page_bytes),
             "restored": bool((after[shadowed] == FP16).all()),
             **self._effective_bits(cache, page_bytes, controller.DEFAULT_RECENCY_FLOOR)}
@@ -1713,14 +1729,15 @@ class Engine:
         recency floor and over every full page."""
         return self._effective_bits(cache, self.page_bytes, controller.DEFAULT_RECENCY_FLOOR)
 
-    def _tiers_and_scores(self, cache: model.PagedCache, source: str,
-                          seed: int) -> tuple[np.ndarray, np.ndarray]:
-        """The cache's page tiers, and the scores `source` gives its pages."""
+    def _tiers_and_scores(self, cache: model.PagedCache, source: str, seed: int,
+                          probed: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """The cache's page tiers, and the scores `source` gives its pages,
+        the zipcache one's `probed`."""
         tiers = cache.pages.page_tiers()
         layers, count = tiers.shape
         semantic = cache.scores.download() if source == "semantic" else None
         return tiers, score_array(source, layers, count, semantic=semantic,
-                                  zipcache=cache.probed, seed=seed)
+                                  zipcache=probed, seed=seed)
 
     def _effective_bits(self, cache: model.PagedCache, page_bytes: dict[str, int],
                         recency_floor: int) -> dict:
@@ -1961,7 +1978,7 @@ class Engine:
         page_tokens = _microinfer.device.page_tokens
         taken = zipcache.ProbedMass(self.config.num_hidden_layers,
                                     -(-self.config.context_window // page_tokens), page_tokens)
-        cache = model.PagedCache(self.config, scorer=taken)
+        cache = model.PagedCache(self.config, masses_to=taken)
         probes = zipcache.probe_positions(len(ids), seed)
         size = min(self.prefill_chunk or len(ids), len(ids))
         ws = model.Workspace(self.config, rows=size)

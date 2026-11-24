@@ -534,9 +534,11 @@ is a condition, `zipcache-70` and `zipcache-80`, B9, on Qwen2.5-1.5B:
 
 - **question-blind, on the screened sets already fixed:** the needle set, the
   anchor-fact dialogue, RULER's five tasks at 8K, and continuation fidelity's
-  50 passages. Not at 32K, question-aware, end to end or on Llama-3.2-1B.
+  50 passages. Question-aware it is refused; at 32K, end to end and on
+  Llama-3.2-1B it is not run here.
 - **The plan's scores** are a probed pass's over what the cache holds at the
-  plan: the prompt and the decoded tokens, never the question.
+  plan: the prompt and the decoded tokens, never the question. In
+  continuation the most recent 5% are mostly the warm tokens, 64 of 106.
 - **What it is paired with.** For the needle set, the dialogue and
   continuation, whose source conditions were logged before #204's and #205's
   kernels, the semantic, uniform and random sources are run again beside it,

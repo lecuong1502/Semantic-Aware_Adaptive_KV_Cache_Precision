@@ -675,8 +675,8 @@ _Avoid_: hypothesis, headline result (the comparison was fixed before the result
 One benchmark-log entry, `rq3-summary`, pooling the screened set's needle
 runs, the latest of each sample in each experiment under each condition,
 by their hashes (#152): accuracy by condition, level and depth with
-intervals, the semantic source paired against uniform and random, and the
-closing question's answer. Every other comparison in it is descriptive.
+intervals, the semantic source paired against uniform and random, and
+against zipcache where it was run, and the closing question's answer. Every other comparison in it is descriptive.
 _Avoid_: report, results table (it is a log entry the tables are printed from)
 
 **32K subset**:

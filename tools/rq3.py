@@ -66,11 +66,12 @@ NEEDLE_SEED = 140
 
 def conditions_for(chosen: list[str] | None, *, screened: bool) -> list[str]:
     """The conditions to run, each once: those chosen, "sources" for every
-    score source of ADR-0017's at each level, "zipcache" for ZipCache's at
-    each (#210), or every one of ADR-0017's, but for the screened set fp16,
+    score source of ADR-0017's at each level, "zipcache" for those and ZipCache's
+    at each, which are paired at one code (#210), or every one of ADR-0017's, but for the screened set fp16,
     which screening ran (#148)."""
     if chosen is not None:
-        groups = {"sources": rq3.SOURCE_CONDITIONS, "zipcache": rq3.ZIPCACHE_CONDITIONS}
+        groups = {"sources": rq3.SOURCE_CONDITIONS,
+                  "zipcache": (*rq3.SOURCE_CONDITIONS, *rq3.ZIPCACHE_CONDITIONS)}
         named = (groups.get(name, [name]) for name in chosen)
         return list(dict.fromkeys(n for names in named for n in names))
     return [c.name for c in rq3.CONDITIONS if not (screened and c.name == "fp16")]
@@ -85,8 +86,8 @@ def main(argv: list[str]) -> int:
                         choices=["sources", "zipcache",
                                  *(c.name for c in (*rq3.CONDITIONS, *rq3.EVICTIONS,
                                                     *rq3.ZIPCACHES, rq3.NO_PLAN))],
-                        help="sources: ADR-0017's at each level (#149); zipcache: ZipCache's "
-                             "at each (#210); default: every one of ADR-0017's, but fp16 with "
+                        help="sources: ADR-0017's at each level (#149); zipcache: those and "
+                             "ZipCache's at each, paired at one code (#210); default: every one of ADR-0017's, but fp16 with "
                              "--screened, whose FP16 runs screening logged")
     runs_of_their_own = parser.add_mutually_exclusive_group()
     runs_of_their_own.add_argument(
@@ -109,7 +110,8 @@ def main(argv: list[str]) -> int:
                         help="draw more a depth, for screening's replacements")
     parser.add_argument("--needle-seed", type=int, default=NEEDLE_SEED)
     parser.add_argument("--plan-seed", type=int, default=0,
-                        help="the random source's seed, with each sample's id (rq3.sample_seed)")
+                        help="the seed of the random source and of zipcache's probes, with each "
+                             "sample's id (rq3.sample_seed)")
     parser.add_argument("--haystack-tokens", type=int, default=None,
                         help=f"default: {needles.DEFAULT_HAYSTACK_TOKENS}")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
@@ -163,10 +165,12 @@ def main(argv: list[str]) -> int:
                                                args.haystack_tokens, args.log)
     args.conditions = conditions_for(args.conditions, screened=args.screened)
     args.experiments = list(dict.fromkeys(args.experiments))
-    if (set(args.conditions) & set(rq3.EVICTION_CONDITIONS)
-            and args.experiments != [rq3_summary.CLOSING_EXPERIMENT]):
-        parser.error(f"eviction is run {rq3_summary.CLOSING_EXPERIMENT} only (#160, "
-                     f"ADR-0017's amendment); drop the other experiments")
+    blind_only = {"eviction": rq3.EVICTION_CONDITIONS, "zipcache": rq3.ZIPCACHE_CONDITIONS}
+    for name, conditions in blind_only.items():
+        if (set(args.conditions) & set(conditions)
+                and args.experiments != [rq3_summary.CLOSING_EXPERIMENT]):
+            parser.error(f"{name} is run {rq3_summary.CLOSING_EXPERIMENT} only (ADR-0017's "
+                         f"amendments, #160 and #210); drop the other experiments")
 
     engine = Engine(REPO / "models" / args.model)
     every = needles.needle_set(held_out_text(), engine.tokenizer, seed=args.needle_seed,

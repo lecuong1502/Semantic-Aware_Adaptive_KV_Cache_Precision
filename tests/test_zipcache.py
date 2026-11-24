@@ -118,9 +118,9 @@ def test_a_page_s_divisor_counts_only_the_queries_and_tokens_that_meet():
 
 
 def test_normalising_takes_off_what_accumulating_gives_early_positions():
-    """Attention even over what each query sees: accumulated, the first page
-    is far above the last; normalised, every page every probe passed is
-    alike, and accumulated again it is not."""
+    """Attention even over what each query sees, every position a probe: the
+    first page accumulates over four times as much more than the last as it
+    is given once normalised, since more queries could attend to it."""
     n, page = 64, 4
     even = [np.tri(n)[None] / np.arange(1, n + 1)[:, None]]
     probes = np.arange(n)
@@ -157,17 +157,14 @@ def test_the_pass_gives_what_masses_taken_at_every_position_give(engine):
     probes = set(zipcache.probe_positions(len(ids), seed).tolist())
     got = engine.probed_scores(ids, seed=seed)
     cfg = engine.config
-    cache = model.PagedCache(cfg, scoring=True)
     taken = []
 
     class Every:
-        nbytes = 0
-
         def fold(self, layer, mass, heads, pages):
             taken.append((layer, pages,
                           mass.to_numpy()[:heads * pages].reshape(heads, pages).mean(axis=0)))
 
-    cache.scores = Every()
+    cache = model.PagedCache(cfg, masses_to=Every())
     ws = model.Workspace(cfg, rows=1)
     sums = np.zeros((cfg.num_hidden_layers, -(-len(ids) // P)))
     pairs = np.zeros(sums.shape[1])
@@ -256,3 +253,23 @@ def test_an_engine_under_pressure_cannot_plan_from_it():
     own plans, made under pressure, read scores as they stand."""
     with pytest.raises(ValueError, match="zipcache"):
         Engine(require_model(NAME), kv_score_source="zipcache")
+
+
+def test_a_zipcache_run_s_emergency_plan_reads_the_scorer(engine):
+    """A condition sets the engine's own score source too, which an emergency
+    plan reads: under zipcache's, the scorer's, whose cache keeps scores, as
+    every source condition's does. Set straight, zipcache is refused."""
+    with rq3.set_for(engine, rq3.condition("zipcache-80")):
+        assert engine.kv_score_source == "semantic" and engine.kv_scoring
+    with pytest.raises(ValueError, match="zipcache"):
+        engine.kv_score_source = "zipcache"
+
+
+@pytest.mark.slow
+def test_the_plan_s_record_names_the_probes_seed(engine):
+    """As the random source's is recorded: which probes a plan came from."""
+    with rq3.set_for(engine, rq3.NO_PLAN), engine.conversation() as chat:
+        chat.turn(prompt(300, 9), 3, stop_at_eos=False)
+        assert chat.plan(0.7, source="zipcache", seed=11).controlled["seed"] == 11
+        restored = chat.restore(source="zipcache", seed=12).controlled
+        assert restored["seed"] == 12 and restored["restored"]

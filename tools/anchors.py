@@ -6,12 +6,13 @@ Three steps, each a command (microinfer.anchors):
    gap). Each FP16 run is an rq3-anchor entry, screening true, and the
    screened set an anchor-screening entry; a gap short after --draws is
    logged as a screening not complete.
-2. By default: the screened set under each condition chosen, every score
-   source at each level, or those --conditions names; one rq3-anchor
-   entry a run. A dialogue's source conditions run its turns once
+2. By default: the screened set under each condition chosen, ADR-0017's
+   score sources at each level, or those --conditions names, ZipCache's
+   (#210) among them; one rq3-anchor entry a run. A dialogue's source conditions run its turns once
    (anchors.runs).
 3. `--summarise`: the anchor-summary entry, recall per condition by gap and
-   the semantic source paired against uniform and random, and its tables;
+   the semantic source paired against uniform and random, and against
+   zipcache if named, and its tables;
    with --evictions, an rq3-eviction-summary entry, its task anchor-fact,
    eviction paired against the semantic source at each level besides.
 
@@ -57,7 +58,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--conditions", nargs="+", default=None,
                         choices=[*rq3.SOURCE_CONDITIONS, *rq3.ZIPCACHE_CONDITIONS,
                                  *rq3.EVICTION_CONDITIONS, *rq3.STATIC_CONDITIONS],
-                        help="default: every score source at each level; fp16's runs are "
+                        help="default: ADR-0017's score sources at each level; fp16's runs are "
                              "screening's")
     parser.add_argument("--evictions", action="store_true",
                         help="eviction at each level and the semantic source there (#160)")
@@ -66,7 +67,8 @@ def main(argv: list[str]) -> int:
                         help="dialogues a gap drawn, at most, to screen")
     parser.add_argument("--anchor-seed", type=int, default=anchors.ANCHOR_SEED)
     parser.add_argument("--plan-seed", type=int, default=0,
-                        help="the random source's seed, with each dialogue's id")
+                        help="the seed of the random source and of zipcache's probes, with each "
+                             "dialogue's id")
     parser.add_argument("--turns", type=int, default=anchors.TURNS)
     parser.add_argument("--passage-tokens", type=int, default=anchors.PASSAGE_TOKENS)
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)

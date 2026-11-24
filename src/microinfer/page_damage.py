@@ -269,8 +269,12 @@ def summarise(entries: Sequence[dict], of: Draws, sample_ids: Sequence[str]) -> 
     runs = [latest[s]["results"] for s in sample_ids]
     picks = np.random.default_rng(SEED).integers(0, len(runs),
                                                  size=(rq3_summary.RESAMPLES, len(runs)))
-    zipcache = (_rhos(runs, "zipcache_scores", "zipcache_rho", picks)
-                if all("zipcache_scores" in r for r in runs) else None)
+    without = [s for s, r in zip(sample_ids, runs) if "zipcache_scores" not in r]
+    if without and len(without) < len(runs):
+        raise ValueError(f"no zipcache scores in {len(without)} of the {len(runs)} samples' runs, "
+                         f"such as {without[:3]}, logged before #210; run tools/page_damage.py "
+                         f"for them")
+    zipcache = None if without else _rhos(runs, "zipcache_scores", "zipcache_rho", picks)
     return {**of._asdict(), "samples": len(runs), "pairs": sum(len(r["kl"]) for r in runs),
             "tier": TIER, **_rhos(runs, "scores", "rho", picks), "zipcache": zipcache,
             "kl_median": float(np.median([k for r in runs for k in r["kl"]])),

@@ -18,8 +18,9 @@ data named, when it is:
 - **descriptive**: each task's semantic source paired against uniform,
   random and, where it was run, zipcache (#210) at each level, by answered
   samples (rq3_summary.paired) and by the mean score's paired difference,
-  with its bootstrap interval; the same pairs by answered samples pooled
-  over the tasks below their ceiling, as the closing test pools them; and,
+  with its bootstrap interval; semantic against zipcache by answered
+  samples pooled over the tasks below their ceiling, as the closing test
+  pools them (`pooled`, empty where zipcache was not run); and,
   for each condition whose runs record them, where its plan left the
   needle: the mean share of each tier over the cache and over the needle's
   pages' cells, and the share of runs with an INT2 cell on the needle.
@@ -193,21 +194,19 @@ def summarise(entries: Sequence[dict], model: str, seed: int, haystack_tokens: i
 
 
 def _pooled(tasks: list[dict[str, list[dict]]], rng: np.random.Generator) -> dict:
-    """At each level, the semantic source paired against each other source
-    over the samples of every one of `tasks`, the conditions whole in all of
-    them."""
+    """At each level, the semantic source paired against zipcache over the
+    samples of every one of `tasks`, where both are whole in all of them
+    (ADR-0017's amendment, #210)."""
     out: dict[str, dict] = {}
     for share in rq3_summary.LEVELS:
         names = rq3.sources_at(share)
-        for other in rq3_summary.OTHER_SOURCES:
-            pair = (names["semantic"], names[other])
-            if not tasks or not all(n in runs for runs in tasks for n in pair):
-                continue
-            semantic, against = (_answered([e for runs in tasks for e in runs[n]]) for n in pair)
-            out.setdefault(rq3_summary.level_name(share), {})[f"semantic-{other}"] = {
+        pair = (names["semantic"], names["zipcache"])
+        if tasks and all(n in runs for runs in tasks for n in pair):
+            semantic, other = (_answered([e for runs in tasks for e in runs[n]]) for n in pair)
+            out[rq3_summary.level_name(share)] = {"semantic-zipcache": {
                 "samples": len(semantic), "semantic_answered": int(semantic.sum()),
-                "other_answered": int(against.sum()),
-                **rq3_summary.paired(semantic, against, rng)}
+                "other_answered": int(other.sum()),
+                **rq3_summary.paired(semantic, other, rng)}}
     return out
 
 

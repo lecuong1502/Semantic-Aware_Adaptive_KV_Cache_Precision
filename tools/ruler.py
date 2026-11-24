@@ -51,7 +51,8 @@ PER_TASK = 50
 TURN_1_S = {"8K": 12.0, "32K": 205.0}
 CLOSING_S = {"8K": 4.0, "32K": 10.0}
 #: A sample's probed pass, once for its zipcache conditions (#210): 8K's as
-#: measured, 32K's that times the square of the lengths' ratio.
+#: timed, unlogged, on Qwen2.5-1.5B, 32K's that times the square of the
+#: lengths' ratio.
 PROBE_S = {"8K": 43.0, "32K": 690.0}
 
 
@@ -252,7 +253,9 @@ def main(argv: list[str]) -> int:
 
 
 def print_summary(s: dict) -> None:
-    names = ["fp16", *ruler_summary.CONDITIONS, *rq3.ZIPCACHE_CONDITIONS]
+    zipcache = [n for n in rq3.ZIPCACHE_CONDITIONS
+                if any(n in row["by_condition"] for row in s["tasks"].values())]
+    names = ["fp16", *ruler_summary.CONDITIONS, *zipcache]
     print("| Task | Ceiling | " + " | ".join(names) + " |")
     print("|---|---|" + "---|" * len(names))
     for task, row in s["tasks"].items():

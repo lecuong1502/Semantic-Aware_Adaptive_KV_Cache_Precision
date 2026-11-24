@@ -47,7 +47,7 @@ Pages = Iterable[tuple[int, int]]
 Scores = dict[tuple[int, int], float]
 
 
-def held_scores(pages: Pages, held: np.ndarray) -> Scores:
+def read_scores(pages: Pages, held: np.ndarray) -> Scores:
     """Each page's score in `held`, (layers, max_pages), the scorer's
     download or a probed pass's: NaN for a page never observed, and for an
     open page."""
@@ -108,9 +108,11 @@ SOURCES = ("semantic", "uniform", "random", "zipcache")
 #: The sources an engine's own plans may read, made under pressure from what
 #: it holds: every one but zipcache, whose scores take a pass.
 RUNTIME_SOURCES = tuple(s for s in SOURCES if s != "zipcache")
+#: The sources a seed decides: random's scores, zipcache's probes.
+SEEDED = ("random", "zipcache")
 
 
-def _held(source: str, given: dict[str, np.ndarray | None]) -> np.ndarray:
+def _held(source: str, **given: np.ndarray | None) -> np.ndarray:
     held = given[source]
     if held is None:
         raise ValueError(f"the {source} source reads {_HELD[source]}; pass {source}=")
@@ -129,7 +131,7 @@ def score_array(source: str, layers: int, pages: int, *, semantic: np.ndarray | 
     [l, i]: what the engine plans from (#105), without a dict of them."""
     _check(source)
     if source in _HELD:
-        held = _held(source, {"semantic": semantic, "zipcache": zipcache})
+        held = _held(source, semantic=semantic, zipcache=zipcache)
         if held.shape[0] < layers or held.shape[1] < pages:
             raise ValueError(f"{layers} layers of {pages} pages are outside the scores' "
                              f"{held.shape[0]} layers of {held.shape[1]} pages")
@@ -147,7 +149,7 @@ def scores_for(source: str, pages: Pages, *, semantic: np.ndarray | None = None,
     _check(source)
     pages = list(pages)
     if source in _HELD:
-        return held_scores(pages, _held(source, {"semantic": semantic, "zipcache": zipcache}))
+        return read_scores(pages, _held(source, semantic=semantic, zipcache=zipcache))
     if source == "uniform":
         return uniform_scores(pages)
     if seed is None:

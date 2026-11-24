@@ -137,7 +137,7 @@ def _conditions(experiment: str, latest: dict[tuple[str, str, str], dict],
     if experiment == "question-aware":
         return list(rq3.SOURCE_CONDITIONS)
     later = (*rq3.LATER_STATIC_CONDITIONS, *rq3.ZIPCACHE_CONDITIONS)
-    return [c.name for c in (*rq3.CONDITIONS, *rq3.ZIPCACHES)
+    return [c.name for c in rq3.WITH_ZIPCACHE
             if c.name not in later or any((s, experiment, c.name) in latest for s in kept)]
 
 

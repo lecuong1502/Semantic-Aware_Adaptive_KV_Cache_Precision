@@ -123,7 +123,11 @@ def test_zipcache_s_rho_is_of_the_same_pages_and_damages(tmp_path):
     assert s["zipcache"]["mean_sample_rho_bootstrap_95"] == pytest.approx([-1, -1])
     assert s["positive_samples"] == 1
     logged_sample(log, "c", [1, 2, 3, 4], [1, 2, 3, 4])
-    assert page_damage.summarise(benchlog.read(log), needle, ["a", "c"])["zipcache"] is None
+    d = page_damage.summarise(benchlog.read(log), needle, ["c"])
+    assert d["zipcache"] is None
+    # a rerun part done is not pooled with runs logged before
+    with pytest.raises(ValueError, match="zipcache.*c"):
+        page_damage.summarise(benchlog.read(log), needle, ["a", "c"])
 
 
 @pytest.mark.slow

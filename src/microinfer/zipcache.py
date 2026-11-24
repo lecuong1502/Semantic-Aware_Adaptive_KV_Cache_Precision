@@ -55,12 +55,9 @@ def probe_positions(positions: int, seed: int) -> np.ndarray:
 
 
 class ProbedMass:
-    """What takes the masses of a pass's probes, in an ImportanceScores' place
-    in its cache: each page's summed on the host, with the (query, token)
+    """What a probed pass's cache gives its masses to (PagedCache's
+    `masses_to`): each page's summed on the host, with the (query, token)
     pairs that could meet there."""
-
-    #: The device memory it holds: none.
-    nbytes = 0
 
     def __init__(self, layers: int, max_pages: int, page_tokens: int):
         self._mass = np.zeros((layers, max_pages))

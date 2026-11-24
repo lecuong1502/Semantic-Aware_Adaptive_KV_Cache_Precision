@@ -321,5 +321,17 @@ def test_question_blind_s_closing_run_is_every_source_at_both_levels():
         "semantic-70", "semantic-80", "uniform-70", "uniform-80", "random-70", "random-80"]
     assert tool.conditions_for(["sources", "semantic-70", "fp16", "fp16"], screened=True) == [
         *rq3.SOURCE_CONDITIONS, "fp16"]  # each once
-    assert tool.conditions_for(["sources", "zipcache"], screened=True) == [
-        *rq3.SOURCE_CONDITIONS, "zipcache-70", "zipcache-80"]  # #210
+    # #210: beside the sources it is paired with, so that both are at one code
+    assert tool.conditions_for(["zipcache"], screened=True) == [
+        *rq3.SOURCE_CONDITIONS, "zipcache-70", "zipcache-80"]
+
+
+def test_zipcache_is_run_question_blind_only(tmp_path, monkeypatch, capsys):
+    """Its question-aware runs would be in no summary (ADR-0017's amendment)."""
+    real = benchlog.environment  # this test runs on a tree being changed
+    monkeypatch.setattr(tool.benchlog, "environment",
+                        lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    with pytest.raises(SystemExit):
+        tool.main(["--issue", "210", "--conditions", "zipcache", "--experiments",
+                   "question-aware", "--log", str(tmp_path / "none.jsonl")])
+    assert "zipcache is run question-blind only" in capsys.readouterr().err
