@@ -554,3 +554,71 @@ is a condition, `zipcache-70` and `zipcache-80`, B9, on Qwen2.5-1.5B:
 - **Page damage.** Each run of #188's correlation now records both scores of
   each page it damages, so ZipCache's Spearman rho is of the same pages,
   damages and resamples as the scorer's. The three tasks are run again.
+
+## As measured (#210): ZipCache's score answers more at 70%
+
+Qwen2.5-1.5B at 8K, question-blind, on the sets fixed above. Every figure is
+from the summaries `rq3-summary` `b5b39004…`, `anchor-summary` `5fe96553…`,
+`continuation-summary` `adf7164a…`, `page-damage-summary` `4c28c55d…`
+(continuation), `88df6679…` (needle) and `f450bb6e…` (dialogue) and
+`ruler-summary` `a57061d8…`, or, where pooled over tasks against uniform and
+random, computed from the runs they name. All 1,700 plans met their byte target,
+by 7,782 bytes at most, and none fell short.
+
+**RULER.**
+
+| Task | Semantic 70 / 80 | Uniform 70 / 80 | Random 70 / 80 | ZipCache 70 / 80 |
+|---|---|---|---|---|
+| MK-1 | 49 / 38 | 50 / 37 | 50 / 38 | 50 / 40 |
+| MK-2 | 50 / 15 | 50 / 19 | 49 / 20 | 50 / 26 |
+| MK-3 | 17 / 1 | 46 / 1 | 44 / 4 | 48 / 3 |
+| MV | 41 / 20 | 31 / 13 | 34 / 9 | 47 / 15 |
+| VT | 49 / 49 | 50 / 30 | 45 / 29 | 50 / 48 |
+| All | 206 / 123 | 227 / 100 | 222 / 100 | 245 / 132 |
+
+- **Semantic against ZipCache:** at 70%, 1 to 40 (p = 4e-11); at 80%, 15 to
+  24 (p = 0.20). Per task only MK-2 at 80% (1 to 12, p = 0.0034) and MK-3 at
+  70% (0 to 31) part them; MV at 80% leans to semantic, 9 to 4 (p = 0.27).
+- **ZipCache against uniform** (from the runs): at 70%, 18 to 0 (p = 7.6e-6),
+  16 of them MV's; at 80%, 45 to 13 (p = 3.0e-5), 18 to 0 on VT, 27 to 13
+  without it (p = 0.038). Against random 25 to 2 and 53 to 21.
+- **Semantic against uniform, pooled at 70%** (from the runs, not logged by
+  #208): 206 against 227, 12 to 33, p = 0.0025 at 8K; 162 against 217, 6 to
+  61, p = 1.5e-12 at 32K; on Llama-3.2-1B 216 against 206, p = 0.099 (#209).
+- **Why at 70%:** ZipCache's plan held at most 0.2% of a task's cache at INT2
+  against semantic's 1.2% to 9.5%, and had an INT2 cell on MK-3's needle in 1
+  run of 50 against 44. Its plan's tiers are uniform's to within a few tenths of
+  a percent of the cache, so what parts them is which pages hold the INT8.
+- **The other sources' runs are #208's,** of commit `a49d026`, whose code is not
+  #210's; the check of 16 runs above is the evidence they reproduce.
+
+**Needles, dialogue and continuation** are paired at one code, the sources run
+again beside ZipCache.
+
+| At 80% | Semantic | Uniform | Random | ZipCache |
+|---|---|---|---|---|
+| Needles of 50 | 48 | 49 | 50 | 48 |
+| Facts of 50 | 48 | 44 | 48 | 49 |
+| Top-1 | 0.937 | 0.865 | 0.876 | 0.928 |
+| Mean KL | 0.0279 | 0.1010 | 0.0825 | 0.0355 |
+| Mean KL at 70% | 0.0023 | 0.0031 | 0.0054 | 0.0010 |
+
+- **Continuation at 80%:** semantic below ZipCache on 48 of 50 passages,
+  -0.0076 [-0.0097, -0.0057]; **at 70%** above it on 30, +0.0013 [0.0002,
+  0.0033], of which one passage (0.046) makes most: the median difference
+  is 4e-5.
+- **Needles and facts:** 1 to 1 and 0 to 1 against semantic, p = 1 for both.
+  The closing answer is still No (0 to 1 against uniform). At 80% uniform's
+  facts are 44, one fewer than #154's run at the older kernels, and the paired
+  difference from semantic is 4 to 0, p = 0.125 (was 3 to 0, 0.25).
+- **Rho** of score and INT4 damage, 64 pages in each of 50 samples, semantic
+  then ZipCache on the same pages: continuation +0.356 [0.307, 0.401] and
+  +0.306 [0.261, 0.350]; needle +0.031 [-0.008, 0.069] and +0.027 [-0.014,
+  0.068]; dialogue +0.068 [0.041, 0.094] and +0.050 [0.011, 0.089]. They
+  replace #189's on the paper's tables: +0.350, +0.006, +0.082 at the older
+  kernels. A difference of rho between the two scores was not tested.
+
+**What it changes.** Attention-guided allocation beats uniform at 80% whichever
+attention score is read, and at 70% the one that loses to it is ours. The claim
+the paper makes is therefore the mechanism's: a runtime planner that takes any
+score, not that this score is the best.
