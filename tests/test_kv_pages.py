@@ -26,13 +26,17 @@ from ulp_gate import fp16_exact
 from microinfer import _microinfer
 from microinfer._microinfer import PagedKVCache, Tier
 from microinfer.config import ModelConfig
+from microinfer.model import rope_scaling
 from microinfer.models import VERIFIED
+from test_rope import assert_table_rounded_once, reference_inv_freq
 
 device = _microinfer.device
 MODELS = sorted(VERIFIED)
+#: The model a test of one shape uses: the development target (ADR-0003).
+SMALL = "qwen2.5-0.5b-instruct"
 PAGE_TOKENS = [16, 48]
 LAYERS = 2
-CFG = ModelConfig.from_card(MODELS[0])
+CFG = ModelConfig.from_card(SMALL)
 
 
 def put(host):
@@ -201,14 +205,15 @@ def test_pages_come_on_demand_go_with_the_cache_and_misuse_is_refused():
 
 def test_the_rope_table_is_the_fp64_value_rounded_once_and_must_reach_every_key():
     """Attention completes keys with cos and sin from this table (ADR-0009,
-    note from #14): each entry is the float64 value rounded once to fp32, out
-    to the model's whole context window, at both models' head_dims. It grows
+    note from #14): each entry is the float64 value rounded once to fp32
+    (test_rope.assert_table_rounded_once), out to the model's whole context
+    window, at every model's head_dim and RoPE scaling. It grows
     by doubling, so a decode step does not rebuild it. A key bias needs a
     table that reaches every key."""
     def rounded_once(name):
         cfg = ModelConfig.from_card(name)
         hd = cfg.head_dim
-        table = device.RopeTable(hd, cfg.rope_theta)
+        table = device.RopeTable(hd, cfg.rope_theta, rope_scaling(cfg))
         table.cover(5)
         table.cover(6)
         assert table.positions == 10, "grows by doubling"
@@ -216,11 +221,8 @@ def test_the_rope_table_is_the_fp64_value_rounded_once_and_must_reach_every_key(
         got = table.to_numpy()
         assert table.nbytes == got.nbytes
         angle = (np.arange(got.shape[0], dtype=np.float64)[:, None]
-                 * cfg.rope_theta ** (-2.0 * np.arange(hd // 2) / hd))
-        for value, reference in ((got[..., 0], np.cos(angle)), (got[..., 1], np.sin(angle))):
-            rounded = reference.astype(np.float32)
-            ulps = np.abs(value - rounded) / np.spacing(np.abs(rounded).astype(np.float32))
-            assert ulps.max() <= 1, f"{ulps.max()} fp32 ulp from the float64 value"
+                 * reference_inv_freq(hd, cfg.rope_theta, cfg.rope_scaling))
+        assert_table_rounded_once(got, angle)
 
     each(MODELS, rounded_once)
 

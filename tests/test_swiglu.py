@@ -18,6 +18,8 @@ from microinfer.config import ModelConfig
 from microinfer.models import VERIFIED
 
 MODELS = sorted(VERIFIED)
+#: The model a test of one shape uses: the development target (ADR-0003).
+SMALL = "qwen2.5-0.5b-instruct"
 
 
 def reference_swiglu(gate: np.ndarray, up: np.ndarray) -> np.ndarray:
@@ -44,7 +46,7 @@ def test_matches_float64_reference_across_widths_and_gate_values():
     def matches(gate, up):
         assert_within_gate(_microinfer.swiglu(gate, up), reference_swiglu(gate, up))
 
-    width = ModelConfig.from_card(MODELS[0]).intermediate_size
+    width = ModelConfig.from_card(SMALL).intermediate_size
     cases = ([make_case(16, ModelConfig.from_card(n).intermediate_size,
                         seed=ModelConfig.from_card(n).intermediate_size) for n in MODELS]
              + [make_case(8, width, seed=int(s * 100), scale=s) for s in (0.01, 1.0, 8.0)]

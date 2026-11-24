@@ -43,7 +43,7 @@ def main(argv: list[str]) -> int:
                      "each entry names the code that produced it")
 
     cfg = ModelConfig.from_card(args.model)
-    tokens = cfg.max_position_embeddings
+    tokens = cfg.context_window
     elements = 2 * tokens * cfg.num_hidden_layers * cfg.num_key_value_heads * cfg.head_dim
     fp16_payload = sum(paged_cache_ranges(cfg, tokens, "FP16"))
     for tier in Engine.KV_TIERS:

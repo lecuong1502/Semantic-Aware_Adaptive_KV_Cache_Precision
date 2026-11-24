@@ -22,6 +22,8 @@ from microinfer.config import ModelConfig
 from microinfer.models import VERIFIED
 
 MODELS = sorted(VERIFIED)
+#: The model a test of one shape uses: the development target (ADR-0003).
+SMALL = "qwen2.5-0.5b-instruct"
 
 
 def projections(cfg: ModelConfig) -> dict[str, tuple[int, int, bool]]:
@@ -103,7 +105,7 @@ def test_matches_float64_reference_at_every_shape():
         check(*make_case(rows, in_f, out_f, bias, seed=in_f + out_f + rows))
 
     each([(n, p, r) for n, p in CASES for r in (1, 64)], projection)
-    cfg = ModelConfig.from_card(MODELS[0])
+    cfg = ModelConfig.from_card(SMALL)
     check(*make_case(4, cfg.hidden_size, cfg.vocab_size, bias=False, seed=11))
     each([(3, 5, 7), (1, 1, 1), (17, 33, 65), (2, 896, 3)], lambda rows, in_f, out_f: check(
         *make_case(rows, in_f, out_f, bias=True, seed=rows * in_f * out_f)))
@@ -116,7 +118,7 @@ def test_the_gate_holds_fp32_input_and_would_reject_fp16_accumulation():
     wrapper disallows it, are simulated and fail at the widest reduction the
     model has (measured, 370 ulp max; were the floor `terms` itself they
     would pass, at 3.0 ulp max and 0.33 mean)."""
-    cfg = ModelConfig.from_card(MODELS[0])
+    cfg = ModelConfig.from_card(SMALL)
     rng = np.random.default_rng(5)
     x = rng.standard_normal((8, cfg.hidden_size), dtype=np.float32)
     w = rng.standard_normal((cfg.hidden_size, cfg.hidden_size), dtype=np.float32) / np.float32(

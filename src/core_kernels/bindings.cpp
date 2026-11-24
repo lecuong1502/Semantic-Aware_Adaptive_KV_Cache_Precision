@@ -79,7 +79,8 @@ namespace
     return s + ")";
   }
 
-  py::array_t<float> rope(FloatArray x, IntArray positions, double theta)
+  py::array_t<float> rope(FloatArray x, IntArray positions, double theta,
+                          const microinfer::RopeScaling &scaling)
   {
     if (x.ndim() != 3)
     {
@@ -124,7 +125,8 @@ namespace
     const int head_dim = static_cast<int>(x.shape(2));
     {
       py::gil_scoped_release release;
-      microinfer::rope(x_ptr, pos_ptr, out_ptr, seq, heads, head_dim, theta);
+      microinfer::rope(x_ptr, pos_ptr, out_ptr, seq, heads, head_dim, theta,
+                       scaling);
     }
     return out;
   }
@@ -434,6 +436,32 @@ PYBIND11_MODULE(_microinfer, m)
 
   m.def("device_name", &microinfer::device_name, "Name of CUDA device 0.");
 
+  py::class_<microinfer::RopeScaling>(
+      m, "RopeScaling",
+      "How RoPE's frequencies depart from theta's (#209). With no arguments, "
+      "plain RoPE, as Qwen2.5 has; with all four, llama3 scaling, as "
+      "Llama-3.2 has, refused where the blend is undefined.")
+      .def(py::init<>())
+      .def(py::init(&microinfer::RopeScaling::llama3), py::kw_only(),
+           py::arg("factor"), py::arg("low_freq_factor"),
+           py::arg("high_freq_factor"),
+           py::arg("original_max_position_embeddings"))
+      .def_readonly("scaled", &microinfer::RopeScaling::scaled)
+      .def_readonly("factor", &microinfer::RopeScaling::factor)
+      .def_readonly("low_freq_factor",
+                    &microinfer::RopeScaling::low_freq_factor)
+      .def_readonly("high_freq_factor",
+                    &microinfer::RopeScaling::high_freq_factor)
+      .def_readonly("original_max_position_embeddings",
+                    &microinfer::RopeScaling::original_max_position_embeddings)
+      .def("__repr__",
+           [](const microinfer::RopeScaling &s)
+           {
+             return s.scaled ? "RopeScaling(llama3, factor=" +
+                                   std::to_string(s.factor) + ")"
+                             : std::string("RopeScaling()");
+           });
+
   py::class_<microinfer::DeviceTensor>(
       m, "DeviceTensor",
       "fp16 on the device: in an arena of its own, or at an offset into a "
@@ -501,6 +529,7 @@ PYBIND11_MODULE(_microinfer, m)
         "hardcoded to a model.");
 
   m.def("rope", &rope, py::arg("x"), py::arg("positions"), py::arg("theta"),
+        py::arg("scaling") = microinfer::RopeScaling{},
         "Rotary position embedding, rotate-half form, over x (seq, heads, "
         "head_dim) with one position per token.\n"
         "theta comes from config.json; the angle is formed in fp64 and the "

@@ -38,7 +38,7 @@ namespace microinfer
 
     // positions is on the device: one int32 per token.
     void rope(const __half *x, const int32_t *positions, __half *out, int seq,
-              int heads, int head_dim, double theta);
+              int heads, int head_dim, double theta, RopeScaling scaling = {});
 
     void swiglu(const __half *gate, const __half *up, __half *out,
                 size_t count);

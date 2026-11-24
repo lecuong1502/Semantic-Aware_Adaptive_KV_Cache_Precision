@@ -430,7 +430,8 @@ void bind_device(py::module_ &parent)
   m.def(
       "rope",
       [](const Span &x, const DeviceIndex &positions, const Span &out, int seq,
-         int heads, int head_dim, double theta)
+         int heads, int head_dim, double theta,
+         const microinfer::RopeScaling &scaling)
       {
         need(x, product(seq, heads, head_dim), "x");
         need(positions, seq, "positions");
@@ -441,11 +442,12 @@ void bind_device(py::module_ &parent)
           throw std::invalid_argument("rope cannot write over its input");
         }
         microinfer::device::rope(x.ptr, positions.data(), out.ptr, seq, heads,
-                                 head_dim, theta);
+                                 head_dim, theta, scaling);
       },
       py::call_guard<py::gil_scoped_release>(), py::arg("x"),
       py::arg("positions"), py::arg("out"), py::arg("seq"), py::arg("heads"),
-      py::arg("head_dim"), py::arg("theta"));
+      py::arg("head_dim"), py::arg("theta"),
+      py::arg("scaling") = microinfer::RopeScaling{});
 
   m.def(
       "attention",
@@ -499,7 +501,9 @@ void bind_device(py::module_ &parent)
       "cos and sin of every RoPE angle per position, fp32 on the device, "
       "formed once in fp64 and read by every layer's attention (ADR-0009, "
       "note from #14).")
-      .def(py::init<int, double>(), py::arg("head_dim"), py::arg("theta"))
+      .def(py::init<int, double, microinfer::RopeScaling>(),
+           py::arg("head_dim"), py::arg("theta"),
+           py::arg("scaling") = microinfer::RopeScaling{})
       .def("cover", &microinfer::RopeTable::cover,
            py::call_guard<py::gil_scoped_release>(), py::arg("positions"),
            "Make positions [0, positions) present, growing if needed.")

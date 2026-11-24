@@ -174,6 +174,7 @@ def main(argv: list[str]) -> int:
     engine = Engine(REPO / "models" / args.model)
     essays, words, _ = ruler.load()
     drawn = {t: ruler.task_set(t, essays, words, engine.tokenizer, seed=args.seed,
+                               template=engine.chat_template,
                                samples=args.draws if args.screen
                                else screened[t]["config"]["draws"],
                                haystack_tokens=tokens) for t in tasks}

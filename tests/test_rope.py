@@ -22,9 +22,14 @@ from ulp_gate import accumulation_floor, assert_within_gate, fp16_exact, input_r
 
 from microinfer import _microinfer
 from microinfer.config import ModelConfig
+from microinfer.model import rope_scaling
 from microinfer.models import VERIFIED
 
 MODELS = sorted(VERIFIED)
+#: A model with plain RoPE, for the tests of plain RoPE's own properties.
+PLAIN = "qwen2.5-0.5b-instruct"
+#: The model with llama3 scaling (#209).
+LLAMA = "llama-3.2-1b-instruct"
 
 
 def positions_for(cfg: ModelConfig) -> np.ndarray:
@@ -40,8 +45,10 @@ def positions_for(cfg: ModelConfig) -> np.ndarray:
                      cfg.max_position_embeddings - 1], dtype=np.int32)
 
 
-def reference_rope(x: np.ndarray, positions: np.ndarray, theta: float):
-    """x: (seq, heads, head_dim). Float64 throughout, angles included.
+def reference_rope(x: np.ndarray, positions: np.ndarray, theta: float,
+                   inv_freq: np.ndarray | None = None):
+    """x: (seq, heads, head_dim). Float64 throughout, angles included;
+    `inv_freq`, if given, in place of theta's plain frequencies.
 
     Returns the rotated values and, per output, the magnitude of the two terms
     summed to make it (`ulp_gate`): `x1*cos - x2*sin` cancels, and near a
@@ -49,7 +56,8 @@ def reference_rope(x: np.ndarray, positions: np.ndarray, theta: float):
     head_dim = x.shape[-1]
     half = head_dim // 2
     x64 = x.astype(np.float64)
-    inv_freq = theta ** (-np.arange(half, dtype=np.float64) * 2.0 / head_dim)
+    if inv_freq is None:
+        inv_freq = theta ** (-np.arange(half, dtype=np.float64) * 2.0 / head_dim)
     angle = positions.astype(np.float64)[:, None] * inv_freq[None, :]  # (seq, half)
     rot = np.exp(1j * angle)[:, None, :]
     x1, x2 = x64[..., :half], x64[..., half:]
@@ -59,10 +67,15 @@ def reference_rope(x: np.ndarray, positions: np.ndarray, theta: float):
     return np.concatenate([z.real, z.imag], axis=-1), terms
 
 
-def check(x: np.ndarray, positions: np.ndarray, theta: float) -> np.ndarray:
-    """The gate for fp16-exact input. Each output is a sum of two terms."""
-    got = _microinfer.rope(x, positions, theta)
-    ref, terms = reference_rope(x, positions, theta)
+def check(x: np.ndarray, positions: np.ndarray, theta: float,
+          cfg: ModelConfig | None = None) -> np.ndarray:
+    """The gate for fp16-exact input. Each output is a sum of two terms.
+    With `cfg`, at its rope_scaling as well as `theta` (#209)."""
+    scaling = None if cfg is None else cfg.rope_scaling
+    got = _microinfer.rope(x, positions, theta,
+                           _microinfer.RopeScaling() if cfg is None else rope_scaling(cfg))
+    ref, terms = reference_rope(x, positions, theta,
+                                reference_inv_freq(x.shape[-1], theta, scaling))
     assert_within_gate(got, ref, accumulation_floor(terms, 2))
     return got
 
@@ -84,18 +97,18 @@ def test_matches_float64_reference_at_every_shape_and_position():
     def shape(cfg, heads):
         positions = positions_for(cfg)
         check(make_x(len(positions), heads, cfg.head_dim, seed=heads), positions,
-              cfg.rope_theta)
+              cfg.rope_theta, cfg)
 
     def one_position(cfg, index):
         pos = positions_for(cfg)[index:index + 1]
         check(make_x(1, cfg.num_attention_heads, cfg.head_dim, seed=int(pos[0])), pos,
-              cfg.rope_theta)
+              cfg.rope_theta, cfg)
 
     each([(shape, c, h) for c in cfgs for h in (c.num_attention_heads, c.num_key_value_heads)]
          + [(one_position, c, i) for c in cfgs for i in range(12)],
          lambda f, c, arg: f(c, arg), name=lambda c: f"{c[0].__name__} {c[1].name} {c[2]}")
 
-    cfg = cfgs[0]
+    cfg = ModelConfig.from_card(PLAIN)
     positions = np.array([4097, 3, 3, 0, 2048], dtype=np.int32)
     check(make_x(len(positions), cfg.num_key_value_heads, cfg.head_dim), positions,
           cfg.rope_theta)
@@ -131,11 +144,13 @@ def test_the_gate_holds_fp32_input_and_would_reject_an_fp32_angle():
         positions = positions_for(cfg)
         x = np.random.default_rng(1).standard_normal(
             (len(positions), cfg.num_attention_heads, cfg.head_dim)).astype(np.float32)
-        ref, terms = reference_rope(x, positions, cfg.rope_theta)
-        assert_within_gate(_microinfer.rope(x, positions, cfg.rope_theta), ref,
-                           input_rounding_floor(terms))
+        ref, terms = reference_rope(x, positions, cfg.rope_theta,
+                                    reference_inv_freq(cfg.head_dim, cfg.rope_theta,
+                                                       cfg.rope_scaling))
+        assert_within_gate(_microinfer.rope(x, positions, cfg.rope_theta, rope_scaling(cfg)),
+                           ref, input_rounding_floor(terms))
 
-    cfg = ModelConfig.from_card(MODELS[0])
+    cfg = ModelConfig.from_card(PLAIN)
     pos = np.array([cfg.max_position_embeddings - 1], dtype=np.int32)
     x = make_x(1, cfg.num_attention_heads, cfg.head_dim, seed=3)
     half = cfg.head_dim // 2
@@ -151,7 +166,7 @@ def test_the_gate_holds_fp32_input_and_would_reject_an_fp32_angle():
 
 def test_attention_score_depends_only_on_relative_position():
     """The property RoPE exists for: <R(m)q, R(n)k> is a function of m - n."""
-    cfg = ModelConfig.from_card(MODELS[0])
+    cfg = ModelConfig.from_card(PLAIN)
     rng = np.random.default_rng(7)
     q = fp16_exact(rng.standard_normal((1, 1, cfg.head_dim)))
     k = fp16_exact(rng.standard_normal((1, 1, cfg.head_dim)))
@@ -164,6 +179,100 @@ def test_attention_score_depends_only_on_relative_position():
     base = score(10, 3)
     for shift in (100, 2048, 5000):
         assert score(10 + shift, 3 + shift) == pytest.approx(base, rel=1e-2, abs=1e-2)
+
+
+# -- llama3 scaling (#209) ----------------------------------------------------
+
+
+def reference_inv_freq(head_dim: int, theta: float, scaling: dict | None) -> np.ndarray:
+    """HuggingFace's `_compute_llama3_parameters`, in float64: frequencies
+    whose wavelength exceeds the original context / low_freq_factor are
+    divided by `factor`, those under the original context / high_freq_factor
+    kept, and those between blended linearly in original context / wavelength.
+    With no scaling, theta's plain frequencies."""
+    inv_freq = theta ** (-np.arange(head_dim // 2, dtype=np.float64) * 2.0 / head_dim)
+    if scaling is None:
+        return inv_freq
+    factor, low, high = scaling["factor"], scaling["low_freq_factor"], scaling["high_freq_factor"]
+    original = float(scaling["original_max_position_embeddings"])
+    wavelength = 2 * np.pi / inv_freq
+    scaled = np.where(wavelength > original / low, inv_freq / factor, inv_freq)
+    smooth = (original / wavelength - low) / (high - low)
+    blended = (1 - smooth) * scaled / factor + smooth * scaled
+    medium = ~(wavelength < original / high) & ~(wavelength > original / low)
+    return np.where(medium, blended, scaled)
+
+
+def assert_table_rounded_once(table: np.ndarray, angle: np.ndarray) -> None:
+    """A RoPE table, (positions, half, {cos, sin}), is the float64 value
+    rounded once to fp32: within one fp32 ulp of the value, beyond what the
+    float64 angle itself is unsure of. That angle, position * inv_freq, is
+    off by up to about a float64 ulp of itself, in the kernel and in the
+    reference alike, and near a zero of cos or sin, far out in a long
+    window, that is more than an fp32 ulp of the value: at position 86568 of
+    Llama-3.2's 131072, cos is -5.1e-6, and the two values are 16 of its ulps
+    apart, each within an angle ulp of the exact one (3.8e-12 and 3.3e-12
+    against 8.5e-12). Over that whole window 9 cells differ by more than one
+    ulp, 3 of cos and 6 of sin; the kernel is the nearer in 3 and the
+    reference in 6, and the two errors sum to at most 1.3 angle ulps. The 4
+    is chosen, not derived."""
+    unsure = 4 * np.abs(angle) * np.finfo(np.float64).eps
+    for value, reference in ((table[..., 0], np.cos(angle)), (table[..., 1], np.sin(angle))):
+        rounded = reference.astype(np.float32)
+        excess = np.maximum(np.abs(value - rounded) - unsure, 0)
+        ulps = excess / np.spacing(np.abs(rounded).astype(np.float32))
+        assert ulps.max() <= 1, f"{ulps.max()} fp32 ulp from the float64 value"
+
+
+def test_the_reference_scales_low_frequencies_keeps_high_ones_and_blends_between():
+    """The reference's own shape, so that a reference wrong in the same way
+    as the kernel cannot pass them both: at Llama-3.2's head_dim the fastest
+    frequency is kept, the slowest divided by 32, and some lie between, each
+    strictly between its two bounds."""
+    cfg = ModelConfig.from_card(LLAMA)
+    plain = reference_inv_freq(cfg.head_dim, cfg.rope_theta, None)
+    scaled = reference_inv_freq(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling)
+    assert scaled[0] == plain[0]
+    assert scaled[-1] == pytest.approx(plain[-1] / 32, rel=1e-15)
+    between = (scaled < plain) & (scaled > plain / 32)
+    assert between.any() and (scaled <= plain).all() and (scaled >= plain / 32).all()
+
+
+def test_llama3_scaling_matches_the_reference():
+    """The rope op with Llama-3.2's scaling against the float64 reference, at
+    its head_dim, its query and key head counts, and positions to the end of
+    its window; and the table attention reads, each entry the float64 value
+    rounded once to fp32, as plain RoPE's is (test_kv_pages.py). Without the
+    scaling, the same op gives the plain angles still."""
+    cfg = ModelConfig.from_card(LLAMA)
+    inv_freq = reference_inv_freq(cfg.head_dim, cfg.rope_theta, cfg.rope_scaling)
+    positions = positions_for(cfg)
+
+    def heads(n):
+        check(make_x(len(positions), n, cfg.head_dim, seed=n), positions, cfg.rope_theta, cfg)
+
+    each([cfg.num_attention_heads, cfg.num_key_value_heads], heads)
+
+    x = make_x(len(positions), cfg.num_key_value_heads, cfg.head_dim)
+    plain = check(x, positions, cfg.rope_theta)
+    assert not np.array_equal(plain, _microinfer.rope(x, positions, cfg.rope_theta,
+                                                      rope_scaling(cfg)))
+
+    table = _microinfer.device.RopeTable(cfg.head_dim, cfg.rope_theta, rope_scaling(cfg))
+    table.cover(int(positions.max()) + 1)
+    got = table.to_numpy()[positions]                     # (positions, half, {cos, sin})
+    assert_table_rounded_once(got, positions.astype(np.float64)[:, None] * inv_freq[None, :])
+
+
+def test_malformed_scaling_is_refused():
+    """A factor below one, high_freq_factor not above low_freq_factor (the
+    blend divides by their difference), and no original window."""
+    card = ModelConfig.from_card(LLAMA).rope_scaling
+    for bad in ({"factor": 0.5}, {"high_freq_factor": 1.0}, {"low_freq_factor": 5.0},
+                {"original_max_position_embeddings": 0}):
+        kwargs = {k: v for k, v in card.items() if k != "rope_type"} | bad
+        with pytest.raises(ValueError):
+            _microinfer.RopeScaling(**kwargs)
 
 
 def test_malformed_input_is_refused():
@@ -180,3 +289,12 @@ def test_malformed_input_is_refused():
     with pytest.raises(ValueError):
         _microinfer.rope(np.zeros((2, 64), dtype=np.float32),
                          np.zeros(2, dtype=np.int32), 1e6)
+
+
+def test_a_config_s_rope_scaling_reaches_the_kernel():
+    """What the forward pass hands the kernels: none for Qwen2.5, llama3's
+    four numbers for Llama-3.2."""
+    assert not rope_scaling(ModelConfig.from_card(PLAIN)).scaled
+    s = rope_scaling(ModelConfig.from_card(LLAMA))
+    assert s.scaled and (s.factor, s.low_freq_factor, s.high_freq_factor,
+                         s.original_max_position_embeddings) == (32.0, 1.0, 4.0, 8192.0)

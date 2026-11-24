@@ -117,7 +117,7 @@ def run(engine, sample, source: str, *, out: str | Path, simulator_context_bytes
     cond = rq3.source_condition(source, SHARE)
     rq3.check_engine(engine)
     simulator = survival.Simulator(out)
-    end_of_turn = engine.tokenizer.token_to_id(rq3.END_OF_TURN)
+    end_of_turn = engine.end_of_turn_id
     measuring = engine.measure_plans
     took: list[Take] = []
     with rq3.set_for(engine, cond), engine.conversation() as chat:

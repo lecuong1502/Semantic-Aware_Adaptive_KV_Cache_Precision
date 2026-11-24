@@ -167,6 +167,7 @@ def main(argv: list[str]) -> int:
 
     engine = Engine(REPO / "models" / args.model)
     every = needles.needle_set(held_out_text(), engine.tokenizer, seed=args.needle_seed,
+                               template=engine.chat_template,
                                samples_per_depth=per_depth,
                                haystack_tokens=args.haystack_tokens)
     chosen = every if args.samples is None else [s for s in every if s.sample_id in args.samples]

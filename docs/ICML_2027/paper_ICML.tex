@@ -88,7 +88,8 @@ than uniform allocation, where a page's score ranks its downgrade's damage
 49, where it does not ($\rho = 0.01$). On five RULER tasks below their ceiling
 it answers more at 80\%, 123 of 250 against 100 at 8K and 100 against 52 at
 32K ($p \le 0.0032$), mostly on variable tracking, and fewer at 70\% where
-needle-shaped fillers hide the needle; downgrading keeps 48 needles where
+needle-shaped fillers hide the needle; on a second family, Llama-3.2-1B, it
+answers 134 against 58 at 8K and 80\%. Downgrading keeps 48 needles where
 evicting the same bytes keeps 16.
 \end{abstract}
 
@@ -416,7 +417,8 @@ All measurements are on one laptop with an NVIDIA RTX 4050 Laptop GPU (6\,GiB,
 whose processes share the GPU throughout. The experimental configuration is
 Qwen2.5-1.5B at 32K positions with its cache at FP16, which leaves about
 1.2\,GB of headroom: the range in which realistic contention decides whether a
-session survives.
+session survives. Llama-3.2-1B-Instruct \citep{llama3herd}, with eight key-value
+heads against two, runs a subset (Appendix~\ref{app:llama}).
 
 \subsection{RQ1: Contention on a Consumer Laptop}
 \label{sec:rq1}
@@ -766,10 +768,22 @@ $2 \times 10^{-5}$. In the dialogue, semantic recalled 48 facts against uniform'
 dialogues answered by semantic alone and none the other way ($p = 0.25$);
 uniform held every fact's page at INT2, semantic 38\% of them.
 
+\textbf{A second family.} On Llama-3.2-1B (Appendix~\ref{app:llama}), semantic
+allocation answered 134 of 250 RULER samples at 8K and 80\% against uniform's 58,
+80 samples by semantic alone and 4 by uniform alone ($p = 2 \times 10^{-19}$),
+more on every task but MK-3, which neither answered, and without variable
+tracking 52 to 3. Its needle set is below its ceiling (static INT2 26 of 50):
+semantic 50, uniform 41 ($p = 0.0039$), though random's 46 is not told apart. The
+KL from FP16 in continuation at 80\% was 0.050 against 0.194. The loss at 70\% on
+MK-3 did not recur, 32 each. The adaptive engine survived S5, which ended the
+static one, one run each.
+
 \textbf{Downgrading keeps what eviction loses.} At the same bytes, eviction
 answered 16 needles and recalled 16 facts at 80\%, and 22 and 21 at 70\%,
 against semantic's 48, 48, 50 and 50; every sample eviction answered, semantic
-did too ($p < 10^{-8}$ throughout). In the dialogue at 80\% eviction kept the
+did too ($p < 10^{-8}$ throughout). On RULER it answered most of
+variable tracking, whose pages the plan held high; on Llama-3.2-1B there it was
+not told apart from semantic (37 against 30 at 80\%, $p = 0.17$). In the dialogue at 80\% eviction kept the
 facts of the last two turns and lost most stated three or more turns back.
 
 \textbf{Recovery and ablations.} After pressure passes, restoring every page
@@ -808,9 +822,11 @@ from its context, and fewer at 70\% where needle-shaped fillers hide it. At
 \section{Limitations}
 \label{sec:limitations}
 
-\textbf{One machine and one model family.} Every measurement is from one
-laptop GPU and Qwen2.5 models with two key-value heads; the thresholds are set
-by a rule, so another machine changes their values but not the method.
+\textbf{One machine, and a second family on a subset.} Every measurement is from
+one laptop GPU; the thresholds are set by a rule, so another machine changes their
+values but not the method. Llama-3.2-1B, with eight key-value heads, ran continuation
+fidelity, the needle set, RULER at 8K and S5 once; the survival matrix, the
+correlation and the 32K results are of Qwen2.5 with two.
 \textbf{Simulated contention.} RQ2 uses a simulator that takes memory but no
 compute, isolating the variable studied; replays reproduce their originals to
 within tens of MiB. \textbf{Rate.} RQ1 characterises the size and speed of
@@ -832,8 +848,8 @@ tasks, below their ceiling, are what separate the sources. \textbf{Where the
 score cannot see the answer.} Question-blind attention does not single out a
 needle among needle-shaped fillers, and there the semantic source's uneven
 allocation put INT2 on the needle that uniform allocation spared at 70\%;
-RULER's yes at 8K rests on variable tracking alone, and only the question-blind
-experiment was run on it.
+RULER's yes at 8K rests on variable tracking alone on Qwen2.5-1.5B, and only the
+question-blind experiment was run on it.
 
 % =====================================================================
 \section{Conclusion}
@@ -934,6 +950,65 @@ and a shared-memory-tiled one, profiled against cuBLAS with Nsight Compute,
 ran 93--267 and 8--28 times slower at 512 rows, the naive kernel bound by its
 load and store queue, the tiled one by shared memory, and cuBLAS by tensor
 cores; they are a study, tested to stay off the inference path.
+
+\section{A Second Model Family: Llama-3.2-1B}
+\label{app:llama}
+
+Llama-3.2-1B-Instruct has 16 layers, eight key-value heads of 64 dimensions, no
+projection bias and scaled rotary frequencies; 32K positions take 1\,GiB at FP16.
+Its sealed pages cost 8.75, 4.75 and 2.75 effective bits at INT8, INT4 and INT2,
+and plans are held to equal bytes as on Qwen2.5-1.5B. Against a float32
+HuggingFace reference, the engine's greedy token at FP16 agrees at 99.98\% of
+5{,}689 positions and its mean KL is $9.8 \times 10^{-7}$; each narrower tier
+costs more (on the 8-prompt tier subset, mean KL $5.3 \times 10^{-6}$ at INT8,
+$1.2 \times 10^{-3}$ at INT4, $7.4 \times 10^{-2}$ at INT2). The samples are
+screened for this model, so they are not Qwen2.5-1.5B's.
+
+\begin{table}[!ht]
+\caption{RULER at 8K on Llama-3.2-1B, question-blind: samples answered of 50 at
+70\% / 80\% of the bytes reclaimed. Bits are 4.98 / 3.40 for every source. Static
+INT2 leaves every task below its ceiling of 40; the closing test pools the five
+at 80\%.}
+\label{tab:llama}
+\centering
+\small
+\begin{tabular}{lrrrrrrr}
+\toprule
+Task & INT2 & INT4 & INT8 & Semantic & Uniform & Random & Eviction \\
+\midrule
+MK-1 & 20 & 50 & 50 & 50 / 43 & 50 / 29 & 49 / 34 & 24 / 22 \\
+MK-2 & 6 & 46 & 50 & 47 / 25 & 48 / 15 & 48 / 22 & 6 / 4 \\
+MK-3 & 0 & 31 & 49 & 32 / 0 & 32 / 0 & 27 / 0 & 1 / 1 \\
+MV & 1 & 41 & 49 & 45 / 36 & 45 / 11 & 41 / 8 & 11 / 4 \\
+VT & 0 & 24 & 41 & 42 / 30 & 31 / 3 & 33 / 3 & 39 / 37 \\
+All, 80\% & & & & 134 & 58 & 67 & 68 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{RULER.} At 80\% the answered share differs by $+0.304$ [$0.244$, $0.364$].
+The answered samples were 15 to 1 on MK-1, 11 to 1 on MK-2, 26 to 1 on MV and 28 to 1
+on VT (each $p \le 0.0064$), and the pooled count against random 73 to 6. Where the
+plans left the answer parts the sources on three tasks: semantic held 50\% of MK-1's (layer, page)
+cells at INT2 against uniform's 84\%, 41\% of MV's against 71\% and 12\% of VT's
+against 76\%; on MK-2, however, both held 76\%, so its gain there is not the
+needle's tier. At 70\% semantic answered 216, uniform 206 and random 198, 20 to 10
+against uniform ($p = 0.099$). FP16 answered 50 of 52, 56, 120, 95 and 177 drawn
+(MK-1, MK-2, MK-3, MV, VT), so VT's and MK-3's screened sets hold 28\% and 42\% of
+their draws. RULER allows 30 tokens for VT's answer: 57 of the 127 VT samples FP16
+missed ran to that limit, and so did 18 of the 50 it answered.
+
+\paragraph{Continuation and needles.} At 80\% the mean KL was 0.050 for semantic,
+0.194 for uniform and 0.158 for random, lower than each on all 50 passages
+(paired difference from uniform $-0.144$ [$-0.159$, $-0.130$]), and top-1 agreement
+89.7, 80.1 and 81.5\%; at 70\%, 0.0017, 0.0049 and 0.0089. On the needle set
+semantic answered 50, uniform 41 and random 46 at 80\%, 9 samples by semantic alone
+against uniform and 4 against random, none the other way ($p = 0.0039$, $0.125$);
+all 50 at 70\%.
+
+\paragraph{Survival.} In S5, the static engine ran out of memory at 23{,}040
+positions and the adaptive engine completed all 32{,}767 in 154 plans, returning
+910\,MiB that the driver saw, every plan to a granule. One run each.
 
 \clearpage % keep the heading and both tables of this section on one page
 \section{The Cost of a Tier and of a Move}

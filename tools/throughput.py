@@ -112,7 +112,7 @@ def step_clock(token_s: list[float], now=time.perf_counter):
 def decode_prompt(engine: Engine, ids: np.ndarray) -> np.ndarray:
     """`ids`, shortened if it must be so that DECODE_STEPS more stay inside
     the model's context window."""
-    return ids[: min(len(ids), engine.config.max_position_embeddings - DECODE_STEPS)]
+    return ids[: min(len(ids), engine.config.context_window - DECODE_STEPS)]
 
 
 def decode_rate(engine: Engine, prompt: np.ndarray,

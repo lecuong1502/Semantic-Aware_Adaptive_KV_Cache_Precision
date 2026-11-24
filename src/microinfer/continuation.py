@@ -85,17 +85,24 @@ def passage_id(i: int) -> str:
     return f"p{i:02d}"
 
 
-def passages(tokens: np.ndarray, count: int = PASSAGES, shape: Shape = Shape()) -> list[Passage]:
+def passages(tokens: np.ndarray, count: int = PASSAGES, shape: Shape = Shape(),
+             bos: int | None = None) -> list[Passage]:
     """The first `count` consecutive passages of `tokens`, the split's token
-    ids; a ValueError if the split holds fewer."""
+    ids with no special token added; a ValueError if the split holds fewer.
+    With `bos`, the family's begin-of-text (#209), each passage opens with
+    it and the split's next tokens follow, one fewer, so that every passage
+    opens as its family's contexts do, not only the first."""
     length = shape.prefix + shape.warm + shape.measured
-    if count * length > len(tokens):
-        raise ValueError(f"{count} passages of {length} tokens need {count * length}; the "
+    taken = length - (bos is not None)
+    if count * taken > len(tokens):
+        raise ValueError(f"{count} passages of {taken} of its tokens need {count * taken}; the "
                          f"split holds {len(tokens)}")
     out = []
     for i in range(count):
-        start = i * length
-        ids = np.asarray(tokens[start:start + length], dtype=np.int32)
+        start = i * taken
+        ids = np.asarray(tokens[start:start + taken], dtype=np.int32)
+        if bos is not None:
+            ids = np.concatenate([[bos], ids]).astype(np.int32)
         warm_end = shape.prefix + shape.warm
         out.append(Passage(passage_id(i), start, ids[:shape.prefix],
                            ids[shape.prefix:warm_end], ids[warm_end:]))

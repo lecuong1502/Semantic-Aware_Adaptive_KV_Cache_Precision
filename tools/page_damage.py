@@ -52,10 +52,11 @@ def needles_of(model: str, engine: Engine, log: Path, unscreened: bool) -> list:
     """The screened needle set, in screening's order, or the set's first."""
     text = held_out_text()
     if unscreened:
-        return needles.needle_set(text, engine.tokenizer, seed=NEEDLE_SEED)
+        return needles.needle_set(text, engine.tokenizer, seed=NEEDLE_SEED,
+                                  template=engine.chat_template)
     kept, draws = rq3.screened(model, NEEDLE_SEED, needles.DEFAULT_HAYSTACK_TOKENS, log)
     every = needles.needle_set(text, engine.tokenizer, seed=NEEDLE_SEED,
-                               samples_per_depth=draws)
+                               template=engine.chat_template, samples_per_depth=draws)
     return kept_of(every, kept)
 
 

@@ -14,10 +14,11 @@ from microinfer.config import ConfigMismatch, ModelConfig
 from microinfer.models import VERIFIED, verified_card
 
 
-def test_both_adr_0003_models_are_recorded_with_the_constants_expected():
+def test_every_adr_0003_model_is_recorded_with_the_constants_expected():
     """The card is a copy of the upstream config.json; the expectation is
     written out separately. They must agree, or one of them is a typo."""
-    assert set(VERIFIED) == {"qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct"}
+    assert set(VERIFIED) == {"qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct",
+                             "llama-3.2-1b-instruct"}
     for name in sorted(VERIFIED):
         ModelConfig.from_card(name).verify(VERIFIED[name])
 
@@ -70,7 +71,8 @@ def test_qwen25_has_no_rope_scaling():
     """ADR-0003 chose this family partly to avoid llama3 rope scaling, which is
     an error-prone surface in a hand-written kernel."""
     for name in VERIFIED:
-        assert ModelConfig.from_card(name).rope_scaling is None
+        if name.startswith("qwen"):
+            assert ModelConfig.from_card(name).rope_scaling is None
 
 
 def test_card_is_a_faithful_copy_of_upstream():
@@ -79,3 +81,53 @@ def test_card_is_a_faithful_copy_of_upstream():
     raw = json.loads(verified_card("qwen2.5-0.5b-instruct").read_text())
     assert raw["architectures"] == ["Qwen2ForCausalLM"]
     assert raw["vocab_size"] == 151936
+
+
+# -- a second family (#209) ----------------------------------------------------
+
+#: Llama-3.2-1B-Instruct's config.json, the committed card (#209).
+LLAMA = json.loads(verified_card("llama-3.2-1b-instruct").read_text())
+
+
+def test_qwen2_carries_a_qkv_bias_and_llama_says_whether_it_does():
+    """Qwen2's config has no attention_bias: the architecture always has one.
+    Llama's says, and Llama-3.2's has none, so ADR-0009's bias path goes
+    unused there."""
+    qwen = ModelConfig.from_card("qwen2.5-0.5b-instruct")
+    assert qwen.architecture == "Qwen2ForCausalLM" and qwen.attention_bias is True
+    llama = ModelConfig.from_dict("llama-3.2-1b-instruct", LLAMA)
+    assert llama.architecture == "LlamaForCausalLM" and llama.attention_bias is False
+    assert llama.head_dim == 64 and llama.kv_bytes_per_token == 32 * 1024
+    assert llama.rope_scaling["rope_type"] == "llama3"
+
+
+def test_an_architecture_the_engine_does_not_run_is_refused():
+    with pytest.raises(ConfigMismatch, match="GemmaForCausalLM"):
+        ModelConfig.from_dict("gemma", dict(LLAMA, architectures=["GemmaForCausalLM"]))
+
+
+def test_a_stated_head_dim_other_than_hidden_over_heads_is_refused():
+    """The engine sizes the projections by hidden_size / num_attention_heads;
+    a model whose head_dim says otherwise is not the model it would run."""
+    with pytest.raises(ConfigMismatch, match="head_dim"):
+        ModelConfig.from_dict("odd", dict(LLAMA, head_dim=128))
+
+
+def test_rope_scaling_other_than_llama3_is_refused():
+    """Only llama3 scaling is implemented (rope_scaling.h); any other kind
+    would run as though it were plain RoPE, which is a silent error. The
+    older spelling, `type`, is read as `rope_type` is."""
+    for scaling in ({"rope_type": "linear", "factor": 2.0}, {"type": "dynamic", "factor": 2.0},
+                    {"rope_type": "yarn", "factor": 4.0}):
+        with pytest.raises(ConfigMismatch, match="rope_scaling"):
+            ModelConfig.from_dict("scaled", dict(LLAMA, rope_scaling=scaling))
+
+
+def test_the_engine_s_window_is_32k_whatever_the_model_s():
+    """Every experiment runs within 32K positions (ADR-0003), and a cache is
+    sized to the engine's window: at Llama-3.2's own 131072, a contiguous
+    cache would take 4 GiB up front, which 6 GiB cannot hold beside the
+    weights. Qwen2.5's window is 32K already."""
+    for name in VERIFIED:
+        assert ModelConfig.from_card(name).context_window == 32768
+    assert ModelConfig.from_card("llama-3.2-1b-instruct").max_position_embeddings == 131072

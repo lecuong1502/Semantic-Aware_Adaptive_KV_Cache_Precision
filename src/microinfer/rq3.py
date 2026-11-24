@@ -27,8 +27,10 @@ An **experiment** is when the plan is made:
   the answer, after them, in the same 32 tokens in all.
 
 A turn stops at its end of turn. Turn 2 closes a turn 1 cut short at its
-tokens, or stopped at <|endoftext|>, and goes on after one that stopped at
-<|im_end|> (needles.Sample.turn_2). A question-aware run logs the answer's
+tokens, or stopped at another end of sequence, <|endoftext|> for Qwen2.5,
+and goes on after one that stopped at its template's end of turn,
+<|im_end|> for Qwen2.5 and <|eot_id|> for Llama-3.2 (needles.Sample.turn_2,
+Engine.end_of_turn_id). A question-aware run logs the answer's
 first tokens, whether they open as the question asks, and whether the code
 comes after them, after the plan: Qwen2.5-1.5B opens "The access code for
 the ... archive is", which is not as asked, but holds no code yet.
@@ -82,7 +84,8 @@ ANSWER_TOKENS = needles.ANSWER_TOKENS
 #: and what they are asked to be (needles.question_text).
 AWARE_TOKENS = 4
 AWARE_OPENING = "The access code is"
-END_OF_TURN = "<|im_end|>"
+#: Qwen2.5's end of turn; a run reads its engine's, Engine.end_of_turn_id (#209).
+END_OF_TURN = needles.END_OF_TURN
 
 
 @dataclass(frozen=True)
@@ -355,7 +358,7 @@ class _Opened:
 def before_plan(engine, chat, sample: Sample, experiment: str) -> _Opened:
     """Turn 1, and question-aware the answer's first tokens: what a run
     holds before its plan, on `chat`."""
-    end_of_turn = engine.tokenizer.token_to_id(END_OF_TURN)
+    end_of_turn = engine.end_of_turn_id
     summary = chat.turn(sample.turn_1, SUMMARY_TOKENS)
     stopped = int(summary[-1]) == end_of_turn
     turn_2 = sample.turn_2_after_eos if stopped else sample.turn_2

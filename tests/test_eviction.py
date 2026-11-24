@@ -16,7 +16,7 @@ from conftest import load_tool, require_model
 from test_kv_pages import CFG, LAYERS, PAGE_TOKENS, normal, put
 from test_quantised_pages import attend, sealed, sealing_at_fp16, store_in_runs
 
-from microinfer import Engine, _microinfer, benchlog, controller, needles, rq3, rq3_summary
+from microinfer import Engine, _microinfer, benchlog, chat, controller, needles, rq3, rq3_summary
 from microinfer._microinfer import PagedKVCache, Tier
 from microinfer.model import tier_page_bytes
 
@@ -299,7 +299,8 @@ def test_an_eviction_condition_runs_a_needle_and_logs_its_evicted_pages(engine):
     eviction as a plan, its pages evicted among the tiers' shares."""
     assert rq3.shares_turn_1(rq3.condition("evict-80"))
     sample = needles.needle_set(load_tool("perplexity").held_out_text(), engine.tokenizer,
-                                seed=160, samples_per_depth=1, haystack_tokens=1024)[5]
+                                seed=160, template=chat.QWEN, samples_per_depth=1,
+                                haystack_tokens=1024)[5]
     (_, results), = rq3.runs(engine, sample, [rq3.condition("evict-80")], "question-blind")
     assert results["plan"]["evicts"] and results["plan"]["target_met"]
     assert results["plan"]["moves"] > 0 and "evicted" in results["tier_shares"]

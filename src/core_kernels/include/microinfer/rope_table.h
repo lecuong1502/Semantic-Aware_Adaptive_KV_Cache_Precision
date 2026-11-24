@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "microinfer/device_buffer.h"
+#include "microinfer/rope_scaling.h"
 
 namespace microinfer
 {
@@ -19,13 +20,14 @@ namespace microinfer
   // is formed once per position here, still in fp64 (rope_angle.cuh), and
   // every layer's attention reads it.
   //
-  // Entry (p, j) is {cos, sin} of p * theta^(-2j / head_dim), for
+  // Entry (p, j) is {cos, sin} of p * inv_freq(j), theta^(-2j / head_dim)
+  // scaled as `scaling` says (rope_scaling.h, #209), for
   // j < head_dim / 2. The table grows with the sequence, doubling so that a
   // decode step does not rebuild it every time.
   class RopeTable
   {
   public:
-    RopeTable(int head_dim, double theta);
+    RopeTable(int head_dim, double theta, RopeScaling scaling = {});
 
     // Makes positions [0, count) present, growing the table if needed.
     void cover(int count);
@@ -39,6 +41,7 @@ namespace microinfer
   private:
     int head_dim_;
     double theta_;
+    RopeScaling scaling_;
     int positions_ = 0;
     std::unique_ptr<DeviceBuffer> table_;
   };

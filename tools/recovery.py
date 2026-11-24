@@ -79,6 +79,7 @@ def main(argv: list[str]) -> int:
         return 0
     engine = Engine(REPO / "models" / args.model)
     every = needles.needle_set(held_out_text(), engine.tokenizer, seed=args.needle_seed,
+                               template=engine.chat_template,
                                samples_per_depth=draws, haystack_tokens=args.haystack_tokens)
     by_id = {s.sample_id: s for s in every}
     engine.load_weights()

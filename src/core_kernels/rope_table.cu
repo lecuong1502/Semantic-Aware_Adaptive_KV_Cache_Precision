@@ -16,7 +16,8 @@ namespace microinfer
     constexpr int kBlockThreads = 256;
 
     __global__ void rope_table_kernel(float *__restrict__ table, int half,
-                                      int head_dim, double theta, size_t count)
+                                      int head_dim, double theta,
+                                      RopeScaling scaling, size_t count)
     {
       for (size_t i =
                static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -24,7 +25,7 @@ namespace microinfer
       {
         double s, c;
         rope_sincos(static_cast<double>(i / half), static_cast<int>(i % half),
-                    head_dim, theta, &s, &c);
+                    head_dim, theta, scaling, &s, &c);
         table[2 * i] = static_cast<float>(c);
         table[2 * i + 1] = static_cast<float>(s);
       }
@@ -32,8 +33,8 @@ namespace microinfer
 
   } // namespace
 
-  RopeTable::RopeTable(int head_dim, double theta)
-      : head_dim_(head_dim), theta_(theta)
+  RopeTable::RopeTable(int head_dim, double theta, RopeScaling scaling)
+      : head_dim_(head_dim), theta_(theta), scaling_(scaling)
   {
     if (head_dim <= 0 || head_dim % 2 != 0)
     {
@@ -59,7 +60,7 @@ namespace microinfer
     auto table = std::make_unique<DeviceBuffer>(2 * entries * sizeof(float));
     rope_table_kernel<<<grid_stride_blocks(entries, kBlockThreads),
                         kBlockThreads>>>(table->as<float>(), half, head_dim_,
-                                         theta_, entries);
+                                         theta_, scaling_, entries);
     cuda_check(cudaGetLastError(), "rope table kernel launch");
     // The old table may still be read by a launch already enqueued; freeing
     // it waits for the device, as cudaFree does.

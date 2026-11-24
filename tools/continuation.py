@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO / "tools"))
 from perplexity import held_out_text  # noqa: E402
 from summarise_rq3 import interval  # noqa: E402
 
-from microinfer import Engine, benchlog, continuation, rq3  # noqa: E402
+from microinfer import Engine, benchlog, chat, continuation, rq3  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
@@ -59,7 +59,8 @@ def main(argv: list[str]) -> int:
 
     done = continuation.logged(args.model, shape, environment["git_commit"], args.log)
     engine = Engine(REPO / "models" / args.model)
-    chosen = continuation.passages(engine.encode(held_out_text()), args.passages, shape)
+    chosen = continuation.passages(chat.encode(engine.tokenizer, held_out_text()), args.passages,
+                                   shape, bos=engine.begin_of_text_id)
     todo = [(p, [rq3.condition(n) for n in args.conditions if (p.passage_id, n) not in done])
             for p in chosen]
     todo = [(p, conds) for p, conds in todo if conds]

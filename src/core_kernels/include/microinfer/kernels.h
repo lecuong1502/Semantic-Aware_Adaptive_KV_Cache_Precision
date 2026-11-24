@@ -6,6 +6,7 @@
 #include <string>
 
 #include "microinfer/device_buffer.h"
+#include "microinfer/rope_scaling.h"
 
 namespace microinfer
 {
@@ -35,10 +36,11 @@ namespace microinfer
   // single token at any position. Applied to queries and keys separately,
   // since they differ in head count.
   //
-  // theta is a parameter because it is config: Qwen2.5 uses 1e6 with no
-  // scaling, which is why ADR-0003 chose it over Llama-3.2.
+  // theta and the scaling are parameters because they are config: Qwen2.5
+  // uses 1e6 with no scaling, Llama-3.2 5e5 with llama3 scaling
+  // (rope_scaling.h, #209).
   void rope(const float *x, const int32_t *positions, float *out, int seq,
-            int heads, int head_dim, double theta);
+            int heads, int head_dim, double theta, RopeScaling scaling = {});
 
   // The MLP activation, silu(gate) * up, elementwise over `count` values.
   void swiglu(const float *gate, const float *up, float *out, size_t count);

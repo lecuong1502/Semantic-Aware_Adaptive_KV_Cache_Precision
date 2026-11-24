@@ -32,7 +32,7 @@ namespace microinfer
     __global__ void rope_kernel(const __half *__restrict__ x,
                                 const int32_t *__restrict__ positions,
                                 __half *__restrict__ out, int heads,
-                                int head_dim, double theta)
+                                int head_dim, double theta, RopeScaling scaling)
     {
       const int token = blockIdx.x / heads;
       const size_t base = static_cast<size_t>(blockIdx.x) * head_dim;
@@ -42,7 +42,7 @@ namespace microinfer
       for (int j = threadIdx.x; j < half; j += blockDim.x)
       {
         double s, c;
-        rope_sincos(pos, j, head_dim, theta, &s, &c);
+        rope_sincos(pos, j, head_dim, theta, scaling, &s, &c);
         const float sf = static_cast<float>(s);
         const float cf = static_cast<float>(c);
 
@@ -56,19 +56,20 @@ namespace microinfer
   } // namespace
 
   void device::rope(const __half *x, const int32_t *positions, __half *out,
-                    int seq, int heads, int head_dim, double theta)
+                    int seq, int heads, int head_dim, double theta,
+                    RopeScaling scaling)
   {
     if (seq <= 0 || heads <= 0 || head_dim <= 0)
     {
       return;
     }
     rope_kernel<<<seq * heads, kBlockThreads>>>(x, positions, out, heads,
-                                                head_dim, theta);
+                                                head_dim, theta, scaling);
     cuda_check(cudaGetLastError(), "rope kernel launch");
   }
 
   void rope(const float *x, const int32_t *positions, float *out, int seq,
-            int heads, int head_dim, double theta)
+            int heads, int head_dim, double theta, RopeScaling scaling)
   {
     if (seq <= 0 || heads <= 0 || head_dim <= 0)
     {
@@ -88,7 +89,7 @@ namespace microinfer
         "cudaMemcpy positions host-to-device");
 
     device::rope(dev_x.as<const __half>(), dev_pos.as<const int32_t>(),
-                 dev_out.as<__half>(), seq, heads, head_dim, theta);
+                 dev_out.as<__half>(), seq, heads, head_dim, theta, scaling);
     cuda_check(cudaDeviceSynchronize(), "rope kernel execution");
 
     download_fp16(out, dev_out, count, "cudaMemcpy output device-to-host");

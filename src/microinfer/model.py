@@ -37,26 +37,33 @@ class LayerWeights:
 
     input_layernorm_weight: Tensor
     self_attn_q_proj_weight: Tensor
-    self_attn_q_proj_bias: Tensor
+    self_attn_q_proj_bias: Tensor | None
     self_attn_k_proj_weight: Tensor
-    self_attn_k_proj_bias: Tensor
+    self_attn_k_proj_bias: Tensor | None
     self_attn_v_proj_weight: Tensor
-    self_attn_v_proj_bias: Tensor
+    self_attn_v_proj_bias: Tensor | None
     self_attn_o_proj_weight: Tensor
     post_attention_layernorm_weight: Tensor
     mlp_gate_proj_weight: Tensor
     mlp_up_proj_weight: Tensor
     mlp_down_proj_weight: Tensor
 
+    #: The projection biases, which Qwen2 has and Llama-3.2 does not (#209).
+    BIASES = ("self_attn_q_proj_bias", "self_attn_k_proj_bias", "self_attn_v_proj_bias")
+
     @classmethod
-    def from_tensors(cls, tensors: dict[str, Tensor], layer: int) -> LayerWeights:
+    def from_tensors(cls, tensors: dict[str, Tensor], layer: int,
+                     bias: bool = True) -> LayerWeights:
+        """Layer `layer`'s tensors; without `bias`, the projection biases are
+        None, not looked for."""
         prefix = f"model.layers.{layer}."
         found = {name[len(prefix):].replace(".", "_"): t
                  for name, t in tensors.items() if name.startswith(prefix)}
-        wanted = {f.name for f in fields(cls)}
+        names = {f.name for f in fields(cls)}
+        wanted = names if bias else names - set(cls.BIASES)
         if missing := wanted - found.keys():
             raise KeyError(f"layer {layer} has no {', '.join(sorted(missing))}")
-        return cls(**{name: found[name] for name in wanted})
+        return cls(**{name: found[name] if name in wanted else None for name in names})
 
 
 @dataclass(frozen=True)
@@ -74,8 +81,22 @@ class Weights:
         # Qwen2.5-0.5B ties the LM head to the embedding and stores no
         # lm_head.weight; 1.5B does not tie.
         head = embed if cfg.tie_word_embeddings else tensors["lm_head.weight"]
-        layers = [LayerWeights.from_tensors(tensors, i) for i in range(cfg.num_hidden_layers)]
+        layers = [LayerWeights.from_tensors(tensors, i, cfg.attention_bias)
+                  for i in range(cfg.num_hidden_layers)]
         return cls(embed=embed, layers=layers, norm=tensors["model.norm.weight"], head=head)
+
+
+def rope_scaling(cfg: ModelConfig) -> _microinfer.RopeScaling:
+    """The kernels' form of the config's rope_scaling (rope_scaling.h): none
+    for Qwen2.5, llama3's four numbers for Llama-3.2 (#209). ModelConfig has
+    refused any other kind already."""
+    s = cfg.rope_scaling
+    if s is None:
+        return _microinfer.RopeScaling()
+    return _microinfer.RopeScaling(
+        factor=float(s["factor"]), low_freq_factor=float(s["low_freq_factor"]),
+        high_freq_factor=float(s["high_freq_factor"]),
+        original_max_position_embeddings=float(s["original_max_position_embeddings"]))
 
 
 class _Cache:
@@ -88,7 +109,7 @@ class _Cache:
         self.heads, self.kv_heads = cfg.num_attention_heads, cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         self.kv_width = self.kv_heads * self.head_dim
-        self.rope = device.RopeTable(cfg.head_dim, cfg.rope_theta)
+        self.rope = device.RopeTable(cfg.head_dim, cfg.rope_theta, rope_scaling(cfg))
         self.length = 0
 
 
@@ -200,7 +221,7 @@ class PagedCache(_Cache):
         tier_map = tier_map or []
         page_tokens = device.page_tokens
         layers = cfg.num_hidden_layers
-        pages_per_layer = -(-cfg.max_position_embeddings // page_tokens)
+        pages_per_layer = -(-cfg.context_window // page_tokens)
         storage = self.tier if halves == device.Halves.Both else Tier.FP16
         seals = device.KVPages.seals_for(self.tier, tier_map, always_seal)
         held = {storage} | {t for row in tier_map for t in row}
@@ -347,6 +368,7 @@ class Model:
         hidden, intermediate = cfg.hidden_size, cfg.intermediate_size
         q_width, kv_width = heads * head_dim, kv_heads * head_dim
         eps = cfg.rms_norm_eps
+        scaling = rope_scaling(cfg)
 
         ids = device.index(token_ids)
         positions = device.index(np.arange(start, start + n, dtype=np.int32))
@@ -372,14 +394,17 @@ class Model:
             # bias reaches 147 against an input-dependent part of 5 to 11, and
             # at that magnitude fp16's ulp is as large as what distinguishes one
             # key from the next. Attention adds the bias back, rotated, in fp32.
+            # Llama-3.2 has no bias (#209): its biases are None, and attention
+            # then takes each key as whole.
             device.rmsnorm_f32(ws.residual, w.input_layernorm_weight, ws.normed, n, hidden, eps)
             device.linear(ws.normed, w.self_attn_q_proj_weight, w.self_attn_q_proj_bias,
                           ws.q_raw, n, hidden, q_width)
             device.linear(ws.normed, w.self_attn_k_proj_weight, None, ws.k_raw, n, hidden, kv_width)
             device.linear(ws.normed, w.self_attn_v_proj_weight, w.self_attn_v_proj_bias,
                           ws.v, n, hidden, kv_width)
-            device.rope(ws.q_raw, positions, ws.q, n, heads, head_dim, cfg.rope_theta)
-            device.rope(ws.k_raw, positions, ws.k, n, kv_heads, head_dim, cfg.rope_theta)
+            device.rope(ws.q_raw, positions, ws.q, n, heads, head_dim, cfg.rope_theta, scaling)
+            device.rope(ws.k_raw, positions, ws.k, n, kv_heads, head_dim, cfg.rope_theta,
+                        scaling)
             cache.store(i, ws.k, ws.v, start, n)
             cache.attend(i, ws.q, w.self_attn_k_proj_bias, ws.attended, n, start + n,
                          ws.k, ws.v, ws.partials)

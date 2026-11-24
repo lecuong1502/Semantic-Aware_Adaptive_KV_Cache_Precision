@@ -68,6 +68,7 @@ def main(argv: list[str]) -> int:
     engine = Engine(REPO / "models" / args.model)
     engine.load_weights()
     drawn = needles.needle_set(held_out_text(), engine.tokenizer, seed=args.needle_seed,
+                               template=engine.chat_template,
                                samples_per_depth=args.draws,
                                haystack_tokens=args.haystack_tokens)
     start = time.perf_counter()

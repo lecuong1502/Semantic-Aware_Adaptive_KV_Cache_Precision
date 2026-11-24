@@ -21,7 +21,7 @@ wonderwords' adjective-noun pairs.
 
 **RQ3's two turns**, as for the needle set (needles):
 1. turn 1, the template's opening, the context and the general request,
-   in Qwen's chat template;
+   in the checkpoint's chat template (chat);
 2. turn 2, the template's question, the answer prefix opening the reply,
    fed, not decoded; the reply is decoded for RULER's generation length.
 
@@ -58,7 +58,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from . import benchlog, needles
+from . import benchlog, chat, needles
 
 #: The haystack's tokens at each length, the needle set's (#146, #156).
 LENGTHS = {"8K": needles.DEFAULT_HAYSTACK_TOKENS, "32K": needles.LONG_HAYSTACK_TOKENS}
@@ -238,11 +238,13 @@ def dumps(samples: list[Sample]) -> bytes:
 
 
 def task_set(task_name: str, essays: str, words: Words, tokenizer, *, seed: int, samples: int,
-             haystack_tokens: int = LENGTHS["8K"], page_tokens: int | None = None) -> list[Sample]:
+             haystack_tokens: int = LENGTHS["8K"], page_tokens: int | None = None,
+             template: chat.Template) -> list[Sample]:
     """`samples` of `task_name`, in order, from a generator seeded by
     `seed`, the task and `haystack_tokens`: drawing more leaves the first
     ones as they are. `essays` is RULER's essay text, `words` its words,
-    and `tokenizer` the checkpoint's."""
+    `tokenizer` the checkpoint's, and `template` its family's
+    (chat.template_for)."""
     if task_name not in TASKS:
         raise ValueError(f"no RULER task {task_name!r} here; these are {list(TASK_NAMES)}")
     if page_tokens is None:
@@ -252,7 +254,8 @@ def task_set(task_name: str, essays: str, words: Words, tokenizer, *, seed: int,
     rng = np.random.default_rng([seed, TASK_NAMES.index(task_name), haystack_tokens])
     build = _Builder(task, tokenizer, words, haystack_tokens, page_tokens,
                      essays if task.haystack == "essay" else None,
-                     np.random.default_rng([seed, TASK_NAMES.index(task_name), haystack_tokens, 1]))
+                     np.random.default_rng([seed, TASK_NAMES.index(task_name), haystack_tokens, 1]),
+                     template)
     return [build.sample(k, rng) for k in range(samples)]
 
 
@@ -288,11 +291,13 @@ class _Builder:
     and an essay haystack's sentences, tokenized once."""
 
     def __init__(self, task: Task, tokenizer, words: Words, haystack_tokens: int,
-                 page_tokens: int, essays: str | None, example_rng: np.random.Generator):
+                 page_tokens: int, essays: str | None, example_rng: np.random.Generator,
+                 template: chat.Template):
         self.task, self.tokenizer, self.words = task, tokenizer, words
         self.tokens, self.page_tokens = haystack_tokens, page_tokens
-        self.closing = self.ids(needles.TURN_1_CLOSING)
-        self.end_of_turn = self.ids(needles.END_OF_TURN)
+        self.template = template
+        self.closing = self.ids(needles.turn_1_closing(template))
+        self.end_of_turn = self.ids(template.end_of_turn)
         self.essay = None if essays is None else self._essay(essays)
         if task.name == "vt":
             # As many noise lines as keep the example within its tokens,
@@ -313,7 +318,7 @@ class _Builder:
                 + "\n")
 
     def ids(self, text: str) -> np.ndarray:
-        return np.asarray(self.tokenizer.encode(text).ids, dtype=np.int32)
+        return chat.encode(self.tokenizer, text)
 
     def _essay(self, essays: str) -> list[np.ndarray]:
         """The essays' first sentences, each a piece of its own, cut to the
@@ -322,8 +327,8 @@ class _Builder:
         pieces, held, at = [], 0, 0
         while held < self.tokens:
             batch = [f" {s}" for s in found[at % len(found):at % len(found) + 256]]
-            for e in self.tokenizer.encode_batch(batch):
-                taken = np.asarray(e.ids, dtype=np.int32)[:self.tokens - held]
+            for ids in chat.encode_batch(self.tokenizer, batch):
+                taken = ids[:self.tokens - held]
                 pieces.append(taken)
                 held += len(taken)
                 if held >= self.tokens:
@@ -404,9 +409,9 @@ class _Builder:
             at = sorted(int(i) for i in rng.choice(len(pieces), len(planted), replace=False))
             texts_of = [f"{n.text}\n" for n in planted]
         words = texts(task, query)
-        opening = np.concatenate([self.ids(needles.TURN_1_OPENING),
-                                  *([self.ids(example)] if example else []),
-                                  self.ids(words.opening)])
+        content = [*([self.ids(example)] if example else []), self.ids(words.opening)]
+        content[0] = chat.content_opening(self.tokenizer, self.template, content[0])
+        opening = np.concatenate([self.ids(self.template.opening), *content])
 
         parts, positions, held, last = [opening], [], len(opening), 0
         for index, needle_text in zip(at, texts_of):
@@ -422,7 +427,7 @@ class _Builder:
         parts.append(self.closing)
 
         targets = tuple(p for p, n in zip(positions, planted) if n.target)
-        after_eos = self.ids(needles.TURN_2_AFTER_EOS.format(question=words.question)
+        after_eos = self.ids(needles.turn_2_after_eos(self.template).format(question=words.question)
                              + words.prefix)
         return Sample(
             sample_id=f"{task.name}-{k}", task=task.name, index=k, haystack_tokens=self.tokens,

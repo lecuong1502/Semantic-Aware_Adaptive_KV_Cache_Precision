@@ -189,7 +189,7 @@ def main(argv: list[str]) -> int:
         signal.signal(sig, lambda *_: stop.set())
 
     engine = Engine(REPO / "models" / args.model, kv_tier="FP16")
-    context = args.context or engine.config.max_position_embeddings
+    context = args.context or engine.config.context_window
     prompt_positions = context - args.decode_positions
     if not 0 < prompt_positions < context:
         parser.error(f"--decode-positions must be between 1 and the context, {context}, less one")

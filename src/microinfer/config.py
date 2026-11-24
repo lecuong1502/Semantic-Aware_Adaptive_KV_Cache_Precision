@@ -22,6 +22,32 @@ class ConfigMismatch(ValueError):
 
 
 @dataclass(frozen=True)
+class Family:
+    """What the engine knows of an architecture beyond its config's numbers
+    (#209): its name, which chat.TEMPLATES keys its template by, and whether
+    its query, key and value projections always carry a bias, as Qwen2's
+    do though its config does not say, or carry one only if its config's
+    `attention_bias` says so, as Llama's."""
+
+    name: str
+    always_biased: bool
+
+
+#: The architectures the forward pass runs (model.py), by config.json's
+#: architectures[0]: the one table a new family is added to.
+FAMILIES = {"Qwen2ForCausalLM": Family("qwen2", always_biased=True),
+            "LlamaForCausalLM": Family("llama3", always_biased=False)}
+
+#: The rope_scaling kinds the kernels implement (rope_scaling.h). Any other
+#: would run as plain RoPE, a silent error, so it is refused.
+ROPE_SCALINGS = ("llama3",)
+
+#: The engine's context window: the experiments' 32K positions (ADR-0003),
+#: and Qwen2.5's own. Llama-3.2's 131072 is not run (#209).
+CONTEXT_WINDOW = 32768
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     """The subset of `config.json` the kernels are parameterised by.
 
@@ -44,12 +70,27 @@ class ModelConfig:
     torch_dtype: str
     hidden_act: str
     rope_scaling: Any | None
+    #: architectures[0] in config.json: one of FAMILIES.
+    architecture: str = "Qwen2ForCausalLM"
+    #: Whether q_proj, k_proj and v_proj carry a bias (ADR-0009's path).
+    attention_bias: bool = True
 
     @property
     def head_dim(self) -> int:
         """Not stored in Qwen2.5's config; derived. 64 for the 0.5B, 128 for the
-        1.5B — which is why no kernel may hardcode it (ADR-0003)."""
+        1.5B — which is why no kernel may hardcode it (ADR-0003). Llama-3.2's
+        states it, and from_dict refuses one that differs from this."""
         return self.hidden_size // self.num_attention_heads
+
+    @property
+    def context_window(self) -> int:
+        """The positions a cache is sized for and a generation may reach:
+        the model's own window, at most CONTEXT_WINDOW."""
+        return min(self.max_position_embeddings, CONTEXT_WINDOW)
+
+    @property
+    def family(self) -> Family:
+        return FAMILIES[self.architecture]
 
     @property
     def kv_bytes_per_token(self) -> int:
@@ -64,14 +105,35 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, name: str, raw: dict) -> ModelConfig:
         missing = [f.name for f in cls.__dataclass_fields__.values()
-                   if f.name not in ("name", "rope_scaling") and f.name not in raw]
+                   if f.name not in ("name", "rope_scaling", "architecture", "attention_bias")
+                   and f.name not in raw]
         if missing:
             raise ConfigMismatch(
                 f"{name}: config.json is missing {', '.join(missing)}. "
                 f"This is not the model this repository was written against."
             )
+        architecture = (raw.get("architectures") or [None])[0]
+        if architecture not in FAMILIES:
+            raise ConfigMismatch(
+                f"{name}: architecture {architecture!r} is not one the engine runs. "
+                f"Known: {', '.join(FAMILIES)}.")
+        bias = FAMILIES[architecture].always_biased or bool(raw.get("attention_bias", False))
+        derived = raw["hidden_size"] // raw["num_attention_heads"]
+        if raw.get("head_dim", derived) != derived:
+            raise ConfigMismatch(
+                f"{name}: head_dim is {raw['head_dim']}, but the engine sizes heads as "
+                f"hidden_size / num_attention_heads = {derived}.")
+        scaling = raw.get("rope_scaling")
+        if scaling is not None:
+            kind = scaling.get("rope_type", scaling.get("type"))
+            if kind not in ROPE_SCALINGS:
+                raise ConfigMismatch(
+                    f"{name}: rope_scaling of type {kind!r} is not implemented; the kernels "
+                    f"implement {', '.join(ROPE_SCALINGS)} (rope_scaling.h).")
         return cls(
             name=name,
+            architecture=architecture,
+            attention_bias=bias,
             num_hidden_layers=raw["num_hidden_layers"],
             hidden_size=raw["hidden_size"],
             num_attention_heads=raw["num_attention_heads"],

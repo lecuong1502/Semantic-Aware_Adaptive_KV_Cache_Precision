@@ -14,7 +14,7 @@ with the checkpoint's tokenizer, no download.
 import pytest
 
 from conftest import require_model
-from microinfer import Engine, ruler
+from microinfer import Engine, chat, ruler
 
 NAME = "qwen2.5-1.5b-instruct"
 ESSAY = " ".join(f"Sentence {i} of the essay says something about startups, and why."
@@ -32,6 +32,7 @@ def tokenizer():
 @pytest.fixture(scope="module")
 def built(tokenizer):
     return {task: ruler.task_set(task, ESSAY, WORDS, tokenizer, seed=208, samples=4,
+                                 template=chat.QWEN,
                                  haystack_tokens=TOKENS, page_tokens=32)
             for task in ruler.TASK_NAMES}
 
@@ -153,9 +154,11 @@ def test_a_haystack_is_cut_to_its_tokens(tokenizer, built):
 def test_the_same_seed_gives_the_same_set_and_more_draws_keep_the_first(tokenizer, built):
     for task in ruler.TASK_NAMES:
         again = ruler.task_set(task, ESSAY, WORDS, tokenizer, seed=208, samples=6,
+                               template=chat.QWEN,
                                haystack_tokens=TOKENS, page_tokens=32)
         assert ruler.dumps(again[:4]) == ruler.dumps(built[task])
         other = ruler.task_set(task, ESSAY, WORDS, tokenizer, seed=209, samples=4,
+                               template=chat.QWEN,
                                haystack_tokens=TOKENS, page_tokens=32)
         assert ruler.dumps(other) != ruler.dumps(built[task])
 
@@ -213,7 +216,7 @@ def test_variable_tracking_opens_with_ruler_s_one_shot_example(tokenizer, built)
 
 def test_a_task_not_ruler_s_is_refused(tokenizer):
     with pytest.raises(ValueError):
-        ruler.task_set("qa_1", ESSAY, WORDS, tokenizer, seed=0, samples=1)
+        ruler.task_set("qa_1", ESSAY, WORDS, tokenizer, seed=0, template=chat.QWEN, samples=1)
 
 
 # -- through RQ3's harness ----------------------------------------------------------------
@@ -235,6 +238,7 @@ def test_a_ruler_sample_runs_through_rq3_s_turns_scored_as_ruler_scores_it(small
     from microinfer import rq3
     for task in ("niah_multivalue", "niah_multikey_2", "vt"):
         (s,) = ruler.task_set(task, ESSAY, WORDS, small_engine.tokenizer, seed=208, samples=1,
+                              template=chat.QWEN,
                               haystack_tokens=1024)
         for name in ("fp16", "semantic-80"):
             r = rq3.run(small_engine, s, rq3.condition(name), "question-blind")
