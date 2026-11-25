@@ -450,6 +450,20 @@ against each contention scenario, three runs a cell (#190, #191): whether a 32K
 generation completes, and how its engine reacts. A cell is a condition
 and a scenario; a matrix run, one of its runs, by its seed.
 
+**External baseline**:
+llama.cpp, a deployed engine run as a process of its own against the same
+contention (#211, ADR-0001's and ADR-0014's amendments): not a condition,
+since it runs no MicroInfer code, and named by its cache type, f16, q8_0 or
+q4_0.
+_Avoid_: condition (those are MicroInfer's), competitor
+
+**Refused contention**:
+The memory the contention simulator asked for and the device did not give it,
+the most of any level of a run (#211). What an engine that holds its memory
+from the load denies the others, where an adaptive one gives it up.
+_Avoid_: shortfall (the survival experiment's is what the engine is left
+short of)
+
 **Turn**:
 One exchange of a conversation the engine continues over a single cache: a
 prompt appended to what the cache holds, and the tokens decoded after it.

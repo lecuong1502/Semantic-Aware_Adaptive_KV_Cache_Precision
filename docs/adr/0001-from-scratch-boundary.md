@@ -49,3 +49,19 @@ The causes differ by stage. The naive kernel is bound by the load/store queue,
 the tiled kernel by shared memory, and cuBLAS by the tensor pipe. The
 hand-written kernels use no tensor cores at all. The measurement strengthens
 this decision; it does not revise it. The write-up is `studies/gemm/README.md`.
+
+---
+
+## Amendment (#211): llama.cpp is run as an external baseline, outside the engine
+
+"No external inference engine is used at any point" is about MicroInfer:
+nothing it runs is another engine's. #211 runs llama.cpp, a deployed
+consumer engine, against the same simulated contention, because baselines
+that are all MicroInfer's own cannot say how an engine people use fares.
+
+It is a process of its own, built and run by its own tools
+(`tools/build_llamacpp.py`, `tools/llamacpp_survival.py`). Nothing of
+MicroInfer's links, imports or copies it, and the module that starts it
+(`microinfer.llamacpp`) sends token ids over HTTP and reads a log. Its
+release, commit, build flags and hashes are logged, its checkpoint is the
+one MicroInfer runs, and its protocol is ADR-0014's amendment.

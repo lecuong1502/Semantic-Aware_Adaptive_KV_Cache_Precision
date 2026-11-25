@@ -380,3 +380,61 @@ top-1 0.806 and KL 0.189, at 2.63 bits. The held table of the
 
 B4 to B6 have no figure yet: their runs logged no timeline. #216's re-run
 of the matrix gives them, and the paper and the thesis take the table then.
+
+---
+
+## Amendment (#211): llama.cpp under the same contention
+
+llama.cpp's server runs the survival experiment's generation, 32704
+positions and 64 tokens of Qwen2.5-1.5B with its weights at FP16, under S1
+and S5, three runs a cell, its cache at f16, q8_0 and q4_0. Fixed before any
+logged run; what it holds was measured first, unlogged, with no contention,
+and one run of S5 a cache type was tried, unlogged, to check the tool.
+
+**What was measured first** (build b12300, 32K context, RTX 4050). Its
+buffers are allocated as it loads: 2945 MiB of weights and the whole cache
+(896 MiB at f16, 476 at q8_0). Through a whole generation the device's free
+memory fell about 30 MiB more. Its prefill of the 32704 positions took about
+13 s and MicroInfer's about 206 s (#208).
+
+That fixes what can be asked of it. A cache that is held from the load has
+nothing to grow under contention, so the failure that ends a static
+MicroInfer, an allocation refused part way, has little to act on. What the
+contention meets is the other side: memory the applications ask for that
+llama.cpp holds and does not give back. A run therefore logs two things.
+
+- **How it ended:** complete, out of memory or failed, at which position and
+  how long after the take. Out of memory is read from the server's log, an
+  allocation on the device refused, which ggml reports or ends the process
+  on; a host allocation is not.
+- **What the contention was refused:** the most the simulator asked for and
+  was not given (`shortfall_bytes` of its events). A MicroInfer run's is in
+  its own events, and the summary gives it beside, from the file its entry
+  names by sha256.
+
+**The protocol.**
+
+- **When.** A completion of no tokens fills the cache to 16384 positions,
+  exactly; the generation waits there until the simulator has taken its
+  first level, as MicroInfer's waits at its chunk boundary.
+- **The same bytes taken.** S5's shortfall, 256 MiB, and S1's base are set
+  from the headroom as an FP16 MicroInfer would have it there
+  (`survival.counted_as_fp16`): llama.cpp's, more by what its cache holds
+  beyond an FP16 cache of 16384 positions. The contention is the same bytes,
+  whatever the engine holds.
+- **S1 is played whole.** Its 494 s meet about 10 s of one llama.cpp
+  generation. The generation is made again, the cache cut back to 16384
+  positions, until the schedule has ended, and a run survives if every one
+  completed. MicroInfer's runs end with their one generation, which on the
+  engine before #204 lasted longer than S1; an engine that finishes sooner
+  would meet less. S5's step is kept to the end of one generation.
+- **Its settings** are one slot, every layer on the device, flash attention
+  for every type, since a quantised value cache needs it, a batch of 512,
+  MicroInfer's chunk, `--fit off`, so that it holds what it was asked to, and
+  no host-memory prompt cache.
+
+**What it does not say.** A llama.cpp that loads while another process holds
+memory may fail to load, or with `--fit on` take a smaller context; both are
+at load, which this does not measure. Its quality at q8_0 and q4_0 is not
+measured here. It is faster than MicroInfer at every step measured, and so
+no comparison of speed is made from these runs.
