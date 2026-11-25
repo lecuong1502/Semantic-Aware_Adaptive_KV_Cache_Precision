@@ -16,8 +16,8 @@ Every time is in seconds from the simulator's take, and every size in MiB:
   what the engine held besides its cache at the trace's first sample, when
   the cache held the contention's position at FP16. The engine is the
   process, other than the simulator, that held most there. What the engine
-  holds besides its cache changes by some tens of MiB as it goes from
-  prefill to decode, so the cache is known to that.
+  holds besides its cache falls by 70 MiB as it goes from prefill to decode
+  (B6's S6 run), so the cache is known to that.
 - **The plans** are the timeline's: a run logs its plans' moves and not when
   each applied (ADR-0014, #207), and the steps after which more pages were
   below FP16 are where its downgrades showed. Its upgrades span the first

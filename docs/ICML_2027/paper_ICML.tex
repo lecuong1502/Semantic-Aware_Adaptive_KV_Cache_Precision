@@ -470,7 +470,8 @@ drops, an application keeping its memory until it closed, so reclaiming memory
 once is not enough. \textbf{It is large:} a median of 154\,MiB, a P90 of
 506\,MiB, and at most 567\,MiB. \textbf{It rises over seconds:} a median of
 1.09\,s from 10\% to 90\% of the amplitude, and a P10 of 242\,ms. Attribution
-named a process for 44 spikes, mostly the browser's GPU process. Beside the
+named a process for 44 spikes, mostly the browser's GPU process
+(Figure~\ref{fig:spikes}). Beside the
 engine at 32K the lowest headroom was 377\,MiB: contention brings a long
 session within a few hundred MiB of failure.
 
@@ -534,29 +535,6 @@ took what left the engine 256\,MiB short of its full FP16 cache, keeping it to
 the end; the rule, rather than a byte count, gives both runs the same shortfall
 whatever else the desktop holds.
 
-\begin{table}[t]
-\caption{The survival experiment at 32K positions. The static engine runs out
-of memory; the adaptive one (semantic) completes, and the driver sees every
-byte it returns.}
-\label{tab:survival}
-\centering
-\small
-\begin{adjustbox}{max width=\columnwidth}
-\begin{tabular}{lrr}
-\toprule
-& Static FP16 & Adaptive \\
-\midrule
-Ending & OOM at 20{,}992 & complete, 32{,}767 \\
-Headroom at the take / taken (MiB) & 1904 / 1630 & 1883 / 1610 \\
-Lowest free after the take (MiB) & 11 & 159 \\
-Plans / downgrades & 0 / 0 & 33 / 85{,}596 \\
-Returned / seen by the driver (MiB) & -- & 746 / 746 \\
-Plans matching the driver to a granule & -- & 32 of 32 \\
-\bottomrule
-\end{tabular}
-\end{adjustbox}
-\end{table}
-
 The static engine ran out of memory at 20{,}992 positions, refused a granule
 with 36\,MiB free (Table~\ref{tab:survival}). The adaptive engine completed
 every token. Its first plan, at RED with 164\,MiB of headroom, applied 44{,}016
@@ -564,6 +542,20 @@ downgrades in 1.7\,s and returned 382\,MiB; later plans downgraded pages as the
 cache sealed them, 10--12\,MiB in about 60\,ms each. Every plan's return was
 seen by the driver to within a 2\,MiB granule: freed memory reached the driver,
 where the other process could take it and the monitor could see it.
+Figure~\ref{fig:survival} shows the same take released after 30\,s.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/survival.pdf}
+\caption{S5's take and its release (S6) at 32K positions, one run, over the static
+FP16 engine's run under S5, to where it ran out of memory. Above, the headroom,
+the thresholds and the level the monitor reported; below, the engine's cache, as
+the driver accounts for it, and what the simulator held. Triangles are steps that
+found pages downgraded; the bar spans the upgrades. The time axis changes scale
+at 40\,s; the two runs are of two commits. The step down at 471\,s, where prefill
+ended, is memory other than the cache's.}
+\label{fig:survival}
+\end{figure}
 
 \paragraph{Reacting during prefill.} Detection took 165\,ms, but with
 512-position chunks every event during prefill waited for the chunk in
@@ -575,29 +567,6 @@ the median for events after an episode's first to 0.86\,s. The first event of
 an episode still waits for the chunk in progress, and at 32K positions prefill
 under pressure takes about 2.4 times as long, the price of acting within a
 second or two.
-
-\begin{table}[t]
-\caption{From a pressure event during prefill to its plan, at 32K positions,
-with chunks of 512 positions, chunks sized by the time per position, and chunks
-sized by a fixed and a per-position part. Modelling the fixed part brings
-later events within about a second; the first event of an episode still waits
-for the chunk in progress.}
-\label{tab:prefill}
-\centering
-\small
-\begin{adjustbox}{max width=\columnwidth}
-\begin{tabular}{lrrr}
-\toprule
-& 512 & Per position & Fixed + per position \\
-\midrule
-First event of the episode & 11.1\,s & 11.1\,s & 11.1\,s \\
-Later events, median & 13.2\,s & 1.5\,s & 0.86\,s \\
-Later events within 1\,s & 0 & 24 of 74 & 3 of 5 \\
-From the take to the end & 668\,s & 1617\,s & 1588\,s \\
-\bottomrule
-\end{tabular}
-\end{adjustbox}
-\end{table}
 
 \paragraph{Across scenarios.} The survival matrix runs the same generation under
 static FP16, INT4 and INT2 engines and the adaptive engine from each score
@@ -811,7 +780,8 @@ pass over the prompt took 43\,s at 8K here; the scorer's scores come with decodi
 \textbf{Graded measures part the sources.} In continuation fidelity at 80\%,
 semantic allocation kept the next-token distribution 3.6 times closer to FP16
 than uniform, a paired difference in mean KL of $-0.073$ [$-0.082$,
-$-0.065$], lower on all 50 passages, and top-1 agreement 7.2 points higher.
+$-0.065$], lower on all 50 passages (Figure~\ref{fig:pages}a), and top-1
+agreement 7.2 points higher.
 At 70\% its KL against uniform's was within the interval, at 0.0023 against
 0.0031. A whole cache at INT4, at 4.63 bits, between the two levels' 5.48 and
 3.98, kept a KL of 0.0055, between semantic's at them; at INT8 it was
@@ -856,11 +826,25 @@ the mean KL from FP16 over them; with no page moved the logits are FP16's to the
 bit. Over 3{,}200 pages a task, Spearman's $\rho$ between score and damage was
 $0.356$ [$0.307$, $0.401$] for continuation, positive in 49 passages of 50, but
 $0.031$ [$-0.008$, $0.069$] on the needles and $0.068$ [$0.041$, $0.094$] in the
-dialogue (95\% bootstrap over samples); for ZipCache's scores of the same pages,
+dialogue (95\% bootstrap over samples; Figure~\ref{fig:pages}b); for ZipCache's
+scores of the same pages,
 $0.306$, $0.027$ and $0.050$. The score ranks pages by the damage
 their downgrade does to the continuation of the text it watched, not by the
 damage to the answer of a question asked after it, which agrees with the null
 comparison on the needle set.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/continuation.pdf}
+\includegraphics[width=\columnwidth]{figures/damage.pdf}
+\caption{(a) Each passage's mean KL from FP16 in continuation at 80\% of the bytes
+reclaimed, semantic allocation against uniform's: every passage lies below the
+line of equal KL. (b) A page's damage, the mean KL with it alone at INT4, against
+its score on each task: the median and quartiles of each tenth of 3{,}200 pages
+by score, with Spearman's $\rho$ over the pages. From the lowest
+scores to the highest it rises on continuation alone.}
+\label{fig:pages}
+\end{figure}
 
 \textbf{Answer.} At equal bytes, attention-guided allocation kept the model's
 output distribution markedly closer to full precision than uniform allocation,
@@ -988,6 +972,16 @@ the threshold. A spike is attributed to the process whose memory gained most
 between the last 5\,Hz sample before the rise and the samples during the peak,
 if it gained at least a quarter of the amplitude.
 
+\begin{figure}[!ht]
+\centering
+\includegraphics[width=\columnwidth]{figures/spikes.pdf}
+\caption{RQ1's spikes: amplitude against rise time, by the process each is
+attributed to. The video player takes the most, in 0.2 to 0.6\,s; the browser's
+spikes are smaller, and 16 of its 27 rise over a second or more. One of the 48, with no
+rise measured, is not shown.}
+\label{fig:spikes}
+\end{figure}
+
 \section{The Contention Simulator}
 \label{app:simulator}
 
@@ -999,6 +993,59 @@ time with absolute deadlines. A change of 64\,MiB is visible to the driver
 synthetic trapezoids of a given amplitude, ramp and plateau, or replays of what
 the processes other than the engine held in an RQ1 recording, played on a base
 that leaves the original's headroom.
+
+\section{The Survival Experiment}
+\label{app:survival}
+
+Table~\ref{tab:survival} gives the two runs of the survival experiment, and
+Table~\ref{tab:prefill} the time from a pressure event during prefill to its plan
+under three rules for sizing chunks (Section~\ref{sec:survival}).
+
+\begin{table}[!ht]
+\caption{The survival experiment at 32K positions. The static engine runs out
+of memory; the adaptive one (semantic) completes, and the driver sees every
+byte it returns.}
+\label{tab:survival}
+\centering
+\small
+\begin{adjustbox}{max width=\columnwidth}
+\begin{tabular}{lrr}
+\toprule
+& Static FP16 & Adaptive \\
+\midrule
+Ending & OOM at 20{,}992 & complete, 32{,}767 \\
+Headroom at the take / taken (MiB) & 1904 / 1630 & 1883 / 1610 \\
+Lowest free after the take (MiB) & 11 & 159 \\
+Plans / downgrades & 0 / 0 & 33 / 85{,}596 \\
+Returned / seen by the driver (MiB) & -- & 746 / 746 \\
+Plans matching the driver to a granule & -- & 32 of 32 \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\end{table}
+
+\begin{table}[!ht]
+\caption{From a pressure event during prefill to its plan, at 32K positions,
+with chunks of 512 positions, chunks sized by the time per position, and chunks
+sized by a fixed and a per-position part. Modelling the fixed part brings
+later events within about a second; the first event of an episode still waits
+for the chunk in progress.}
+\label{tab:prefill}
+\centering
+\small
+\begin{adjustbox}{max width=\columnwidth}
+\begin{tabular}{lrrr}
+\toprule
+& 512 & Per position & Fixed + per position \\
+\midrule
+First event of the episode & 11.1\,s & 11.1\,s & 11.1\,s \\
+Later events, median & 13.2\,s & 1.5\,s & 0.86\,s \\
+Later events within 1\,s & 0 & 24 of 74 & 3 of 5 \\
+From the take to the end & 668\,s & 1617\,s & 1588\,s \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\end{table}
 
 \section{The From-Scratch Boundary}
 \label{app:boundary}

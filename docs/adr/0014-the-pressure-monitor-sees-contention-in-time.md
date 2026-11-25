@@ -494,8 +494,8 @@ anew. The figure's script reads the log alone.
   reports it, less what the engine held besides an FP16 cache of the
   contention's position at the recording's first sample. The same account
   serves a static run, which had no timeline before #207. What the engine
-  holds besides its cache falls by some 66 MiB as prefill ends, which shows
-  as a step down in the cache.
+  holds besides its cache falls by 70 MiB as prefill ends, which shows as a
+  step down in the cache.
 - **A downgrade** is marked at each step that found more pages below FP16
   than the step before it, since a run logs its plans' moves and not when
   each applied. A run's marks are then its downgrade plans as steps saw
