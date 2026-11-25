@@ -517,22 +517,50 @@ bias, 1.03 otherwise, and a mean of 0.36 at most.
 - The per-page attention mass is a decode step's, of one query, so its kernel
   is the one before. **Its tolerance over the same cache is therefore zero**:
   the masses are the same bits, which `test_prefill_attention.py` holds between
-  the two kernels asked for, and `prefill-agreement`, still to be logged, holds
-  of the scores over a whole model. Against float64 they keep the tolerance
+  the two kernels asked for, and `prefill-agreement` `dab1b0f8` found of the
+  scores over three whole models, at every tier and over a mixed map. Against float64 they keep the tolerance
   they had, 32 fp32 ulps (`test_attention_mass.py`). The build before #213 and
   this one gave the same bytes, masses among them, in an unlogged check at both
   Qwen2.5 models' shapes. Over the caches two prefills leave, the scores differ
-  as the caches do, which the same entry will give beside its control.
+  as the caches do: by at most 0.06% of the largest score at FP16, and 10% at
+  INT2, where the control differs by up to 14%.
 
 **The gate between the two kernels** is `tools/prefill_agreement.py`'s, which
 one build can take: `device.set_prefill_on_tensor_cores(False)` asks for the
 kernel before. Over the same cache, and before a page of the queries seals,
 what differs is the kernel alone, and that is held to top-1 99% and KL 1e-3 at
 every tier and over a mixed map, at 32 queries a launch; a chunk of 512 is held
-to it at FP16, where no seal magnifies it. Its runs are still to be logged. Over
-a whole prefill a tier carries any last-bit difference as far as it carries
-cuBLAS's, as #204's note found of INT4 and INT2, so the whole prefill is
-reported beside its control, the kernel before against itself in chunks of 256.
+to it at FP16, where no seal magnifies it. Over a whole prefill a tier carries
+any last-bit difference as far as it carries cuBLAS's, as #204's note found of
+INT4 and INT2, so the whole prefill is reported beside its control, the kernel
+before against itself in chunks of 256.
+
+**As measured** (`prefill-agreement` `dab1b0f8`, at 0b78b69, the code of
+2e2d4a2; WikiText-2, 512 positions a figure, KL over 32 of them):
+
+| | One page, one cache | One chunk, one cache | Whole prefill | Control |
+|---|---:|---:|---:|---:|
+| 0.5B FP16 | 99.8%, 1.5e-6 | 100%, 1.7e-6 | 100%, 3.0e-6 | 100%, 2.6e-6 |
+| 0.5B INT8 | 100%, 2.0e-6 | 100%, 8.3e-6 | 99.8%, 3.0e-5 | 99.6%, 2.0e-5 |
+| 0.5B INT4 | 99.6%, 2.5e-6 | 99.0%, **1.4e-3** | **98.0%, 6.4e-3** | **97.5%, 6.0e-3** |
+| 0.5B INT2 | 99.8%, 2.3e-6 | **92.6%, 3.3e-2** | **85.4%, 0.14** | **84.0%, 0.20** |
+| 0.5B mixed | 100%, 2.1e-6 | **95.9%, 5.4e-3** | **92.8%, 3.8e-2** | **92.8%, 2.6e-2** |
+| 1.5B FP16 | 100%, 1.4e-6 | 100%, 8.7e-7 | 100%, 1.9e-6 | 100%, 1.5e-6 |
+| 1.5B INT8 | 100%, 1.0e-6 | 99.8%, 5.7e-6 | 99.8%, 1.3e-5 | 100%, 1.4e-5 |
+| 1.5B INT4 | 100%, 1.7e-6 | 99.6%, 3.4e-4 | **97.3%, 1.7e-3** | **97.7%, 1.2e-3** |
+| 1.5B INT2 | 100%, 2.3e-6 | **94.9%, 2.0e-2** | **91.0%, 6.3e-2** | **89.6%, 9.5e-2** |
+| 1.5B mixed | 99.8%, 1.0e-6 | **97.7%, 4.4e-3** | **95.3%, 1.9e-2** | **94.1%, 1.5e-2** |
+| Llama FP16 | 99.6%, 1.9e-6 | 100%, 1.5e-6 | 100%, 1.9e-6 | 100%, 2.3e-6 |
+| Llama INT8 | 100%, 2.2e-6 | 99.8%, 3.1e-6 | 99.6%, 1.9e-5 | 99.4%, 1.6e-5 |
+| Llama INT4 | 99.8%, 1.8e-6 | 99.8%, 1.3e-4 | **97.7%, 2.1e-3** | **97.5%, 4.4e-3** |
+| Llama INT2 | 100%, 1.8e-6 | **93.8%, 1.3e-2** | **79.7%, 0.16** | **77.7%, 0.14** |
+| Llama mixed | 100%, 1.8e-6 | 99.0%, **1.7e-3** | **95.3%, 2.9e-2** | **95.3%, 1.9e-2** |
+
+In bold, what fails the gate. The kernel's own difference passes at every tier
+and over the mixed map. Where the whole prefill fails, the control fails beside
+it, and the two are within 2.0 points of top-1 everywhere, the kernels' the
+higher or equal in 13 cells of 15: it measures the tier. The gate against HuggingFace passes at FP16: 99.72% and 1.1e-4 on 0.5B
+(`gate` `c6025e32`), 99.98% and 3.5e-6 on 1.5B (`2fee0cf9`).
 
 **How a launch is laid out.** A warp is one head's tile of 16 queries. A block
 has every head of a KV head's group, and two tiles of queries where its
@@ -551,9 +579,24 @@ workspace's partials grew from 1.3 to 10.7 MB at head_dim 128, headroom no
 longer free while prefill runs. A decode step's workspace holds what it did.
 #204's statement that a chunk of 512 never splits no longer holds.
 
-**Speed.** Chunks of 512 positions at 8K, 16K and 32K, before and after, are
-`prefill-chunk-cost` entries (`tools/prefill_chunk_cost.py`), still to be
-logged.
+**Speed.** A chunk of 512 positions in the engine, Qwen2.5-1.5B, seconds before
+and after, the median of three each, alternating in one build
+(`prefill-chunk-cost`, at c3c092c). A context is where its chunks begin, and
+they follow one another; the 32K one begins at 29,696, to leave them room.
+
+| | 8K | 16K | 32K | Entry |
+|---|---:|---:|---:|---|
+| FP16 | 1.72, 0.18 | 3.07, 0.25 | 5.42, 0.37 | `6951d3ae` |
+| INT8 | 1.95, 0.19 | 3.47, 0.27 | 6.00, 0.40 | `d3c62ecd` |
+| INT4 | 2.00, 0.20 | 3.56, 0.28 | 6.15, 0.40 | `fde7e3ec` |
+| INT2 | 1.98, 0.20 | 3.53, 0.27 | 6.06, 0.40 | `3c9422bd` |
+| Mixed | 1.96, 0.20 | 3.48, 0.27 | 6.03, 0.40 | `ec332292` |
+
+That is 9.5 to 15.3 times faster. The issue's 11 to 16 s a chunk was the engine
+before #204, at 16K to 24K. A chunk of 512 now takes less than
+`pressure_chunk_seconds`, 0.8 s, at every tier and context here, so the first
+event of an episode would wait less than half a second for it. The survival
+experiment is run again by #214, which measures that.
 
 **What can no longer be repeated to the bit:** every logged result that
 prefills, which is every one that runs a model. #216 re-runs RQ3 and the

@@ -3,7 +3,8 @@
 
     .venv/bin/python tools/record_checkpoint.py [--model qwen2.5-0.5b-instruct]
 
-Appends three entries: the correctness gate, the greedy smoke test, and the
+Appends three entries: the correctness gate, the greedy smoke test, where the
+golden set holds HuggingFace's continuations, as Qwen2.5-0.5B's does, and the
 peak device memory of a generation. These are the log's first entries, the
 first working version it was asked to start from.
 
@@ -83,15 +84,18 @@ def main(argv: list[str]) -> int:
         smoke.append({"prompt": item.prompt_id, "match": same,
                       "first_divergence": None if same else first})
         continued.append(len(item) + len(item.generated))
-    matching = sum(s["match"] for s in smoke)
-    print(f"\nsmoke: {matching}/{len(smoke)} match HuggingFace")
-    benchlog.append(
-        "smoke", model=args.model, precision_tiers=TIERS,
-        context_length={"min": min(continued), "max": max(continued), "prompts": len(smoke),
-                        "new_tokens": golden.manifest["smoke_tokens"]},
-        config={"reference": reference, "greedy": golden.manifest["greedy"]},
-        results={"matching": matching, "prompts": len(smoke), "per_prompt": smoke},
-        log=args.log)
+    if smoke:
+        matching = sum(s["match"] for s in smoke)
+        print(f"\nsmoke: {matching}/{len(smoke)} match HuggingFace")
+        benchlog.append(
+            "smoke", model=args.model, precision_tiers=TIERS,
+            context_length={"min": min(continued), "max": max(continued), "prompts": len(smoke),
+                            "new_tokens": golden.manifest["smoke_tokens"]},
+            config={"reference": reference, "greedy": golden.manifest["greedy"]},
+            results={"matching": matching, "prompts": len(smoke), "per_prompt": smoke},
+            log=args.log)
+    else:
+        print("\nsmoke: none, the golden set holds no continuation of this model's")
 
     # Peak device memory, after a warm run (tests/test_inference.py says why).
     ids = np.arange(100, 100 + PEAK_PROMPT, dtype=np.int32)
@@ -110,7 +114,7 @@ def main(argv: list[str]) -> int:
                  "device_total": peak.device_total},
         log=args.log)
 
-    print(f"\nappended 3 entries to {args.log.relative_to(REPO)}")
+    print(f"\nappended {3 if smoke else 2} entries to {args.log.relative_to(REPO)}")
     return 0
 
 
