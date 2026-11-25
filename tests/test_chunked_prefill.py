@@ -1,7 +1,10 @@
 """Chunked prefill (#15): a long prompt prefilled a chunk at a time, so the
 workspace is sized to a chunk and not to the prompt.
 
-**What "the same output" means here, and why not bits.** Attention is
+**What "the same output" means here, and why not bits.** A chunk of one
+position is a decode step's launch, which another attention kernel computes
+than a longer chunk's (#213), and a chunk over a long cache splits its keys by
+its number of queries (#204): each rounds in its own places. Else attention is
 row-invariant: a query's output does not depend on which other queries share
 its launch, to the bit. cuBLAS is not. It picks its algorithm, tiling and
 split-K from the GEMM's shape, so the same row of a projection can round

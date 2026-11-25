@@ -144,8 +144,8 @@ def measure(cfg: ModelConfig, tier: str, length: int, tile: int, repeat: int, ba
         out1.to_numpy()
 
     result = {} if partials is None else {"splits": {
-        "decode": list(device.attention_split(1, length, heads, kv_heads)),
-        "prefill_tile": list(device.attention_split(tile, length, heads, kv_heads))}}
+        "decode": list(device.attention_split(1, length, heads, kv_heads, hd)),
+        "prefill_tile": list(device.attention_split(tile, length, heads, kv_heads, hd))}}
     for name, launch in (("decode", decode(False)), ("decode_with_mass", decode(True)),
                          ("prefill_tile", prefill_tile)):
         us = timed(launch, sync, repeat, batch)

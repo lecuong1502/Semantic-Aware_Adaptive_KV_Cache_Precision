@@ -480,3 +480,124 @@ bit on this one:
 use a split launch and repeat as they did. The `gate` does where a prompt's
 last chunk splits, and was logged again here. #216 re-runs RQ3 and the
 survival matrix on this engine.
+
+---
+
+## Note from #213: prefill on the tensor cores, gated as a new kernel
+
+A launch of more than one query, a prefill's, runs on the tensor cores at
+the models' head_dims, 64 and 128: `mma.sync` with fp16 operands accumulated
+in fp32 (`prefill_attention.cuh`). A decode step, and another head_dim, run
+on the kernel that computed prefill before, which is unchanged.
+
+**The gate is unchanged, and the weights are not in fp16.** The amendment of
+#8 found that holding the softmax weights in fp16 for P @ V reads 83 ulp, and
+left that trade to this ADR. It is not taken. A softmax weight is an fp32
+number, and so is a key completed by its bias (ADR-0009). Each is multiplied
+as two fp16 ones, its nearest and what that leaves, which together hold 22
+bits. The remainder's product is summed in fp16, at half the cost of an fp32
+sum on a consumer GPU; it is 2^-11 of the whole, so what fp16 rounds of it is
+2^-22. A query, a value and a key with no bias are fp16 already.
+`test_prefill_attention.py` and every prefill case of `test_attention.py` and
+`test_split_attention.py` hold it to float64 within 4 ulp max and 1 ulp mean,
+with the floor of the amendment of #8. With either remainder left out they
+fail. Measured once, unlogged, over the three models' shapes: at most 1.94 ulp
+where the running maximum rises through the keys, at most 1.56 with the key
+bias, 1.03 otherwise, and a mean of 0.36 at most.
+
+**What holds to the bit, and what no longer does.**
+
+- A query's output in an unsplit launch depends on no other query, nor on the
+  layout its keys are read through: through pages, at every tier, it is what
+  it is over contiguous keys.
+- A query in a chunk and the same query as a decode step agree within the
+  gate, not to the bit: two kernels compute them. `causal_reference` in
+  `test_quantised_pages.py` therefore compares a chunk's query with the same
+  query run with one other.
+- The per-page attention mass is a decode step's, of one query, so its kernel
+  is the one before. **Its tolerance over the same cache is therefore zero**:
+  the masses are the same bits, which `test_prefill_attention.py` holds between
+  the two kernels asked for, and `prefill-agreement` `dab1b0f8` found of the
+  scores over three whole models, at every tier and over a mixed map. Against float64 they keep the tolerance
+  they had, 32 fp32 ulps (`test_attention_mass.py`). The build before #213 and
+  this one gave the same bytes, masses among them, in an unlogged check at both
+  Qwen2.5 models' shapes. Over the caches two prefills leave, the scores differ
+  as the caches do: by at most 0.06% of the largest score at FP16, and 10% at
+  INT2, where the control differs by up to 14%.
+
+**The gate between the two kernels** is `tools/prefill_agreement.py`'s, which
+one build can take: `device.set_prefill_on_tensor_cores(False)` asks for the
+kernel before. Over the same cache, and before a page of the queries seals,
+what differs is the kernel alone, and that is held to top-1 99% and KL 1e-3 at
+every tier and over a mixed map, at 32 queries a launch; a chunk of 512 is held
+to it at FP16, where no seal magnifies it. Over a whole prefill a tier carries
+any last-bit difference as far as it carries cuBLAS's, as #204's note found of
+INT4 and INT2, so the whole prefill is reported beside its control, the kernel
+before against itself in chunks of 256.
+
+**As measured** (`prefill-agreement` `dab1b0f8`, at 0b78b69, the code of
+2e2d4a2; WikiText-2, 512 positions a figure, KL over 32 of them):
+
+| | One page, one cache | One chunk, one cache | Whole prefill | Control |
+|---|---:|---:|---:|---:|
+| 0.5B FP16 | 99.8%, 1.5e-6 | 100%, 1.7e-6 | 100%, 3.0e-6 | 100%, 2.6e-6 |
+| 0.5B INT8 | 100%, 2.0e-6 | 100%, 8.3e-6 | 99.8%, 3.0e-5 | 99.6%, 2.0e-5 |
+| 0.5B INT4 | 99.6%, 2.5e-6 | 99.0%, **1.4e-3** | **98.0%, 6.4e-3** | **97.5%, 6.0e-3** |
+| 0.5B INT2 | 99.8%, 2.3e-6 | **92.6%, 3.3e-2** | **85.4%, 0.14** | **84.0%, 0.20** |
+| 0.5B mixed | 100%, 2.1e-6 | **95.9%, 5.4e-3** | **92.8%, 3.8e-2** | **92.8%, 2.6e-2** |
+| 1.5B FP16 | 100%, 1.4e-6 | 100%, 8.7e-7 | 100%, 1.9e-6 | 100%, 1.5e-6 |
+| 1.5B INT8 | 100%, 1.0e-6 | 99.8%, 5.7e-6 | 99.8%, 1.3e-5 | 100%, 1.4e-5 |
+| 1.5B INT4 | 100%, 1.7e-6 | 99.6%, 3.4e-4 | **97.3%, 1.7e-3** | **97.7%, 1.2e-3** |
+| 1.5B INT2 | 100%, 2.3e-6 | **94.9%, 2.0e-2** | **91.0%, 6.3e-2** | **89.6%, 9.5e-2** |
+| 1.5B mixed | 99.8%, 1.0e-6 | **97.7%, 4.4e-3** | **95.3%, 1.9e-2** | **94.1%, 1.5e-2** |
+| Llama FP16 | 99.6%, 1.9e-6 | 100%, 1.5e-6 | 100%, 1.9e-6 | 100%, 2.3e-6 |
+| Llama INT8 | 100%, 2.2e-6 | 99.8%, 3.1e-6 | 99.6%, 1.9e-5 | 99.4%, 1.6e-5 |
+| Llama INT4 | 99.8%, 1.8e-6 | 99.8%, 1.3e-4 | **97.7%, 2.1e-3** | **97.5%, 4.4e-3** |
+| Llama INT2 | 100%, 1.8e-6 | **93.8%, 1.3e-2** | **79.7%, 0.16** | **77.7%, 0.14** |
+| Llama mixed | 100%, 1.8e-6 | 99.0%, **1.7e-3** | **95.3%, 2.9e-2** | **95.3%, 1.9e-2** |
+
+In bold, what fails the gate. The kernel's own difference passes at every tier
+and over the mixed map. Where the whole prefill fails, the control fails beside
+it, and the two are within 2.0 points of top-1 everywhere, the kernels' the
+higher or equal in 13 cells of 15: it measures the tier. The gate against HuggingFace passes at FP16: 99.72% and 1.1e-4 on 0.5B
+(`gate` `c6025e32`), 99.98% and 3.5e-6 on 1.5B (`2fee0cf9`).
+
+**How a launch is laid out.** A warp is one head's tile of 16 queries. A block
+has every head of a KV head's group, and two tiles of queries where its
+registers and, over a cache that seals, a page hold both. The key and value
+tile is loaded, completed and dequantised once for all of them. The kernel
+before loaded it for each block of 16 queries of one head, twelve times as often
+at Qwen2.5-1.5B's shape. A row in shared memory is eight elements longer than it holds: without
+them the eight rows an `ldmatrix` reads from lie in one run of banks. An
+unlogged launch of 512 queries over 32,704 keys on the RTX 4050, at FP16, took
+21 ms without them and 12 with, while the kernel was being written.
+
+**A split launch's partials are larger.** A chunk of 512 queries is 32 blocks
+of equal length over 20 multiprocessors, of which 8 have nothing to do for the
+second half; it now splits its keys in three at Qwen2.5-1.5B's shape. A prefill
+workspace's partials grew from 1.3 to 10.7 MB at head_dim 128, headroom no
+longer free while prefill runs. A decode step's workspace holds what it did.
+#204's statement that a chunk of 512 never splits no longer holds.
+
+**Speed.** A chunk of 512 positions in the engine, Qwen2.5-1.5B, seconds before
+and after, the median of three each, alternating in one build
+(`prefill-chunk-cost`, at c3c092c). A context is where its chunks begin, and
+they follow one another; the 32K one begins at 29,696, to leave them room.
+
+| | 8K | 16K | 32K | Entry |
+|---|---:|---:|---:|---|
+| FP16 | 1.72, 0.18 | 3.07, 0.25 | 5.42, 0.37 | `6951d3ae` |
+| INT8 | 1.95, 0.19 | 3.47, 0.27 | 6.00, 0.40 | `d3c62ecd` |
+| INT4 | 2.00, 0.20 | 3.56, 0.28 | 6.15, 0.40 | `fde7e3ec` |
+| INT2 | 1.98, 0.20 | 3.53, 0.27 | 6.06, 0.40 | `3c9422bd` |
+| Mixed | 1.96, 0.20 | 3.48, 0.27 | 6.03, 0.40 | `ec332292` |
+
+That is 9.5 to 15.3 times faster. The issue's 11 to 16 s a chunk was the engine
+before #204, at 16K to 24K. A chunk of 512 now takes less than
+`pressure_chunk_seconds`, 0.8 s, at every tier and context here, so the first
+event of an episode would wait less than half a second for it. The survival
+experiment is run again by #214, which measures that.
+
+**What can no longer be repeated to the bit:** every logged result that
+prefills, which is every one that runs a model. #216 re-runs RQ3 and the
+survival matrix on this engine.

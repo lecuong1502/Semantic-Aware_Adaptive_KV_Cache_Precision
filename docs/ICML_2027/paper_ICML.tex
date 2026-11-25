@@ -322,9 +322,10 @@ Each tier has its own virtual address range, reserved through the VMM interface
 for the whole context window. Physical memory is mapped a 2\,MiB granule at a
 time as pages arrive; a tier's live pages occupy its lowest slots, freeing a
 page moves the tier's last page into its slot, and an empty granule is returned
-to the driver. One attention kernel reads every page at the tier the page table
-records for it, dequantising as it loads, in a single pass; query tiles are
-aligned to pages, so a tile reads one tier.
+to the driver. Attention reads every page at the tier the page table records
+for it, dequantising as it loads, in a single pass; query tiles are aligned to
+pages, so a tile reads one tier. One kernel decodes, and another, on the tensor
+cores, prefills (Appendix~\ref{app:boundary}).
 
 \subsection{Runtime Requantisation}
 \label{sec:requantisation}
@@ -349,7 +350,7 @@ commits differed by 16\%.
 \subsection{The Importance Scorer}
 \label{sec:scorer}
 
-The attention kernel computes the softmax online, one page per tile. On
+The decode kernel computes the softmax online, one page per tile. On
 request each tile writes its partial $\sum \exp(s - m)$ with its maximum $m$,
 and once the softmax's final maximum and sum are known these are normalised
 into each page's share of the attention mass, with no second pass over the
@@ -567,7 +568,10 @@ taking about 1.7\,s: a step has a large fixed part. Modelling that part brings
 the median for events after an episode's first to 0.86\,s. The first event of
 an episode still waits for the chunk in progress, and at 32K positions prefill
 under pressure takes about 2.4 times as long, the price of acting within a
-second or two.
+second or two. These runs predate prefill on the tensor cores. In one build, a
+chunk of 512 after 8K, 16K and 30K positions now takes 0.18, 0.25 and 0.37\,s at
+FP16, against 1.7, 3.1 and 5.4\,s by the kernel before, and at most 0.40\,s at
+any tier; the reaction has not been run again on it.
 
 \paragraph{Across scenarios.} The survival matrix runs the same generation under
 static FP16, INT4 and INT2 engines and the adaptive engine from each score
@@ -877,8 +881,9 @@ apart; an adaptive engine also meets more of a schedule than a static one.
 \textbf{An external engine in part.} llama.cpp ran two scenarios, loaded before
 contention came; its loading under contention and its quality at q8\_0 and q4\_0
 are not measured. \textbf{Reacting at step boundaries.} The first event of an
-episode waits for the step in progress, and at long contexts a step's fixed part exceeds a
-second, so no chunk size meets a 1\,s target there. \textbf{Attention as a
+episode waits for the step in progress, and at long contexts a step's fixed part
+exceeded a second on the engine RQ2 ran on, so no chunk size met a 1\,s target
+there. \textbf{Attention as a
 signal.} We use attention mass as a predictor of which pages will be consulted
 again, not as an explanation of the model; RQ3 tests that use by its outcome
 and page by page, one page moved to INT4 at a time, which shows the ranking a
@@ -1059,7 +1064,14 @@ bias seeded into its output so that the result is rounded once. A naive GEMM
 and a shared-memory-tiled one, profiled against cuBLAS with Nsight Compute,
 ran 93--267 and 8--28 times slower at 512 rows, the naive kernel bound by its
 load and store queue, the tiled one by shared memory, and cuBLAS by tensor
-cores; they are a study, tested to stay off the inference path.
+cores; they are a study, tested to stay off the inference path. Prefill's
+attention multiplies on the tensor cores through two instructions written by
+hand, with fp16 operands accumulated in fp32; a key completed by its bias and a
+softmax weight, which one fp16 would not hold, are each multiplied as two. Over
+one cache it and the kernel it replaced agree on at least 99.6\% of next tokens
+at every tier and over a mixed map, on three models, with a mean KL of at most
+$2.6 \times 10^{-6}$. Over a whole prefill a low tier carries their last-bit
+difference as far as it carries cuBLAS's.
 
 \section{A Second Model Family: Llama-3.2-1B}
 \label{app:llama}
@@ -1166,9 +1178,10 @@ simulator was refused nothing by any engine, one run each: the step comes while 
 has still half its growth to make. llama.cpp's S5 runs took 1176--1258\,MiB of
 1486--1560 asked at f16 and all of 1480--1554 at q8\_0 and q4\_0. From the load to
 the contention its memory grew by 16--28\,MiB. Its prefill ran at
-2{,}338--2{,}620 positions a second, an order of magnitude faster than
-MicroInfer's, and its decoding at 34--42 tokens a second; the runs were not made
-to compare the two engines' speeds.
+2{,}338--2{,}620 positions a second, an order of magnitude faster than the
+MicroInfer of the matrix (a chunk of 512 now takes 0.25\,s after 16K positions,
+Section~\ref{sec:survival}), and its decoding at 34--42 tokens a second; the runs
+were not made to compare the two engines' speeds.
 
 \section{The Cost of a Tier and of a Move}
 \label{app:moves}

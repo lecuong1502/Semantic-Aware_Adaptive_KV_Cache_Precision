@@ -53,10 +53,10 @@ namespace microinfer
   void linear(const float *x, const float *weight, const float *bias,
               float *out, int rows, int in_features, int out_features);
 
-  // Attention tiles: queries per thread block, and keys per step of the online
-  // softmax. Public so that tests can place sequence lengths relative to them
-  // (a length below one tile, one that is not a multiple of it) instead of
-  // guessing.
+  // Attention tiles: queries per thread block, or per warp on the tensor
+  // cores (#213), and keys per step of the online softmax. Public so that tests
+  // can place sequence lengths relative to them (a length below one tile, one
+  // that is not a multiple of it) instead of guessing.
   constexpr int kAttentionTileQ = 16;
   constexpr int kAttentionTileK = 32;
 

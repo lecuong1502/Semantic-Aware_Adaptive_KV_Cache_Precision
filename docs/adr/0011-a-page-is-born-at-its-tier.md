@@ -35,7 +35,8 @@ At a quantised tier:
   were written to. A prompt prefilled at once and the same tokens decoded one
   at a time therefore read the same cache. They choose the same tokens, up to
   where cuBLAS rounds a key differently in a one-row GEMM than in a long one
-  (ADR-0006, note from #15).
+  (ADR-0006, note from #15), and, since #213, where prefill's attention kernel
+  and decode's round an output differently (ADR-0006, note from #213).
 - **The attention kernel's query tiles are aligned to absolute positions.**
   No tile then spans two pages, and each tile knows which page its queries
   are on. P must be a multiple of the tile, 16, which the ablation's 16, 32

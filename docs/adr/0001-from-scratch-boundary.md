@@ -52,6 +52,15 @@ this decision; it does not revise it. The write-up is `studies/gemm/README.md`.
 
 ---
 
+## Note from #213: tensor cores by hand
+
+Prefill's attention multiplies on the tensor cores (ADR-0006, note from #213),
+through two instructions written by hand, `mma.sync` and `ldmatrix.sync`
+(`tensor_cores.cuh`). An instruction is not a library: no GEMM is called, and
+the boundary above stands.
+
+---
+
 ## Amendment (#211): llama.cpp is run as an external baseline, outside the engine
 
 "No external inference engine is used at any point" is about MicroInfer:
