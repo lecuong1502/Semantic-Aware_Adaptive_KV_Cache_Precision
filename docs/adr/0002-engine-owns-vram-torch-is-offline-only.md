@@ -133,3 +133,16 @@ thing it judges.
 What would break the rule is arithmetic *between* kernels that the next
 kernel depends on. That is what the ADR was written against, because it is
 where a host round-trip would quietly become part of every latency figure.
+
+---
+
+## Amendment (#211): the golden environment converts a checkpoint for llama.cpp
+
+PyTorch "appears in exactly one place", `tools/gen_golden.py`. #211 gives its
+environment a second use: `tools/build_llamacpp.py` runs llama.cpp's own
+converter there, a script of llama.cpp's that imports torch, to write the
+checkpoint MicroInfer runs as a GGUF file. It is run once, offline, as the
+golden generator is, and imports nothing of MicroInfer; `gen_golden.py` is
+still the only file of this repository that imports torch, and no process
+that runs the engine does. The converter's one further dependency is kept
+beside the environment, in `data/llamacpp/`, not installed in it.

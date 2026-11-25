@@ -100,8 +100,17 @@ def as_fp16(cfg: ModelConfig, headroom_bytes: int, *, positions: int, kv_tier: s
     """The headroom an FP16 engine would leave where one at `kv_tier`
     leaves `headroom_bytes`, its cache at `positions`: less by what the
     FP16 cache would hold beyond it."""
-    return headroom_bytes - (paged_cache_bytes(cfg, positions)
-                             - paged_cache_bytes(cfg, positions, kv_tier))
+    return counted_as_fp16(cfg, headroom_bytes, positions=positions,
+                           held_bytes=paged_cache_bytes(cfg, positions, kv_tier))
+
+
+def counted_as_fp16(cfg: ModelConfig, headroom_bytes: int, *, positions: int,
+                    held_bytes: int) -> int:
+    """The headroom an FP16 engine would leave, its cache at `positions`,
+    where one whose cache holds `held_bytes` leaves `headroom_bytes`: a
+    static tier's (as_fp16), or an external baseline's, which holds its
+    whole context's from its load (llamacpp_survival)."""
+    return headroom_bytes - (paged_cache_bytes(cfg, positions) - held_bytes)
 
 
 def step(nbytes: int, pulse_s: float | None = None) -> Schedule:
