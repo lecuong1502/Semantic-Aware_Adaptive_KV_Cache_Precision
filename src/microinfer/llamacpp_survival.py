@@ -250,14 +250,9 @@ def refused_mib_of(entry: dict, folders: Sequence[Path]) -> float | None:
     simulator's events its entry names, found in one of `folders`; None if
     none holds them. ValueError if what is there is not the file the entry
     names, by its sha256."""
-    for name, sha256 in entry["config"].get("files", {}).items():
-        if not name.endswith(".events.jsonl"):
-            continue
-        for folder in folders:
-            path = Path(folder) / name
-            if path.is_file():
-                if benchlog.file_sha256(path) != sha256:
-                    raise ValueError(f"{path} is not the file its entry names: its sha256 is "
-                                     f"another")
-                return max(e["shortfall_bytes"] for e in _events(path)) / MIB
+    for name in entry["config"].get("files", {}):
+        if name.endswith(".events.jsonl"):
+            path = benchlog.named_file(entry, name, folders)
+            return None if path is None else max(
+                e["shortfall_bytes"] for e in _events(path)) / MIB
     return None

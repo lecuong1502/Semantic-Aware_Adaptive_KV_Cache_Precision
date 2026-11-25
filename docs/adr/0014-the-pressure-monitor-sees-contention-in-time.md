@@ -472,3 +472,33 @@ load to the contention. From the contention's position prefill ran at 2338 to
 - B6 refused 130 MiB in one of three runs, more than q8_0 and q4_0 did in any.
 - MicroInfer's rows are the engine before #204 (B8's after it), and are to be
   made again on one build by #216.
+
+---
+
+## Amendment (#212): a run against time is logged for the paper's figure
+
+The log names a survival run's recordings by sha256 and does not hold them,
+and git does not track them. A figure of a run against time, drawn from
+them, could not be redrawn from what is published. `tools/summarise_timeline.py`
+reads what the figure plots from two runs' recordings
+(`microinfer.survival_timeline`) and logs it as one "survival-timeline"
+entry, which names both runs' entries. It runs no engine and measures nothing
+anew. The figure's script reads the log alone.
+
+- **Which runs.** An adaptive engine's and a static one's, under contention
+  set alike: its position, shortfall and thresholds, the model and the
+  context, or the tool refuses them. The paper's are B6's S6 run (#155) and
+  B1's S5 run (#108), the runs its tables report. S6 is S5's step and its
+  release. #216's runs replace them by their hashes.
+- **The cache's bytes** are the engine's process memory as the driver
+  reports it, less what the engine held besides an FP16 cache of the
+  contention's position at the recording's first sample. The same account
+  serves a static run, which had no timeline before #207. What the engine
+  holds besides its cache falls by some 66 MiB as prefill ends, which shows
+  as a step down in the cache.
+- **A downgrade** is marked at each step that found more pages below FP16
+  than the step before it, since a run logs its plans' moves and not when
+  each applied. A run's marks are then its downgrade plans as steps saw
+  them: B6's S6 run has nine of each.
+- **The headroom** is the lowest sample of each 0.25 s, to 620 s after the
+  take.
