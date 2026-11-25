@@ -12,14 +12,13 @@ pooled. Reads only the benchmark log. Needs matplotlib (pyproject's
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import benchlog, figures  # noqa: E402
+from microinfer import figures  # noqa: E402
 
 OUT = figures.FOLDER / "continuation.pdf"
 MODEL = "qwen2.5-1.5b-instruct"
@@ -28,7 +27,7 @@ MODEL = "qwen2.5-1.5b-instruct"
 def draw(entries: list[dict]):
     points = figures.passage_kls(entries, MODEL, "uniform-80", "semantic-80")
     with figures.style():
-        figure, axes = figures.new(1.6)
+        figure, axes = figures.subplots(1.6)
         low = min(points.x.min(), points.y.min())
         high = max(points.x.max(), points.y.max())
         axes.plot([low / 2, 2 * high], [low / 2, 2 * high], color=figures.MUTED, linewidth=0.8,
@@ -47,15 +46,5 @@ def draw(entries: list[dict]):
     return figure
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", type=Path, default=OUT)
-    parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
-    args = parser.parse_args(argv)
-    benchlog.verify(args.log)
-    figures.save(draw(benchlog.read(args.log)), args.out)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(figures.main(sys.argv[1:], __doc__, OUT, draw))

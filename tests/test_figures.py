@@ -41,7 +41,7 @@ def write_recording(folder: Path, name: str, *, free, engine, taken, levels, ste
     """A run's recordings in `folder`, as the survival experiment leaves
     them, and the entry that names them: `free`, `engine` and `taken` are
     (seconds from the take, MiB), `levels` (seconds, level) and `steps`
-    (seconds, pages below FP16)."""
+    (seconds, position, effective bits, pages below FP16)."""
     folder.mkdir(parents=True, exist_ok=True)
     out = folder / f"{name}.csv.gz"
     device = recorder._TraceWriter(out, recorder.FORMAT, {}, recorder.COLUMNS)
@@ -64,7 +64,9 @@ def write_recording(folder: Path, name: str, *, free, engine, taken, levels, ste
     recorder.companion(out, ".replay.json").write_text(json.dumps({"simulator_pid": SIMULATOR}))
     lines(".pressure.jsonl", [{"t_mono_ns": at(s), "level": level} for s, level in levels])
     if steps is not None:
-        lines(".timeline.jsonl", [{"t": at(s) / 1e9, "pages_below_fp16": n} for s, n in steps])
+        lines(".timeline.jsonl", [{"t": at(s) / 1e9, "position": position, "effective_bits": bits,
+                                  "pages_below_fp16": below}
+                                 for s, position, bits, below in steps])
     files = {f.name: benchlog.file_sha256(f) for f in folder.iterdir()
              if f.name.startswith(f"{name}.")}
     return {"kind": "survival", "sha256": name * 8, "git_commit": "c" * 40, "model": MODEL,
@@ -78,30 +80,31 @@ def write_recording(folder: Path, name: str, *, free, engine, taken, levels, ste
 
 
 def adaptive(folder: Path, **changes) -> dict:
-    """A run whose engine held 3000 MiB at the take, gave back 400 at 10 s
-    and took them again at 60, the simulator keeping 1600 MiB for 30 s."""
+    """A run whose cache, at 16384 positions, was taken to 4 bits by 10 s and
+    restored at 60, the simulator keeping 1600 MiB for 30 s."""
     given = {"free": [(-0.5, 2000.0), (0.0, 1900.0), (0.1, 150.0), (0.2, 160.0), (10.0, 540.0),
                       (30.0, 2100.0), (60.0, 1700.0), (70.0, 1700.0)],
-             "engine": [(-0.5, 3000.0), (5.0, 3000.0), (10.0, 2600.0), (60.0, 3000.0),
-                        (70.0, 3000.0)],
+             "engine": [(-0.5, 3000.0), (70.0, 3000.0)],
              "taken": [(0.0, 1600.0), (30.0, 0.0)],
              "levels": [(-40.0, "GREEN"), (0.15, "RED"), (10.1, "YELLOW"), (30.1, "GREEN")],
-             "steps": [(-40.0, 0), (10.0, 100), (12.0, 100), (15.0, 130), (50.0, 130),
-                       (60.0, 0), (70.0, 0)],
+             "steps": [(-40.0, 16, None, None), (-0.8, 16384, 16.0, 0), (10.0, 16384, 4.0, 100),
+                       (12.0, 16384, 4.0, 100), (15.0, 16384, 4.0, 130),
+                       (50.0, 16384, 8.0, 130), (60.0, 32768, 16.0, 0), (70.0, 32768, 16.0, 0)],
              "run": {"recovery": {"first_upgrade_s": 40.0, "last_upgrade_s": 60.0}}}
     return write_recording(folder, "adaptive", **{**given, **changes})
 
 
-def test_a_timeline_is_read_from_the_recordings_its_entry_names(tmp_path):
-    """Seconds are from the simulator's take. The engine is the process that
-    held most at the first sample, the simulator aside, and its memory is
-    given less what it held besides the FP16 cache of the contention's
-    position, so that it starts at that cache's bytes and moves as the
-    driver saw it move."""
+CACHE = round(paged_cache_bytes(ModelConfig.from_card(MODEL), 16384) / MIB, 2)
+
+
+def test_a_run_is_read_against_time_from_the_recordings_its_entry_names(tmp_path):
+    """Seconds are from the simulator's take. An adaptive run's cache is its
+    positions' FP16 bytes at the effective bits of its steps. It begins with
+    the recording, at what the step before that held; a point between two
+    equal to it is left out."""
     t = survival_timeline.read(adaptive(tmp_path), [tmp_path])
-    cache = paged_cache_bytes(ModelConfig.from_card(MODEL), 16384) / MIB
-    assert t["cache_mib"] == [[-0.5, cache], [5.0, cache], [10.0, cache - 400.0],
-                              [60.0, cache], [70.0, cache]]
+    assert t["cache_mib"] == [[-0.5, CACHE], [10.0, CACHE / 4], [15.0, CACHE / 4],
+                              [50.0, CACHE / 2], [60.0, 2 * CACHE], [70.0, 2 * CACHE]]
     assert t["simulator_mib"] == [[0.0, 1600.0], [30.0, 0.0]]
     assert t["levels"] == [[-40.0, "GREEN"], [0.15, "RED"], [10.1, "YELLOW"], [30.1, "GREEN"]]
     assert t["end_s"] == 70.0 and t["ending"] == "complete"
@@ -117,20 +120,29 @@ def test_the_steps_that_found_more_pages_below_fp16_are_its_downgrades(tmp_path)
     assert t["upgrades_s"] == [40.0, 60.0]
 
 
-def test_the_headroom_kept_is_the_least_of_each_bin(tmp_path):
+def test_the_headroom_kept_is_the_least_of_each_bin(tmp_path, monkeypatch):
     """A figure's points are fewer than a 50 Hz trace's, and the lowest of
     each bin is kept, so that no dip is thinned away."""
-    t = survival_timeline.read(adaptive(tmp_path), [tmp_path], bin_s=1.0)
+    monkeypatch.setattr(survival_timeline, "BIN_S", 1.0)
+    t = survival_timeline.read(adaptive(tmp_path), [tmp_path])
     assert [0.1, 150.0] in t["headroom_mib"]
     assert [0.0, 1900.0] not in t["headroom_mib"] and [0.2, 160.0] not in t["headroom_mib"]
     assert [-0.5, 2000.0] in t["headroom_mib"] and [10.0, 540.0] in t["headroom_mib"]
 
 
-def test_a_timeline_is_cut_where_it_is_told_to_be(tmp_path):
-    t = survival_timeline.read(adaptive(tmp_path), [tmp_path], until_s=20.0)
+def test_a_run_is_read_to_where_the_figure_s_axis_ends(tmp_path, monkeypatch):
+    monkeypatch.setattr(survival_timeline, "UNTIL_S", 20.0)
+    t = survival_timeline.read(adaptive(tmp_path), [tmp_path])
     for series in ("headroom_mib", "cache_mib", "simulator_mib", "levels"):
         assert all(p[0] <= 20.0 for p in t[series]), series
     assert t["downgrades_s"] == [10.0, 15.0] and t["end_s"] == 70.0
+
+
+def test_an_adaptive_run_that_ran_out_is_read_to_its_last_step(tmp_path):
+    """Not to where its engine held most: its downgrades come after that."""
+    t = survival_timeline.read(adaptive(tmp_path, run={"ending": {"state": "out of memory"}}),
+                               [tmp_path])
+    assert t["end_s"] == 70.0 and t["downgrades_s"] == [10.0, 15.0]
 
 
 def static(folder: Path, **changes) -> dict:
@@ -150,8 +162,16 @@ def test_a_run_that_ran_out_ends_where_its_engine_last_held_its_most(tmp_path):
     headroom and the cache end with it."""
     t = survival_timeline.read(static(tmp_path), [tmp_path])
     assert t["end_s"] == 25.0 and t["ending"] == "out of memory"
-    assert t["headroom_mib"][-1] == [25.0, 30.0] and t["cache_mib"][-1][0] == 25.0
+    assert t["headroom_mib"][-1] == [25.0, 30.0]
     assert t["downgrades_s"] == [] and t["upgrades_s"] is None
+
+
+def test_a_static_run_s_cache_is_the_driver_s_account_less_what_is_not_cache(tmp_path):
+    """The engine is the process that held most at the first sample, the
+    simulator aside, and its cache starts at the contention's position's and
+    moves as the driver saw the engine move."""
+    t = survival_timeline.read(static(tmp_path), [tmp_path])
+    assert t["cache_mib"] == [[-0.5, CACHE], [20.0, CACHE + 90.0], [25.0, CACHE + 120.0]]
 
 
 def test_an_adaptive_run_with_no_timeline_is_refused(tmp_path):
@@ -171,43 +191,40 @@ def test_a_recording_that_is_nowhere_is_refused(tmp_path):
         survival_timeline.read(adaptive(tmp_path), [tmp_path / "elsewhere"])
 
 
-def test_the_tool_logs_the_timeline_naming_both_runs(tmp_path, monkeypatch):
+def tool_on(tmp_path, monkeypatch, *, static_shortfall: float = 256.0):
+    """The tool, the log of a static and an adaptive run it is to read, and
+    their entries' hashes."""
     log = tmp_path / "benchmark.jsonl"
-    hashes = []
-    for entry in (static(tmp_path / "data"), adaptive(tmp_path / "data")):
-        hashes.append(benchlog.append(entry["kind"], model=MODEL, context_length=32767,
-                                      precision_tiers=None, config=entry["config"],
-                                      results=entry["results"], log=log)["sha256"])
-    tool = load_tool("summarise_timeline")
+    entries = static(tmp_path / "data"), adaptive(tmp_path / "data")
+    entries[0]["config"]["shortfall_mib"] = static_shortfall
+    hashes = [benchlog.append(e["kind"], model=MODEL, context_length=32767, precision_tiers=None,
+                              config=e["config"], results=e["results"], log=log)["sha256"]
+              for e in entries]
+    tool = load_tool("summarise_survival_timeline")
     monkeypatch.setattr(tool.benchlog, "environment", clean)
     monkeypatch.setattr(tool, "RECORDINGS", (tmp_path / "data",))
-    argv = ["--issue", "212", "--log", str(log), "--static", hashes[0][:8],
-            "--adaptive", hashes[1][:8]]
-    assert tool.main(argv) == 0
+    return tool, log, hashes
+
+
+def test_the_tool_logs_the_survival_timeline_naming_both_runs(tmp_path, monkeypatch):
+    tool, log, (of_static, of_adaptive) = tool_on(tmp_path, monkeypatch)
+    assert tool.main(["--issue", "212", "--log", str(log), "--static", of_static[:8],
+                      "--adaptive", of_adaptive[:8]]) == 0
     logged = benchlog.read(log)[-1]
     assert logged["kind"] == survival_timeline.KIND
-    assert logged["results"]["static"]["entry"] == hashes[0]
-    assert logged["results"]["adaptive"]["entry"] == hashes[1]
+    assert logged["results"]["static"]["entry"] == of_static
+    assert logged["results"]["adaptive"]["entry"] == of_adaptive
     assert logged["results"]["thresholds_mib"] == {"RED": 512.0, "YELLOW": 1024.0}
     benchlog.verify(log)
 
 
-def test_the_tool_refuses_runs_of_different_contention(tmp_path, monkeypatch):
+def test_the_tool_refuses_runs_of_different_contention(tmp_path, monkeypatch, capsys):
     """An overlay of a run left 256 MiB short on one left 128 compares nothing."""
-    log = tmp_path / "benchmark.jsonl"
-    hashes = []
-    for entry in (static(tmp_path / "data"), adaptive(tmp_path / "data")):
-        if entry["config"]["engine"] == "static":
-            entry["config"]["shortfall_mib"] = 128.0
-        hashes.append(benchlog.append(entry["kind"], model=MODEL, context_length=32767,
-                                      precision_tiers=None, config=entry["config"],
-                                      results=entry["results"], log=log)["sha256"])
-    tool = load_tool("summarise_timeline")
-    monkeypatch.setattr(tool.benchlog, "environment", clean)
-    monkeypatch.setattr(tool, "RECORDINGS", (tmp_path / "data",))
+    tool, log, (of_static, of_adaptive) = tool_on(tmp_path, monkeypatch, static_shortfall=128.0)
     with pytest.raises(SystemExit):
-        tool.main(["--issue", "212", "--log", str(log), "--static", hashes[0][:8],
-                   "--adaptive", hashes[1][:8]])
+        tool.main(["--issue", "212", "--log", str(log), "--static", of_static[:8],
+                   "--adaptive", of_adaptive[:8]])
+    assert "shortfall_mib" in capsys.readouterr().err
 
 
 _environment = benchlog.environment
@@ -245,14 +262,20 @@ def test_a_passage_s_point_is_its_two_runs_of_the_latest_summary():
     """The runs the summary pooled, and no other: one superseded, or of
     another condition, gives no point."""
     points = figures.passage_kls(continuation_log(), MODEL, "semantic-80", "uniform-80")
-    assert points.entry == "s"
     assert dict(zip(points.passages, zip(points.x.tolist(), points.y.tolist()))) == {
         "p0": (0.02, 0.10), "p1": (0.03, 0.09)}
 
 
 def test_a_passage_with_one_run_of_the_two_is_refused():
+    log = continuation_log()
+    log[-2]["results"]["entries"].remove("d")
+    with pytest.raises(ValueError, match="p1 has a run of only one"):
+        figures.passage_kls(log, MODEL, "semantic-80", "uniform-80")
+
+
+def test_a_summary_whose_run_the_log_lacks_is_refused():
     log = [e for e in continuation_log() if e["sha256"] != "d"]
-    with pytest.raises(ValueError, match="p1|d"):
+    with pytest.raises(ValueError, match="lacks 1 of the runs"):
         figures.passage_kls(log, MODEL, "semantic-80", "uniform-80")
 
 
@@ -270,7 +293,6 @@ def damage_log(task: str = "needle") -> list[dict]:
                for i, part in enumerate(np.split(scores, 2))]
     summary = {"kind": "page-damage-summary", "sha256": f"{task}-s", "model": MODEL,
                "results": {"task": task, "model": MODEL, "pooled_rho": 1.0,
-                           "pooled_rho_bootstrap_95": [0.9, 1.0],
                            "entries": [e["sha256"] for e in entries]}}
     return [*entries, summary]
 
@@ -280,8 +302,7 @@ def test_damage_is_binned_by_the_score_s_rank_with_the_spread_of_each_bin():
     is, each at its median score with the median and quartiles of its
     damages."""
     bins = figures.damage_bins(damage_log(), MODEL, "needle", bins=10)
-    assert bins.rho == 1.0 and bins.rho_95 == [0.9, 1.0] and bins.entry == "needle-s"
-    assert bins.pages == 100 and bins.score.shape == (10,)
+    assert bins.rho == 1.0 and bins.score.shape == (10,)
     assert np.allclose(bins.median, 10 * bins.score)
     assert (bins.low < bins.median).all() and (bins.median < bins.high).all()
     assert bins.score[0] == pytest.approx(np.median(np.linspace(0.001, 1.0, 100)[:10]))
@@ -325,17 +346,15 @@ def spike_log() -> list[dict]:
 
 def test_a_spike_s_point_is_its_amplitude_and_rise_by_the_process_named():
     """A spike with no rise measured has no point, nor one censored, as RQ1's
-    table counts them; those left out are counted."""
-    points = figures.spike_points(spike_log())
-    assert points.by_process == {
+    table counts them."""
+    assert figures.spike_points(spike_log()) == {
         "Browser": [(0.5, 100.0)], "Video player": [(0.9, 500.0)], "Engine": [(3.0, 180.0)],
         "Other or none": [(0.3, 90.0), (0.2, 80.0)]}
-    assert points.unmeasured == 1
 
 
 # -- the drawings ----------------------------------------------------------------------------
 
-def timeline_log(tmp_path) -> list[dict]:
+def survival_timeline_log(tmp_path) -> list[dict]:
     runs = {name: survival_timeline.read(make(tmp_path / name), [tmp_path / name])
             for name, make in (("static", static), ("adaptive", adaptive))}
     return [{"kind": survival_timeline.KIND, "sha256": "t",
@@ -343,7 +362,7 @@ def timeline_log(tmp_path) -> list[dict]:
 
 
 def entries_of(script: str, tmp_path) -> list[dict]:
-    return {"figure_survival": lambda: timeline_log(tmp_path),
+    return {"figure_survival": lambda: survival_timeline_log(tmp_path),
             "figure_continuation": continuation_log,
             "figure_damage": lambda: [e for t in ("continuation", "needle", "anchor")
                                       for e in damage_log(t)],
@@ -361,12 +380,12 @@ def test_a_script_draws_its_figure_from_the_log(script, tmp_path, monkeypatch):
     pytest.importorskip("matplotlib")
     tool = load_tool(script)
     entries = entries_of(script, tmp_path)
-    monkeypatch.setattr(tool.benchlog, "verify", lambda log: len(entries))
-    monkeypatch.setattr(tool.benchlog, "read", lambda log: entries)
+    monkeypatch.setattr(figures.benchlog, "verify", lambda log: len(entries))
+    monkeypatch.setattr(figures.benchlog, "read", lambda log: entries)
     drawn = []
     for name in ("a.pdf", "b.pdf"):
         out = tmp_path / name
-        assert tool.main(["--out", str(out)]) == 0
+        assert figures.main(["--out", str(out)], tool.__doc__, tool.OUT, tool.draw) == 0
         drawn.append(out.read_bytes())
     assert drawn[0] == drawn[1]
     assert drawn[0].startswith(b"%PDF")
@@ -390,6 +409,18 @@ def test_series_are_told_apart_without_their_colour(script, tmp_path):
         marks = [(line.get_linestyle(), line.get_marker(), line.get_fillstyle(),
                   str(line.get_markerfacecolor()) in ("none", "white")) for line in named]
         assert len(set(marks)) == len(marks), [line.get_label() for line in named]
+
+
+def test_a_run_s_ending_is_marked_once_and_inside_its_axes(tmp_path):
+    """The time axis is drawn in two panels: a mark past the first's end
+    would be drawn outside it."""
+    pytest.importorskip("matplotlib")
+    figure = load_tool("figure_survival").draw(survival_timeline_log(tmp_path))
+    marked = [(axes, line) for axes in figure.axes for line in axes.lines
+              if line.get_label() == "Out of memory"]
+    assert len(marked) == 2  # the headroom and the cache
+    for axes, line in marked:
+        assert axes.get_xlim()[0] <= line.get_xdata()[0] <= axes.get_xlim()[1]
 
 
 def test_the_figures_the_paper_includes_are_committed():

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Log two survival runs against time, for the paper's timeline (#212).
+"""Log the survival timeline, for the paper's figure (#212).
 
-    .venv/bin/python tools/summarise_timeline.py --issue 212
+    .venv/bin/python tools/summarise_survival_timeline.py --issue 212
         [--adaptive 94948638] [--static e2f55721]
 
 The log names a survival run's recordings by sha256 and does not hold them.
-This reads what the timeline plots from the recordings of two runs, an
+This reads what the figure plots from the recordings of two runs, an
 adaptive engine's and a static one's under the same contention
 (microinfer.survival_timeline), and logs it as one "survival-timeline"
 entry, so that tools/figure_survival.py draws the figure from the log alone.
@@ -35,7 +35,7 @@ KINDS = ("survival", "pulse-release")
 CONTENTION = ("contention_at", "shortfall_mib", "thresholds")
 
 
-def named(parser: argparse.ArgumentParser, entries: list[dict], prefix: str,
+def run_of(parser: argparse.ArgumentParser, entries: list[dict], prefix: str,
           engine: str) -> dict:
     found = [e for e in entries if e["kind"] in KINDS and e["sha256"].startswith(prefix)]
     if len(found) != 1 or found[0]["config"]["engine"] != engine:
@@ -56,7 +56,7 @@ def main(argv: list[str]) -> int:
                      "entry names the code that produced it")
     benchlog.verify(args.log)  # the hashes the entry names are of the runs as appended
     entries = benchlog.read(args.log)
-    runs = {engine: named(parser, entries, getattr(args, engine), engine)
+    runs = {engine: run_of(parser, entries, getattr(args, engine), engine)
             for engine in ("static", "adaptive")}
     static, adaptive = runs["static"], runs["adaptive"]
     differ = [k for k in CONTENTION if static["config"][k] != adaptive["config"][k]]

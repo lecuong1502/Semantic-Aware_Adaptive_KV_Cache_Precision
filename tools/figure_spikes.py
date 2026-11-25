@@ -11,14 +11,13 @@ extra).
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import benchlog, figures  # noqa: E402
+from microinfer import figures  # noqa: E402
 
 OUT = figures.FOLDER / "spikes.pdf"
 #: Each process's marker, its fill and its colour.
@@ -31,8 +30,8 @@ MARKS = {"Browser": ("o", figures.BLUE, figures.BLUE),
 def draw(entries: list[dict]):
     points = figures.spike_points(entries)
     with figures.style():
-        figure, axes = figures.new(1.7)
-        for name, spikes in points.by_process.items():
+        figure, axes = figures.subplots(1.7)
+        for name, spikes in points.items():
             marker, face, colour = MARKS[name]
             rise, amplitude = zip(*spikes) if spikes else ((), ())
             axes.plot(rise, amplitude, linestyle="none", marker=marker, markersize=4,
@@ -47,15 +46,5 @@ def draw(entries: list[dict]):
     return figure
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", type=Path, default=OUT)
-    parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
-    args = parser.parse_args(argv)
-    benchlog.verify(args.log)
-    figures.save(draw(benchlog.read(args.log)), args.out)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(figures.main(sys.argv[1:], __doc__, OUT, draw))

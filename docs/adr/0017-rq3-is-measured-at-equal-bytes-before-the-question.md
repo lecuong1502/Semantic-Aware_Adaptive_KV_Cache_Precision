@@ -225,7 +225,9 @@ needs six discordant samples or more, all one way.
   semantic, both its turn-2 misses recovered; uniform's one miss stayed. At
   32K, a 30 s pulse during prefill was survived under both sources, every
   page restored 532 s (semantic) and 541 s (uniform) after the pressure
-  ended, with prefill still under way (`pulse-release`, #155).
+  ended, prefill having ended some 440 s after the release
+  (`pulse-release`, #155; corrected in #212, which first plotted it: this
+  said prefill was still under way).
 
 **What it means.** At equal bytes, allocation by attention did not keep
 needle accuracy better than uniform allocation, on a task too easy at this

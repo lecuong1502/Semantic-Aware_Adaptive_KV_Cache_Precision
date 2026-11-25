@@ -2,8 +2,9 @@
 
 Each figure is a script of its own, tools/figure_*.py, that reads benchmark
 log entries and writes one vector PDF to docs/ICML_2027/figures/. The points
-it plots are read here, from a summary entry and the runs that entry names,
-so that a figure shows what its table reports.
+of three of them are read here, from a summary entry and the runs that entry
+names, so that a figure shows what its table reports. The survival timeline's
+are read by microinfer.survival_timeline and logged as an entry of their own.
 
 `style` sets ICML's rules and the paper's look: a column's width, a serif
 face near the paper's, fonts embedded as TrueType (a submission may hold no
@@ -15,12 +16,15 @@ engine needs it (pyproject's `figures` extra).
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+import argparse
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+from . import benchlog
 
 REPO = Path(__file__).resolve().parents[2]
 #: Where the paper includes its figures from.
@@ -61,13 +65,11 @@ def _pooled(entries: Sequence[dict], summary: dict) -> list[dict]:
 
 @dataclass(frozen=True)
 class PassageKls:
-    """Each passage's mean KL from FP16 under two conditions, and the
-    "continuation-summary" entry that pooled the runs."""
+    """Each passage's mean KL from FP16 under two conditions."""
 
     passages: list[str]
     x: np.ndarray
     y: np.ndarray
-    entry: str
 
 
 def passage_kls(entries: Sequence[dict], model: str, x: str, y: str) -> PassageKls:
@@ -84,24 +86,19 @@ def passage_kls(entries: Sequence[dict], model: str, x: str, y: str) -> PassageK
     if unpaired := sorted(kls[x].keys() ^ kls[y].keys()):
         raise ValueError(f"passage {unpaired[0]} has a run of only one of {x} and {y}")
     passages = sorted(kls[x])
-    return PassageKls(passages, *(np.array([kls[c][p] for p in passages]) for c in (x, y)),
-                      summary["sha256"])
+    return PassageKls(passages, *(np.array([kls[c][p] for p in passages]) for c in (x, y)))
 
 
 @dataclass(frozen=True)
 class DamageBins:
     """A task's pages in bins by their score: each bin's median score and the
-    quartiles of its pages' damage, with the rho of the "page-damage-summary"
-    entry that pooled them."""
+    quartiles of its pages' damage, with their rho, as the summary gives it."""
 
     score: np.ndarray
     low: np.ndarray
     median: np.ndarray
     high: np.ndarray
-    pages: int
     rho: float
-    rho_95: list[float]
-    entry: str
 
 
 def damage_bins(entries: Sequence[dict], model: str, task: str, *, bins: int = 10) -> DamageBins:
@@ -118,21 +115,8 @@ def damage_bins(entries: Sequence[dict], model: str, task: str, *, bins: int = 1
     chosen = [held == k for k in np.unique(held)]
     low, median, high = (np.array([np.percentile(damage[c], q) for c in chosen])
                          for q in (25, 50, 75))
-    results = summary["results"]
     return DamageBins(np.array([np.median(scores[c]) for c in chosen]), low, median, high,
-                      len(scores), results["pooled_rho"], results["pooled_rho_bootstrap_95"],
-                      summary["sha256"])
-
-
-@dataclass(frozen=True)
-class SpikePoints:
-    """RQ1's spikes as (rise in s, amplitude in MiB) by the process each is
-    attributed to, how many have no rise measured and so no point, and the
-    "contention-summary" entry that pooled the recordings."""
-
-    by_process: dict[str, list[tuple[float, float]]]
-    unmeasured: int
-    entry: str
+                      summary["results"]["pooled_rho"])
 
 
 #: The processes spikes are attributed to, by the program's name; the engine
@@ -141,26 +125,22 @@ PROCESSES = {"chrome": "Browser", "vlc": "Video player", "python": "Engine"}
 OTHER = "Other or none"
 
 
-def spike_points(entries: Sequence[dict]) -> SpikePoints:
-    """The spikes of the recordings the latest contention summary pooled,
-    those censored left out, as RQ1 counts them."""
+def spike_points(entries: Sequence[dict]) -> dict[str, list[tuple[float, float]]]:
+    """RQ1's spikes as (rise in s, amplitude in MiB) by the process each is
+    attributed to, from the recordings the latest contention summary pooled:
+    without those censored, as RQ1 counts them, or with no rise measured."""
     summary = latest(entries, "contention-summary",
                      lambda e: "recordings" in e["results"]["spikes"])
     by_hash = {e["sha256"]: e for e in entries}
     points: dict[str, list[tuple[float, float]]] = {
         name: [] for name in (*PROCESSES.values(), OTHER)}
-    unmeasured = 0
     for recording in summary["results"]["spikes"]["recordings"]:
         for spike in by_hash[recording["entry"]]["results"]["spikes"]:
-            if spike["ending"] == "censored":
-                continue
-            if spike["rise_ms"] is None:
-                unmeasured += 1
-                continue
-            program = Path((spike["process"] or "").split(" ")[0]).name
-            points[PROCESSES.get(program, OTHER)].append(
-                (spike["rise_ms"] / 1e3, spike["amplitude_mib"]))
-    return SpikePoints(points, unmeasured, summary["sha256"])
+            if spike["ending"] != "censored" and spike["rise_ms"] is not None:
+                program = Path((spike["process"] or "").split(" ")[0]).name
+                points[PROCESSES.get(program, OTHER)].append(
+                    (spike["rise_ms"] / 1e3, spike["amplitude_mib"]))
+    return points
 
 
 # -- how they are drawn --------------------------------------------------------------------
@@ -189,7 +169,7 @@ def style():
         yield matplotlib
 
 
-def new(height_in: float, *rows_columns: int, **options):
+def subplots(height_in: float, *rows_columns: int, **options):
     """A column-wide figure and its axes (matplotlib's subplots)."""
     from matplotlib import figure
 
@@ -204,3 +184,14 @@ def save(drawn, out: str | Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with style():
         drawn.savefig(out, format="pdf", metadata={"CreationDate": None})
+
+
+def main(argv: list[str], description: str, out: Path, draw: Callable) -> int:
+    """A figure's script: draw it from the log, verified, and write it."""
+    parser = argparse.ArgumentParser(description=description.splitlines()[0])
+    parser.add_argument("--out", type=Path, default=out)
+    parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
+    args = parser.parse_args(argv)
+    benchlog.verify(args.log)
+    save(draw(benchlog.read(args.log)), args.out)
+    return 0

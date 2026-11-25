@@ -542,18 +542,19 @@ downgrades in 1.7\,s and returned 382\,MiB; later plans downgraded pages as the
 cache sealed them, 10--12\,MiB in about 60\,ms each. Every plan's return was
 seen by the driver to within a 2\,MiB granule: freed memory reached the driver,
 where the other process could take it and the monitor could see it.
-Figure~\ref{fig:survival} shows the same take released after 30\,s.
+Figure~\ref{fig:survival} shows a run under the same rule, released after 30\,s.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/survival.pdf}
-\caption{S5's take and its release (S6) at 32K positions, one run, over the static
-FP16 engine's run under S5, to where it ran out of memory. Above, the headroom,
-the thresholds and the level the monitor reported; below, the engine's cache, as
-the driver accounts for it, and what the simulator held. Triangles are steps that
-found pages downgraded; the bar spans the upgrades. The time axis changes scale
-at 40\,s; the two runs are of two commits. The step down at 471\,s, where prefill
-ended, is memory other than the cache's.}
+\caption{The adaptive engine under S6, S5's take released after 30\,s, and the
+static FP16 engine under S5, its take kept, to where it ran out of memory; one run
+each. Above, the level the adaptive run's monitor reported, the headroom and the
+thresholds; below, each engine's cache and what its simulator took. Triangles are
+the steps that found pages downgraded by a plan, and the bar spans the upgrades.
+The time axis changes scale at 40\,s and ends at 620\,s; the adaptive run
+completed its 32{,}767 positions at 4231\,s. The runs differ in commit and in
+prompt, 30{,}720 positions and 2{,}048 decoded against 32{,}704 and 64.}
 \label{fig:survival}
 \end{figure}
 
@@ -780,7 +781,7 @@ pass over the prompt took 43\,s at 8K here; the scorer's scores come with decodi
 \textbf{Graded measures part the sources.} In continuation fidelity at 80\%,
 semantic allocation kept the next-token distribution 3.6 times closer to FP16
 than uniform, a paired difference in mean KL of $-0.073$ [$-0.082$,
-$-0.065$], lower on all 50 passages (Figure~\ref{fig:pages}a), and top-1
+$-0.065$], lower on all 50 passages (Figure~\ref{fig:pages}, top), and top-1
 agreement 7.2 points higher.
 At 70\% its KL against uniform's was within the interval, at 0.0023 against
 0.0031. A whole cache at INT4, at 4.63 bits, between the two levels' 5.48 and
@@ -811,7 +812,7 @@ facts of the last two turns and lost most stated three or more turns back.
 from its shadow took under 0.7\,s at 8K positions; a third turn then answered
 50 of 50 needles under semantic, both of its turn-2 misses recovered. At 32K,
 a 30\,s pulse during prefill was survived by all three sources with every page
-restored, about nine minutes after the release, with prefill still under way.
+restored, about nine minutes after the release, the first seven of them prefill.
 None of nine quality ablations at 80\% changed needle accuracy detectably
 ($p \ge 0.5$); planning by importance alone, without the tier's error, lost
 the most, two samples. Two were not at equal bytes: without INT2, and with a
@@ -826,7 +827,7 @@ the mean KL from FP16 over them; with no page moved the logits are FP16's to the
 bit. Over 3{,}200 pages a task, Spearman's $\rho$ between score and damage was
 $0.356$ [$0.307$, $0.401$] for continuation, positive in 49 passages of 50, but
 $0.031$ [$-0.008$, $0.069$] on the needles and $0.068$ [$0.041$, $0.094$] in the
-dialogue (95\% bootstrap over samples; Figure~\ref{fig:pages}b); for ZipCache's
+dialogue (95\% bootstrap over samples; Figure~\ref{fig:pages}, bottom); for ZipCache's
 scores of the same pages,
 $0.306$, $0.027$ and $0.050$. The score ranks pages by the damage
 their downgrade does to the continuation of the text it watched, not by the
@@ -837,12 +838,13 @@ comparison on the needle set.
 \centering
 \includegraphics[width=\columnwidth]{figures/continuation.pdf}
 \includegraphics[width=\columnwidth]{figures/damage.pdf}
-\caption{(a) Each passage's mean KL from FP16 in continuation at 80\% of the bytes
+\caption{Top: each passage's mean KL from FP16 in continuation at 80\% of the bytes
 reclaimed, semantic allocation against uniform's: every passage lies below the
-line of equal KL. (b) A page's damage, the mean KL with it alone at INT4, against
+line of equal KL. Bottom: a page's damage, the mean KL with it alone at INT4, against
 its score on each task: the median and quartiles of each tenth of 3{,}200 pages
-by score, with Spearman's $\rho$ over the pages. From the lowest
-scores to the highest it rises on continuation alone.}
+by score, with Spearman's $\rho$ over the pages. On
+continuation it rises with the score; on the needle and in the dialogue it rises
+to the middle of the scores and falls back.}
 \label{fig:pages}
 \end{figure}
 

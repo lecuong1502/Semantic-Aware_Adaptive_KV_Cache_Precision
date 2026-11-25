@@ -12,14 +12,13 @@ matplotlib (pyproject's `figures` extra).
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import benchlog, figures  # noqa: E402
+from microinfer import figures  # noqa: E402
 
 OUT = figures.FOLDER / "damage.pdf"
 MODEL = "qwen2.5-1.5b-instruct"
@@ -28,7 +27,7 @@ TASKS = {"continuation": "Continuation", "needle": "Needle", "anchor": "Dialogue
 
 def draw(entries: list[dict]):
     with figures.style() as matplotlib:
-        figure, panels = figures.new(1.5, 1, len(TASKS), sharey=True)
+        figure, panels = figures.subplots(1.5, 1, len(TASKS), sharey=True)
         for axes, (task, name) in zip(panels, TASKS.items()):
             bins = figures.damage_bins(entries, MODEL, task)
             axes.errorbar(bins.score, bins.median, yerr=[bins.median - bins.low,
@@ -46,15 +45,5 @@ def draw(entries: list[dict]):
     return figure
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", type=Path, default=OUT)
-    parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
-    args = parser.parse_args(argv)
-    benchlog.verify(args.log)
-    figures.save(draw(benchlog.read(args.log)), args.out)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(figures.main(sys.argv[1:], __doc__, OUT, draw))
