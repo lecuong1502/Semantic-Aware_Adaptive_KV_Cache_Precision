@@ -11,6 +11,7 @@ built (tools/build_llamacpp.py).
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
@@ -49,6 +50,7 @@ def test_the_server_is_one_slot_at_the_whole_context_its_cache_at_one_type():
     assert given["-ctk"] == given["-ctv"] == "q8_0"
     assert given["-fa"] == "on"  # a quantised value cache needs it; every type has it
     assert given["--fit"] == "off"  # what is asked for, not what fits
+    assert given["--sse-ping-interval"] == "-1"  # a hung completion's stream goes silent
     assert given["--host"] == "127.0.0.1" and given["--port"] == "9"
     with pytest.raises(ValueError, match="q5_0"):
         llamacpp.command("llama-server", "m.gguf", port=9, context=32768, cache_type="q5_0")
@@ -64,10 +66,18 @@ def test_a_log_with_no_cache_on_the_device_is_refused():
         llamacpp.device_buffers_mib(LOADED.replace("CUDA0 KV", "CPU KV"))
 
 
+#: As build b12300's source writes them: an error of CUDA's, with the call it
+#: was on its third line (ggml_cuda_error), and ggml's own.
+CUDA_ERROR = ("E CUDA error: {}\nE   current device: 0, in function alloc at ggml-cuda.cu:623\n"
+              "E   cuMemCreate(&handle, reserve_size, &prop, 0)\n")
+
+
 @pytest.mark.parametrize("line", [
     "E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 896.00 MiB on device 0: "
     "cudaMalloc failed: out of memory",
-    "ggml-cuda.cu:640: CUDA error: cuMemCreate(&handle, reserve_size, &prop, 0): out of memory",
+    CUDA_ERROR.format("out of memory"),
+    CUDA_ERROR.format("the resource allocation failed"),  # cuBLAS's
+    "E alloc_tensor_range: failed to allocate CUDA0 buffer of size 939524096",
     "E process_ubatch: failed to allocate graph",
     "graph_compute: GGML status: error (failed to allocate memory)",
 ])
@@ -79,6 +89,11 @@ def test_a_device_allocation_that_failed_is_out_of_memory(line):
     "E srv update_slots: Compute error. off = 0, n_batch = 512, ret = -3",
     "D alloc: failed to allocate 12.00 MiB of pinned memory: out of memory",
     "E srv prompt_save: failed to allocate memory for prompt cache state: bad_alloc",
+    "E alloc_tensor_range: failed to allocate CUDA_Host buffer of size 4096",
+    "E output_reserve: failed to allocate output buffer of size 0.58 MiB",
+    "E ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 4096",
+    "E ggml_malloc: failed to allocate  12.00 MB",
+    CUDA_ERROR.format("unspecified launch failure"),
 ])
 def test_another_failure_or_the_host_s_allocations_are_not(line):
     assert not llamacpp.out_of_memory(LOADED + line)
@@ -88,7 +103,8 @@ def test_another_failure_or_the_host_s_allocations_are_not(line):
 
 class Answering(BaseHTTPRequestHandler):
     """/completion answered as a stream, the events of `server.events`; None
-    ends the connection there, as a server that died does."""
+    ends the connection there, as a server that died does, and a number
+    sends nothing for that many seconds."""
 
     def do_POST(self):
         self.server.asked.append(json.loads(self.rfile.read(
@@ -98,6 +114,9 @@ class Answering(BaseHTTPRequestHandler):
         for event in self.server.events:
             if event is None:
                 return
+            if isinstance(event, float):
+                time.sleep(event)
+                continue
             self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
 
     def log_message(self, *args):
@@ -132,8 +151,10 @@ def test_a_completion_reports_each_position_and_how_it_stopped(answering):
                         {"content": "", "stop": True, "tokens_predicted": 3,
                          "stop_type": "limit", "timings": TIMINGS}]
     reached = []
-    done = llamacpp.complete(answering.server_port, np.arange(100), 3, report=reached.append)
-    assert reached == [40, 100, 101, 102]
+    done = llamacpp.complete(answering.server_port, np.arange(100), 3,
+                             report=lambda *r: reached.append(r))
+    # a token decoded is not yet in the cache: the next step feeds it
+    assert reached == [(40, 0), (100, 0), (100, 1), (101, 2)]
     assert done["tokens_predicted"] == 3 and done["timings"] == TIMINGS
     (asked,) = answering.asked
     assert asked["prompt"] == list(range(100)) and asked["n_predict"] == 3
@@ -144,18 +165,25 @@ def test_a_completion_reports_each_position_and_how_it_stopped(answering):
 def test_a_stream_that_breaks_off_is_a_lost_server(answering):
     answering.events = [progress(40), None]
     with pytest.raises(llamacpp.Lost, match="broke off"):
-        llamacpp.complete(answering.server_port, np.arange(100), 3, report=lambda n: None)
+        llamacpp.complete(answering.server_port, np.arange(100), 3, report=lambda *r: None)
 
 
 def test_an_error_event_is_a_lost_server_that_says_why(answering):
     answering.events = [progress(40), {"error": {"code": 500, "message": "Compute error."}}]
     with pytest.raises(llamacpp.Lost, match="Compute error"):
-        llamacpp.complete(answering.server_port, np.arange(100), 3, report=lambda n: None)
+        llamacpp.complete(answering.server_port, np.arange(100), 3, report=lambda *r: None)
+
+
+def test_a_server_gone_silent_is_lost(answering, monkeypatch):
+    monkeypatch.setattr(llamacpp, "SILENCE_TIMEOUT_S", 0.1)
+    answering.events = [progress(40), 0.5]
+    with pytest.raises(llamacpp.Lost, match="timed out"):
+        llamacpp.complete(answering.server_port, np.arange(100), 3, report=lambda *r: None)
 
 
 def test_no_server_is_a_lost_server():
     with pytest.raises(llamacpp.Lost):
-        llamacpp.complete(1, np.arange(4), 1, report=lambda n: None)
+        llamacpp.complete(1, np.arange(4), 1, report=lambda *r: None)
 
 
 # -- the run -----------------------------------------------------------------------------------
@@ -164,7 +192,7 @@ class Simulated:
     """The simulator's place in a run: what it was asked to play."""
 
     def __init__(self, out):
-        self.out, self.played, self.closed, self.started_ns = out, None, False, 123
+        self.out, self.played, self.closed = out, None, False
 
     def play(self, schedule):
         self.played = schedule
@@ -182,25 +210,31 @@ class Simulated:
 
 
 class Serving:
-    """A llama.cpp that is not one: every completion answers, until the one
-    that is to be lost; and the clock it moves."""
+    """A llama.cpp that is not one: every completion answers and is written to
+    its log, until the one that is lost, `lost_at` its place among them, part
+    way through a batch or, `decoded` tokens in, of its decoding; and the
+    clock it moves."""
 
     buffers_mib = {"model": 2944.0, "KV": 896.0, "compute": 100.0}
 
-    def __init__(self, clock, *, lost_at=None, log=LOADED, seconds=10.0):
-        self.clock, self.lost_at, self.text, self.seconds = clock, lost_at, log, seconds
+    def __init__(self, clock, *, lost_at=None, decoded=0, dying="", log=LOADED, seconds=10.0):
+        self.clock, self.lost_at, self.decoded = clock, lost_at, decoded
+        self.dying, self.text, self.seconds = dying, log, seconds
         self.asked = []
 
     def complete(self, ids, new_tokens, report):
         self.asked.append((len(ids), new_tokens))
-        if self.lost_at is not None and len(self.asked) > self.lost_at:
-            report(20000)
+        if len(self.asked) - 1 == self.lost_at:
+            self.text += self.dying
+            if self.decoded:
+                report(len(ids) + self.decoded - 1, self.decoded)
+            elif new_tokens:
+                report(20000, 0)
             raise llamacpp.Lost("the stream broke off")
         if new_tokens:
             self.clock[0] += self.seconds
-        report(len(ids) + max(new_tokens - 1, 0))
-        return {"tokens_predicted": new_tokens, "timings": TIMINGS,
-                "tokens_evaluated": len(ids), "stop_type": "limit"}
+        report(len(ids), 0)
+        return {"tokens_predicted": new_tokens, "timings": TIMINGS}
 
     def log(self):
         return self.text
@@ -256,26 +290,58 @@ def test_a_schedule_is_played_to_its_end_the_generation_repeated_from_the_positi
                                 contention_at=16384, out=tmp_path / "r.csv.gz",
                                 schedule=lambda headroom: schedule)
     assert serving.asked == [(16384, 0), (32704, 64)] + [(16384, 0), (32704, 64)] * 2
-    assert len(run.generations) == 3 and run.played_s == 30.0
-    assert run.ending["seconds"] == 30.0
+    assert len(run.generations) == 3 and run.ending["seconds"] == 30.0
+
+
+OOM = CUDA_ERROR.format("out of memory")
+
+
+def met(tmp_path, serving, schedule=Schedule([(0.0, 400 * MIB)])):
+    return llamacpp_survival.run(serving, ModelConfig.from_card(NAME), np.arange(32704), 64,
+                                 contention_at=16384, out=tmp_path / "r.csv.gz",
+                                 schedule=lambda headroom: schedule)
 
 
 def test_a_server_lost_out_of_memory_says_where_and_when(tmp_path, clock):
-    serving = Serving(clock, lost_at=1, log=LOADED + "CUDA error: cuMemCreate: out of memory")
-    run = llamacpp_survival.run(serving, ModelConfig.from_card(NAME), np.arange(32704), 64,
-                                contention_at=16384, out=tmp_path / "r.csv.gz",
-                                schedule=lambda headroom: Schedule([(0.0, 400 * MIB)]))
+    run = met(tmp_path, Serving(clock, lost_at=1, dying=OOM))
     assert not run.survived
     assert run.ending == {"state": survival.OUT_OF_MEMORY, "positions": 20000, "tokens": 0,
                           "seconds": 0.0, "error": "the stream broke off"}
 
 
+def test_a_server_lost_decoding_says_how_many_tokens_it_had_decoded(tmp_path, clock):
+    run = met(tmp_path, Serving(clock, lost_at=1, decoded=10, dying=OOM))
+    assert (run.ending["positions"], run.ending["tokens"]) == (32713, 10)
+
+
+#: Long enough for a second generation: 10 s is one's.
+LONGER = Schedule([(0.0, 400 * MIB), (15.0, 0)])
+
+
+def test_a_server_lost_in_a_later_generation_says_when(tmp_path, clock):
+    run = met(tmp_path, Serving(clock, lost_at=3, dying=OOM), LONGER)
+    assert run.ending["state"] == survival.OUT_OF_MEMORY and len(run.generations) == 1
+    assert (run.ending["positions"], run.ending["seconds"]) == (20000, 10.0)
+
+
+def test_a_server_lost_as_its_cache_is_cut_back_is_not_credited_with_the_last_generation(
+        tmp_path, clock):
+    run = met(tmp_path, Serving(clock, lost_at=2, dying=OOM), LONGER)
+    assert (run.ending["positions"], run.ending["tokens"]) == (16384, 0)
+
+
 def test_a_server_lost_otherwise_failed(tmp_path, clock):
-    run = llamacpp_survival.run(Serving(clock, lost_at=1), ModelConfig.from_card(NAME),
-                                np.arange(32704), 64, contention_at=16384,
-                                out=tmp_path / "r.csv.gz",
-                                schedule=lambda headroom: Schedule([(0.0, 400 * MIB)]))
+    assert met(tmp_path, Serving(clock, lost_at=1)).ending["state"] == llamacpp_survival.FAILED
+
+
+def test_an_allocation_that_failed_before_and_was_recovered_did_not_end_it(tmp_path, clock):
+    run = met(tmp_path, Serving(clock, lost_at=1, log=LOADED + OOM))
     assert run.ending["state"] == llamacpp_survival.FAILED
+
+
+def test_a_server_lost_before_its_contention_came_is_no_run(tmp_path, clock):
+    with pytest.raises(llamacpp.Lost):
+        met(tmp_path, Serving(clock, lost_at=0))
 
 
 def test_a_generation_of_fewer_tokens_is_not_complete(tmp_path, clock):
@@ -288,7 +354,7 @@ def test_a_generation_of_fewer_tokens_is_not_complete(tmp_path, clock):
                                 contention_at=16384, out=tmp_path / "r.csv.gz",
                                 schedule=lambda headroom: Schedule([(0.0, 400 * MIB)]))
     assert run.ending["state"] == llamacpp_survival.FAILED and not run.survived
-    assert "5 of 64" in run.ending["error"]
+    assert "5 of 64" in run.ending["error"] and run.ending["positions"] == 32708
 
 
 def test_the_simulator_gives_back_what_it_took_whatever_the_run_came_to(tmp_path, clock,
@@ -314,7 +380,7 @@ def test_the_simulator_gives_back_what_it_took_whatever_the_run_came_to(tmp_path
 
 def test_s5_s_step_is_the_survival_experiment_s_rule():
     cfg = ModelConfig.from_card(NAME)
-    rule = llamacpp_survival.Contention("S5", 0, None)
+    rule = llamacpp_survival.Contention("S5", 0, matrix.Rq1.read())
     played = rule.schedule(cfg, 2000 * MIB, positions=16384, context=32767,
                            simulator_context_bytes=82 * MIB)
     assert played.points == [(0.0, survival.contention_bytes(
@@ -335,15 +401,15 @@ def entry(cache_type, scenario, run, *, survived=True, refused=0.0, state="compl
     return {"kind": llamacpp_survival.KIND, "model": NAME, "sha256": f"{cache_type}{run}",
             "config": {"cache_type": cache_type, "scenario": scenario, "run": run},
             "results": {"survived": survived, "refused_mib": refused, "taken_mib": 500.0,
-                        "ending": {"state": state, "positions": 32767, "seconds": 11.0},
-                        "generations": [{"timings": TIMINGS}],
+                        "ending": {"state": state, "positions": 32767, "seconds": 11.0,
+                                   "error": None},
                         "buffers_mib": {"KV": 896.0}}}
 
 
 def test_the_runs_go_run_by_run_over_the_cells():
     runs = llamacpp_survival.runs(("f16", "q4_0"), ("S1", "S5"), 2)
-    assert runs[:4] == [("f16", "S1", 0), ("q4_0", "S1", 0), ("f16", "S5", 0),
-                        ("q4_0", "S5", 0)]
+    assert [r.name for r in runs[:5]] == ["S1-f16-r0", "S1-q4_0-r0", "S5-f16-r0", "S5-q4_0-r0",
+                                          "S1-f16-r1"]
     assert len(runs) == 8
 
 
@@ -355,7 +421,8 @@ def test_a_run_logged_at_the_same_code_and_build_is_not_made_again(tmp_path):
                             "build": {"binary_sha256": "b", "gguf_sha256": "g"}}, log=log)
     commit = benchlog.read(log)[0]["git_commit"]
     build = {"binary_sha256": "b", "gguf_sha256": "g"}
-    assert llamacpp_survival.logged(commit, build, log) == {("f16", "S5", 1)}
+    assert llamacpp_survival.logged(commit, build, log) == {
+        llamacpp_survival.BaselineRun("f16", "S5", 1)}
     assert llamacpp_survival.logged(commit, {**build, "binary_sha256": "c"}, log) == set()
     assert llamacpp_survival.logged("another", build, log) == set()
 
@@ -368,7 +435,8 @@ def test_the_summary_gives_each_cell_s_endings_and_what_its_contention_was_refus
         entry("q8_0", "S1", 0)])
     cell = s["S5"]["f16"]
     assert cell["survived"] == 2 and cell["runs"] == 3
-    assert cell["endings"] == ["complete", "complete", "out of memory"]
+    assert [e["state"] for e in cell["endings"]] == ["complete", "complete", "out of memory"]
+    assert cell["endings"][0]["seconds"] == 11.0
     assert cell["refused_mib"] == [256.0, 280.0, 0.0]
     assert cell["wilson_95"][0] < 2 / 3 < cell["wilson_95"][1]
     assert s["S1"]["q8_0"]["runs"] == 1
@@ -395,24 +463,56 @@ def test_the_runs_name_the_build_logged_and_refuse_another(tmp_path):
     binary.write_bytes(b"binary")
     gguf.write_bytes(b"weights")
     with pytest.raises(ValueError, match="build_llamacpp"):
-        llamacpp.logged_build(log, binary, gguf)
-    benchlog.append(llamacpp.BUILD_KIND, model=NAME, context_length=None, precision_tiers=None,
-                    results={"binary_sha256": benchlog.file_sha256(binary),
-                             "gguf_sha256": benchlog.file_sha256(gguf)}, log=log)
-    assert llamacpp.logged_build(log, binary, gguf)["binary_sha256"] == \
-        benchlog.file_sha256(binary)
+        llamacpp.logged_build(NAME, log, binary=binary, gguf=gguf)
+
+    def built(model, weights):
+        benchlog.append(llamacpp.BUILD_KIND, model=model, context_length=None,
+                        precision_tiers=None, config={"tag": "b12300"},
+                        results={"binary_sha256": benchlog.file_sha256(binary),
+                                 "gguf_sha256": weights}, log=log)
+
+    built(NAME, benchlog.file_sha256(gguf))
+    built("another-model", "its own")
+    build = llamacpp.logged_build(NAME, log, binary=binary, gguf=gguf)
+    assert build["tag"] == "b12300" and build["entry"] == benchlog.read(log)[0]["sha256"]
     binary.write_bytes(b"another")
     with pytest.raises(ValueError, match="another build"):
-        llamacpp.logged_build(log, binary, gguf)
+        llamacpp.logged_build(NAME, log, binary=binary, gguf=gguf)
 
 
-def test_the_tool_refuses_a_dirty_tree(tmp_path, monkeypatch):
+def test_the_tool_refuses_a_dirty_tree(tmp_path, monkeypatch, capsys):
     tool = load_tool("llamacpp_survival")
     real = tool.benchlog.environment
     monkeypatch.setattr(tool.benchlog, "environment",
                         lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": True})
     with pytest.raises(SystemExit):
         tool.main(["--issue", "211", "--log", str(tmp_path / "log.jsonl")])
+    assert "uncommitted" in capsys.readouterr().err
+
+
+def test_a_run_lost_before_its_contention_is_not_logged_and_the_next_is_made(
+        tmp_path, monkeypatch, capsys):
+    tool = load_tool("llamacpp_survival")
+    real = tool.benchlog.environment
+    monkeypatch.setattr(tool.benchlog, "environment",
+                        lambda log=benchlog.DEFAULT_LOG: {**real(log), "git_dirty": False})
+    monkeypatch.setattr(tool.llamacpp, "logged_build", lambda model, log: {
+        "binary_sha256": "b", "gguf_sha256": "g"})
+    monkeypatch.setattr(tool.matrix.Rq1, "read", lambda log: None)
+    monkeypatch.setattr(tool, "SETTLE_S", 0.0)
+    made = []
+
+    def make(run, *rest):
+        made.append(run.name)
+        if run.cache_type == "f16":
+            raise llamacpp.Lost("did not load")
+        return {"survived": True, "ending": {}, "asked_mib": 0, "taken_mib": 0, "refused_mib": 0}
+
+    monkeypatch.setattr(tool, "make", make)
+    assert tool.main(["--issue", "211", "--scenarios", "S5", "--runs", "1", "--out-dir",
+                      str(tmp_path), "--log", str(tmp_path / "log.jsonl")]) == 1
+    assert made == ["S5-f16-r0", "S5-q8_0-r0", "S5-q4_0-r0"]
+    assert "S5-f16-r0" in capsys.readouterr().err
 
 
 @pytest.mark.slowest
@@ -429,5 +529,5 @@ def test_the_real_server_meets_a_step_at_a_small_scale(tmp_path):
                                     schedule=lambda h: Schedule([(0.0, 100 * MIB)]))
     assert run.survived, run.ending
     assert run.ending["positions"] == 4015 and run.refused_bytes == 0
-    assert server.buffers_mib["KV"] == pytest.approx(28 * 4096 * 2 * 256 * 34 / 32 / MIB,
-                                                     rel=0.01)
+    elements = ModelConfig.from_card(NAME).kv_bytes_per_token / 2 * 4096
+    assert server.buffers_mib["KV"] == pytest.approx(elements * 34 / 32 / MIB, rel=0.01)

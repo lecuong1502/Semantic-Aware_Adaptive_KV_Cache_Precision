@@ -11,9 +11,9 @@ own, taking memory when its cache holds the position contention comes at
   first level.
 - **The same bytes taken.** The rule that sets them, S5's shortfall or a
   scenario's base, is given the headroom an FP16 MicroInfer would have had
-  there: what llama.cpp leaves, more by what its cache, the whole context's
-  from the start, holds beyond an FP16 cache of those positions
-  (survival.counted_as_fp16).
+  there: what llama.cpp leaves, and the difference between what its cache
+  holds, the whole context's from the start, and an FP16 cache of those
+  positions (survival.counted_as_fp16).
 - **The whole schedule.** llama.cpp's generation takes seconds where
   MicroInfer's took minutes, and would meet a few of S1's pulses. It is
   therefore made again, the cache cut back to the contention's position,
@@ -21,7 +21,8 @@ own, taking memory when its cache holds the position contention comes at
   generation's end, one generation.
 
 **What a run comes to** is how it ended, COMPLETE, OUT_OF_MEMORY or FAILED,
-at what position and how long after the take, and **what the contention was
+at what position and how long after the take; a server lost before the
+contention came has met none, and is not a run. And **what the contention was
 refused**: the most the simulator asked for and the device did not have.
 An engine that holds its memory from the load is not made to run out by
 what comes after; what comes after is.
@@ -40,6 +41,7 @@ import numpy as np
 
 from . import benchlog, llamacpp, nvml, recorder, rq3_summary, survival
 from . import survival_matrix as matrix
+from . import survival_summary
 from .config import ModelConfig
 from .footprint import MIB
 from .schedule import Schedule
@@ -50,7 +52,7 @@ SUMMARY_KIND = "llamacpp-summary"
 SCENARIOS = ("S1", "S5")
 RUNS = 3
 #: S5's shortfall, the survival experiment's (#108).
-SHORTFALL_BYTES = 256 * MIB
+SHORTFALL_BYTES = int(survival_summary.S5_GENERATION["shortfall_mib"] * MIB)
 #: A run that ended neither complete nor out of memory.
 FAILED = "failed"
 #: The MicroInfer conditions whose refused contention is given beside.
@@ -58,7 +60,18 @@ BESIDE = ("B1", "B8", "B2", "B4", "B6")
 
 _now = time.monotonic
 
-Cell = tuple[str, str, int]
+
+class BaselineRun(NamedTuple):
+    """One run of llama.cpp: its cell, a cache type against a scenario, and
+    which of the cell's runs it is, the scenario's seed."""
+
+    cache_type: str
+    scenario: str
+    run: int
+
+    @property
+    def name(self) -> str:
+        return f"{self.scenario}-{self.cache_type}-r{self.run}"
 
 
 class Serving(Protocol):
@@ -67,7 +80,7 @@ class Serving(Protocol):
     buffers_mib: dict[str, float]
 
     def complete(self, ids: Sequence[int] | np.ndarray, new_tokens: int,
-                 report: Callable[[int], None]) -> dict: ...
+                 report: llamacpp.Report) -> dict: ...
 
     def log(self) -> str: ...
 
@@ -78,7 +91,7 @@ class Contention(NamedTuple):
 
     scenario: str
     seed: int
-    rq1: matrix.Rq1 | None
+    rq1: matrix.Rq1
 
     def schedule(self, cfg: ModelConfig, headroom_bytes: int, *, positions: int, context: int,
                  simulator_context_bytes: int) -> Schedule:
@@ -103,18 +116,16 @@ class Run:
 
     ending: dict
     contention_position: int
-    #: The headroom as it was when the simulator was started, with the cache
-    #: held from the load.
+    #: The headroom once the server had loaded, and when the simulator was
+    #: started: as it was, the whole cache held.
+    loaded_headroom_bytes: int
     headroom_bytes: int
     #: The first level, what the simulator asked for and what it was given,
     #: and the most of any level it was refused.
     asked_bytes: int
     taken_bytes: int
     refused_bytes: int
-    #: How much of the schedule the run met, its duration, and its peak.
-    played_s: float
     schedule: Schedule
-    started_ns: int | None
     generations: list[dict] = field(default_factory=list)
 
     @property
@@ -128,14 +139,17 @@ def run(server: Serving, cfg: ModelConfig, prompt: np.ndarray, new_tokens: int, 
     the simulator play what `schedule` makes of the headroom then, as an FP16
     MicroInfer would have it, and complete `prompt` and `new_tokens`, again
     and again from `contention_at` until the schedule has been played,
-    while the recorder records the device to `out`. A server lost, or a
-    completion of fewer tokens, ends the run where it stood."""
+    while the recorder records the device to `out`. A server lost once the
+    contention has come, or a completion of fewer tokens, ends the run where
+    it stood; one lost before raises Lost."""
     out = Path(out)
-    reached = [0]
+    reached = tokens = 0
 
-    def report(positions: int) -> None:
-        reached[0] = positions
+    def report(positions: int, decoded: int) -> None:
+        nonlocal reached, tokens
+        reached, tokens = positions, decoded
 
+    loaded_headroom = nvml.memory().free
     server.complete(prompt[:contention_at], 0, report)
     headroom = nvml.memory().free
     played = schedule(survival.counted_as_fp16(
@@ -144,37 +158,36 @@ def run(server: Serving, cfg: ModelConfig, prompt: np.ndarray, new_tokens: int, 
     simulator = survival.Simulator(out)
     generations: list[dict] = []
     error = None
-    tokens = 0
     try:
         simulator.play(played)
         took = _now()
         while not generations or _now() - took < played.duration_s:
+            logged = len(server.log())  # an allocation that failed before was recovered
+            report(contention_at, 0)
             if generations:  # cut the cache back to where the contention came
                 server.complete(prompt[:contention_at], 0, report)
-            reached[0], tokens = contention_at, 0
             began = _now()
             done = server.complete(prompt, new_tokens, report)
-            tokens = int(done["tokens_predicted"])
+            report(len(prompt) + new_tokens - 1, int(done["tokens_predicted"]))
             if tokens != new_tokens:
                 error = f"the server stopped after {tokens} of {new_tokens} tokens"
+                reached = len(prompt) + max(tokens - 1, 0)
                 break
-            reached[0] = len(prompt) + new_tokens - 1
             generations.append({"seconds": _now() - began, "timings": done.get("timings")})
     except llamacpp.Lost as exc:
         error = str(exc)
-        tokens = 0
     finally:
         ended = _now()
         simulator.close()
     state = survival.COMPLETE if error is None else (
-        survival.OUT_OF_MEMORY if llamacpp.out_of_memory(server.log()) else FAILED)
-    ending = {"state": state, "positions": reached[0], "tokens": tokens,
+        survival.OUT_OF_MEMORY if llamacpp.out_of_memory(server.log()[logged:]) else FAILED)
+    ending = {"state": state, "positions": reached, "tokens": tokens,
               "seconds": ended - took, "error": error}
     events = _events(recorder.companion(out, ".events.jsonl"))
     first = events[1]  # after the simulator's idle lead
-    return Run(ending, contention_at, headroom, played.points[0][1], first["taken_bytes"],
-               max(e["shortfall_bytes"] for e in events), ended - took, played,
-               simulator.started_ns, generations)
+    return Run(ending, contention_at, loaded_headroom, headroom, played.points[0][1],
+               first["taken_bytes"], max(e["shortfall_bytes"] for e in events), played,
+               generations)
 
 
 def _events(path: Path) -> list[dict]:
@@ -184,60 +197,51 @@ def _events(path: Path) -> list[dict]:
 # -- the matrix of its runs ----------------------------------------------------------------
 
 
-def runs(cache_types: Sequence[str] = tuple(llamacpp.CACHE_TYPES),
-         scenarios: Sequence[str] = SCENARIOS, count: int = RUNS) -> list[Cell]:
+def runs(cache_types: Sequence[str] = llamacpp.CACHE_TYPES,
+         scenarios: Sequence[str] = SCENARIOS, count: int = RUNS) -> list[BaselineRun]:
     """The runs, every cell's first before any cell's second."""
-    return [(c, s, r) for r in range(count) for s in scenarios for c in cache_types]
+    return [BaselineRun(c, s, r) for r in range(count) for s in scenarios for c in cache_types]
 
 
-def logged(commit: str, build: dict, log: str | Path = benchlog.DEFAULT_LOG) -> set[Cell]:
+def logged(commit: str, build: dict, log: str | Path = benchlog.DEFAULT_LOG) -> set[BaselineRun]:
     """The runs logged at the code of `commit` (benchlog.same_code) with the
     binary and the model file of `build`."""
     if not Path(log).exists():
         return set()
     same_code = benchlog.same_code_as(commit, log)
     wanted = {k: build[k] for k in ("binary_sha256", "gguf_sha256")}
-    return {_cell(e) for e in benchlog.read(log)
+    return {_run_of(e) for e in benchlog.read(log)
             if e["kind"] == KIND and same_code(e["git_commit"])
             and all(e["config"]["build"][k] == v for k, v in wanted.items())}
 
 
-def _cell(entry: dict) -> Cell:
+def _run_of(entry: dict) -> BaselineRun:
     config = entry["config"]
-    return config["cache_type"], config["scenario"], config["run"]
+    return BaselineRun(config["cache_type"], config["scenario"], config["run"])
 
 
 def summarise(entries: Iterable[dict]) -> dict[str, dict[str, dict]]:
     """Each scenario's cells by cache type, the latest entry of each run: the
-    runs that completed with their Wilson 95% interval, how each ended and
-    where, what each one's contention was refused and given, and the speeds of
-    each run's first generation."""
-    latest: dict[Cell, dict] = {}
-    for e in entries:
-        if e["kind"] == KIND:
-            latest[_cell(e)] = e
-    out: dict[str, dict[str, dict]] = {}
-    for cell in sorted(latest, key=lambda c: (c[1], list(llamacpp.CACHE_TYPES).index(c[0]))):
-        out.setdefault(cell[1], {}).setdefault(cell[0], [])
-        out[cell[1]][cell[0]].append(latest[cell])
-    return {scenario: {c: _cell_summary(es) for c, es in cells.items()}
-            for scenario, cells in out.items()}
+    runs that completed with their Wilson 95% interval, how each ended, where,
+    when and why, and what each one's contention was given and refused."""
+    latest = {_run_of(e): e for e in entries if e["kind"] == KIND}
+    cells: dict[str, dict[str, list[dict]]] = {}
+    for run in sorted(latest, key=lambda r: (r.scenario, llamacpp.CACHE_TYPES.index(
+            r.cache_type), r.run)):
+        cells.setdefault(run.scenario, {}).setdefault(run.cache_type, []).append(latest[run])
+    return {scenario: {c: _cell_summary(es) for c, es in by_type.items()}
+            for scenario, by_type in cells.items()}
 
 
 def _cell_summary(entries: Sequence[dict]) -> dict:
-    entries = sorted(entries, key=lambda e: e["config"]["run"])
     results = [e["results"] for e in entries]
     survived = sum(r["survived"] for r in results)
-    firsts = [r["generations"][0]["timings"] for r in results if r["generations"]]
     return {"survived": survived, "runs": len(results),
             "wilson_95": list(rq3_summary.wilson(survived, len(results))),
-            "endings": [r["ending"]["state"] for r in results],
-            "positions": [r["ending"]["positions"] for r in results],
+            "endings": [r["ending"] for r in results],
             "refused_mib": [r["refused_mib"] for r in results],
             "taken_mib": [r["taken_mib"] for r in results],
             "kv_mib": results[0]["buffers_mib"]["KV"],
-            "prompt_per_second": [t["prompt_per_second"] for t in firsts],
-            "predicted_per_second": [t["predicted_per_second"] for t in firsts],
             "entries": [e["sha256"] for e in entries]}
 
 

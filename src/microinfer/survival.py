@@ -106,9 +106,10 @@ def as_fp16(cfg: ModelConfig, headroom_bytes: int, *, positions: int, kv_tier: s
 
 def counted_as_fp16(cfg: ModelConfig, headroom_bytes: int, *, positions: int,
                     held_bytes: int) -> int:
-    """as_fp16, for an engine whose cache holds `held_bytes` at `positions`:
-    another tier's, or an engine's that holds its whole cache from its load
-    (llamacpp_survival)."""
+    """The headroom an FP16 engine would leave, its cache at `positions`,
+    where one whose cache holds `held_bytes` leaves `headroom_bytes`: a
+    static tier's (as_fp16), or an external baseline's, which holds its
+    whole context's from its load (llamacpp_survival)."""
     return headroom_bytes - (paged_cache_bytes(cfg, positions) - held_bytes)
 
 

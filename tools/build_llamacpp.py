@@ -8,15 +8,15 @@ In data/llamacpp/, outside git: llama.cpp's source at a pinned release,
 llama-server built from it with CUDA, and the model MicroInfer itself runs,
 converted from the same checkpoint to a GGUF file at FP16. The converter is
 llama.cpp's own and needs torch, so it runs in the golden generator's
-environment, .venv-golden (ADR-0002), with sentencepiece, which it imports
+environment, .venv-golden (ADR-0002's amendment), with sentencepiece, which it imports
 for every Qwen model, beside it rather than in it.
 
-Each step is made only if what it makes is not there, so the same command
-takes it up; a source at another commit, or changed, is refused. Then a
-"llamacpp-build" entry names the release and commit, the build's flags and
-compilers, what the binary says it is, and the sha256 of the binary, the
-model file and the checkpoint: what every run is checked against. Refuses a
-dirty tree.
+The source and the model file are made only if they are not there, and cmake
+builds only what is not built, so the same command takes it up; a source at
+another commit, or changed, is refused. Then a "llamacpp-build" entry names
+the release and commit, the build's flags and compilers, what the binary says
+it is, and the sha256 of the binary, of the model file, which every run is
+checked against, and of the checkpoint. Refuses a dirty tree.
 
 The build takes about 12 minutes of every core, most of it the CUDA kernels;
 the web UI, the tests and TLS are left out, none of which the server needs.

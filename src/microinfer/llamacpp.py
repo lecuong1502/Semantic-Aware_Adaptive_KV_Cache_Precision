@@ -1,8 +1,7 @@
 """llama.cpp, run as an external baseline (#211): its server and its log.
 
-Every other condition runs inside MicroInfer, so a reader cannot tell how an
-engine people deploy fares under the same contention. llama.cpp is that
-engine. It is a process of its own that nothing of MicroInfer's links or
+Every condition runs inside MicroInfer, so a reader cannot tell how an engine
+people deploy fares under the same contention. llama.cpp is that engine. It is a process of its own that nothing of MicroInfer's links or
 imports (ADR-0001's amendment): this module starts llama-server, sends it
 token ids over HTTP, and reads its log.
 
@@ -20,9 +19,13 @@ positions.
 
 **How it ends.** A completion streams its progress, so that a server lost
 part way has said how far it got (`Lost`). Whether it was lost for device
-memory is read from its log (`out_of_memory`): ggml's allocations that failed, and CUDA's
-own error, which ends the process. An allocation of the host's that failed
-is not.
+memory is read from its log (`out_of_memory`): an allocation of ggml's on the
+device that failed, or an error of CUDA's or cuBLAS's own, on which ggml ends
+the process. An allocation of the host's that failed is not.
+
+The server's pings, which would keep a hung completion's stream from going
+silent, are off, and so is the backtrace ggml takes as it aborts, which would
+keep a dead one's open.
 
 The build and the model file are made by tools/build_llamacpp.py, from a
 pinned release and from the checkpoint MicroInfer itself runs, and logged
@@ -33,6 +36,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import re
 import socket
 import subprocess
@@ -51,9 +55,8 @@ ROOT = REPO / "data" / "llamacpp"
 BINARY = ROOT / "build" / "bin" / "llama-server"
 
 BUILD_KIND = "llamacpp-build"
-#: The ggml types its cache is run at, with the bits each holds an element in:
-#: 32 elements of q8_0 are 34 bytes and of q4_0 18.
-CACHE_TYPES = {"f16": 16.0, "q8_0": 8.5, "q4_0": 4.5}
+#: The ggml types its cache is run at: 16, 8.5 and 4.5 bits an element.
+CACHE_TYPES = ("f16", "q8_0", "q4_0")
 #: MicroInfer's default prefill chunk, llama.cpp's logical and physical batch.
 BATCH = 512
 #: Verbose enough to say what its buffers hold.
@@ -64,6 +67,10 @@ SILENCE_TIMEOUT_S = 120.0
 EXIT_WAIT_S = 30.0
 POLL_S = 0.05
 HOST = "127.0.0.1"
+
+
+#: The positions a server's cache holds, and the tokens decoded, as they come.
+Report = Callable[[int, int], None]
 
 
 class Lost(RuntimeError):
@@ -84,7 +91,7 @@ def command(binary: str | Path, gguf: str | Path, *, port: int, context: int,
     return [str(binary), "-m", str(gguf), "-c", str(context), "-np", "1", "-ngl", "99",
             "-b", str(BATCH), "-ub", str(BATCH), "-fa", "on",
             "-ctk", cache_type, "-ctv", cache_type, "--fit", "off", "--cache-ram", "0",
-            "-lv", str(VERBOSITY), "--host", HOST, "--port", str(port)]
+            "--sse-ping-interval", "-1", "-lv", str(VERBOSITY), "--host", HOST, "--port", str(port)]
 
 
 _BUFFER = re.compile(r"\bCUDA\d+\s+(\w+) buffer size =\s*([\d.]+) MiB")
@@ -102,22 +109,29 @@ def device_buffers_mib(log: str) -> dict[str, float]:
     return found
 
 
-_FAILED = re.compile(r"out of memory|failed to allocate")
-_HOST = re.compile(r"pinned|prompt cache|host", re.IGNORECASE)
+#: What build b12300 writes where an allocation on the device fails: the
+#: CUDA buffer type's, the pool's and the kernels' (ggml_cuda_error),
+#: cuBLAS's, and the scheduler's buffers and graphs, which are the device's.
+_OUT_OF_MEMORY = re.compile(
+    r"cudaMalloc failed: out of memory|CUDA error: .*out of memory"
+    r"|CUDA error: .*resource allocation failed|failed to allocate CUDA\d"
+    r"|failed to allocate compute|failed to allocate graph"
+    r"|GGML status: error \(failed to allocate memory\)")
 
 
 def out_of_memory(log: str) -> bool:
     """Whether the server's log says an allocation on the device failed."""
-    return any(_FAILED.search(line) and not _HOST.search(line) for line in log.splitlines())
+    return _OUT_OF_MEMORY.search(log) is not None
 
 
 def complete(port: int, ids: Sequence[int] | np.ndarray, new_tokens: int,
-             report: Callable[[int], None]) -> dict:
+             report: Report) -> dict:
     """A completion of `new_tokens` after `ids`, greedy and past any end of
     sequence, over the server's one slot, whose cache it continues where the
-    two share a prefix. `report` is called with the positions the cache holds,
-    after each batch of the prompt and after each token decoded. Returns the
-    server's last event, with its timings. Raises Lost."""
+    two share a prefix. `report` is called after each batch of the prompt and
+    each token with the positions the cache holds and the tokens decoded: the
+    last of them is not yet fed. Returns the server's last event, with its
+    timings. Raises Lost."""
     body = json.dumps({"prompt": [int(t) for t in ids], "n_predict": int(new_tokens),
                        "temperature": 0.0, "ignore_eos": True, "cache_prompt": True,
                        "id_slot": 0, "stream": True, "return_progress": True,
@@ -131,8 +145,6 @@ def complete(port: int, ids: Sequence[int] | np.ndarray, new_tokens: int,
                        f"{response.read().decode(errors='replace').strip()}")
         decoded = 0
         for line in response:
-            if line.startswith(b"error:"):
-                line = b"data: {\"error\":" + line.partition(b":")[2].strip() + b"}"
             if not line.startswith(b"data:"):
                 continue
             event = json.loads(line.partition(b":")[2])
@@ -141,11 +153,10 @@ def complete(port: int, ids: Sequence[int] | np.ndarray, new_tokens: int,
             if event.get("stop"):
                 return event
             if "prompt_progress" in event:
-                report(int(event["prompt_progress"]["processed"]))
+                report(int(event["prompt_progress"]["processed"]), 0)
             else:
-                # the first token comes with the prompt's last batch, unfed
                 decoded += len(event.get("tokens") or ())
-                report(len(ids) + decoded)
+                report(len(ids) + max(decoded - 1, 0), decoded)
     except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
         raise Lost(f"the server did not answer: {exc!r}") from exc
     finally:
@@ -176,7 +187,8 @@ class Server:
     def __enter__(self) -> Server:
         began = time.monotonic()
         with open(self.log_path, "wb") as out:
-            self._proc = subprocess.Popen(self.command, stdout=out, stderr=subprocess.STDOUT)
+            self._proc = subprocess.Popen(self.command, stdout=out, stderr=subprocess.STDOUT,
+                                          env={**os.environ, "GGML_NO_BACKTRACE": "1"})
         try:
             while not self._healthy():
                 if self._proc.poll() is not None:
@@ -206,7 +218,7 @@ class Server:
         return self.log_path.read_text(errors="replace")
 
     def complete(self, ids: Sequence[int] | np.ndarray, new_tokens: int,
-                 report: Callable[[int], None]) -> dict:
+                 report: Report) -> dict:
         return complete(self.port, ids, new_tokens, report)
 
     def _healthy(self) -> bool:
@@ -230,18 +242,19 @@ class Server:
             self._proc.wait()
 
 
-def logged_build(log: str | Path, binary: str | Path = BINARY,
-                 gguf: str | Path | None = None, model: str | None = None) -> dict:
-    """The last build logged, its binary and model file the ones on disk by
-    their hashes. ValueError if none is, or another is on disk."""
-    gguf = gguf_path(model) if gguf is None else Path(gguf)
-    builds = [e for e in benchlog.read(log) if e["kind"] == BUILD_KIND] \
-        if Path(log).exists() else []
+def logged_build(model: str, log: str | Path, *, binary: Path = BINARY,
+                 gguf: Path | None = None) -> dict:
+    """The last build logged for `model`: its config, and its results, whose
+    binary and model file are the ones on disk by their hashes. ValueError if
+    none is, or another is on disk."""
+    gguf = gguf_path(model) if gguf is None else gguf
+    builds = [e for e in benchlog.read(log) if e["kind"] == BUILD_KIND
+              and e["model"] == model] if Path(log).exists() else []
     if not builds:
         raise ValueError("no llama.cpp build is logged; run tools/build_llamacpp.py")
-    build = builds[-1]["results"]
+    build = {**builds[-1]["config"], **builds[-1]["results"], "entry": builds[-1]["sha256"]}
     for path, key in ((binary, "binary_sha256"), (gguf, "gguf_sha256")):
-        if not Path(path).is_file() or benchlog.file_sha256(Path(path)) != build[key]:
+        if not path.is_file() or benchlog.file_sha256(path) != build[key]:
             raise ValueError(f"{path} is not the one logged, but another build's, or missing; "
                              f"run tools/build_llamacpp.py")
     return build
