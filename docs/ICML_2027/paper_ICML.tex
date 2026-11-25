@@ -80,7 +80,9 @@ and the monitor detects every catchable episode within 236\,ms with no false
 positive. With Qwen2.5-1.5B at 32K positions, the adaptive engine survives a
 contention that runs the static engine out of memory, returning 746\,MiB that
 the driver sees returned, and across four scenarios of three runs each it
-survived every run the static engine failed but one that exceeded the device.
+survived every run the static engine failed but one that exceeded the device;
+llama.cpp, which reserves its cache at load, survives as well, its FP16 cache
+refusing the other process up to 364\,MiB.
 At equal reclaimed bytes and 80\% of them reclaimed, attention-guided
 allocation keeps the next-token distribution 3.6 times closer to full precision
 than uniform allocation, where a page's score ranks its downgrade's damage
@@ -215,7 +217,8 @@ private reservation is never returned to the driver.
 \citep{ollama} bring quantised models to personal machines, PowerInfer
 \citep{song2024powerinfer} splits work between GPU and CPU by neuron activity,
 and FlexGen \citep{sheng2023flexgen} offloads to host memory and disk. They
-treat capacity as fixed when the model loads.
+treat capacity as fixed when the model loads; Section~\ref{sec:survival}
+measures what that means for llama.cpp under contention.
 
 \paragraph{Uniform cache quantisation.} KVQuant \citep{hooper2024kvquant} and
 KIVI \citep{liu2024kivi} show that the cache tolerates aggressive quantisation;
@@ -402,9 +405,10 @@ that. At GREEN chunks stay at 512 positions.
 \textit{MicroInfer} is a Python orchestrator over CUDA kernels written for
 this work: embedding, RMSNorm, rotary embeddings, SwiGLU, attention over
 contiguous, paged and quantised pages, the paged cache and its VMM allocator,
-quantisation at every tier, and greedy sampling. No inference engine is used.
-The one exception is the dense projections, which call cuBLAS \citep{cublas}
-with fp32 accumulation; hand-written GEMMs ran 8--28 times slower at 512 rows,
+quantisation at every tier, and greedy sampling. No other
+inference engine is part of it; llama.cpp is run only as a baseline beside it.
+The one exception to hand-written kernels is the dense projections, which call
+cuBLAS \citep{cublas} with fp32 accumulation; hand-written GEMMs ran 8--28 times slower at 512 rows,
 and would have confounded every latency we report with the cost of a slow
 matrix multiplication (Appendix~\ref{app:boundary}). No deep learning
 framework runs beside the engine, whose caching allocator would hide freed
@@ -622,7 +626,8 @@ one.
 \caption{Runs that completed every token, of three a cell in the pulse grid
 (S1), the pulse train (S2), RQ1's arrivals (S3) and RQ1's replays (S4), or of
 the survival experiment's one (S5, and S6, its release, which a static engine
-has no upgrade path to exercise). A Wilson 95\% interval at 3/3 is
+has no upgrade path to exercise). llama.cpp, by its cache's type, ran S1 and S5
+only, three runs each. A Wilson 95\% interval at 3/3 is
 [44, 100]\%, at 2/3 [21, 94]\%. $^\dagger$Run on a faster build, and so
 against less of each schedule.}
 \label{tab:matrix}
@@ -640,10 +645,31 @@ Static INT8$^\dagger$ & 3/3 & 3/3 & 3/3 & 3/3 & 1/1 & -- \\
 Adaptive, uniform & 3/3 & 3/3 & 3/3 & 3/3 & 1/1 & 1/1 \\
 Adaptive, random & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
 Adaptive, semantic & 3/3 & 3/3 & 2/3 & 3/3 & 1/1 & 1/1 \\
+\midrule
+llama.cpp, f16 & 3/3 & -- & -- & -- & 3/3 & -- \\
+llama.cpp, q8\_0 & 3/3 & -- & -- & -- & 3/3 & -- \\
+llama.cpp, q4\_0 & 3/3 & -- & -- & -- & 3/3 & -- \\
 \bottomrule
 \end{tabular}
 \end{adjustbox}
 \end{table}
+
+\paragraph{A deployed engine.} llama.cpp ran the same model and generation, its
+weights at FP16 and its cache at f16, q8\_0 and q4\_0, against the same bytes of
+S1 and S5 (Appendix~\ref{app:llamacpp}). All 18 runs completed. It allocates the
+whole cache as it loads, 896\,MiB at f16, so contention that comes later has
+nothing left to refuse it; what it holds is refused to the process that asks. At
+f16 the simulator was refused 340--364\,MiB at the worst of S1's pulses and some
+part of them for 60 of its 494\,s, and 302--310\,MiB of S5's step. At q8\_0 and
+q4\_0 it was refused nothing but 8\,MiB once, and the cache is at 8 or 4 bits
+from the first token, as a static engine's is. In S1 the adaptive engine refused
+nothing from the uniform source, and nothing in two runs of the semantic one's
+three and 130\,MiB in the third; the static FP16 engine refused 244--274\,MiB
+before it ran out. The out-of-memory failure is thus that of a cache
+allocated as it grows. Reserving it averts the failure and moves the shortfall
+to the other process; a narrower cache averts both here and is paid for throughout.
+The adaptive engine holds FP16 until pressure comes and gives the memory up
+then.
 
 \subsection{RQ3: Quality at Equal Compression}
 \label{sec:rq3}
@@ -862,8 +888,10 @@ contention, not how often it occurs over a working day. \textbf{Few runs.}
 Survival is three runs a cell in four scenarios and one in the step and the
 release, which bound a rate only loosely and cannot tell the score sources
 apart; an adaptive engine also meets more of a schedule than a static one.
-\textbf{Reacting at step boundaries.} The first event of an episode waits for
-the step in progress, and at long contexts a step's fixed part exceeds a
+\textbf{An external engine in part.} llama.cpp ran two scenarios, loaded before
+contention came; its loading under contention and its quality at q8\_0 and q4\_0
+are not measured. \textbf{Reacting at step boundaries.} The first event of an
+episode waits for the step in progress, and at long contexts a step's fixed part exceeds a
 second, so no chunk size meets a 1\,s target there. \textbf{Attention as a
 signal.} We use attention mass as a predictor of which pages will be consulted
 again, not as an explanation of the model; RQ3 tests that use by its outcome
@@ -890,8 +918,10 @@ reasons it neither causes nor sees. We showed that this contention is large,
 rises over seconds and mostly persists; that a monitor consulting no scheduler
 detects it within a quarter of a second; and that an engine which reallocates
 cache precision at runtime, page by page, and returns the memory to the driver,
-survives a contention that ends a static engine, in every run of four scenarios
-that ended one but a draw that exceeded the device. At equal bytes, allocating
+survives a contention that ends a static engine whose cache grows, in every run
+of four scenarios that ended one but a draw that exceeded the device, where an
+engine that reserves its cache survives by refusing that memory to others. At equal
+bytes, allocating
 that precision by attention kept the model's output closer to full precision
 than allocating it uniformly, and more of RULER's answers at 80\% though fewer
 at 70\% where our score could not find the needle and ZipCache's, on the same
@@ -1063,6 +1093,33 @@ task at 8K and 70\%, ZipCache's source against uniform: 16 to 0 on MV
 on VT, 9 to 2 on MK-2 ($p = 0.065$), 10 to 8 on MV, 5 to 2 on MK-1 and 3 to 1 on
 MK-3. Against semantic at 80\%, 12 to 1 on MK-2 ($p = 0.0034$) is the only task
 that parts them, and MV leans the other way, 4 to 9 ($p = 0.27$).
+
+\section{llama.cpp Under the Same Contention}
+\label{app:llamacpp}
+
+llama.cpp's server (release b12300, commit ccd360f, built from source with CUDA)
+ran Qwen2.5-1.5B converted at FP16 from the checkpoint MicroInfer runs: a 32K
+context in one slot, every layer on the device, flash attention at every cache
+type, as a quantised value cache needs, and batches of 512, MicroInfer's chunk.
+Each run starts a server of its own, fills its cache to exactly 16{,}384 positions
+by a completion of no tokens, and completes the 32{,}704-position prompt and 64
+tokens once the simulator has taken its first level. S1's base and S5's shortfall
+are set from the headroom an FP16 MicroInfer would have there, counting
+llama.cpp's preallocated cache as one of the positions held, so that the bytes
+taken are the same. One generation lasts 8--9\,s from the contention's
+position and would meet a few of S1's pulses, so it is made again, the cache cut
+back to 16{,}384 positions, until the schedule has been played: 57--64
+generations a run, each of them complete in every run. Refused contention is the
+most, over a run's levels, that the simulator asked for and was not given.
+MicroInfer's comes from the events its matrix runs recorded; those runs, on the
+build before split-key decode, met all of S1 where they completed. In S5 its
+simulator was refused nothing by any engine, one run each: the step comes while the cache
+has still half its growth to make. llama.cpp's S5 runs took 1176--1258\,MiB of
+1486--1560 asked at f16 and all of 1480--1554 at q8\_0 and q4\_0. From the load to
+the contention its memory grew by 16--28\,MiB. Its prefill ran at
+2{,}338--2{,}620 positions a second, an order of magnitude faster than
+MicroInfer's, and its decoding at 34--42 tokens a second; the runs were not made
+to compare the two engines' speeds.
 
 \section{The Cost of a Tier and of a Move}
 \label{app:moves}

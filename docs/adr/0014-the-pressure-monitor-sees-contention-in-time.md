@@ -443,3 +443,32 @@ memory may fail to load, or with `--fit on` take a smaller context; both are
 at load, which this does not measure. Its quality at q8_0 and q4_0 is not
 measured here. Its timings are in each run's entry; the two engines' speeds
 are not compared from these runs.
+
+**As measured (#211).** The build is `llamacpp-build` `8970966f`, the summary
+`llamacpp-summary` `f5f7b4a0`, the runs at `d7cb760`. All 18 completed every
+token of every generation, 57 to 64 generations a run of S1, each met whole.
+
+| Engine | S1 survived | S1 refused (MiB) | S5 survived | S5 refused (MiB) |
+|---|---|---|---|---|
+| llama.cpp f16 | 3/3 | 364, 360, 340 | 3/3 | 302, 310, 310 |
+| llama.cpp q8_0 | 3/3 | 0, 8, 0 | 3/3 | 0, 0, 0 |
+| llama.cpp q4_0 | 3/3 | 0, 0, 0 | 3/3 | 0, 0, 0 |
+| B1 | 0/3 | 274, 254, 244 | 0/1 | 0 |
+| B2 | 3/3 | 0, 0, 0 | 1/1 | 0 |
+| B4 | 3/3 | 0, 0, 0 | 1/1 | 0 |
+| B6 | 3/3 | 0, 0, 130 | 1/1 | 0 |
+| B8 (less of S1 met) | 3/3 | 0, 0, 0 | 1/1 | 0 |
+
+At f16 some part of S1 was refused for 60 s of its 494 s. The buffers were the
+2945 MiB, 896, 476 and 252 MiB expected; memory grew by 16 to 28 MiB from the
+load to the contention. From the contention's position prefill ran at 2338 to
+2620 positions a second and decoding at 34 to 42 tokens a second.
+
+- The failure B1 meets is that of a cache allocated as it grows. Reserving it
+  averts the failure, and the shortfall is the other process's.
+- A narrower cache averts both in S1 and S5, as B2's and B8's do, for its precision
+  throughout. The mechanism's claim against it is FP16 while there is room,
+  not survival.
+- B6 refused 130 MiB in one of three runs, more than q8_0 and q4_0 did in any.
+- MicroInfer's rows are the engine before #204 (B8's after it), and are to be
+  made again on one build by #216.
