@@ -8,7 +8,7 @@ The kernel that prefills on the tensor cores rounds in other places than the
 one before it, which a decode step still runs, so prefill's logits differ in
 their last bits. Its correctness gate is ADR-0006's top-1 agreement and KL,
 between the two kernels, which one build holds both of
-(device.prefill_on_tensor_cores): the one before is the reference. Each model
+(device.set_prefill_on_tensor_cores): the one before is the reference. Each model
 runs at every tier and over a mixed map, which cycles the four tiers page by
 page, each layer's row offset by one, over WikiText-2's test split.
 
@@ -25,11 +25,17 @@ page, each layer's row offset by one, over WikiText-2's test split.
   256 rather than 512, which moves the same logits by cuBLAS's rounding alone
   (ADR-0006, note from #15): how far a tier carries noise of that size.
 
-Then 32 positions are forced one by one after each whole prefill, as decode
-steps, and the importance scores they leave are compared: a step's per-page
-attention mass is the decode kernel's, which is unchanged, over the cache
-each prefill left. Their largest difference, as a share of the largest score,
-and the rank correlation are logged, with the control's.
+Then 32 positions are forced one by one, as decode steps, and the importance
+scores they leave are compared. A step's per-page attention mass is the
+decode kernel's, which is unchanged, so over one cache the scores are the
+same to the bit whichever kernel prefill may use. Over the caches each whole
+prefill leaves, and the control's, they differ as the caches do: their
+largest difference, as a share of the largest score, and their rank
+correlation.
+
+It passes if every model and configuration passes the gate over one page and
+keeps the scores over one cache to the bit, and passes it at FP16, where no
+seal magnifies a difference, over one chunk and over a whole prefill.
 
 Appends one "prefill-agreement" entry. Refuses a dirty tree.
 """
@@ -57,26 +63,30 @@ from microinfer.page_damage import spearman  # noqa: E402
 
 #: Decode steps forced after a prefill, for the importance scores they leave.
 STEPS = 32
-on_tensor_cores = _microinfer.device.prefill_on_tensor_cores
+#: The model with no key bias and groups of four, not among decode_agreement's.
+LLAMA = "llama-3.2-1b-instruct"
+use_tensor_cores = _microinfer.device.set_prefill_on_tensor_cores
 
 
 def run(engine: Engine, ids: np.ndarray, context: int, chunk: int, *, context_on: bool,
-        chunk_on: bool, scores: bool) -> tuple[np.ndarray, np.ndarray | None]:
+        chunk_on: bool, steps_on: bool | None = None) -> tuple[np.ndarray, np.ndarray | None]:
     """The logits after each of the `chunk` positions after `context`, the
-    context prefilled on the tensor cores or not, and the chunk; and the
-    scores STEPS decode steps after them leave, if asked for."""
-    asked = on_tensor_cores(context_on)
+    context prefilled on the tensor cores or not, and the chunk; and, with
+    `steps_on`, the scores that STEPS decode steps after them leave, the
+    tensor cores allowed or not meanwhile."""
+    allowed = use_tensor_cores(context_on)
     try:
         with engine.conversation() as conversation:
             conversation.force(ids[:context])
-            on_tensor_cores(chunk_on)
+            use_tensor_cores(chunk_on)
             logits = conversation.force(ids[context:context + chunk], logits=True)
-            if not scores:
+            if steps_on is None:
                 return logits, None
+            use_tensor_cores(steps_on)
             conversation.force(ids[context + chunk:context + chunk + STEPS], one_by_one=True)
             return logits, conversation.scores()
     finally:
-        on_tensor_cores(asked)
+        use_tensor_cores(allowed)
 
 
 def page_contexts(context: int, pages: int) -> list[int]:
@@ -88,8 +98,11 @@ def page_contexts(context: int, pages: int) -> list[int]:
 
 def scores_apart(reference: np.ndarray, scores: np.ndarray) -> dict:
     """How far two runs' importance scores are: their largest difference as a
-    share of the reference's largest score, and their rank correlation."""
-    held = np.isfinite(reference) & np.isfinite(scores)
+    share of the reference's largest score, and their rank correlation. A
+    page one run observed and the other did not raises ValueError."""
+    held = np.isfinite(reference)
+    if not np.array_equal(held, np.isfinite(scores)):
+        raise ValueError("the two runs observed different pages")
     a, b = reference[held], scores[held]
     return {"max_difference": float(np.abs(a - b).max()), "largest": float(a.max()),
             "max_relative_to_largest": float(np.abs(a - b).max() / a.max()),
@@ -104,19 +117,20 @@ def compare(engine: Engine, ids: np.ndarray, args: argparse.Namespace) -> dict:
         return gate(reference.argmax(-1), reference[at], logits.argmax(-1), logits[at])
 
     new, new_scores = run(engine, ids, context, chunk, context_on=True, chunk_on=True,
-                          scores=True)
-    over_same, _ = run(engine, ids, context, chunk, context_on=True, chunk_on=False,
-                       scores=False)
+                          steps_on=True)
+    _, same_cache_scores = run(engine, ids, context, chunk, context_on=True, chunk_on=True,
+                               steps_on=False)
+    over_same, _ = run(engine, ids, context, chunk, context_on=True, chunk_on=False)
     before, before_scores = run(engine, ids, context, chunk, context_on=False, chunk_on=False,
-                                scores=True)
+                                steps_on=False)
     engine_chunk, engine.prefill_chunk = engine.prefill_chunk, CONTROL_CHUNK
     try:
         control, control_scores = run(engine, ids, context, chunk, context_on=False,
-                                      chunk_on=False, scores=True)
+                                      chunk_on=False, steps_on=False)
     finally:
         engine.prefill_chunk = engine_chunk
     one_page = {on: np.concatenate([
-        run(engine, ids, at_page, PAGE_TOKENS, context_on=True, chunk_on=on, scores=False)[0]
+        run(engine, ids, at_page, PAGE_TOKENS, context_on=True, chunk_on=on)[0]
         for at_page in page_contexts(context, args.pages)]) for on in (False, True)}
     few = sampled(len(one_page[True]), args.samples)
     return {
@@ -125,6 +139,7 @@ def compare(engine: Engine, ids: np.ndarray, args: argparse.Namespace) -> dict:
         "one_chunk": gated(over_same, new),
         "whole_prefill": gated(before, new),
         "control_before_in_chunks_of_256": gated(before, control),
+        "scores_over_one_cache": scores_apart(same_cache_scores, new_scores),
         "scores": scores_apart(before_scores, new_scores),
         "scores_control": scores_apart(before_scores, control_scores)}
 
@@ -132,7 +147,7 @@ def compare(engine: Engine, ids: np.ndarray, args: argparse.Namespace) -> dict:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--issue", type=int, required=True)
-    parser.add_argument("--models", nargs="+", default=list(MODELS))
+    parser.add_argument("--models", nargs="+", default=[*MODELS, LLAMA])
     parser.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=CONFIGS)
     parser.add_argument("--context", type=int, default=8192)
     parser.add_argument("--chunk", type=int, default=512)
@@ -170,14 +185,18 @@ def main(argv: list[str]) -> int:
                     f"Spearman {v['spearman']:.6f}"), flush=True)
         del engine
     gates = [k for k in next(iter(next(iter(results.values())).values())) if "scores" not in k]
-    passed = {what: all(r[what]["passed"] for per in results.values() for r in per.values())
-              for what in gates}
+    cells = [(config, r) for per in results.values() for config, r in per.items()]
+    passed = {what: all(r[what]["passed"] for _, r in cells) for what in gates}
+    passed["scores_over_one_cache_to_the_bit"] = all(
+        r["scores_over_one_cache"]["max_difference"] == 0 for _, r in cells)
+    passed["at_FP16"] = all(r[what]["passed"] for config, r in cells if config == "FP16"
+                            for what in ("one_chunk", "whole_prefill"))
     benchlog.append(
         "prefill-agreement", model=list(args.models),
         context_length={"min": args.context + 1, "max": args.context + args.chunk},
         precision_tiers=None,
         config={"issue": args.issue,
-                "reference": "the kernel before, device.prefill_on_tensor_cores(False)",
+                "reference": "the kernel before, device.set_prefill_on_tensor_cores(False)",
                 "text": SPLIT, "context": args.context, "chunk": args.chunk,
                 "pages": args.pages,
                 "page_contexts": page_contexts(args.context, args.pages),
@@ -187,7 +206,8 @@ def main(argv: list[str]) -> int:
                 "top1_min": TOP1_MIN, "kl_max": KL_MAX, "control_chunk": CONTROL_CHUNK},
         results={"passed": passed, "per_model": results}, log=args.log)
     print(passed)
-    return 0 if passed["one_page"] else 1
+    return 0 if all(passed[what] for what in ("one_page", "scores_over_one_cache_to_the_bit",
+                                              "at_FP16")) else 1
 
 
 if __name__ == "__main__":

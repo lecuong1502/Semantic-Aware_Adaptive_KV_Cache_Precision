@@ -8,10 +8,12 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include "microinfer/attention_partials.cuh"
 #include "microinfer/kernels.h"
 #include "microinfer/kv_layouts.cuh"
+#include "microinfer/packed_halves.cuh"
 #include "microinfer/tensor_cores.cuh"
 
 namespace microinfer
@@ -29,9 +31,22 @@ namespace microinfer
       return head_dim <= 64 ? 16 : 12;
     }
 
-    constexpr bool prefill_head_dim(int head_dim)
+    // Calls run(std::integral_constant<int, head_dim>) if the kernel is
+    // compiled for it, as it is for the models', and says whether it is: the
+    // one list of them.
+    template <typename Run> bool with_prefill_head_dim(int head_dim, Run &&run)
     {
-      return head_dim == 64 || head_dim == 128;
+      switch (head_dim)
+      {
+      case 64:
+        run(std::integral_constant<int, 64>{});
+        return true;
+      case 128:
+        run(std::integral_constant<int, 128>{});
+        return true;
+      default:
+        return false;
+      }
     }
 
     // What P is multiplied by before it is rounded to fp16, and o divided by
@@ -66,13 +81,6 @@ namespace microinfer
       low = __float2half_rn(x - __half2float(high));
     }
 
-    // Half `e` of two in a register, widened.
-    __device__ __forceinline__ float element(uint32_t two, int e)
-    {
-      return __half2float(
-          __ushort_as_half(static_cast<unsigned short>(two >> (16 * e))));
-    }
-
     // Causal attention with online softmax, as attention_kernel has it, and
     // as its comment describes: the same tiles of kAttentionTileQ queries,
     // the same key tiles, masking, splits and partials, and the same output
@@ -102,7 +110,7 @@ namespace microinfer
       using namespace tensor_cores;
       constexpr int kRows = kAttentionTileQ;
       constexpr int kKeys = kAttentionTileK;
-      constexpr int kScoreColumns = kKeys / 8; // C's of a warp's scores
+      constexpr int kScoreParts = kKeys / 8; // C's, of 8 keys each
       constexpr int kHalf = D / 2;
       constexpr int kStride = prefill_stride(D);
       static_assert(kRows == 16, "a warp's C is 16 rows");
@@ -234,10 +242,10 @@ namespace microinfer
         }
         __syncthreads();
 
-        float s[kScoreColumns][4];
-        [[maybe_unused]] uint32_t s_low[kScoreColumns][2] = {};
+        float s[kScoreParts][4];
+        [[maybe_unused]] uint32_t s_low[kScoreParts][2] = {};
 #pragma unroll
-        for (int f = 0; f < kScoreColumns; ++f)
+        for (int f = 0; f < kScoreParts; ++f)
         {
 #pragma unroll
           for (int r = 0; r < 4; ++r)
@@ -251,7 +259,7 @@ namespace microinfer
           uint32_t a[4];
           load_a(a, q_at + kHalfBytes * d);
 #pragma unroll
-          for (int f = 0; f < kScoreColumns; ++f)
+          for (int f = 0; f < kScoreParts; ++f)
           {
             uint32_t b[2];
             if constexpr (kBias)
@@ -268,7 +276,7 @@ namespace microinfer
         // thread's columns, then over the four threads that share its rows.
         float m_tile[2] = {-INFINITY, -INFINITY};
 #pragma unroll
-        for (int f = 0; f < kScoreColumns; ++f)
+        for (int f = 0; f < kScoreParts; ++f)
         {
 #pragma unroll
           for (int r = 0; r < 4; ++r)
@@ -306,10 +314,10 @@ namespace microinfer
 
         // P, as the A's of its product with V: two C's of scores each.
         float sum[2] = {0.0f, 0.0f};
-        uint32_t p_high[kScoreColumns / 2][4];
-        uint32_t p_low[kScoreColumns / 2][4];
+        uint32_t p_high[kScoreParts / 2][4];
+        uint32_t p_low[kScoreParts / 2][4];
 #pragma unroll
-        for (int f = 0; f < kScoreColumns; ++f)
+        for (int f = 0; f < kScoreParts; ++f)
         {
 #pragma unroll
           for (int side = 0; side < 2; ++side)
@@ -340,7 +348,7 @@ namespace microinfer
           float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
           uint32_t acc_low[2] = {0u, 0u};
 #pragma unroll
-          for (int f = 0; f < kScoreColumns / 2; ++f)
+          for (int f = 0; f < kScoreParts / 2; ++f)
           {
             uint32_t b[2];
             load_b_columns(b, v_at + kHalfBytes * (16 * f * kStride + 8 * n));

@@ -95,10 +95,10 @@ namespace microinfer
     //
     // A decode block holds the group's every head, and loads and dequantises
     // each key tile once for all of them (#204). A launch of more queries, a
-    // prefill's, runs on the tensor cores at the models' head_dims
-    // (prefill_attention.cuh, #213). At another head_dim, or where it is
-    // asked for, this kernel computes it, a block of one head's queries,
-    // which loads its KV tile for itself. Neither changes a row's arithmetic.
+    // prefill's, has a block of one head's queries, which loads its KV tile
+    // for itself. Neither changes a row's arithmetic. At the models' head_dims
+    // such a launch is not this kernel's but prefill_attention_kernel's, on
+    // the tensor cores (#213), unless set_prefill_on_tensor_cores said not.
     //
     // Keys may be stored without their projection's bias (ADR-0009). Then
     // k_bias is non-null, and each key is completed as it is loaded:
@@ -605,6 +605,8 @@ namespace microinfer
       int lead;
       int splits;
       int split_keys;
+      // Whether prefill_attention_kernel computes it.
+      bool on_tensor_cores;
     };
 
     // A launch splits its keys until it has about this many blocks for each
@@ -632,27 +634,21 @@ namespace microinfer
       return blocks;
     }
 
-    // The rows of partials a caller's buffer holds, whatever the launch: for
-    // the splits a decode step takes and more, so that a prefill chunk of 512
-    // queries of a dozen heads may take three, without which its thirty-odd
-    // blocks leave most of the device idle at the end (#213). At head_dim
-    // 128, 10.7 MB on 20 multiprocessors.
-    long partial_rows()
+    // The rows of partials a caller's buffer holds, whatever the launch: a
+    // tile for each block a launch is split to, and, for launches of more
+    // than one query, eight, so that a prefill chunk of 512 queries of a
+    // dozen heads may take three splits, without which 8 of 20
+    // multiprocessors have nothing to do for the second half of it (#213). At
+    // head_dim 128 there, 10.7 MB, and a decode step's 1.3.
+    long partial_rows(bool one_query)
     {
       return static_cast<long>(split_blocks()) * kAttentionTileQ *
-             kPrefillHeadsPerBlock;
+             (one_query ? 1 : kPrefillHeadsPerBlock);
     }
 
-    // Whether prefill runs on the tensor cores, as it does unless asked
-    // otherwise (device::prefill_on_tensor_cores).
-    std::atomic<bool> tensor_cores_asked{true};
-
-    // Whether a launch runs on the tensor cores (prefill_attention_kernel):
-    // a prefill's, of more than one query, at a head_dim it is compiled for.
-    bool on_tensor_cores(int seq_q, int head_dim)
-    {
-      return seq_q > 1 && prefill_head_dim(head_dim) && tensor_cores_asked;
-    }
+    // Whether prefill may run on the tensor cores: it may, unless
+    // device::set_prefill_on_tensor_cores said not.
+    std::atomic<bool> tensor_cores_allowed{true};
 
     // The most consecutive heads of a group of `group` that divide it and
     // are at most `most`.
@@ -672,15 +668,17 @@ namespace microinfer
     // cores a block has the group's heads too, and two tiles of queries where
     // its warps and, aligned, a page hold them. Keys are split only where
     // partials are given to hold the splits, and only where the launch has
-    // too few blocks to fill the device, counting blocks of two tiles whether
-    // or not a page holds both, so that the layout decides nothing of it. A
+    // too few blocks to fill the device: on the tensor cores, counting blocks
+    // of two tiles from the first query, whether or not a page holds both and
+    // wherever its tiles begin, so that the layout decides nothing of it. A
     // run of keys is a whole number of key tiles, and at least a page, so
     // that a page spans at most two runs.
     LaunchShape shape_for(int seq_q, int seq_k, int heads, int kv_heads,
                           int head_dim, bool aligned, int page_tokens,
                           bool may_split)
     {
-      LaunchShape p{1, kAttentionTileQ, 0, 1, round_up(seq_k, kAttentionTileK)};
+      LaunchShape p{
+          1, kAttentionTileQ, 0, 1, round_up(seq_k, kAttentionTileK), false};
       int queries_counted = kAttentionTileQ;
       const int group = heads / kv_heads;
       if (seq_q == 1)
@@ -688,8 +686,10 @@ namespace microinfer
         p.queries_per_block = queries_counted = 1;
         p.heads_per_block = heads_of_group(group, kAttentionTileQ);
       }
-      else if (on_tensor_cores(seq_q, head_dim))
+      else if (tensor_cores_allowed &&
+               with_prefill_head_dim(head_dim, [](auto) {}))
       {
+        p.on_tensor_cores = true;
         p.heads_per_block = heads_of_group(group, kPrefillHeadsPerBlock);
         constexpr int kTwoTiles = 2 * kAttentionTileQ;
         if (seq_q > kAttentionTileQ &&
@@ -708,12 +708,13 @@ namespace microinfer
         return p;
       }
       const long blocks =
-          static_cast<long>(ceil_div(p.lead + seq_q, queries_counted)) *
+          static_cast<long>(ceil_div((p.on_tensor_cores ? 0 : p.lead) + seq_q,
+                                     queries_counted)) *
           (heads / p.heads_per_block);
       // No more splits than the partials hold rows of.
       const int splits = static_cast<int>(std::min<long>(
           {split_blocks() / blocks, seq_k / kMinSplitKeys,
-           partial_rows() / (static_cast<long>(seq_q) * heads)}));
+           partial_rows(seq_q == 1) / (static_cast<long>(seq_q) * heads)}));
       if (splits <= 1)
       {
         return p;
@@ -768,7 +769,6 @@ namespace microinfer
       const LaunchShape p =
           shape_for(seq_q, seq_k, heads, kv_heads, head_dim, aligned,
                     page_tokens, partials != nullptr);
-      const bool tensor = on_tensor_cores(seq_q, head_dim);
       // The masses take two floats per head and page of the block's keys
       // in shared memory besides: all of them with one split.
       const int mass_local_pages =
@@ -783,7 +783,7 @@ namespace microinfer
       // releases the GIL: two threads may both make the call, which is
       // harmless, but not race on the variable.
       const size_t smem =
-          tensor
+          p.on_tensor_cores
               ? prefill_shared_bytes(head_dim,
                                      p.heads_per_block * p.queries_per_block /
                                          kAttentionTileQ,
@@ -841,13 +841,9 @@ namespace microinfer
                       opted_in_without);
         }
       };
-      if (tensor && head_dim == 64)
+      if (p.on_tensor_cores)
       {
-        run_prefill_at(std::integral_constant<int, 64>{});
-      }
-      else if (tensor)
-      {
-        run_prefill_at(std::integral_constant<int, 128>{});
+        with_prefill_head_dim(head_dim, run_prefill_at);
       }
       else if (mass.mass != nullptr)
       {
@@ -870,14 +866,15 @@ namespace microinfer
 
   } // namespace
 
-  size_t device::attention_partials_floats(int head_dim)
+  size_t device::attention_partials_floats(int head_dim, bool one_query)
   {
-    return static_cast<size_t>(partial_rows()) * partial_slot_floats(head_dim);
+    return static_cast<size_t>(partial_rows(one_query)) *
+           partial_slot_floats(head_dim);
   }
 
-  bool device::prefill_on_tensor_cores(bool asked)
+  bool device::set_prefill_on_tensor_cores(bool allowed)
   {
-    return tensor_cores_asked.exchange(asked);
+    return tensor_cores_allowed.exchange(allowed);
   }
 
   std::pair<int, int> device::attention_split(int seq_q, int seq_k, int heads,
@@ -993,8 +990,9 @@ namespace microinfer
     upload_fp16(dev_v, v, kv_count, "cudaMemcpy v host-to-device");
     // This surface splits a long launch's keys as the engine does, into
     // partials of its own.
-    DeviceBuffer dev_partials(device::attention_partials_floats(head_dim) *
-                              sizeof(float));
+    DeviceBuffer dev_partials(
+        device::attention_partials_floats(head_dim, seq_q == 1) *
+        sizeof(float));
     std::optional<DeviceBuffer> dev_bias;
     std::optional<RopeTable> rope;
     if (k_bias != nullptr)

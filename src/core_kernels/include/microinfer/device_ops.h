@@ -70,24 +70,29 @@ namespace microinfer
     // splits its keys into (#204): each run of keys gives each row a partial
     // softmax, and a second kernel folds them. That changes the order in
     // which a long launch sums, so its output differs in its last bits from
-    // one not split; null splits nothing, and sums as the kernel always did.
-    // Whether a launch splits depends on its shape and the device, never on
-    // the layout its keys are read through.
+    // one not split; null splits nothing. Whether a launch splits depends on
+    // its shape, the device and the kernel that computes it, and on the
+    // tensor cores never on the layout its keys are read through.
+    //
+    // A launch of more than one query is computed on the tensor cores at the
+    // head_dims the models have (#213), and reads fp16 two at a time: q, k, v
+    // and k_bias begin on a multiple of 4 bytes.
     void attention(const __half *q, const __half *k, const __half *v,
                    const __half *k_bias, const RopeTable *rope, __half *out,
                    int seq_q, int seq_k, int heads, int kv_heads, int head_dim,
                    float *partials = nullptr);
 
-    // The floats a launch's partials need, whatever its shape: bounded by
-    // the blocks a launch is split to, a tile of rows each.
-    std::size_t attention_partials_floats(int head_dim);
+    // The floats a launch's partials need, whatever its shape, of one query
+    // or of any number: a launch takes no more splits than they hold.
+    std::size_t attention_partials_floats(int head_dim, bool one_query);
 
-    // Whether a launch of more than one query, a prefill's, runs on the
-    // tensor cores (#213), at the head_dims it can. It does unless this says
-    // not to; then it is computed as a launch of one query is, by the kernel
-    // that computed prefill before, which measurements compare it with. What
-    // was asked before is returned. Not for an engine in use.
-    bool prefill_on_tensor_cores(bool asked);
+    // Says whether launches of more than one query, a prefill's, may run on
+    // the tensor cores (#213), as they do until this says not, and returns
+    // what was said before. Not allowed, they are computed by the kernel that
+    // computed prefill before, which measurements compare it with. It holds
+    // for every launch after it, whoever makes it: not for use while another
+    // thread launches.
+    bool set_prefill_on_tensor_cores(bool allowed);
 
     // How a launch given partials splits its keys: into `first` key runs of
     // `second` keys each, the last shorter. One run is no split. With a

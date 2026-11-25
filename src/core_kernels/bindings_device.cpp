@@ -88,14 +88,15 @@ namespace
   size_t product(int a, int b, int c) { return product(a, b) * c; }
 
   // An attention launch's partials (#204), checked for room, or none.
-  float *partials_for(microinfer::DeviceFloats *partials, int head_dim)
+  float *partials_for(microinfer::DeviceFloats *partials, int head_dim,
+                      int seq_q)
   {
     if (partials == nullptr)
     {
       return nullptr;
     }
     const std::size_t floats =
-        microinfer::device::attention_partials_floats(head_dim);
+        microinfer::device::attention_partials_floats(head_dim, seq_q == 1);
     if (partials->count() < floats)
     {
       throw std::invalid_argument(
@@ -473,7 +474,7 @@ void bind_device(py::module_ &parent)
         microinfer::device::attention(
             q.ptr, k.ptr, v.ptr, k_bias ? k_bias->ptr : nullptr, rope, out.ptr,
             seq_q, seq_k, heads, kv_heads, head_dim,
-            partials_for(partials, head_dim));
+            partials_for(partials, head_dim, seq_q));
       },
       py::call_guard<py::gil_scoped_release>(), py::arg("q"), py::arg("k"),
       py::arg("v"), py::arg("k_bias"), py::arg("rope"), py::arg("out"),
@@ -486,13 +487,13 @@ void bind_device(py::module_ &parent)
       "its keys (#204); without it none does.");
 
   m.def("attention_partials", &microinfer::device::attention_partials_floats,
-        py::arg("head_dim"),
-        "The floats an attention launch's partials take, whatever its shape "
-        "(#204).");
-  m.def("prefill_on_tensor_cores", &microinfer::device::prefill_on_tensor_cores,
-        py::arg("asked"),
-        "Whether a launch of more than one query runs on the tensor cores "
-        "(#213), as it does unless told not to; returns what was asked "
+        py::arg("head_dim"), py::arg("one_query") = false,
+        "The floats an attention launch's partials take, whatever its shape, "
+        "or with one_query a decode step's (#204).");
+  m.def("set_prefill_on_tensor_cores",
+        &microinfer::device::set_prefill_on_tensor_cores, py::arg("allowed"),
+        "Says whether launches of more than one query may run on the tensor "
+        "cores (#213), as they do until told not; returns what was said "
         "before. For measurements that compare the two kernels.");
   m.def("attention_split", &microinfer::device::attention_split,
         py::arg("seq_q"), py::arg("seq_k"), py::arg("heads"),
@@ -791,7 +792,7 @@ void bind_device(py::module_ &parent)
                         keys ? keys->ptr : nullptr,
                         values ? values->ptr : nullptr,
                         mass != nullptr ? mass->data() : nullptr,
-                        partials_for(partials, head_dim));
+                        partials_for(partials, head_dim, seq_q));
           },
           py::call_guard<py::gil_scoped_release>(), py::arg("layer"),
           py::arg("q"), py::arg("k_bias"), py::arg("rope"), py::arg("out"),

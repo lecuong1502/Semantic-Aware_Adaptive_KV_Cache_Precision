@@ -110,12 +110,5 @@ namespace microinfer
                    : "r"(address));
     }
 
-    // Two fp16 values in one register, `low` in its low half.
-    __device__ __forceinline__ uint32_t pack(__half low, __half high)
-    {
-      return (static_cast<uint32_t>(__half_as_ushort(high)) << 16) |
-             __half_as_ushort(low);
-    }
-
   } // namespace tensor_cores
 } // namespace microinfer

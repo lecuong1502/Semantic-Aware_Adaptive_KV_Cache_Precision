@@ -66,29 +66,24 @@ def test_a_chunk_over_a_long_cache_matches_the_float64_reference():
 
 
 def test_many_small_weights_beside_a_large_one_are_kept():
-    """One key far above the rest, and thousands whose weights are under fp16's
-    smallest number beside it but add up to as much: in one fp16 they would be
-    flushed or coarse, and the output would be that one key's value."""
-    def kept(cfg):
+    """One key far above the rest, and thousands that weigh little each and
+    much together: at score 8 above them, 3e-4 of it each and 1.4 of it in
+    all; at 12, 6e-6 each, among fp16's subnormals, and 2.5% in all. One fp16
+    would hold the second to a percent, all of them alike."""
+    def kept(cfg, score):
         heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
         seq_k, seq_q = 4096, 20
         q, k, v = make_qkv(seq_q, seq_k, heads, hd, seed=3, kv_heads=kv_heads)
         k *= 0.01
         q *= 0.01
         q[..., 0] = 8.0
-        # Score 8 = ln(4096) - 0.3 for key 0, near 0 for every other, whose
-        # weights are then 2^-11.6 each and 0.7 in all ...
         k[:, :, 0] = 0.0
-        k[0, :, 0] = np.float16(np.sqrt(hd))
+        k[0, :, 0] = np.float16(score / 8 * np.sqrt(hd))
         v[0] = 1.0
-        ref = launch(cfg, q, k, v)
-        check(q, k, v, got=ref)
-        assert abs(ref.mean()) < 0.7, "the rest should weigh as much as key 0"
-        # ... and 17, 6e-8 of the largest each, fp16's smallest number.
-        k[0, :, 0] = np.float16(17 / 8 * np.sqrt(hd))
         check(q, k, v, got=launch(cfg, q, k, v))
 
-    each(CFGS, kept, name=lambda c: f"hd={c.head_dim}")
+    each([(c, s) for c in CFGS for s in (8, 12)], kept,
+         name=lambda c: f"hd={c[0].head_dim} score {c[1]}")
 
 
 def test_large_values_do_not_overflow_the_fp16_sums():
@@ -139,19 +134,37 @@ def test_a_head_dim_it_is_not_compiled_for_is_still_attended():
 
 
 def test_the_kernel_before_can_be_asked_for_and_a_decode_step_is_always_its():
-    """prefill_on_tensor_cores says which kernel computes a chunk, and returns
-    what was asked before. Both are within the gate. A launch of one query
-    gives the same bits whichever is asked for."""
+    """set_prefill_on_tensor_cores says which kernel computes a chunk, and
+    returns what was said before. Both are within the gate. A decode step
+    gives the same output and the same per-page masses, to the bit, whichever
+    it says: over one cache, an importance score's tolerance is zero."""
     cfg = CFGS[0]
     q, k, v = make_qkv(40, 300, cfg.num_attention_heads, cfg.head_dim, seed=9,
                        kv_heads=cfg.num_key_value_heads)
-    on, one = launch(cfg, q, k, v), launch(cfg, q[-1:], k, v)
-    assert device.prefill_on_tensor_cores(False) is True
+    def decode_step():
+        """One query over a cache of every tier, with its masses."""
+        seq = 300
+        rng = np.random.default_rng(2)
+        _, cache = pages_for(cfg, 32, Tier.FP16,
+                             tier_map=[[MAP[i % 4] for i in range(seq // 32 + 1)]] * 2)
+        keys = normal(rng, seq, cfg.num_key_value_heads, cfg.head_dim)
+        store_in_runs(cache, 0, keys, keys, [seq - 1, 1])
+        rope = device.RopeTable(cfg.head_dim, cfg.rope_theta)
+        rope.cover(seq)
+        out = device.empty(cfg.num_attention_heads * cfg.head_dim)
+        mass = device.empty_f32(cfg.num_attention_heads * (seq // 32 + 1))
+        cache.attention(0, put(q[-1:]), None, rope, out, 1, seq, cfg.num_attention_heads,
+                        cfg.num_key_value_heads, cfg.head_dim, put(keys[-1:]), put(keys[-1:]),
+                        mass)
+        return out.to_numpy(), mass.to_numpy()
+
+    on, step = launch(cfg, q, k, v), decode_step()
+    assert device.set_prefill_on_tensor_cores(False) is True
     try:
-        off, one_off = launch(cfg, q, k, v), launch(cfg, q[-1:], k, v)
+        off, step_off = launch(cfg, q, k, v), decode_step()
     finally:
-        assert device.prefill_on_tensor_cores(True) is False
-    assert not np.array_equal(on, off), "two kernels round in different places"
+        assert device.set_prefill_on_tensor_cores(True) is False
     check(q, k, v, got=off)
-    np.testing.assert_array_equal(one, one_off)
+    for a, b in zip(step, step_off):
+        np.testing.assert_array_equal(a, b)
     np.testing.assert_array_equal(launch(cfg, q, k, v), on)

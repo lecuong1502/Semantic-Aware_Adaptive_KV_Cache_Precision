@@ -11,6 +11,7 @@
 #include <cstdint>
 
 #include "microinfer/device_ops.h"
+#include "microinfer/packed_halves.cuh"
 #include "microinfer/quant.h"
 
 namespace microinfer
@@ -43,11 +44,6 @@ namespace microinfer
       uint32_t value[2];
     };
 
-    __device__ __forceinline__ uint32_t two_halves(const __half *at)
-    {
-      return *reinterpret_cast<const uint32_t *>(at);
-    }
-
     // The quad of channels `at`, `at` + 1 and those `half` after them of rows
     // held at fp16.
     __device__ __forceinline__ Quad quad_of_rows(const __half *key_row,
@@ -59,9 +55,9 @@ namespace microinfer
     }
 
     // Element `at` of key j's row, widened to fp32, and of its value's row.
-    // Three layouts, one kernel: the arithmetic is shared, so only addressing
-    // and dequantisation differ between them. The paged path gives
-    // bit-identical output to the contiguous one (#14), and the quantised
+    // Three layouts, read by each attention kernel: the arithmetic is shared,
+    // so only addressing and dequantisation differ between them. The paged path
+    // gives bit-identical output to the contiguous one (#14), and the quantised
     // one gives what either gives over the pages dequantise_page would
     // return (#18).
     //
@@ -80,7 +76,7 @@ namespace microinfer
       {
         return v[j * row + at];
       }
-      // Key j's quad in KV head `kv_head` from channel `d` of it, both even.
+      // Key j's quad in KV head `kv_head` from channel `d` of it, an even one.
       __device__ Quad quad(int j, int kv_head, int d, int head_dim) const
       {
         return quad_of_rows(k + j * row, v + j * row,
@@ -192,8 +188,7 @@ namespace microinfer
             fmaf(static_cast<float>(pair & kMask), scale0, zero0));
         const __half high = __float2half_rn(
             fmaf(static_cast<float>((pair >> Bits) & kMask), scale1, zero1));
-        return (static_cast<uint32_t>(__half_as_ushort(high)) << 16) |
-               __half_as_ushort(low);
+        return pack(low, high);
       }
       __device__ Quad quad(const std::uint8_t *page, int t, int kv_head, int d,
                            int head_dim) const
@@ -261,11 +256,11 @@ namespace microinfer
     // addresses, and a page is read in that tier's format. A tier no page
     // of the cache can be at has no layout, and is never named.
     //
-    // The branch costs no divergence within a warp. A key tile is loaded
-    // one key row at a time, head_dim consecutive elements per row, and
-    // head_dim is a multiple of the warp's 32 lanes in every model here, so
-    // a warp's lanes all load one row, of one page, at one tier. Different
-    // warps may take different branches, which costs nothing.
+    // The branch costs no divergence within a warp, where a key tile lies in
+    // one page. A tile is loaded row by row, and a warp's lanes load
+    // consecutive elements of one row, or, by quads at head_dim 64, of two
+    // adjacent ones: of one page, at one tier. Different warps may take
+    // different branches, which costs nothing.
     struct TierFormats
     {
       const std::uint8_t *tiers;

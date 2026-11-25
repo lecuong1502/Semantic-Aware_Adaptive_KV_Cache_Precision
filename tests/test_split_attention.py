@@ -12,9 +12,9 @@ partials, which the engine's workspace holds; without them it is the
 unsplit kernel, which every other attention test holds to its references.
 
 What holds to the bit is what does not depend on the order of the sums:
-- the plan depends on the launch's shape alone, so a split launch through
-  pages, at any tier, gives the bits it gives over contiguous keys holding
-  what the pages hold;
+- the plan depends on the launch's shape, and the kernel that computes it,
+  alone, so a split launch through pages, at any tier, gives the bits it gives
+  over contiguous keys holding what the pages hold;
 - asking for the masses changes no bit of the output;
 - an evicted page is a masked one, to the bit, even where a whole run of
   keys is unread.
@@ -28,12 +28,12 @@ within twice that.
 
 import numpy as np
 from conftest import each
-from test_attention import check, make_qkv, reference_attention
+from test_attention import check, make_qkv, reference_attention, rotated_bias
 from test_attention_mass import MASS_TOLERANCE, SUM_TOLERANCE
 from test_kv_pages import CFG, LAYERS, MODELS, normal, put
 from test_kv_pages import pages_for as fp16_pages_for
 from test_quantised_pages import pages_for, sealed, store_in_runs
-from ulp_gate import assert_within_gate, floor_from_bound
+from ulp_gate import assert_within_gate, floor_from_bound, fp16_exact
 
 from microinfer import _microinfer
 from microinfer._microinfer import Tier
@@ -171,22 +171,26 @@ def test_a_split_decode_reads_each_page_at_its_own_tier_to_the_bit():
          matches, name=lambda c: f"hd={c[0].head_dim} {c[1].name}{' mapped' if c[2] else ''}")
 
 
-def test_a_split_prefill_tile_over_sealed_pages_matches_the_float64_reference():
-    """The queries of one prefill tile over a long cache born from a map of
-    every tier, starting where no tile does, so that the launch has two:
-    each query's output is within the gate of float64
-    attention over what it reads, the pages before its own as sealed and
-    its own as it came."""
-    def matches(cfg):
+def test_split_prefill_over_sealed_pages_matches_the_float64_reference():
+    """The queries of one prefill tile, and of two and more, as the engine
+    prefills them: over a long cache born from a map of every tier, starting
+    where no tile does, with the key bias and without. Each query's output is
+    within the gate of float64 attention over what it reads, the pages before
+    its own as sealed and its own as it came."""
+    def matches(cfg, n, biased):
         heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
-        seq, n = 3000 + 5, TILE_Q
+        seq = 1200 + 5
+        assert splits(n, seq, cfg, 32)[0] > 1
         allocator, cache, k, v = causal_cache(cfg, 32, Tier.FP16, True, seq, n, 12)
-        q = normal(np.random.default_rng(4), n, heads, hd)
+        rng = np.random.default_rng(4)
+        q = normal(rng, n, heads, hd)
+        bias = fp16_exact(normal(rng, kv_heads, hd) * 30) if biased else None
+        rotated = rotated_bias(bias, seq, cfg.rope_theta) if biased else 0.0
         rope = device.RopeTable(hd, cfg.rope_theta)
         rope.cover(seq)
         out = device.empty(q.size)
-        cache.attention(0, put(q), None, rope, out, n, seq, heads, kv_heads, hd,
-                        put(k[-n:]), put(v[-n:]), partials=partials(cfg))
+        cache.attention(0, put(q), put(bias) if biased else None, rope, out, n, seq, heads,
+                        kv_heads, hd, put(k[-n:]), put(v[-n:]), partials=partials(cfg))
         got = out.to_numpy().reshape(n, heads, hd)
         sealed_k, sealed_v = sealed(allocator, cfg, 0, seq // 32, 32)
         refs, bounds = [], []
@@ -194,12 +198,15 @@ def test_a_split_prefill_tile_over_sealed_pages_matches_the_float64_reference():
             own = pos // 32 * 32
             kk = np.concatenate([sealed_k[:own], k[own:pos + 1]])
             vv = np.concatenate([sealed_v[:own], v[own:pos + 1]])
+            if biased:
+                kk = kk.astype(np.float64) + rotated[:pos + 1]
             ref, bound = reference_attention(q[i:i + 1], kk, vv, positions=np.array([pos]))
             refs.append(ref)
             bounds.append(bound)
         assert_within_gate(got, np.concatenate(refs), floor_from_bound(np.concatenate(bounds)))
 
-    each(CFGS, matches, name=lambda c: f"hd={c.head_dim}")
+    each([(c, n, b) for c in CFGS for n, b in ((TILE_Q, False), (2 * TILE_Q + 7, True))], matches,
+         name=lambda c: f"hd={c[0].head_dim} {c[1]} queries bias={c[2]}")
 
 
 def mass_seq(page_tokens):

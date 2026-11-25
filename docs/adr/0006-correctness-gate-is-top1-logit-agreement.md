@@ -515,36 +515,41 @@ bias, 1.03 otherwise, and a mean of 0.36 at most.
   `test_quantised_pages.py` therefore compares a chunk's query with the same
   query run with one other.
 - The per-page attention mass is a decode step's, of one query, so its kernel
-  is the one before: over the same cache it is the same to the bit (the build
-  before and this one gave the same bytes, output and masses, in an unlogged
-  check at both Qwen2.5 models' shapes). Over the caches two prefills leave,
-  the scores differ as the caches do; `prefill-agreement` logs by how much,
-  beside its control.
+  is the one before. **Its tolerance over the same cache is therefore zero**:
+  the masses are the same bits, which `test_prefill_attention.py` holds between
+  the two kernels asked for, and `prefill-agreement`, still to be logged, holds
+  of the scores over a whole model. Against float64 they keep the tolerance
+  they had, 32 fp32 ulps (`test_attention_mass.py`). The build before #213 and
+  this one gave the same bytes, masses among them, in an unlogged check at both
+  Qwen2.5 models' shapes. Over the caches two prefills leave, the scores differ
+  as the caches do, which the same entry will give beside its control.
 
 **The gate between the two kernels** is `tools/prefill_agreement.py`'s, which
-one build can take: `device.prefill_on_tensor_cores(False)` asks for the
+one build can take: `device.set_prefill_on_tensor_cores(False)` asks for the
 kernel before. Over the same cache, and before a page of the queries seals,
 what differs is the kernel alone, and that is held to top-1 99% and KL 1e-3 at
-every tier and over a mixed map. Over a whole prefill a tier carries any
-last-bit difference as far as it carries cuBLAS's, as #204's note found of
-INT4 and INT2, so the whole prefill is reported beside its control, the kernel
-before against itself in chunks of 256.
+every tier and over a mixed map, at 32 queries a launch; a chunk of 512 is held
+to it at FP16, where no seal magnifies it. Its runs are still to be logged. Over
+a whole prefill a tier carries any last-bit difference as far as it carries
+cuBLAS's, as #204's note found of INT4 and INT2, so the whole prefill is
+reported beside its control, the kernel before against itself in chunks of 256.
 
 **How a launch is laid out.** A warp is one head's tile of 16 queries. A block
 has every head of a KV head's group, and two tiles of queries where its
 registers and, over a cache that seals, a page hold both. The key and value
-tile is loaded, completed and dequantised once for all of them. What limited
-the kernel before was not arithmetic but loading: each block of 16 queries of
-one head loaded its tile for itself, six times a group at Qwen2.5-1.5B's
-shape. A row in shared memory is eight elements longer than it holds: without
-them the eight rows an `ldmatrix` reads from lie in one run of banks, and the
-same launch took 21 ms against 12.
+tile is loaded, completed and dequantised once for all of them. The kernel
+before loaded it for each block of 16 queries of one head, twelve times as often
+at Qwen2.5-1.5B's shape. A row in shared memory is eight elements longer than it holds: without
+them the eight rows an `ldmatrix` reads from lie in one run of banks. An
+unlogged launch of 512 queries over 32,704 keys on the RTX 4050, at FP16, took
+21 ms without them and 12 with, while the kernel was being written.
 
-**A split launch's partials are larger.** A chunk of 512 queries is 32 blocks,
-which leave most of 20 multiprocessors idle at the end; it now splits its keys
-in three at Qwen2.5-1.5B's shape. The workspace's partials grew from 1.3 to
-10.7 MB at head_dim 128, all of it headroom no longer free. #204's statement
-that a chunk of 512 never splits no longer holds.
+**A split launch's partials are larger.** A chunk of 512 queries is 32 blocks
+of equal length over 20 multiprocessors, of which 8 have nothing to do for the
+second half; it now splits its keys in three at Qwen2.5-1.5B's shape. A prefill
+workspace's partials grew from 1.3 to 10.7 MB at head_dim 128, headroom no
+longer free while prefill runs. A decode step's workspace holds what it did.
+#204's statement that a chunk of 512 never splits no longer holds.
 
 **Speed.** Chunks of 512 positions at 8K, 16K and 32K, before and after, are
 `prefill-chunk-cost` entries (`tools/prefill_chunk_cost.py`), still to be

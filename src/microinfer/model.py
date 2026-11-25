@@ -340,9 +340,10 @@ class Workspace:
         self.gate = device.empty(rows * intermediate)
         self.up = device.empty(rows * intermediate)
         self.activated = device.empty(rows * intermediate)
-        # Where attention splits a long launch's keys (#204): the same size
-        # for any step, bounded by the blocks a launch is split to.
-        self.partials = device.empty_f32(device.attention_partials(cfg.head_dim))
+        # Where attention splits a long launch's keys (#204): one size for a
+        # step of one row, a decode step's, and one for any other (#213).
+        self.partials = device.empty_f32(
+            device.attention_partials(cfg.head_dim, one_query=rows == 1))
         self.scratch = device.empty(
             device.scratch_elements(min(rows, LOGIT_CHUNK_ROWS), cfg.vocab_size))
 

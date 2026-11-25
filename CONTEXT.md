@@ -82,7 +82,8 @@ thread block a run, in the manner of flash-decoding (#204): each block
 leaves a partial maximum, sum and output, its **partials**, in the engine's
 workspace, and a second kernel folds them. A launch splits only when given
 partials and when it has too few blocks to fill the device: a decode step
-past 511 positions, or a short prefill chunk at a long context. A key run
+past 511 positions, or a prefill chunk, the engine's 512 among them, over a
+cache of 512 positions or more (#213). A key run
 is a span of positions of one launch, not a page and not a store's batch.
 _Avoid_: chunk (that is a prefill step's positions), block (CUDA's, not
 the cache's), run alone (RQ3's and the matrix's runs are measurements)
