@@ -82,13 +82,21 @@ namespace microinfer
     // the blocks a launch is split to, a tile of rows each.
     std::size_t attention_partials_floats(int head_dim);
 
+    // Whether a launch of more than one query, a prefill's, runs on the
+    // tensor cores (#213), at the head_dims it can. It does unless this says
+    // not to; then it is computed as a launch of one query is, by the kernel
+    // that computed prefill before, which measurements compare it with. What
+    // was asked before is returned. Not for an engine in use.
+    bool prefill_on_tensor_cores(bool asked);
+
     // How a launch given partials splits its keys: into `first` key runs of
     // `second` keys each, the last shorter. One run is no split. With a
     // positive page_tokens, as a causal paged launch over pages of that size
     // aligns its tiles; with none, as a contiguous one. For tests, so that a
     // case can be placed where splitting happens.
     std::pair<int, int> attention_split(int seq_q, int seq_k, int heads,
-                                        int kv_heads, int page_tokens);
+                                        int kv_heads, int head_dim,
+                                        int page_tokens);
 
     // The entry of a page in a causal table of tiers that no query reads
     // (#160): an evicted page, or one masked for the reference evicting is

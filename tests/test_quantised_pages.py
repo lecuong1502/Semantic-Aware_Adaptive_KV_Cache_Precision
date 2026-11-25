@@ -14,8 +14,9 @@ The proof is equality, not tolerance, in two steps:
 - each query's output is, to the bit, attention over contiguous keys and
   values holding the pages before its own as dequantise_page returns them,
   and its own page's positions as they came. Attention's output for one
-  query depends on no other query, so a query run alone is the reference
-  for the same query run among many.
+  query depends on no other query, so a query run with one other is the
+  reference for the same query run among many. Run alone it is a decode
+  step, which another kernel computes (#213), and is the reference for one.
 
 So everything quantisation loses was measured already, by test_quant.py and
 tools/quant_roundtrip.py, and nothing here may lose more, or less. P runs at
@@ -84,9 +85,11 @@ def store_in_runs(cache, layer, k, v, runs):
 
 
 def causal_reference(cfg, allocator, layer, q, k, v, bias, start, page_tokens):
-    """Each query alone, over what it may read: the pages before its own as
-    sealed, each at its own tier, and its own page's positions as they
-    came."""
+    """Each query by itself, over what it may read: the pages before its own
+    as sealed, each at its own tier, and its own page's positions as they
+    came. By itself is alone if it is a decode step's one query, and with
+    a second, at the position before, if it is a prefill's, so that the
+    kernel is the one that computes it among many."""
     heads, kv_heads, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
     seq_k = len(k)
     rope = device.RopeTable(hd, cfg.rope_theta)
@@ -98,10 +101,12 @@ def causal_reference(cfg, allocator, layer, q, k, v, bias, start, page_tokens):
         own = pos // page_tokens * page_tokens
         kk = np.concatenate([sealed_k[:own], k[own:pos + 1]])
         vv = np.concatenate([sealed_v[:own], v[own:pos + 1]])
-        out = device.empty(heads * hd)
-        device.attention(put(q[i:i + 1]), put(kk), put(vv), b, rope, out, 1, pos + 1,
-                         heads, kv_heads, hd)
-        rows.append(out.to_numpy())
+        # Position 0 has none before it, and its output is its own value.
+        n = 2 if len(q) > 1 and pos > 0 else 1
+        out = device.empty(n * heads * hd)
+        device.attention(put(np.repeat(q[i:i + 1], n, axis=0)), put(kk), put(vv), b, rope, out,
+                         n, pos + 1, heads, kv_heads, hd)
+        rows.append(out.to_numpy()[-heads * hd:])
     return np.concatenate(rows)
 
 

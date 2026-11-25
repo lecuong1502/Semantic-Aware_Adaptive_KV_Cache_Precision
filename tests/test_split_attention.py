@@ -52,7 +52,7 @@ MAP = [Tier.INT8, Tier.FP16, Tier.INT2, Tier.INT4]
 
 def splits(seq_q, seq_k, cfg, page_tokens=0):
     return device.attention_split(seq_q, seq_k, cfg.num_attention_heads,
-                                  cfg.num_key_value_heads, page_tokens)
+                                  cfg.num_key_value_heads, cfg.head_dim, page_tokens)
 
 
 def partials(cfg):

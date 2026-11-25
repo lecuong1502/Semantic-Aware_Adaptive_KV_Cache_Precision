@@ -480,3 +480,76 @@ bit on this one:
 use a split launch and repeat as they did. The `gate` does where a prompt's
 last chunk splits, and was logged again here. #216 re-runs RQ3 and the
 survival matrix on this engine.
+
+---
+
+## Note from #213: prefill on the tensor cores, gated as a new kernel
+
+A launch of more than one query, a prefill's, runs on the tensor cores at
+the models' head_dims, 64 and 128: `mma.sync` with fp16 operands accumulated
+in fp32 (`prefill_attention.cuh`). A decode step, and another head_dim, run
+on the kernel that computed prefill before, which is unchanged.
+
+**The gate is unchanged, and the weights are not in fp16.** The amendment of
+#8 found that holding the softmax weights in fp16 for P @ V reads 83 ulp, and
+left that trade to this ADR. It is not taken. A softmax weight is an fp32
+number, and so is a key completed by its bias (ADR-0009). Each is multiplied
+as two fp16 ones, its nearest and what that leaves, which together hold 22
+bits. The remainder's product is summed in fp16, at half the cost of an fp32
+sum on a consumer GPU; it is 2^-11 of the whole, so what fp16 rounds of it is
+2^-22. A query, a value and a key with no bias are fp16 already.
+`test_prefill_attention.py` and every prefill case of `test_attention.py` and
+`test_split_attention.py` hold it to float64 within 4 ulp max and 1 ulp mean,
+with the floor of the amendment of #8. With either remainder left out they
+fail. Measured once, unlogged, over the three models' shapes: at most 1.94 ulp
+where the running maximum rises through the keys, at most 1.56 with the key
+bias, 1.03 otherwise, and a mean of 0.36 at most.
+
+**What holds to the bit, and what no longer does.**
+
+- A query's output in an unsplit launch depends on no other query, nor on the
+  layout its keys are read through: through pages, at every tier, it is what
+  it is over contiguous keys.
+- A query in a chunk and the same query as a decode step agree within the
+  gate, not to the bit: two kernels compute them. `causal_reference` in
+  `test_quantised_pages.py` therefore compares a chunk's query with the same
+  query run with one other.
+- The per-page attention mass is a decode step's, of one query, so its kernel
+  is the one before: over the same cache it is the same to the bit (the build
+  before and this one gave the same bytes, output and masses, in an unlogged
+  check at both Qwen2.5 models' shapes). Over the caches two prefills leave,
+  the scores differ as the caches do; `prefill-agreement` logs by how much,
+  beside its control.
+
+**The gate between the two kernels** is `tools/prefill_agreement.py`'s, which
+one build can take: `device.prefill_on_tensor_cores(False)` asks for the
+kernel before. Over the same cache, and before a page of the queries seals,
+what differs is the kernel alone, and that is held to top-1 99% and KL 1e-3 at
+every tier and over a mixed map. Over a whole prefill a tier carries any
+last-bit difference as far as it carries cuBLAS's, as #204's note found of
+INT4 and INT2, so the whole prefill is reported beside its control, the kernel
+before against itself in chunks of 256.
+
+**How a launch is laid out.** A warp is one head's tile of 16 queries. A block
+has every head of a KV head's group, and two tiles of queries where its
+registers and, over a cache that seals, a page hold both. The key and value
+tile is loaded, completed and dequantised once for all of them. What limited
+the kernel before was not arithmetic but loading: each block of 16 queries of
+one head loaded its tile for itself, six times a group at Qwen2.5-1.5B's
+shape. A row in shared memory is eight elements longer than it holds: without
+them the eight rows an `ldmatrix` reads from lie in one run of banks, and the
+same launch took 21 ms against 12.
+
+**A split launch's partials are larger.** A chunk of 512 queries is 32 blocks,
+which leave most of 20 multiprocessors idle at the end; it now splits its keys
+in three at Qwen2.5-1.5B's shape. The workspace's partials grew from 1.3 to
+10.7 MB at head_dim 128, all of it headroom no longer free. #204's statement
+that a chunk of 512 never splits no longer holds.
+
+**Speed.** Chunks of 512 positions at 8K, 16K and 32K, before and after, are
+`prefill-chunk-cost` entries (`tools/prefill_chunk_cost.py`), still to be
+logged.
+
+**What can no longer be repeated to the bit:** every logged result that
+prefills, which is every one that runs a model. #216 re-runs RQ3 and the
+survival matrix on this engine.

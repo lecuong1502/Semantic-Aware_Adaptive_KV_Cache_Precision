@@ -8,13 +8,17 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <algorithm>
 
+#include "microinfer/attention_partials.cuh"
 #include "microinfer/check.h"
 #include "microinfer/device_buffer.h"
 #include "microinfer/device_ops.h"
 #include "microinfer/kernels.h"
+#include "microinfer/kv_layouts.cuh"
+#include "microinfer/prefill_attention.cuh"
 #include "microinfer/quant.h"
 #include "microinfer/rope_table.h"
 #include "microinfer/staging.h"
@@ -89,10 +93,12 @@ namespace microinfer
     // interleaved — and the KV heads are never copied out to one per query
     // head. group == 1 is ordinary multi-head attention.
     //
-    // A prefill block, of one head's queries, loads its KV tile for itself,
-    // so a group's blocks load the same tile `group` times. A decode block
-    // holds the group's every head, and loads and dequantises each tile once
-    // for all of them (#204). Neither changes a row's arithmetic.
+    // A decode block holds the group's every head, and loads and dequantises
+    // each key tile once for all of them (#204). A launch of more queries, a
+    // prefill's, runs on the tensor cores at the models' head_dims
+    // (prefill_attention.cuh, #213). At another head_dim, or where it is
+    // asked for, this kernel computes it, a block of one head's queries,
+    // which loads its KV tile for itself. Neither changes a row's arithmetic.
     //
     // Keys may be stored without their projection's bias (ADR-0009). Then
     // k_bias is non-null, and each key is completed as it is loaded:
@@ -101,267 +107,6 @@ namespace microinfer
     // precision of a key. A tile's keys are held as fp32 in shared memory for
     // that reason. Without k_bias, widening fp16 to fp32 is exact, and the
     // arithmetic is what it always was.
-    __device__ float rotated_bias(const __half *__restrict__ bias, int position,
-                                  int d, int head_dim,
-                                  const float *__restrict__ rope)
-    {
-      // Rotate-half pairing: dimension j with j + half. cos and sin come from
-      // the table (rope_table.h), formed once per position in fp64.
-      const int half = head_dim / 2;
-      const int j = d < half ? d : d - half;
-      const float *cs = rope + 2 * (static_cast<size_t>(position) * half + j);
-      const float b1 = __half2float(bias[j]);
-      const float b2 = __half2float(bias[j + half]);
-      return d < half ? b1 * cs[0] - b2 * cs[1] : b2 * cs[0] + b1 * cs[1];
-    }
-
-    // Element `at` of key j's row, widened to fp32, and of its value's row.
-    // Three layouts, one kernel: the arithmetic is shared, so only addressing
-    // and dequantisation differ between them. The paged path gives
-    // bit-identical output to the contiguous one (#14), and the quantised
-    // one gives what either gives over the pages dequantise_page would
-    // return (#18).
-    //
-    // Contiguous: rows (tokens, kv_heads, head_dim), one after another.
-    struct ContiguousKV
-    {
-      const __half *k;
-      const __half *v;
-      size_t row;
-
-      __device__ float key(int j, size_t at) const
-      {
-        return __half2float(k[j * row + at]);
-      }
-      __device__ __half value(int j, size_t at) const
-      {
-        return v[j * row + at];
-      }
-      // What a query tile starting at `position` reads: the same for every
-      // tile here. Only the causal layout below depends on it.
-      __device__ ContiguousKV view_for(int) const { return *this; }
-      // Every key is read here; only a causal cache's pages may be unread.
-      __device__ bool reads(int) const { return true; }
-    };
-
-    // Paged (ADR-0004, ADR-0007): key j is in page j / page_tokens at row
-    // j % page_tokens. A page holds page_tokens rows of keys, then as many of
-    // values. `pages` is the page table for this layer, resolved on the host
-    // for this launch alone, so no launch reads an address an allocator
-    // operation may since have moved.
-    struct PagedKV
-    {
-      const unsigned long long *pages;
-      int page_tokens;
-      size_t row;
-
-      __device__ const __half *key_row(int j) const
-      {
-        return reinterpret_cast<const __half *>(pages[j / page_tokens]) +
-               (j % page_tokens) * row;
-      }
-      __device__ float key(int j, size_t at) const
-      {
-        return __half2float(key_row(j)[at]);
-      }
-      __device__ __half value(int j, size_t at) const
-      {
-        return key_row(j)[static_cast<size_t>(page_tokens) * row + at];
-      }
-      __device__ PagedKV view_for(int) const { return *this; }
-      __device__ bool reads(int) const { return true; }
-    };
-
-    // How a sealed page's rows are read: a quantised page in quant.h's
-    // layout, each code dequantised exactly as dequantise_page does it, one
-    // fp32 fused multiply-add rounded once to fp16 ...
-    template <int Bits> struct QuantisedFormat
-    {
-      static constexpr int kPerByte = 8 / Bits;
-      static constexpr unsigned kMask = (1u << Bits) - 1;
-
-      QuantisedPageLayout layout;
-      size_t row;
-      int kv_heads;
-      // ceil(2^32 / head_dim): a value's KV head, at / head_dim, as one
-      // multiply rather than a division by a number known only at run
-      // time, which cost INT4 decode a fifth of its time at 32K (#204).
-      // Exact while at * head_dim < 2^32 (attention_paged_causal).
-      unsigned long long head_dim_reciprocal;
-
-      __device__ __half decode(const std::uint8_t *page, size_t codes, size_t e,
-                               const __half *scales, const __half *zeros,
-                               size_t group) const
-      {
-        const unsigned byte = page[codes + e / kPerByte];
-        const float q =
-            static_cast<float>((byte >> ((e % kPerByte) * Bits)) & kMask);
-        return __float2half_rn(
-            fmaf(q, __half2float(scales[group]), __half2float(zeros[group])));
-      }
-      __device__ float key(const std::uint8_t *page, int t, size_t at) const
-      {
-        return __half2float(decode(
-            page, layout.key_codes, t * row + at,
-            reinterpret_cast<const __half *>(page + layout.key_scales),
-            reinterpret_cast<const __half *>(page + layout.key_zeros), at));
-      }
-      __device__ __half value(const std::uint8_t *page, int t, size_t at) const
-      {
-        return decode(
-            page, layout.value_codes, t * row + at,
-            reinterpret_cast<const __half *>(page + layout.value_scales),
-            reinterpret_cast<const __half *>(page + layout.value_zeros),
-            static_cast<size_t>(t) * kv_heads +
-                ((static_cast<unsigned long long>(at) * head_dim_reciprocal) >>
-                 32));
-      }
-    };
-
-    // ... or an FP16 page, keys then values, as PagedKV reads it: a page
-    // born at FP16 in a cache that seals (ADR-0011, amended by #90), or a
-    // diagnostic page of KVPages' Halves::Keys and Halves::Values, whose
-    // other half was quantised and dequantised when the page was sealed.
-    struct Fp16Format
-    {
-      size_t row;
-      int page_tokens;
-
-      __device__ float key(const std::uint8_t *page, int t, size_t at) const
-      {
-        return __half2float(
-            reinterpret_cast<const __half *>(page)[t * row + at]);
-      }
-      __device__ __half value(const std::uint8_t *page, int t, size_t at) const
-      {
-        return reinterpret_cast<const __half *>(
-            page)[(static_cast<size_t>(page_tokens) + t) * row + at];
-      }
-    };
-
-    // Each sealed page read at its own tier (#91): `tiers` is the layer's
-    // table of the tier the page table records for each page, beside its
-    // addresses, and a page is read in that tier's format. A tier no page
-    // of the cache can be at has no layout, and is never named.
-    //
-    // The branch costs no divergence within a warp. A key tile is loaded
-    // one key row at a time, head_dim consecutive elements per row, and
-    // head_dim is a multiple of the warp's 32 lanes in every model here, so
-    // a warp's lanes all load one row, of one page, at one tier. Different
-    // warps may take different branches, which costs nothing.
-    struct TierFormats
-    {
-      const std::uint8_t *tiers;
-      Fp16Format fp16;
-      QuantisedFormat<8> int8;
-      QuantisedFormat<4> int4;
-      QuantisedFormat<2> int2;
-
-      // Calls read(format) with page p's format: the one switch on a tier.
-      template <typename Read>
-      __device__ auto with_format(int p, Read read) const
-      {
-        switch (static_cast<Tier>(tiers[p]))
-        {
-        case Tier::INT8:
-          return read(int8);
-        case Tier::INT4:
-          return read(int4);
-        case Tier::INT2:
-          return read(int2);
-        case Tier::FP16:
-          break;
-        }
-        return read(fp16);
-      }
-      __device__ float key(int p, const std::uint8_t *page, int t,
-                           size_t at) const
-      {
-        return with_format(p, [&](const auto &format)
-                           { return format.key(page, t, at); });
-      }
-      __device__ __half value(int p, const std::uint8_t *page, int t,
-                              size_t at) const
-      {
-        return with_format(p, [&](const auto &format)
-                           { return format.value(page, t, at); });
-      }
-    };
-
-    // A cache that seals, read causally (ADR-0011): a query reads every page
-    // before its own as sealed, each at its own tier, and its own page at
-    // FP16, as decode does, whatever else arrived in the same launch. Of its
-    // own page, the positions before `start`, the first query's, are in the
-    // open page they were written to; the rest are the rows this launch's
-    // queries brought, `chunk_k` and `chunk_v`. The kernel's query tiles are
-    // aligned so that no tile spans two pages, and view_for binds a tile's
-    // page. A sealed page whose tier is kUnreadPage, evicted or masked
-    // (#160), is read by no query: reads() says so, and key() and value()
-    // give zeros for it without touching its address, which may have been
-    // freed.
-    struct CausalPagedKV
-    {
-      const unsigned long long *sealed;
-      const __half *open;
-      const __half *chunk_k;
-      const __half *chunk_v;
-      int page_tokens;
-      int start;
-      size_t row;
-      TierFormats formats;
-      int own = 0;
-
-      __device__ CausalPagedKV view_for(int position) const
-      {
-        CausalPagedKV view = *this;
-        view.own = position / page_tokens;
-        return view;
-      }
-      __device__ const std::uint8_t *page(int p) const
-      {
-        return reinterpret_cast<const std::uint8_t *>(sealed[p]);
-      }
-      __device__ bool unread(int p) const
-      {
-        return formats.tiers[p] == device::kUnreadPage;
-      }
-      // A query's own page and those after it are always read.
-      __device__ bool reads(int j) const
-      {
-        const int p = j / page_tokens;
-        return p >= own || !unread(p);
-      }
-      __device__ float key(int j, size_t at) const
-      {
-        const int p = j / page_tokens;
-        const int t = j % page_tokens;
-        if (p < own)
-        {
-          return unread(p) ? 0.0f : formats.key(p, page(p), t, at);
-        }
-        if (j >= start)
-        {
-          return __half2float(
-              chunk_k[static_cast<size_t>(j - start) * row + at]);
-        }
-        return __half2float(open[t * row + at]);
-      }
-      __device__ __half value(int j, size_t at) const
-      {
-        const int p = j / page_tokens;
-        const int t = j % page_tokens;
-        if (p < own)
-        {
-          return unread(p) ? __float2half(0.0f)
-                           : formats.value(p, page(p), t, at);
-        }
-        if (j >= start)
-        {
-          return chunk_v[static_cast<size_t>(j - start) * row + at];
-        }
-        return open[(static_cast<size_t>(page_tokens) + t) * row + at];
-      }
-    };
 
     // A decode step's per-page attention mass (#98), kept by the thread of
     // each query head's row as the key tiles go by. Pages come in order, so
@@ -421,26 +166,13 @@ namespace microinfer
     }
     constexpr int kScoreStride = kAttentionTileK + 1;
 
-    // What one slot of a split launch's partials holds (see `launch`): the
-    // row's m, its l, the mass its first page carries over from the split
-    // before (decode only), and its unnormalised output.
-    constexpr int kPartialM = 0;
-    constexpr int kPartialL = 1;
-    constexpr int kPartialCarry = 2;
-    constexpr int kPartialOut = 3;
-
-    __host__ __device__ inline size_t partial_slot_floats(int head_dim)
-    {
-      return static_cast<size_t>(head_dim) + kPartialOut;
-    }
-
     // A tile's rows are (query, head) pairs: queries_per_block queries, each
     // with heads_per_block consecutive query heads of one KV head, row r
     // being query r / heads_per_block and head r % heads_per_block of them.
-    // Prefill has 16 queries of one head a row, as the kernel always had;
-    // decode has its one query and every head of a GQA group, which then
-    // share each key tile the block loads and dequantises (#204). A row's
-    // arithmetic is its own whichever rows share its tile.
+    // Prefill, off the tensor cores, has 16 queries of one head a row, as the
+    // kernel always had; decode has its one query and every head of a GQA
+    // group, which then share each key tile the block loads and dequantises
+    // (#204). A row's arithmetic is its own whichever rows share its tile.
     //
     // A launch may also split each query's keys into `splits` runs of
     // `split_keys` (blockIdx.z), each block making a partial m, l and
@@ -900,27 +632,73 @@ namespace microinfer
       return blocks;
     }
 
+    // The rows of partials a caller's buffer holds, whatever the launch: for
+    // the splits a decode step takes and more, so that a prefill chunk of 512
+    // queries of a dozen heads may take three, without which its thirty-odd
+    // blocks leave most of the device idle at the end (#213). At head_dim
+    // 128, 10.7 MB on 20 multiprocessors.
+    long partial_rows()
+    {
+      return static_cast<long>(split_blocks()) * kAttentionTileQ *
+             kPrefillHeadsPerBlock;
+    }
+
+    // Whether prefill runs on the tensor cores, as it does unless asked
+    // otherwise (device::prefill_on_tensor_cores).
+    std::atomic<bool> tensor_cores_asked{true};
+
+    // Whether a launch runs on the tensor cores (prefill_attention_kernel):
+    // a prefill's, of more than one query, at a head_dim it is compiled for.
+    bool on_tensor_cores(int seq_q, int head_dim)
+    {
+      return seq_q > 1 && prefill_head_dim(head_dim) && tensor_cores_asked;
+    }
+
+    // The most consecutive heads of a group of `group` that divide it and
+    // are at most `most`.
+    int heads_of_group(int group, int most)
+    {
+      int h = std::min(group, most);
+      while (group % h != 0)
+      {
+        --h;
+      }
+      return h;
+    }
+
     // A decode step's one query takes every head of its KV head's group in
-    // one block, or as many of them as divide the group and fit a tile; a
-    // launch of more queries takes a tile of queries of one head. Keys are
-    // split only where partials are given to hold the splits, and only
-    // where the launch has too few blocks to fill the device. A run of keys
-    // is a whole number of key tiles, and at least a page, so that a page
-    // spans at most two runs.
+    // one block, or as many of them as divide the group and fit a tile. A
+    // launch of more queries takes a tile of them, of one head; on the tensor
+    // cores a block has the group's heads too, and two tiles of queries where
+    // its warps and, aligned, a page hold them. Keys are split only where
+    // partials are given to hold the splits, and only where the launch has
+    // too few blocks to fill the device, counting blocks of two tiles whether
+    // or not a page holds both, so that the layout decides nothing of it. A
+    // run of keys is a whole number of key tiles, and at least a page, so
+    // that a page spans at most two runs.
     LaunchShape shape_for(int seq_q, int seq_k, int heads, int kv_heads,
-                          bool aligned, int page_tokens, bool may_split)
+                          int head_dim, bool aligned, int page_tokens,
+                          bool may_split)
     {
       LaunchShape p{1, kAttentionTileQ, 0, 1, round_up(seq_k, kAttentionTileK)};
+      int queries_counted = kAttentionTileQ;
+      const int group = heads / kv_heads;
       if (seq_q == 1)
       {
-        const int group = heads / kv_heads;
-        p.queries_per_block = 1;
-        for (int h = std::min(group, kAttentionTileQ); h >= 1; --h)
+        p.queries_per_block = queries_counted = 1;
+        p.heads_per_block = heads_of_group(group, kAttentionTileQ);
+      }
+      else if (on_tensor_cores(seq_q, head_dim))
+      {
+        p.heads_per_block = heads_of_group(group, kPrefillHeadsPerBlock);
+        constexpr int kTwoTiles = 2 * kAttentionTileQ;
+        if (seq_q > kAttentionTileQ &&
+            2 * p.heads_per_block <= prefill_warps_per_block(head_dim))
         {
-          if (group % h == 0)
+          queries_counted = kTwoTiles;
+          if (!aligned || page_tokens % kTwoTiles == 0)
           {
-            p.heads_per_block = h;
-            break;
+            p.queries_per_block = kTwoTiles;
           }
         }
       }
@@ -930,10 +708,12 @@ namespace microinfer
         return p;
       }
       const long blocks =
-          static_cast<long>(ceil_div(p.lead + seq_q, p.queries_per_block)) *
+          static_cast<long>(ceil_div(p.lead + seq_q, queries_counted)) *
           (heads / p.heads_per_block);
-      const int splits = static_cast<int>(
-          std::min<long>(split_blocks() / blocks, seq_k / kMinSplitKeys));
+      // No more splits than the partials hold rows of.
+      const int splits = static_cast<int>(std::min<long>(
+          {split_blocks() / blocks, seq_k / kMinSplitKeys,
+           partial_rows() / (static_cast<long>(seq_q) * heads)}));
       if (splits <= 1)
       {
         return p;
@@ -985,8 +765,10 @@ namespace microinfer
                                     "head_dim must be even; got " +
                                     std::to_string(head_dim));
       }
-      const LaunchShape p = shape_for(seq_q, seq_k, heads, kv_heads, aligned,
-                                      page_tokens, partials != nullptr);
+      const LaunchShape p =
+          shape_for(seq_q, seq_k, heads, kv_heads, head_dim, aligned,
+                    page_tokens, partials != nullptr);
+      const bool tensor = on_tensor_cores(seq_q, head_dim);
       // The masses take two floats per head and page of the block's keys
       // in shared memory besides: all of them with one split.
       const int mass_local_pages =
@@ -1001,13 +783,19 @@ namespace microinfer
       // releases the GIL: two threads may both make the call, which is
       // harmless, but not race on the variable.
       const size_t smem =
-          shared_bytes(head_dim, p.heads_per_block * p.queries_per_block) +
-          2 * static_cast<size_t>(p.heads_per_block) * mass_local_pages *
-              sizeof(float);
+          tensor
+              ? prefill_shared_bytes(head_dim,
+                                     p.heads_per_block * p.queries_per_block /
+                                         kAttentionTileQ,
+                                     k_bias != nullptr)
+              : shared_bytes(head_dim,
+                             p.heads_per_block * p.queries_per_block) +
+                    2 * static_cast<size_t>(p.heads_per_block) *
+                        mass_local_pages * sizeof(float);
       const dim3 grid(ceil_div(p.lead + seq_q, p.queries_per_block),
                       heads / p.heads_per_block, p.splits);
       const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-      const auto run = [&](auto kernel, std::atomic<size_t> &opted_in)
+      const auto allow = [&](auto kernel, std::atomic<size_t> &opted_in)
       {
         if (smem > opted_in.load())
         {
@@ -1017,15 +805,51 @@ namespace microinfer
                      "cudaFuncSetAttribute attention shared memory");
           opted_in = smem;
         }
+      };
+      const float *table = k_bias != nullptr ? rope->data() : nullptr;
+      const auto run = [&](auto kernel, std::atomic<size_t> &opted_in)
+      {
+        allow(kernel, opted_in);
         kernel<<<grid, kBlockThreads, smem>>>(
             q, kv, k_bias, out, seq_q, seq_k, heads, kv_heads, head_dim, scale,
-            k_bias != nullptr ? rope->data() : nullptr, p.lead,
-            p.heads_per_block, p.queries_per_block, p.split_keys, p.splits,
-            partials, mass.mass, mass.page_tokens, mass_local_pages);
+            table, p.lead, p.heads_per_block, p.queries_per_block, p.split_keys,
+            p.splits, partials, mass.mass, mass.page_tokens, mass_local_pages);
       };
       static std::atomic<size_t> opted_in{0};
       static std::atomic<size_t> opted_in_with_mass{0};
-      if (mass.mass != nullptr)
+      const auto run_prefill = [&](auto kernel, std::atomic<size_t> &opted_in)
+      {
+        allow(kernel, opted_in);
+        const int tiles = p.queries_per_block / kAttentionTileQ;
+        kernel<<<grid, 32 * p.heads_per_block * tiles, smem>>>(
+            q, kv, k_bias, out, seq_q, seq_k, heads, kv_heads, scale, table,
+            p.lead, p.heads_per_block, tiles, p.split_keys, p.splits, partials);
+      };
+      const auto run_prefill_at = [&](auto dim)
+      {
+        constexpr int kD = decltype(dim)::value;
+        static std::atomic<size_t> opted_in_with_bias{0};
+        static std::atomic<size_t> opted_in_without{0};
+        if (k_bias != nullptr)
+        {
+          run_prefill(prefill_attention_kernel<KV, kD, true>,
+                      opted_in_with_bias);
+        }
+        else
+        {
+          run_prefill(prefill_attention_kernel<KV, kD, false>,
+                      opted_in_without);
+        }
+      };
+      if (tensor && head_dim == 64)
+      {
+        run_prefill_at(std::integral_constant<int, 64>{});
+      }
+      else if (tensor)
+      {
+        run_prefill_at(std::integral_constant<int, 128>{});
+      }
+      else if (mass.mass != nullptr)
       {
         run(attention_kernel<KV, true>, opted_in_with_mass);
       }
@@ -1048,15 +872,20 @@ namespace microinfer
 
   size_t device::attention_partials_floats(int head_dim)
   {
-    return static_cast<size_t>(split_blocks()) * kAttentionTileQ *
-           partial_slot_floats(head_dim);
+    return static_cast<size_t>(partial_rows()) * partial_slot_floats(head_dim);
+  }
+
+  bool device::prefill_on_tensor_cores(bool asked)
+  {
+    return tensor_cores_asked.exchange(asked);
   }
 
   std::pair<int, int> device::attention_split(int seq_q, int seq_k, int heads,
-                                              int kv_heads, int page_tokens)
+                                              int kv_heads, int head_dim,
+                                              int page_tokens)
   {
     check_grouping(heads, kv_heads);
-    const LaunchShape p = shape_for(seq_q, seq_k, heads, kv_heads,
+    const LaunchShape p = shape_for(seq_q, seq_k, heads, kv_heads, head_dim,
                                     page_tokens > 0, page_tokens, true);
     return {p.splits, p.split_keys};
   }

@@ -163,7 +163,9 @@ def test_the_precision_contract_is_fp32_scores_and_weights():
 
     And the floor admits fp32 scores and sums, and no more: holding the
     softmax weights in fp16 for P @ V, as tensor-core kernels do, is
-    simulated and fails the gate. That trade would go through ADR-0006."""
+    simulated and fails the gate. That trade would go through ADR-0006.
+    Prefill's kernel on the tensor cores holds each as two fp16 instead
+    (#213), and is held to this floor by every prefill case here."""
     cfg = ModelConfig.from_card(SMALL)
     rng = np.random.default_rng(4)
     q, k, v = (rng.standard_normal((50, cfg.num_attention_heads, cfg.head_dim)).astype(np.float32)
