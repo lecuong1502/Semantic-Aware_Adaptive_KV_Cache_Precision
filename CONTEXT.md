@@ -450,6 +450,13 @@ against each contention scenario, three runs a cell (#190, #191): whether a 32K
 generation completes, and how its engine reacts. A cell is a condition
 and a scenario; a matrix run, one of its runs, by its seed.
 
+**Survival timeline**:
+Two survival runs against time, an adaptive engine's and a static one's under
+contention set alike, as the paper's figure draws them (#212, ADR-0014's
+amendment): headroom, pressure level, cache bytes, the simulator's bytes and
+the downgrades. Logged from the runs' recordings as one entry.
+_Avoid_: timeline alone (a run's own record of its steps, #207)
+
 **External baseline**:
 llama.cpp, a deployed engine run as a process of its own against the same
 contention (#211, ADR-0001's and ADR-0014's amendments): not a condition,

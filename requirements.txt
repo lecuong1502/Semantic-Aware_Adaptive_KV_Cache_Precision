@@ -41,6 +41,9 @@ pybind11==3.1.0
 # Test
 pytest==9.1.1
 
+# Figures (pyproject's `figures` extra): the paper's plots, drawn from the log.
+matplotlib==3.11.2
+
 # Transitive, pinned so the environment is reproducible rather than merely
 # satisfiable.
 iniconfig==2.3.0
@@ -64,3 +67,12 @@ idna==3.20
 PyYAML==6.0.3
 tqdm==4.70.1
 typing_extensions==4.16.0
+# Through matplotlib.
+contourpy==1.4.0
+cycler==0.12.1
+fonttools==4.69.0
+kiwisolver==1.5.1
+pillow==13.0.0
+pyparsing==3.3.3
+python-dateutil==4.0.0
+tzdata==2026.6

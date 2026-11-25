@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,19 @@ def file_sha256(path: str | Path) -> str:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def named_file(entry: dict, name: str, folders: Iterable[str | Path]) -> Path | None:
+    """The file `name`, which `entry` names by its sha256 among its
+    config's files, found in one of `folders`; None if none holds it.
+    ValueError if what is there is not the file the entry names."""
+    for folder in folders:
+        path = Path(folder) / name
+        if path.is_file():
+            if file_sha256(path) != entry["config"]["files"][name]:
+                raise ValueError(f"{path} is not the file its entry names: its sha256 is another")
+            return path
+    return None
 
 
 def environment(log: str | Path = DEFAULT_LOG) -> dict[str, Any]:
