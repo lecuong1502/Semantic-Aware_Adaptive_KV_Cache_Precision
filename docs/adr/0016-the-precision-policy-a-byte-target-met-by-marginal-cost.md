@@ -387,10 +387,13 @@ controlled restore of every page (unlogged):
 | Uniform | 334, 6.8 s | 68, 1.5 s |
 | Random | 1,778, 36.0 s | 200, 4.0 s |
 
-Semantic's moves still cost about three times uniform's, 10 against 3.7 µs
-(unlogged):
-its pages are scattered through each tier, and a free fills each hole by
-moving a page down from the tier's end.
+Semantic's moves still cost the allocator about five times uniform's, 38
+against 7.6 µs a move of `move_pages` (unlogged). Part of it is that its pages
+are scattered through each tier, and a free fills each hole by moving a page
+down from the tier's end: timed alone, a batch of 512 moves freeing from the
+middle cost 1.6 times one freeing from the end. The rest is not accounted for.
+Each batch also reads `page_tiers()` and `shadowed()` afresh, about 3.5 ms each
+at 30K positions whatever the order: a third of the budget, left for later.
 
 **2. The margin, the owner's decision of 2026-11-26.** Upgrades kept headroom
 at or above `T_high` + 512 MiB, 1536 MiB, one P90 spike above YELLOW, which
@@ -404,7 +407,7 @@ and growth keeps no margin: the semantic one's last upgrade left 1511 MiB
 The margin is now **128 MiB, two spike thresholds**: enough that the desktop's
 own jitter does not swing the level between YELLOW and GREEN as upgrades bring
 headroom down to YELLOW. One P90 spike's room above RED is kept by YELLOW
-itself. `controller.DEFAULT_UPGRADE_SPIKE_BYTES`.
+itself. `controller.DEFAULT_UPGRADE_MARGIN_BYTES`.
 
 - **What it changes.** A cache can be restored to FP16 wherever its FP16 size
   leaves headroom at or above 1152 MiB. Restored that close to YELLOW, the
@@ -413,3 +416,22 @@ itself. `controller.DEFAULT_UPGRADE_SPIKE_BYTES`.
 - **What it does not.** RQ3's controlled restore kept no margin and keeps none.
   Results before #237 were measured with 512 MiB; #216 runs the survival matrix
   again with 128.
+
+**As measured (#237).** S5 and S6 again at 1442f35, Qwen2.5-1.5B. S6, a 30 s
+pulse during prefill, 30,720 positions and 2,048 decoded: every source restored
+its whole cache to FP16 (`pulse-release` `f0294324…`, `76b5cf30…`,
+`731c6406…`):
+
+| Source | Moves up | Steps | Moves a step | Restored, after the release | Bits after |
+|---|---:|---:|---:|---:|---:|
+| Semantic | 81,144 | 506 | 160 | 51 s | 12.09 |
+| Uniform | 81,060 | 133 | 609 | 17 s | 14.54 |
+| Random | 81,060 | 557 | 146 | 56 s | 12.04 |
+
+The first upgrade came 5 s after the release, the cooldown. Each step's batches
+took about 22 ms. Once restored, 1281 to 1297 MiB stayed free at the lowest,
+above the 1152 MiB kept, and the level stayed GREEN: no run downgraded again or
+had an upgrade plan cancelled. S5 (`survival` `e5c675ad…`, `2588d7d5…`,
+`15e965a7…`): the static engine ran out of memory at 21,504 positions, 2.7 s
+after the take; the semantic engine completed, 33 plans, 748 MiB returned and
+seen by the driver plan by plan; every event waited at most 192 ms for its step.

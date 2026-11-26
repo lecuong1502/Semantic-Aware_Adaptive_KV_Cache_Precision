@@ -517,3 +517,16 @@ its cache to FP16 (ADR-0016, note from #214; #237). The survival matrix, S1 to
 S4, was not run again: its protocol meets little of S1's 494 s on an engine
 that finishes the positions after the take in some 15 s, which #216 is to
 settle before it runs.
+
+---
+
+## Note from #237: S5 and S6 on the fixed upgrades
+
+#237 fixed the upgrades' pace and margin (ADR-0016, amendment from #237) and ran
+S5 and S6 again at 1442f35. S5: the static FP16 engine ran out of memory at
+21,504 positions, 2.7 s after the take (`survival` `e5c675ad…`); the semantic
+engine completed, 33 plans, 85,596 downgrades, 748 MiB returned and seen by the
+driver, plan by plan to a granule (`2588d7d5…`). S6: every source completed and
+restored its whole cache to FP16, 17 to 56 s after the release
+(`pulse-release` `f0294324…`, `76b5cf30…`, `731c6406…`). The paper's survival
+figure is drawn from `survival-timeline` `f74739e3…`.
