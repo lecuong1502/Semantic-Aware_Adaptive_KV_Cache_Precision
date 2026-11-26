@@ -82,7 +82,8 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import Engine, benchlog, controller, monitor, recorder, replay, survival  # noqa: E402
+from microinfer import Engine, benchlog, controller, monitor, recorder, replay  # noqa: E402
+from microinfer import survival  # noqa: E402
 from microinfer import survival_matrix as matrix  # noqa: E402
 from microinfer.footprint import MIB  # noqa: E402
 from microinfer.score_sources import RUNTIME_SOURCES  # noqa: E402
