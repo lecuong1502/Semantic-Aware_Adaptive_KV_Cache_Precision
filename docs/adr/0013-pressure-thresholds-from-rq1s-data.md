@@ -147,7 +147,16 @@ plan replaces it now, before the new decoding entries are logged:
 
 **The thresholds are unchanged,** and so is what every result measured
 against them means. The plan still outlasts a fast spike's ramp: only one
-under 103 ms, 2.9 µs a move, would lower YELLOW, and a move that takes its
-shadow costs six times that. A move from a shadow already held costs about
-3 µs (ADR-0015), so pinning shadows ahead of need, left for later there, is
-what would move YELLOW, and should run this rule again.
+under 68 ms, under 2.0 µs a move, would lower YELLOW, to 960 MiB, and a move that
+takes its shadow costs about ten times that. A move from a shadow already
+held costs about 3 µs (ADR-0015), so even pinning every shadow ahead of need
+would leave YELLOW where it is.
+
+- **What the entry measured.** It is Seam B, at Qwen2.5-1.5B's shapes with no
+  model loaded, and its cost a move is the fit over batches of 1 to 4096
+  first downgrades to INT4. The rule's plan downgrades to INT8, which
+  quantises no more and writes more; ADR-0015's figure for a batch's fixed part,
+  0.2 to 0.3 ms, is of the entry before its review's fixes (`1532d515…`).
+- **A later `plan-apply-speed` entry** is the one the rule takes. #214 logs
+  one; this table is derived again from it once logged, and the test fails if
+  the thresholds move.

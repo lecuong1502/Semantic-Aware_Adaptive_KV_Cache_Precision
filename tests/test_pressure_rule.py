@@ -48,8 +48,9 @@ def test_the_rule_gives_red_k_and_yellow_from_amplitude_rise_and_the_plan():
 
 def test_the_monitors_defaults_are_the_rule_applied_to_rq1s_log():
     """ADR-0013's values: RQ1's 48 spikes, what a plan's moves cost on the
-    1.5B model and INT8's effective bits, as the log holds them. If an entry is logged
-    again, this fails until the ADR and the defaults are brought up to date."""
+    1.5B model and INT8's effective bits, as the log holds them. An entry
+    logged again that moves them fails this until the ADR and the defaults
+    are brought up to date."""
     measures = pressure_rule.measures_from_log()
     assert len(measures.amplitudes_bytes) == 48
     assert pressure_rule.derive(measures).thresholds == monitor.DEFAULT

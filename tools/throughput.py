@@ -101,16 +101,16 @@ def decode_runs(engine: Engine, prompt: np.ndarray, repeat: int, warmup: int) ->
     median run's."""
     for _ in range(warmup):
         with_steps(engine, prompt)()
-    rates, timed_steps = [], 0
+    rates, timed = [], []
     for _ in range(repeat):
         token_s: list[float] = []
         with_steps(engine, prompt, step_clock(token_s))()
         rates.append(len(token_s) / sum(token_s))
-        timed_steps = len(token_s)
-    rate = statistics.median(rates)
-    return {"prompt_tokens": len(prompt), "steps": DECODE_STEPS, "steps_timed": timed_steps,
-            "seconds": DECODE_STEPS / rate, "tokens_per_second": rate,
-            "runs_tokens_per_second": rates}
+        timed.append(len(token_s))
+    # "seconds" was a generation less its prefill before #214; a run's steps'
+    # own time is in its rate, so it is not given.
+    return {"prompt_tokens": len(prompt), "steps": DECODE_STEPS, "steps_timed": timed,
+            "tokens_per_second": statistics.median(rates), "runs_tokens_per_second": rates}
 
 
 def step_clock(token_s: list[float], now=time.perf_counter):
@@ -243,8 +243,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--kv-tier", default="FP16", choices=Engine.KV_TIERS,
                         help="the static tier the cache is held at (#18)")
     parser.add_argument("--prefill-only", action="store_true",
-                        help="log prefill alone; at 32K each decode timing costs two "
-                             "more prefills")
+                        help="log prefill alone; at 32K each decode run costs a "
+                             "prefill more")
     parser.add_argument("--monitor", action="store_true",
                         help="measure the pressure monitor's cost to decoding, instead")
     parser.add_argument("--scorer", action="store_true",

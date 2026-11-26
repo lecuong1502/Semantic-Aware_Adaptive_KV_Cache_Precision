@@ -62,4 +62,4 @@ def test_decode_is_timed_by_its_steps_run_by_run(monkeypatch):
                         lambda token_s: clocked(token_s, now=lambda: next(clock)))
     got = tool.decode_runs(Engine(), [1, 2], repeat=3, warmup=0)
     assert got["runs_tokens_per_second"] == [2.0, 4.0, 1.0]
-    assert got["tokens_per_second"] == 2.0 and got["steps_timed"] == 2
+    assert got["tokens_per_second"] == 2.0 and got["steps_timed"] == [2, 2, 2]

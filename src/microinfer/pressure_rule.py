@@ -18,8 +18,9 @@ that they still are. #45 names them T_low, T_high and K:
   linear ramp. The plan is the one that must be done before RED: enough
   FP16 pages downgraded to INT8 to give the amplitude back, each page of
   each layer one move, at what a batch of moves costs, a fixed part and a
-  part a move, as plan-apply-speed measured it on RQ1's configuration (#205),
-  each move taking its shadow.
+  part a move, as plan-apply-speed measured it at RQ1's model's shapes
+  (#205): moves that take their shadows, to INT4, which no INT8 move costs
+  more than by much.
 
 The rule was set before any plan was applied (#105 applies them), and timed
 the plan then at the bandwidth decoding reached, as ADR-0013 says, until a
@@ -40,6 +41,7 @@ from . import benchlog, spikes
 from .config import ModelConfig
 from .contention import RQ1_ISSUES, logged_recordings
 from .footprint import MIB
+from .model import tier_page_bytes
 from .monitor import POLL_S, Thresholds
 
 #: The resolution thresholds are rounded up to.
@@ -138,16 +140,14 @@ def measures_from_log(log: str | Path = benchlog.DEFAULT_LOG, issues=RQ1_ISSUES,
         if entry["model"] != model:
             continue
         kind = entry["kind"]
-        if kind == "plan-apply-speed":
+        if kind == "plan-apply-speed" and "batch_seconds_a_move" in entry["results"]:
             plan = entry
         elif kind == "kv-quantisation-roundtrip" and entry["precision_tiers"] == {tier: 1.0}:
             bits = entry
     if plan is None or bits is None:
         raise ValueError(f"the log lacks what a plan costs on {model}, or {tier}'s "
                          f"effective bits")
-    cfg = ModelConfig.from_card(model)
-    page_bytes = (2 * plan["config"]["page_tokens"] * cfg.num_key_value_heads * cfg.head_dim
-                  * FP16_BITS // 8)
+    page_bytes = tier_page_bytes(ModelConfig.from_card(model), plan["config"]["page_tokens"])[0]
     return Measures(
         amplitudes, rises, plan["results"]["batch_fixed_seconds"],
         plan["results"]["batch_seconds_a_move"], page_bytes,
