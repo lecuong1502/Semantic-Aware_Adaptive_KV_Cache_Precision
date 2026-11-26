@@ -388,12 +388,35 @@ controlled restore of every page (unlogged):
 | Random | 1,778, 36.0 s | 200, 4.0 s |
 
 Semantic's moves still cost the allocator about five times uniform's, 38
-against 7.6 µs a move of `move_pages` (unlogged). Part of it is that its pages
-are scattered through each tier, and a free fills each hole by moving a page
-down from the tier's end: timed alone, a batch of 512 moves freeing from the
-middle cost 1.6 times one freeing from the end. The rest is not accounted for.
-Each batch also reads `page_tiers()` and `shadowed()` afresh, about 3.5 ms each
-at 30K positions whatever the order: a third of the budget, left for later.
+against 7.6 µs a move of `move_pages` (unlogged), and each batch read
+`page_tiers()` and `shadowed()` afresh, about 3.5 ms each at 30K positions,
+whatever the order: a third of the budget. Both were the work of a batch
+growing with the cache, not with its moves, and both are fixed:
+
+- **A free scanned its tiers.** `PagedKVCache::free_pages` found the slots it
+  frees by looking up every slot of every tier the batch touched, twice. A
+  semantic batch, its pages scattered, touched every tier; uniform's, its ties
+  freeing the newest pages, mostly one. It now takes the freed slots from the
+  page table and scans only the tier's tail it gives up: the work is the pages
+  freed.
+- **The maps were read page by page.** `page_tiers()` and `shadowed()` looked
+  up each page in the page table and the shadow store; they now read each
+  tier's pages, and the shadows, in one pass (`KVPages::tiers_into`,
+  `shadowed_into`): 0.07 and about 1 ms.
+
+The controlled restore of every page at 30,720 positions, each fix in turn
+(unlogged, the median of three for semantic):
+
+| Source | Pace fixed | Maps in one pass | Frees by the page table |
+|---|---:|---:|---:|
+| Semantic | 7.6 s | 4.6 s | 1.07 s |
+| Uniform | 1.56 s | 0.96 s | 0.87 s |
+| Random | 8.7 s | 4.3 s | 1.06 s |
+
+A move now costs `move_pages` 8.5 µs under semantic against 6.7 µs under
+uniform. The first column was measured in a later session than the table
+above, whose 4.6 / 1.5 / 4.0 s are the same code: with many small batches, a
+restore's time varied by about two between sessions.
 
 **2. The margin, the owner's decision of 2026-11-26.** Upgrades kept headroom
 at or above `T_high` + 512 MiB, 1536 MiB, one P90 spike above YELLOW, which

@@ -236,3 +236,29 @@ def test_a_batch_that_frees_a_tier_s_top_pages_waits_for_what_reads_them():
         np.testing.assert_array_equal(
             allocator.read(layer, page),
             _microinfer.quantise_page(k[layer][span], v[layer][span], Tier.INT4, page_tokens))
+
+
+def test_the_whole_cache_s_tiers_and_shadows_are_each_page_s():
+    """page_tiers() and shadowed(), each a whole cache in one call, give
+    what page_tier and has_shadow give page by page, after batches of
+    moves and an eviction: an evicted page at evicted_tier, with no
+    shadow. They read the tiers' pages and the shadows in one pass each,
+    not the page table page by page, which took 3.5 ms each at 30K
+    positions, a third of a plan's budget for every batch (#237)."""
+    pages = 8
+    (_, (_, cache)), _, _, _ = twins(PAGE_TOKENS[0], pages, 7)
+    for batch in (FIRST, SECOND):
+        cache.move_pages(batch)
+    cache.evict(0, 2)
+    tiers, shadowed = cache.page_tiers(), cache.shadowed()
+    assert tiers.shape == shadowed.shape == (LAYERS, pages)
+    assert tiers.dtype == np.int8 and shadowed.dtype == bool
+    for layer in range(LAYERS):
+        for page in range(pages):
+            if (layer, page) == (0, 2):
+                assert tiers[layer, page] == device.evicted_tier
+                assert not shadowed[layer, page]
+                continue
+            assert tiers[layer, page] == int(cache.page_tier(layer, page)), (layer, page)
+            assert shadowed[layer, page] == cache.has_shadow(layer, page), (layer, page)
+    assert len(set(tiers.ravel().tolist())) > 2 and shadowed.any() and not shadowed.all()

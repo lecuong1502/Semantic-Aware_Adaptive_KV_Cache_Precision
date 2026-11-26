@@ -278,6 +278,68 @@ namespace microinfer
     return allocator_.locate(key).tier;
   }
 
+  namespace
+  {
+    // A page of positions' index into a (layers, pages) map, or -1 for a
+    // key outside it: an open page, or one staged by a batch.
+    long long map_index(PageKey key, int layers, int pages)
+    {
+      if (key.layer < 0 || key.layer >= layers || key.page_index < 0 ||
+          key.page_index >= pages)
+      {
+        return -1;
+      }
+      return static_cast<long long>(key.layer) * pages + key.page_index;
+    }
+  } // namespace
+
+  void KVPages::tiers_into(std::int8_t *out) const
+  {
+    const std::size_t n = static_cast<std::size_t>(layers_) * pages_;
+    std::fill(out, out + n, std::int8_t{-1});
+    for (int t = 0; t < kTierCount; ++t)
+    {
+      for (const PageKey &key : allocator_.pages(static_cast<Tier>(t)))
+      {
+        const long long i = map_index(key, layers_, pages_);
+        if (i >= 0)
+        {
+          out[i] = static_cast<std::int8_t>(t);
+        }
+      }
+    }
+    for (const PageKey &key : evicted_)
+    {
+      const long long i = map_index(key, layers_, pages_);
+      if (i >= 0)
+      {
+        out[i] = static_cast<std::int8_t>(kTierCount);
+      }
+    }
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      if (out[i] < 0)
+      {
+        const PageKey key{static_cast<int>(i / pages_),
+                          static_cast<int>(i % pages_)};
+        page_tier(key); // PageNotFound, as one page's read would be
+      }
+    }
+  }
+
+  void KVPages::shadowed_into(bool *out) const
+  {
+    std::fill(out, out + static_cast<std::size_t>(layers_) * pages_, false);
+    for (const PageKey &key : shadows_.keys())
+    {
+      const long long i = map_index(key, layers_, pages_);
+      if (i >= 0 && !evicted(key))
+      {
+        out[i] = true;
+      }
+    }
+  }
+
   KVPages::ResolvedPage KVPages::resolve_page(PageKey key) const
   {
     const Tier tier = allocator_.locate(key).tier;

@@ -840,9 +840,9 @@ void bind_device(py::module_ &parent)
           "shadowed",
           [](const KVPages &c)
           {
-            return per_page<bool>(
-                c, [&](microinfer::PageKey key)
-                { return c.shadows().contains(key) && !c.evicted(key); });
+            py::array_t<bool> out({c.layers(), c.pages_per_layer()});
+            c.shadowed_into(out.mutable_data());
+            return out;
           },
           "Whether each page of positions holds an FP16 shadow, (layers, "
           "pages_per_layer): the pages an upgrade plan may restore (#106). An "
@@ -860,14 +860,9 @@ void bind_device(py::module_ &parent)
           "page_tiers",
           [](const KVPages &c)
           {
-            return per_page<std::int8_t>(
-                c,
-                [&](microinfer::PageKey key)
-                {
-                  return static_cast<std::int8_t>(
-                      c.evicted(key) ? microinfer::kTierCount
-                                     : static_cast<int>(c.page_tier(key)));
-                });
+            py::array_t<std::int8_t> out({c.layers(), c.pages_per_layer()});
+            c.tiers_into(out.mutable_data());
+            return out;
           },
           "Every page of positions' tier, (layers, pages_per_layer), as the "
           "page table records it: one call, for a plan (#105). An evicted "
