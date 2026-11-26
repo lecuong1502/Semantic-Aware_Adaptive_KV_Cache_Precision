@@ -82,7 +82,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from microinfer import Engine, benchlog, monitor, recorder, replay, survival  # noqa: E402
+from microinfer import Engine, benchlog, controller, monitor, recorder, replay, survival  # noqa: E402
 from microinfer import survival_matrix as matrix  # noqa: E402
 from microinfer.footprint import MIB  # noqa: E402
 from microinfer.score_sources import RUNTIME_SOURCES  # noqa: E402
@@ -194,6 +194,7 @@ def main(argv: list[str]) -> int:
               else None,
               "pulse_s": args.pulse,
               "upgrade_cooldown_seconds": engine.kv_upgrade_cooldown_seconds,
+              "upgrade_margin_mib": controller.DEFAULT_UPGRADE_SPIKE_BYTES / MIB,
               "simulator_context_bytes": context_bytes, "poll_s": monitor.POLL_S,
               "thresholds": asdict(monitor.DEFAULT),
               "files": {f.name: benchlog.file_sha256(f) for f in files if f.exists()}}

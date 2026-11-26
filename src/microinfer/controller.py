@@ -68,6 +68,7 @@ import numpy as np
 from . import benchlog
 from .footprint import MIB
 from .monitor import GREEN, RED, Level, Thresholds
+from .spikes import DEFAULT_THRESHOLD_BYTES
 
 #: The tiers, from FP16 down: a downgrade takes a page one step along it.
 TIERS = ("FP16", "INT8", "INT4", "INT2")
@@ -85,9 +86,13 @@ DEFAULT_RECENCY_FLOOR = 128
 #: How long after the last downgrade an upgrade must wait (#88, #103).
 DEFAULT_UPGRADE_COOLDOWN_SECONDS = 5.0
 #: The headroom kept above GREEN's threshold, T_high, once upgrades are
-#: made: one P90 spike of everyday applications, ADR-0013's 506 MiB rounded
-#: up (#88).
-DEFAULT_UPGRADE_SPIKE_BYTES = 512 * MIB
+#: made: two spike thresholds, 128 MiB, so that the level does not swing
+#: between YELLOW and GREEN on the desktop's own jitter (#237). T_high
+#: already keeps one P90 spike above RED (ADR-0013). It was one P90 spike
+#: more, 512 MiB (#88), which an FP16 cache of 32K positions on Qwen2.5-1.5B
+#: never left on the RTX 4050: once downgraded, the cache could not come
+#: back to FP16.
+DEFAULT_UPGRADE_SPIKE_BYTES = 2 * DEFAULT_THRESHOLD_BYTES
 
 
 @dataclass(frozen=True)
@@ -577,8 +582,8 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
                  options: PlanOptions = DEFAULT_OPTIONS) -> UpgradePlan:
     """The upgrades for this headroom (#103), at GREEN only: at least
     `cooldown_seconds` after the last downgrade, and taking no more than the
-    headroom above GREEN's threshold, T_high, plus `spike_bytes`, a P90
-    spike (#88). `scores` and `tiers` by (layer, page). Only the pages in
+    headroom above GREEN's threshold, T_high, plus `spike_bytes`, a margin
+    against the desktop's jitter (#237). `scores` and `tiers` by (layer, page). Only the pages in
     `shadowed`, those holding an FP16 shadow, are upgraded, each from it
     (#96): a page born at a quantised tier never had FP16 bytes, and stays
     where it is. The clock is time.monotonic(), `now_seconds` unless given;

@@ -58,7 +58,7 @@ The controller is pure logic with no device code (#101).
   - at least 5 s after the later of the last downgrade and the end of the
     last pressure;
   - only while headroom stays at or above `T_high` + 512 MiB, one P90
-    spike;
+    spike (128 MiB since #237; see its amendment);
   - in the reverse of a downgrade plan's order, largest gain first;
   - in batches within the same per-step time budget as YELLOW's downgrades.
 - **Three score sources plug into the same planner** (#104). All three meet
@@ -360,3 +360,53 @@ milliseconds:
   left no room to restore it: no S6 run of #214 restored its cache
   (`pulse-release` `a2f64a62…`, `b384d307…`, `054c06ed…`). #237 is to find out
   whether that, and the semantic source's slow pacing there, should change.
+
+---
+
+## Amendment (#237): upgrades keep 128 MiB above YELLOW, and are paced by large batches
+
+#214's S6 runs restored no cache to FP16 (ADR-0016, note from #214). Two
+causes, each measured on the engine, Qwen2.5-1.5B at 30,720 positions, a
+controlled plan at 80% then a controlled restore, which keeps no margin:
+
+**1. The pace.** A batch's time a move was its whole time over its moves for a
+batch of fewer than 32 moves, and the pace is twice the largest of the last 64.
+A step's last batch, cut short by what is left of the budget, is mostly its
+fixed part: a batch of one move takes 0.14 to 0.43 ms, of 512 moves 2.6 to
+4.3 ms (unlogged). Read as a move's time it raised the pace tenfold for the next
+64 batches, which were then as small and read the same way. The semantic and
+random sources, whose orders leave such batches, fell to about 36 moves a step;
+uniform's, which rarely did, did not. A batch too small to measure past its
+fixed part now gives no time, and the pace stays the large batches'. The
+controlled restore of every page (unlogged):
+
+| Source | Before: steps, seconds | After: steps, seconds |
+|---|---:|---:|
+| Semantic | 1,816, 37.1 s | 231, 4.6 s |
+| Uniform | 334, 6.8 s | 68, 1.5 s |
+| Random | 1,778, 36.0 s | 200, 4.0 s |
+
+Semantic's moves still cost about three times uniform's, 10 against 3.7 µs:
+its pages are scattered through each tier, and a free fills each hole by
+moving a page down from the tier's end.
+
+**2. The margin, the owner's decision of 2026-11-26.** Upgrades kept headroom
+at or above `T_high` + 512 MiB, 1536 MiB, one P90 spike above YELLOW, which
+itself keeps one P90 spike above RED (ADR-0013). On the RTX 4050, Qwen2.5-1.5B
+with an FP16 cache of 32K positions leaves about 1310 MiB with nothing
+contending. Once a cache at 32K was downgraded, it could not come back to FP16.
+#155's runs came back only because their cache grew at FP16 after the release,
+and growth keeps no margin: they ended at 1511 MiB.
+
+The margin is now **128 MiB, two spike thresholds**: enough that the desktop's
+own jitter does not swing the level between YELLOW and GREEN as upgrades bring
+headroom down to YELLOW. One P90 spike's room above RED is kept by YELLOW
+itself. `controller.DEFAULT_UPGRADE_SPIKE_BYTES`.
+
+- **What it changes.** A cache can be restored to FP16 wherever its FP16 size
+  leaves headroom at or above 1152 MiB. Restored that close to YELLOW, the
+  next spike finds the engine at YELLOW, not at GREEN with a spike to spare,
+  and downgrades again gradually rather than not at all.
+- **What it does not.** RQ3's controlled restore kept no margin and keeps none.
+  Results before #237 were measured with 512 MiB; #216 runs the survival matrix
+  again with 128.

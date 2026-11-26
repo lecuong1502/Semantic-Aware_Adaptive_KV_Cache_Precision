@@ -85,8 +85,10 @@ def test_a_batch_fits_its_bytes_and_its_time_and_takes_one_move_at_least():
 
 
 def test_a_batch_s_time_a_move_is_measured_past_its_fixed_part_when_large_enough():
+    """A batch of fewer moves than PACED_BATCH_MOVES is mostly its fixed part,
+    and says nothing of a move's time: it gives none (#237)."""
     small = {"moves": 4, "shadows_taken": 4, "seconds": 0.004}
-    assert move_seconds(small) == 0.001
+    assert move_seconds(small) is None
     n = engine.PACED_BATCH_MOVES
     large = {"moves": n, "shadows_taken": n,
              "seconds": engine.BATCH_FIXED_SECONDS + n * (engine.SHADOW_PIN_SECONDS + 1e-5)}
@@ -113,7 +115,8 @@ class Pages:
         for layer, page, tier in moves:
             self.tiers[layer, page] = int(tier)
         self.batches.append(len(moves))
-        self.last_batch = {"moves": len(moves), "shadows_taken": len(moves), "seconds": 1e-4}
+        self.last_batch = {"moves": len(moves), "shadows_taken": len(moves),
+                           "seconds": getattr(self, "batch_seconds", 1e-4)}
 
 
 def applying(plan, fits, upgrades=False):
@@ -165,6 +168,26 @@ def test_an_upgrade_plan_is_held_to_the_budget_as_a_downgrade_plan_is():
     e._recent_moves.append(1e-6)
     e._apply(cache, time.perf_counter(), False, None)
     assert entry.ended == "applied" and (pages.tiers == FP16).all()
+
+
+def test_a_small_batch_does_not_slow_the_batches_after_it():
+    """A step's last batch, cut short by what is left of the budget, is
+    timed mostly by its fixed part. Taken for a move's time, it once made
+    every later batch as small, and the semantic source's upgrades went at
+    36 pages a step, too slowly to finish (#237). It is not taken: the pace
+    stays the large batches'."""
+    plan = Plan([(layer, p, INT4, FP16) for layer in range(2) for p in range(4)], level=GREEN)
+    e = Engine(require_model(NAME))
+    pages = Pages(fits=100)
+    pages.tiers[:] = INT4
+    pages.batch_seconds = 0.004  # 4 moves in 4 ms: 1 ms a move, were it read so
+    cache = SimpleNamespace(pages=pages, nbytes=0)
+    entry = SimpleNamespace(plan=plan, upgrades=True, skipped=0, batches=[], ended="")
+    e._pending, e._cursor = entry, 0
+    e._recent_moves.append(1e-5)
+    e._apply(cache, time.perf_counter(), False, None)
+    assert entry.ended == "applied"
+    assert list(e._recent_moves) == [1e-5]
 
 
 def test_a_downgrade_plan_at_yellow_waits_for_the_next_step_once_the_budget_is_spent():
