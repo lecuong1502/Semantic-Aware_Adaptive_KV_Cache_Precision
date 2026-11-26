@@ -58,7 +58,7 @@ The controller is pure logic with no device code (#101).
   - at least 5 s after the later of the last downgrade and the end of the
     last pressure;
   - only while headroom stays at or above `T_high` + 512 MiB, one P90
-    spike;
+    spike (128 MiB since #237; see its amendment);
   - in the reverse of a downgrade plan's order, largest gain first;
   - in batches within the same per-step time budget as YELLOW's downgrades.
 - **Three score sources plug into the same planner** (#104). All three meet
@@ -360,3 +360,106 @@ milliseconds:
   left no room to restore it: no S6 run of #214 restored its cache
   (`pulse-release` `a2f64a62…`, `b384d307…`, `054c06ed…`). #237 is to find out
   whether that, and the semantic source's slow pacing there, should change.
+
+---
+
+## Amendment (#237): upgrades keep 128 MiB above YELLOW, and are paced by large batches
+
+#214's S6 runs restored no cache to FP16 (ADR-0016, note from #214). Two
+causes, each measured on the engine, Qwen2.5-1.5B at 30,720 positions, a
+controlled plan at 80% then a controlled restore, which keeps no margin:
+
+**1. The pace.** The pace is twice the largest time a move of the last 64
+batches, and a batch of fewer than 32 moves gave its whole time over its
+moves as that time. A step's last batch, cut short by what is left of the
+budget, is mostly its fixed part: a batch of one move takes 0.14 to 0.43 ms,
+of 512 moves 2.6 to 4.3 ms (unlogged). Read as a move's time it set the pace
+at 0.3 to 0.9 ms a move, against about 10 µs from large batches, for the next
+64 batches, which were then as small and read the same way. The semantic and
+random sources, whose orders leave such batches, fell to about 36 moves a step;
+uniform's, which rarely did, did not. A batch too small to measure past its
+fixed part now gives no time, and the pace stays the large batches'. The
+controlled restore of every page (unlogged):
+
+| Source | Before: steps, seconds | After: steps, seconds |
+|---|---:|---:|
+| Semantic | 1,816, 37.1 s | 231, 4.6 s |
+| Uniform | 334, 6.8 s | 68, 1.5 s |
+| Random | 1,778, 36.0 s | 200, 4.0 s |
+
+Semantic's moves still cost the allocator about five times uniform's, 38
+against 7.6 µs a move of `move_pages` (unlogged), and each batch read
+`page_tiers()` and `shadowed()` afresh, about 3.5 ms each at 30K positions,
+whatever the order: a third of the budget. Both were the work of a batch
+growing with the cache, not with its moves, and both are fixed:
+
+- **A free scanned its tiers.** `PagedKVCache::free_pages` found the slots it
+  frees by looking up every slot of every tier the batch touched, twice. A
+  semantic batch, its pages scattered, touched every tier; uniform's, its ties
+  freeing the newest pages, mostly one. It now takes the freed slots from the
+  page table and scans only the tier's tail it gives up: the work is the pages
+  freed.
+- **The maps were read page by page.** `page_tiers()` and `shadowed()` looked
+  up each page in the page table and the shadow store; they now read each
+  tier's pages, and the shadows, in one pass (`KVPages::tiers_into`,
+  `shadowed_into`): 0.07 and about 1 ms.
+
+The controlled restore of every page at 30,720 positions, each fix in turn
+(unlogged, the median of three for semantic):
+
+| Source | Pace fixed | Maps in one pass | Frees by the page table |
+|---|---:|---:|---:|
+| Semantic | 7.6 s | 4.6 s | 1.07 s |
+| Uniform | 1.56 s | 0.96 s | 0.87 s |
+| Random | 8.7 s | 4.3 s | 1.06 s |
+
+A move now costs `move_pages` 8.5 µs under semantic against 6.7 µs under
+uniform. The first column was measured in a later session than the table
+above, whose 4.6 / 1.5 / 4.0 s are the same code: with many small batches, a
+restore's time varied by about two between sessions.
+
+**2. The margin, the owner's decision of 2026-11-26.** Upgrades kept headroom
+at or above `T_high` + 512 MiB, 1536 MiB, one P90 spike above YELLOW, which
+itself keeps one P90 spike above RED (ADR-0013). On the RTX 4050, Qwen2.5-1.5B
+with an FP16 cache of 32K positions leaves about 1310 MiB with nothing
+contending. Once a cache at 32K was downgraded, it could not come back to FP16.
+#155's runs came back only because their cache grew at FP16 after the release,
+and growth keeps no margin: the semantic one's last upgrade left 1511 MiB
+(`survival-timeline` `6ae3da2f…`, of `94948638…`).
+
+The margin is now **128 MiB, two spike thresholds**: enough that the desktop's
+own jitter does not swing the level between YELLOW and GREEN as upgrades bring
+headroom down to YELLOW. One P90 spike's room above RED is kept by YELLOW
+itself. `controller.DEFAULT_UPGRADE_MARGIN_BYTES`.
+
+- **What it changes.** A cache can be restored to FP16 wherever its FP16 size
+  leaves headroom at or above 1152 MiB. Restored that close to YELLOW, the
+  next spike finds the engine at YELLOW, not at GREEN with a spike to spare,
+  and downgrades again gradually rather than not at all.
+- **What it does not.** RQ3's controlled restore kept no margin and keeps none.
+  Results before #237 were measured with 512 MiB; #216 runs the survival matrix
+  again with 128.
+
+**As measured (#237).** S5 and S6 again at 1442f35, with the pace and margin
+fixed, and again at 018193a, with the frees and maps fixed too; Qwen2.5-1.5B.
+S6, a 30 s pulse during prefill, 30,720 positions and 2,048 decoded: every
+source restored its whole cache to FP16 in both.
+
+| Source | Steps of upgrades | Moves a step | Restored, after the release | Bits after |
+|---|---:|---:|---:|---:|
+| Semantic, 018193a (`2635abe0…`) | 58 | 1,403 | 9.5 s | 14.59 |
+| Uniform, 018193a (`f0f9d1a8…`) | 50 | 1,626 | 9.0 s | 14.71 |
+| Random, 018193a (`c37c16f2…`) | 61 | 1,333 | 9.8 s | 14.64 |
+| Semantic, 1442f35 (`f0294324…`) | 506 | 160 | 51 s | 12.09 |
+| Uniform, 1442f35 (`76b5cf30…`) | 133 | 609 | 17 s | 14.54 |
+| Random, 1442f35 (`731c6406…`) | 557 | 146 | 56 s | 12.04 |
+
+The first upgrade came 5 s after the release, the cooldown, and a step's
+upgrades took 18 to 22 ms. Once restored, 1437 to 1441 MiB stayed free at the
+lowest at 018193a, 1281 to 1297 MiB at 1442f35 as the desktop held more, each
+above the 1152 MiB kept, and the level stayed GREEN: no run downgraded again or
+had an upgrade plan cancelled. S5 at 018193a (`survival` `15927e16…`,
+`ad920f4f…`, `62abaf82…`): the static engine ran out of memory at 21,504
+positions, 2.6 s after the take; the semantic engine completed, 34 plans,
+748 MiB returned and seen by the driver plan by plan; every event waited at
+most 196 ms for its step.

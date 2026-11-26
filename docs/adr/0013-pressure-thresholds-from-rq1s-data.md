@@ -160,4 +160,6 @@ would leave YELLOW where it is.
   20 µs in one entry and 0.86 ms in the next, against ADR-0015's 0.2 to 0.3 ms;
   it is a millisecond of the plan's 638, and the moves are the rest.
 - **A later `plan-apply-speed` entry** is the one the rule takes; the test fails
-  if the thresholds move.
+  if the thresholds move. #237 measured it again after a free stopped scanning
+  its tiers (`e2780007…`): 0.39 ms and 16.3 µs a move, a plan of 575 ms, and the
+  thresholds stay.

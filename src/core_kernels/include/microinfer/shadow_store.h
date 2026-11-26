@@ -47,6 +47,9 @@ namespace microinfer
     std::uint8_t *add(PageKey key);
 
     bool contains(PageKey key) const;
+    // Every page with a shadow, in key order: one pass, for a whole cache's
+    // map of them (#237).
+    std::vector<PageKey> keys() const;
     // The shadow's bytes, page_bytes of them; PageNotFound if `key` has none.
     const std::uint8_t *shadow(PageKey key) const;
     // The same bytes, at the address the device reads them by (#205): pinned

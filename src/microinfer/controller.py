@@ -35,7 +35,7 @@ and however short of memory the cache is, nor is an open page, (layer,
 
 Upgrades (#103) are planned at GREEN only, at least 5 s after the last
 downgrade, and never past a headroom of GREEN's threshold, T_high, plus
-512 MiB, one P90 spike: in the reverse of a downgrade plan's order, the
+128 MiB, two spike thresholds (#237): in the reverse of a downgrade plan's order, the
 largest score x error removed / bytes taken first, in batches within the
 same budget. With room for every one, and the scores a plan was made from
 unchanged and all present, they undo it backwards: each tier down costs
@@ -68,6 +68,7 @@ import numpy as np
 from . import benchlog
 from .footprint import MIB
 from .monitor import GREEN, RED, Level, Thresholds
+from .spikes import DEFAULT_THRESHOLD_BYTES
 
 #: The tiers, from FP16 down: a downgrade takes a page one step along it.
 TIERS = ("FP16", "INT8", "INT4", "INT2")
@@ -85,9 +86,13 @@ DEFAULT_RECENCY_FLOOR = 128
 #: How long after the last downgrade an upgrade must wait (#88, #103).
 DEFAULT_UPGRADE_COOLDOWN_SECONDS = 5.0
 #: The headroom kept above GREEN's threshold, T_high, once upgrades are
-#: made: one P90 spike of everyday applications, ADR-0013's 506 MiB rounded
-#: up (#88).
-DEFAULT_UPGRADE_SPIKE_BYTES = 512 * MIB
+#: made: two spike thresholds, 128 MiB, so that the level does not swing
+#: between YELLOW and GREEN on the desktop's own jitter (#237). T_high
+#: already keeps one P90 spike above RED (ADR-0013). It was one P90 spike
+#: more, 512 MiB (#88), which an FP16 cache of 32K positions on Qwen2.5-1.5B
+#: never left on the RTX 4050: once downgraded, the cache could not come
+#: back to FP16.
+DEFAULT_UPGRADE_MARGIN_BYTES = 2 * DEFAULT_THRESHOLD_BYTES
 
 
 @dataclass(frozen=True)
@@ -572,13 +577,14 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
                  last_downgrade_seconds: float | None,
                  now_seconds: float | None = None,
                  cooldown_seconds: float = DEFAULT_UPGRADE_COOLDOWN_SECONDS,
-                 spike_bytes: int = DEFAULT_UPGRADE_SPIKE_BYTES,
+                 upgrade_margin_bytes: int = DEFAULT_UPGRADE_MARGIN_BYTES,
                  budget_seconds: float = DEFAULT_BUDGET_SECONDS,
                  options: PlanOptions = DEFAULT_OPTIONS) -> UpgradePlan:
     """The upgrades for this headroom (#103), at GREEN only: at least
     `cooldown_seconds` after the last downgrade, and taking no more than the
-    headroom above GREEN's threshold, T_high, plus `spike_bytes`, a P90
-    spike (#88). `scores` and `tiers` by (layer, page). Only the pages in
+    headroom above GREEN's threshold, T_high, plus `upgrade_margin_bytes`, a
+    margin against the desktop's jitter (#237). `scores` and `tiers` by
+    (layer, page). Only the pages in
     `shadowed`, those holding an FP16 shadow, are upgraded, each from it
     (#96): a page born at a quantised tier never had FP16 bytes, and stays
     where it is. The clock is time.monotonic(), `now_seconds` unless given;
@@ -614,7 +620,8 @@ def upgrade_plan(headroom_bytes: int, thresholds: Thresholds,
     return upgrade_plan_arrays(
         headroom_bytes, thresholds, score_array, tier_index, shadow_array, page_bytes, errors,
         move_seconds=move_seconds, last_downgrade_seconds=last_downgrade_seconds,
-        now_seconds=now_seconds, cooldown_seconds=cooldown_seconds, spike_bytes=spike_bytes,
+        now_seconds=now_seconds, cooldown_seconds=cooldown_seconds,
+        upgrade_margin_bytes=upgrade_margin_bytes,
         budget_seconds=budget_seconds, options=options)
 
 
@@ -624,7 +631,7 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
                         last_downgrade_seconds: float | None,
                         now_seconds: float | None = None,
                         cooldown_seconds: float = DEFAULT_UPGRADE_COOLDOWN_SECONDS,
-                        spike_bytes: int = DEFAULT_UPGRADE_SPIKE_BYTES,
+                        upgrade_margin_bytes: int = DEFAULT_UPGRADE_MARGIN_BYTES,
                         budget_seconds: float = DEFAULT_BUDGET_SECONDS,
                         options: PlanOptions = DEFAULT_OPTIONS) -> UpgradePlan:
     """upgrade_plan(), on arrays: `scores`, `tiers` and `shadowed`,
@@ -644,7 +651,7 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
                          f"{now_seconds} s: both times must come from one clock, "
                          f"time.monotonic()")
     level = thresholds.classify(headroom_bytes)
-    available = headroom_bytes - thresholds.yellow_below_bytes - spike_bytes
+    available = headroom_bytes - thresholds.yellow_below_bytes - upgrade_margin_bytes
 
     def held(reason: str) -> UpgradePlan:
         none, nothing = np.zeros(0, dtype=np.int64), np.zeros(0)
@@ -660,7 +667,7 @@ def upgrade_plan_arrays(headroom_bytes: int, thresholds: Thresholds, scores: np.
                     f"downgrade, {cooldown_seconds} s needed")
     if available <= 0:
         return held(f"headroom: {headroom_bytes} bytes leave none above T_high + "
-                    f"{spike_bytes} bytes")
+                    f"{upgrade_margin_bytes} bytes")
 
     upgradable = (tiers > 0) & shadowed
     scored = scores[upgradable & ~np.isnan(scores)]

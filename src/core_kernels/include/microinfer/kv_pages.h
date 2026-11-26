@@ -284,6 +284,17 @@ namespace microinfer
     // as it holds no evicted one.
     Tier page_tier(PageKey key) const;
 
+    // Every page of positions' tier, (layers, pages_per_layer) row-major
+    // into `out`: page_tier's, or kTierCount for an evicted page (#160).
+    // Read from each tier's pages and the evicted set in one pass, not from
+    // the page table page by page, whose lookups took 3.5 ms at 30K
+    // positions, a third of a plan's budget, for every batch (#237).
+    // PageNotFound, as page_tier, for a page held nowhere.
+    void tiers_into(std::int8_t *out) const;
+    // Whether each page of positions holds an FP16 shadow, as
+    // shadows().contains, an evicted page's left unread, into `out` alike.
+    void shadowed_into(bool *out) const;
+
     int page_tokens() const { return page_tokens_; }
     // Pages of positions held in each layer; the open pages are not counted.
     int pages_per_layer() const { return pages_; }

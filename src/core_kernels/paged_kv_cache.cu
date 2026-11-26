@@ -256,29 +256,41 @@ namespace microinfer
     std::array<TierMoves, kTierCount> moves;
     std::array<bool, kTierCount> touched{};
     std::size_t copies = 0;
+    // Each tier's freed slots, from the page table: the work is the pages
+    // freed, not the tier's pages, which a batch of upgrades at 30K
+    // positions scanned twice for every tier it touched (#237).
+    std::array<std::vector<std::size_t>, kTierCount> freed;
+    for (const PageKey &key : freeing)
+    {
+      const PageLocation loc = table_.at(key);
+      freed[static_cast<int>(loc.tier)].push_back(loc.slot);
+    }
     for (int t = 0; t < kTierCount; ++t)
     {
-      const Range &r = ranges_[t];
-      std::size_t freed = 0;
-      for (const PageKey &slot : r.slots)
-      {
-        freed += freeing.count(slot);
-      }
-      if (freed == 0)
+      std::vector<std::size_t> &going = freed[t];
+      if (going.empty())
       {
         continue;
       }
+      std::sort(going.begin(), going.end());
       touched[t] = true;
       TierMoves &m = moves[t];
-      m.kept = r.slots.size() - freed;
-      for (std::size_t slot = 0; slot < r.slots.size(); ++slot)
+      const std::size_t held = ranges_[t].slots.size();
+      m.kept = held - going.size();
+      // Holes are the freed slots below `kept`; movers the slots at or
+      // above it that are not freed, each in ascending order.
+      auto above = going.begin();
+      for (; above != going.end() && *above < m.kept; ++above)
       {
-        const bool going = freeing.count(r.slots[slot]) != 0;
-        if (slot < m.kept && going)
+        m.holes.push_back(*above);
+      }
+      for (std::size_t slot = m.kept; slot < held; ++slot)
+      {
+        if (above != going.end() && *above == slot)
         {
-          m.holes.push_back(slot);
+          ++above;
         }
-        else if (slot >= m.kept && !going)
+        else
         {
           m.movers.push_back(slot);
         }

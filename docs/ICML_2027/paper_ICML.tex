@@ -383,8 +383,8 @@ costs more per byte than the last; a page the model hardly attends to goes deep
 first. The open pages and the last 128 positions are never downgraded.
 Upgrades come at GREEN only, largest gain first, at least 5\,s after the later
 of the last downgrade and the end of pressure, and never below $T_\mathrm{high}
-+ 512$\,MiB of headroom. Any \textit{score source} plugs into the same
-planner and meets the same byte target to within one page's move. At runtime it
++ 128$\,MiB of headroom, two spike thresholds against the desktop's jitter.
+Any \textit{score source} plugs into the same planner and meets the same byte target to within one page's move. At runtime it
 is the scorer's (\textit{semantic}), equal scores spread evenly across positions
 (\textit{uniform}, the baseline), or seeded random scores; RQ3 adds ZipCache's.
 
@@ -537,12 +537,13 @@ took what left the engine 256\,MiB short of its full FP16 cache, keeping it to
 the end; the rule, rather than a byte count, gives both runs the same shortfall
 whatever else the desktop holds.
 
-The static engine ran out of memory at 22{,}016 positions, 3.0\,s after the take,
-refused a granule with 30\,MiB free (Table~\ref{tab:survival}). The adaptive
-engine completed every token. Its first plan, at RED with 165\,MiB of headroom,
-applied 44{,}016 downgrades in 0.67\,s and returned 382\,MiB, 0.88\,s after the
+The static engine ran out of memory at 21{,}504 positions, 2.6\,s after the take,
+refused a granule with 29\,MiB free (Table~\ref{tab:survival}). The adaptive
+engine completed every token. Its first plan, at RED with 164\,MiB of headroom,
+applied 44{,}016 downgrades in 0.60\,s and returned 382\,MiB, 0.66\,s after the
 RED event; later plans, at each return to RED and as the cache sealed pages,
-returned up to 182\,MiB, most of them 12\,MiB or less in about 25\,ms. Every plan's return was seen by the driver to within
+returned up to 32\,MiB, most of them 12\,MiB or less in about 15\,ms. Every
+plan's return was seen by the driver to within
 a 2\,MiB granule: freed memory reached the driver, where the other process could
 take it and the monitor could see it. Figure~\ref{fig:survival} shows a run
 under the same rule, released after 30\,s.
@@ -555,23 +556,24 @@ static FP16 engine under S5, its take kept, to where it ran out of memory; one r
 each. Above, the level the adaptive run's monitor reported, the headroom and the
 thresholds; below, each engine's cache and what its simulator took. Triangles are
 the steps that found pages downgraded by a plan, and the bar spans the upgrades.
-The time axis changes scale at 40\,s. The adaptive run completed its 32{,}767
-positions at 163\,s, with part of its cache still below FP16. The runs differ in
+The time axis changes scale at 40\,s. The adaptive run's whole cache was back at
+FP16 9.5\,s after the release, and it completed its 32{,}767 positions at
+106\,s. The runs differ in
 prompt, 30{,}720 positions and 2{,}048 decoded against 32{,}704 and 64.}
 \label{fig:survival}
 \end{figure}
 
-\paragraph{Reacting during prefill.} Detection took 85\,ms. Every pressure
-event, the first of the episode among them, waited at most 218\,ms for the step
-it came in, and was planned 184\,ms after it at the median
-(Table~\ref{tab:prefill}). On the engine before split-key decode and prefill on
+\paragraph{Reacting during prefill.} The monitor reported the take after
+86\,ms. Every pressure event, the first of the episode among them, waited at
+most 196\,ms for the step it came in, and was planned 154\,ms after it at the
+median (Table~\ref{tab:prefill}). On the engine before split-key decode and prefill on
 the tensor cores, events during prefill waited for a chunk of 512 that took 11
 to 16\,s, 13.2\,s at the median, and sizing chunks by time brought later events
 to 0.86\,s at the cost of 2.4 times the prefill. A chunk of 512 now takes 0.19,
 0.27 and 0.40\,s after 8K, 16K and 30K positions at FP16, against 1.8, 3.3 and
 5.7\,s by the kernel before in the same build, and at most 0.44\,s at any tier.
 That is under the 0.8\,s chunks are sized to, so sizing changes nothing: with
-chunks of 512 under pressure too, the waits and the 16.9\,s from the take to the
+chunks of 512 under pressure too, the waits and the 14.8\,s from the take to the
 end were the same.
 
 \paragraph{Across scenarios.} The survival matrix runs the same generation under
@@ -816,14 +818,14 @@ facts of the last two turns and lost most stated three or more turns back.
 \textbf{Recovery and ablations.} After pressure passes, restoring every page
 from its shadow took under 0.7\,s at 8K positions; a third turn then answered
 50 of 50 needles under semantic, both of its turn-2 misses recovered. At 32K,
-a 30\,s pulse during prefill was survived by all three sources, but the upgrades
-after it restored part of the cache: 6.1, 10.7 and 8.2 effective bits after the
-pressure from the semantic, uniform and random sources. Prefill now ends before
-the release, so the whole cache is held when the upgrades come, and keeping
-512\,MiB above YELLOW leaves no room for all of it at FP16; the semantic source's
-upgrades also went at 36 pages a step against uniform's 210 (an open issue). On
-the engine before, every page was restored, the cache still growing after the
-release.
+a 30\,s pulse during prefill was survived by all three sources, and the upgrades
+after it restored every page to FP16, 9.5, 9.0 and 9.8\,s after the release from
+the semantic, uniform and random sources: 5\,s of cooldown, then about 1400
+upgrades a step for 4\,s. A whole cache of 31K positions at FP16 left 1280 to
+1440\,MiB free, as the
+desktop held more or less, under 512\,MiB above YELLOW: upgrades now keep
+128\,MiB above it, and with the 512\,MiB they first kept, a cache downgraded at
+32K on this device could not come back to FP16.
 None of nine quality ablations at 80\% changed needle accuracy detectably
 ($p \ge 0.5$); planning by importance alone, without the tier's error, lost
 the most, two samples. Two were not at equal bytes: without INT2, and with a
@@ -1016,7 +1018,7 @@ under three rules for sizing chunks (Section~\ref{sec:survival}).
 
 \begin{table}[!ht]
 \caption{The survival experiment at 32K positions (\texttt{survival} entries
-\texttt{5e819ea1} and \texttt{1e099d65}). The static engine runs out of memory;
+\texttt{15927e16} and \texttt{ad920f4f}). The static engine runs out of memory;
 the adaptive one (semantic) completes, and the driver sees every byte it
 returns.}
 \label{tab:survival}
@@ -1027,13 +1029,13 @@ returns.}
 \toprule
 & Static FP16 & Adaptive \\
 \midrule
-Ending & OOM at 22{,}016 & complete, 32{,}767 \\
-Headroom at the take / taken (MiB) & 1723 / 1450 & 1764 / 1490 \\
-Lowest free after the take (MiB) & 37 & 89 \\
-Plans / downgrades & 0 / 0 & 17 / 85{,}596 \\
+Ending & OOM at 21{,}504 & complete, 32{,}767 \\
+Headroom at the take / taken (MiB) & 1912 / 1640 & 1904 / 1632 \\
+Lowest free after the take (MiB) & 33 & 30 \\
+Plans / downgrades & 0 / 0 & 34 / 85{,}596 \\
 Returned / seen by the driver (MiB) & -- & 748 / 748 \\
-Plans matching the driver to a granule & -- & 16 of 16 \\
-From the take to the end & 3.0\,s & 16.9\,s \\
+Plans matching the driver to a granule & -- & 33 of 33 \\
+From the take to the end & 2.6\,s & 14.8\,s \\
 \bottomrule
 \end{tabular}
 \end{adjustbox}
@@ -1042,7 +1044,7 @@ From the take to the end & 3.0\,s & 16.9\,s \\
 \begin{table}[!ht]
 \caption{From a pressure event to its plan in the survival experiment, chunks
 sized under pressure by a fixed and a per-position part and kept at 512
-positions (\texttt{1e099d65}, \texttt{9544e952}); before, on the engine before
+positions (\texttt{ad920f4f}, \texttt{62abaf82}); before, on the engine before
 split-key decode and prefill on the tensor cores, at chunks of 512 and so sized
 (\texttt{1fdbeebd} and \texttt{04b95e3f}). A chunk now takes under the 0.8\,s it is
 sized to, and the two are alike.}
@@ -1056,9 +1058,9 @@ sized to, and the two are alike.}
 & Sized & 512 & Sized & 512 \\
 \midrule
 First event of the episode & 0.21\,s & 0.17\,s & 11.1\,s & 11.1\,s \\
-Later events, median & 0.18\,s & 0.19\,s & 0.86\,s & 13.2\,s \\
-Later events within 1\,s & 9 of 9 & 9 of 9 & 3 of 5 & 0 \\
-From the take to the end & 16.9\,s & 16.9\,s & 1588\,s & 668\,s \\
+Later events, median & 0.15\,s & 0.16\,s & 0.86\,s & 13.2\,s \\
+Later events within 1\,s & 8 of 8 & 7 of 7 & 3 of 5 & 0 \\
+From the take to the end & 14.8\,s & 14.8\,s & 1588\,s & 668\,s \\
 \bottomrule
 \end{tabular}
 \end{adjustbox}
@@ -1217,8 +1219,8 @@ INT2 & 150 & 2.63 & 11.541 \\
 
 \vspace{1.5em}
 \caption{The time to move one page of one layer on Qwen2.5-1.5B, median of 256
-moves (\texttt{requantisation-latency} entries \texttt{97bd6f53} to
-\texttt{a8d0f8a3}). Copying the shadow on a first downgrade takes about
+moves (\texttt{requantisation-latency} entries \texttt{28072fdf} to
+\texttt{28c74887}). Copying the shadow on a first downgrade takes about
 11\,$\mu$s of the move. Below, decode throughput at 32K positions with the whole
 cache at each tier, the median of five runs of 31 timed steps, whose rates lie
 within 2\% of it (\texttt{decode-throughput} \texttt{a7901dd7},
@@ -1232,9 +1234,9 @@ Move & Median ($\mu$s) \\
 \midrule
 FP16 to INT8 / INT4 / INT2 & 16 / 22 / 32 \\
 The same, a first downgrade, copying the shadow & 29 / 35 / 45 \\
-INT8 to INT4 / INT2, from the shadow & 40 / 42 \\
-INT4 to INT8 / INT2, from the shadow & 26 / 43 \\
-INT2 to INT8 / INT4, from the shadow & 26 / 32 \\
+INT8 to INT4 / INT2, from the shadow & 39 / 42 \\
+INT4 to INT8 / INT2, from the shadow & 26 / 42 \\
+INT2 to INT8 / INT4, from the shadow & 26 / 31 \\
 Any tier to FP16, from the shadow & 11 \\
 \midrule
 Decode at 32K, FP16 / INT8 / INT4 / INT2 (tokens/s) & 26.2 / 23.2 / 22.8 / 23.1 \\

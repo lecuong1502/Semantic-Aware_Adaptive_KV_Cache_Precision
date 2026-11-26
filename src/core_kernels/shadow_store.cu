@@ -113,6 +113,17 @@ namespace microinfer
     return shadows_.count(key) != 0;
   }
 
+  std::vector<PageKey> ShadowStore::keys() const
+  {
+    std::vector<PageKey> out;
+    out.reserve(shadows_.size());
+    for (const auto &entry : shadows_)
+    {
+      out.push_back(entry.first);
+    }
+    return out;
+  }
+
   const std::uint8_t *ShadowStore::shadow(PageKey key) const
   {
     const auto it = shadows_.find(key);

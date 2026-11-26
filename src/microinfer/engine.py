@@ -294,7 +294,8 @@ BATCH_FIXED_SECONDS = 0.0005
 SHADOW_PIN_SECONDS = 2e-5
 #: The least a move is taken to cost when the budget sizes a batch.
 MIN_MOVE_SECONDS = 1e-6
-#: Moves a batch has before its time a move is measured past its fixed part.
+#: Moves a batch has before its time a move is measured, past its fixed
+#: part; a smaller batch gives the pace no time at all (#237).
 PACED_BATCH_MOVES = 32
 #: The empty granules an adaptive cache keeps mapped at each quantised tier,
 #: so that an emergency plan's first downgrades have room (#107).
@@ -356,13 +357,17 @@ def next_batch(plan, first: int, held: np.ndarray, shadowed: np.ndarray,
     return MoveBatch(moves, k, skipped, needs)
 
 
-def move_seconds(batch: dict) -> float:
+def move_seconds(batch: dict) -> float | None:
     """What a move of a batch took, for pacing the next (#205): past the
     batch's fixed part and its shadows' pinning, for a batch large enough
-    that those are measured apart; for a small one, its whole time a move,
-    which errs long."""
+    that those are measured apart; None for a smaller one, whose time is
+    mostly its fixed part. Taken for a move's time, as it was before #237,
+    such a batch, a step's last, cut short by the budget, raised the pace's
+    maximum for the next 64 batches tenfold, and kept them small, to be
+    measured so in turn: upgrades from the semantic source went at 36 pages
+    a step."""
     if batch["moves"] < PACED_BATCH_MOVES:
-        return batch["seconds"] / max(batch["moves"], 1)
+        return None
     rest = (batch["seconds"] - BATCH_FIXED_SECONDS
             - batch["shadows_taken"] * SHADOW_PIN_SECONDS)
     return max(rest, 0.0) / batch["moves"]
@@ -1682,7 +1687,7 @@ class Engine:
         plan = controller.upgrade_plan_arrays(
             thresholds.yellow_below_bytes + needed + 1, thresholds, scores, tiers, shadowed,
             page_bytes, errors, move_seconds=seconds, last_downgrade_seconds=None,
-            spike_bytes=0, budget_seconds=self.kv_plan_budget_seconds,
+            upgrade_margin_bytes=0, budget_seconds=self.kv_plan_budget_seconds,
             options=self.kv_plan_options)
         entry = self._controlled_record(cache, plan, source, started)
         self._pending, entry.ended = None, "applied"
@@ -1852,7 +1857,9 @@ class Engine:
                             raise
                         bytes_cap = batch.bytes // 2
                         continue
-                    self._recent_moves.append(move_seconds(pages.last_batch))
+                    measured = move_seconds(pages.last_batch)
+                    if measured is not None:
+                        self._recent_moves.append(measured)
                     if not entry.upgrades:
                         self.last_downgrade_seconds = time.monotonic()
                 entry.skipped += batch.skipped
