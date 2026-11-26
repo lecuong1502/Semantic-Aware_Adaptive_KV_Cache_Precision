@@ -16,13 +16,16 @@ that they still are. #45 names them T_low, T_high and K:
   and no more than its amplitude, rounded up the same way. A fast spike is
   one at RQ1's P10 rise time, its measure over spikes.MEASURED_SHARE of a
   linear ramp. The plan is the one that must be done before RED: enough
-  FP16 pages downgraded to INT8 to give the amplitude back, read and written
-  at INT8, at the bandwidth decoding reaches in RQ1's configuration, the
-  model at its longest logged context, its weights read once per token.
+  FP16 pages downgraded to INT8 to give the amplitude back, each page of
+  each layer one move, at what a batch of moves costs, a fixed part and a
+  part a move, as plan-apply-speed measured it on RQ1's configuration (#205),
+  each move taking its shadow.
 
-It was set before any plan was applied (#105 applies them), so its time
-is an estimate, and ADR-0013 says why this one: the slowest the log
-supports.
+The rule was set before any plan was applied (#105 applies them), and timed
+the plan then at the bandwidth decoding reached, as ADR-0013 says, until a
+plan was measured. #214 puts the measured plan in its place, as ADR-0013
+said it would, before decoding's bandwidth was measured again: it gives the
+same thresholds.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from pathlib import Path
 import numpy as np
 
 from . import benchlog, spikes
+from .config import ModelConfig
 from .contention import RQ1_ISSUES, logged_recordings
 from .footprint import MIB
 from .monitor import POLL_S, Thresholds
@@ -55,7 +59,11 @@ class Measures:
 
     amplitudes_bytes: list[float]
     rises_s: list[float]
-    bandwidth_bytes_per_s: float
+    #: What a batch of moves costs: its fixed part, and its part a move.
+    plan_fixed_s: float
+    plan_s_a_move: float
+    #: The bytes of one FP16 page of one layer, what one move downgrades.
+    page_bytes: int
     downgrade_bits: float  # per element at the tier a plan downgrades to
     sources: dict[str, list[str]] = field(default_factory=dict)
 
@@ -69,7 +77,8 @@ class Workings:
     ramp_ms: float
     detect_ms: float
     downgraded_fp16_mib: float
-    bandwidth_gb_per_s: float
+    moves: int
+    us_a_move: float
     apply_ms: float
     taken_while_acting_mib: float
 
@@ -98,11 +107,12 @@ def derive(measures: Measures, poll_s: float = POLL_S) -> Derivation:
     detect_s = (persist + 1) * poll_s
     ratio = measures.downgrade_bits / FP16_BITS
     downgraded = amplitude / (1 - ratio)  # FP16 bytes that give the amplitude back
-    apply_s = downgraded * (1 + ratio) / measures.bandwidth_bytes_per_s
+    moves = math.ceil(downgraded / measures.page_bytes)
+    apply_s = measures.plan_fixed_s + moves * measures.plan_s_a_move
     ramp_s = rise / spikes.MEASURED_SHARE
     taken = min(amplitude, amplitude / ramp_s * (detect_s + apply_s))
     workings = Workings(amplitude / MIB, rise * 1e3, ramp_s * 1e3, detect_s * 1e3,
-                        downgraded / MIB, measures.bandwidth_bytes_per_s / 1e9, apply_s * 1e3,
+                        downgraded / MIB, moves, measures.plan_s_a_move * 1e6, apply_s * 1e3,
                         taken / MIB)
     return Derivation(Thresholds(red, red + _round_up(taken), persist), workings)
 
@@ -110,10 +120,9 @@ def derive(measures: Measures, poll_s: float = POLL_S) -> Derivation:
 def measures_from_log(log: str | Path = benchlog.DEFAULT_LOG, issues=RQ1_ISSUES,
                       model: str = MODEL, tier: str = DOWNGRADE_TIER) -> Measures:
     """RQ1's spikes, recovered and lasting, censored ones left out: their
-    amplitudes, and the rise times measured; the decode bandwidth of `model`
-    at its longest logged context, its weights read once per token; and the
-    effective bits of `tier` for `model`. Where an entry has been logged
-    again, the latest."""
+    amplitudes, and the rise times measured; what a plan's batch of moves
+    costs on `model`, and the bytes of its FP16 page; and the effective bits
+    of `tier` for `model`. Where an entry has been logged again, the latest."""
     amplitudes, rises, recordings = [], [], []
     for entry in logged_recordings(log, issues):
         recordings.append(entry["sha256"])
@@ -124,25 +133,24 @@ def measures_from_log(log: str | Path = benchlog.DEFAULT_LOG, issues=RQ1_ISSUES,
             if spike["rise_ms"] is not None:
                 rises.append(spike["rise_ms"] / 1e3)
 
-    decode = weights = bits = None
+    plan = bits = None
     for entry in benchlog.read(log):
         if entry["model"] != model:
             continue
         kind = entry["kind"]
-        if kind == "decode-throughput" and (
-                decode is None or entry["context_length"] >= decode["context_length"]):
-            decode = entry
-        elif kind == "weight-allocation" and "arena_bytes" in entry["results"]:
-            weights = entry
+        if kind == "plan-apply-speed":
+            plan = entry
         elif kind == "kv-quantisation-roundtrip" and entry["precision_tiers"] == {tier: 1.0}:
             bits = entry
-    if decode is None or weights is None or bits is None:
-        raise ValueError(f"the log lacks {model}'s decode throughput, its weights' arena "
-                         f"bytes or {tier}'s effective bits")
+    if plan is None or bits is None:
+        raise ValueError(f"the log lacks what a plan costs on {model}, or {tier}'s "
+                         f"effective bits")
+    cfg = ModelConfig.from_card(model)
+    page_bytes = (2 * plan["config"]["page_tokens"] * cfg.num_key_value_heads * cfg.head_dim
+                  * FP16_BITS // 8)
     return Measures(
-        amplitudes, rises,
-        weights["results"]["arena_bytes"] * decode["results"]["tokens_per_second"],
+        amplitudes, rises, plan["results"]["batch_fixed_seconds"],
+        plan["results"]["batch_seconds_a_move"], page_bytes,
         bits["results"]["effective_bits"],
-        {"contention-trace": recordings, "decode-throughput": [decode["sha256"]],
-         "weight-allocation": [weights["sha256"]],
+        {"contention-trace": recordings, "plan-apply-speed": [plan["sha256"]],
          "kv-quantisation-roundtrip": [bits["sha256"]]})

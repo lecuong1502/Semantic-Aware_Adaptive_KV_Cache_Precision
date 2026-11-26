@@ -41,3 +41,25 @@ def test_the_overhead_gives_each_side_s_per_token_latency(engine):
         latency = results["token_ms"][side]
         assert latency["n"] == len(latency["runs"]) == 2 * (tool.DECODE_STEPS - 1)
         assert 0 < latency["median"] <= latency["p99"] <= latency["max"]
+
+
+def test_decode_is_timed_by_its_steps_run_by_run(monkeypatch):
+    """Each run's rate is its timed steps over their time, the prefill left
+    out, and the figure is the median run's (#214)."""
+    tool = load_tool("throughput")
+    clock = iter([1.0, 1.5, 2.0,  # run 1: steps of 0.5 s
+                  11.0, 11.25, 11.5,  # run 2: 0.25 s
+                  21.0, 22.0, 23.0])  # run 3: 1 s
+
+    class Engine:
+        def generate(self, prompt, new, *, stop_at_eos, report=None):
+            for position in range(3):
+                if report is not None:
+                    report(tool.DECODING, position, 0)
+
+    clocked = tool.step_clock
+    monkeypatch.setattr(tool, "step_clock",
+                        lambda token_s: clocked(token_s, now=lambda: next(clock)))
+    got = tool.decode_runs(Engine(), [1, 2], repeat=3, warmup=0)
+    assert got["runs_tokens_per_second"] == [2.0, 4.0, 1.0]
+    assert got["tokens_per_second"] == 2.0 and got["steps_timed"] == 2

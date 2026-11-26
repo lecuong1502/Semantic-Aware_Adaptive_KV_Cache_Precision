@@ -119,3 +119,35 @@ These are the provisional values of #61, now derived.
   RQ1 measured was 567 MiB. A spike above the P90 can still run a machine
   that sits just above RED out of memory. That risk is the one the P90
   accepts, and #64 and #65 measure what the monitor misses.
+
+---
+
+## Amendment (#214): the plan's measured cost replaces decoding's bandwidth
+
+The rule timed its plan at the bandwidth decoding reached, "until Milestone 2
+measures one. Once it does, its time replaces this estimate." #205 measured
+one (`plan-apply-speed` `867dcd81…`, ADR-0015): a batch of moves costs 20 µs
+and 18.2 µs a move, each move taking its page's shadow. #214 measures
+decoding again on an engine some fifty times faster at 32K, which at its
+bandwidth would have timed the plan at about 20 ms and moved YELLOW to 896 MiB.
+That would have been the estimate outliving what it stood for. The measured
+plan replaces it now, before the new decoding entries are logged:
+
+- **The plan** downgrades the FP16 pages that give the amplitude back at INT8,
+  one move a page of a layer, 32 KiB at Qwen2.5-1.5B's shape and 32 positions a
+  page. It takes the batch's fixed part and the moves' part.
+- The rule takes the latest `plan-apply-speed` entry of the model, as it took
+  the latest decoding entry, and no longer reads decoding or the weights.
+
+| | Working | Value |
+|---|---|---|
+| Plan applied | 1099 MiB of FP16, 35,153 moves, at 20 µs + 18.2 µs a move | 641 ms |
+| Taken while acting | 506 MiB × (200 + 641) ms / 303 ms, at most 506 MiB | 506 MiB |
+| YELLOW below (T_high) | 512 + 506 MiB, rounded up | **1024 MiB** |
+
+**The thresholds are unchanged,** and so is what every result measured
+against them means. The plan still outlasts a fast spike's ramp: only one
+under 103 ms, 2.9 µs a move, would lower YELLOW, and a move that takes its
+shadow costs six times that. A move from a shadow already held costs about
+3 µs (ADR-0015), so pinning shadows ahead of need, left for later there, is
+what would move YELLOW, and should run this rule again.
