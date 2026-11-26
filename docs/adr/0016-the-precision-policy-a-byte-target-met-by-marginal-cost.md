@@ -440,21 +440,26 @@ itself. `controller.DEFAULT_UPGRADE_MARGIN_BYTES`.
   Results before #237 were measured with 512 MiB; #216 runs the survival matrix
   again with 128.
 
-**As measured (#237).** S5 and S6 again at 1442f35, Qwen2.5-1.5B. S6, a 30 s
-pulse during prefill, 30,720 positions and 2,048 decoded: every source restored
-its whole cache to FP16 (`pulse-release` `f0294324…`, `76b5cf30…`,
-`731c6406…`):
+**As measured (#237).** S5 and S6 again at 1442f35, with the pace and margin
+fixed, and again at 018193a, with the frees and maps fixed too; Qwen2.5-1.5B.
+S6, a 30 s pulse during prefill, 30,720 positions and 2,048 decoded: every
+source restored its whole cache to FP16 in both.
 
-| Source | Moves up | Steps | Moves a step | Restored, after the release | Bits after |
-|---|---:|---:|---:|---:|---:|
-| Semantic | 81,144 | 506 | 160 | 51 s | 12.09 |
-| Uniform | 81,060 | 133 | 609 | 17 s | 14.54 |
-| Random | 81,060 | 557 | 146 | 56 s | 12.04 |
+| Source | Steps of upgrades | Moves a step | Restored, after the release | Bits after |
+|---|---:|---:|---:|---:|
+| Semantic, 018193a (`2635abe0…`) | 58 | 1,403 | 9.5 s | 14.59 |
+| Uniform, 018193a (`f0f9d1a8…`) | 50 | 1,626 | 9.0 s | 14.71 |
+| Random, 018193a (`c37c16f2…`) | 61 | 1,333 | 9.8 s | 14.64 |
+| Semantic, 1442f35 (`f0294324…`) | 506 | 160 | 51 s | 12.09 |
+| Uniform, 1442f35 (`76b5cf30…`) | 133 | 609 | 17 s | 14.54 |
+| Random, 1442f35 (`731c6406…`) | 557 | 146 | 56 s | 12.04 |
 
-The first upgrade came 5 s after the release, the cooldown. Each step's batches
-took about 22 ms. Once restored, 1281 to 1297 MiB stayed free at the lowest,
+The first upgrade came 5 s after the release, the cooldown, and a step's
+upgrades took 18 to 22 ms. Once restored, 1437 to 1441 MiB stayed free at the
+lowest at 018193a, 1281 to 1297 MiB at 1442f35 as the desktop held more, each
 above the 1152 MiB kept, and the level stayed GREEN: no run downgraded again or
-had an upgrade plan cancelled. S5 (`survival` `e5c675ad…`, `2588d7d5…`,
-`15e965a7…`): the static engine ran out of memory at 21,504 positions, 2.7 s
-after the take; the semantic engine completed, 33 plans, 748 MiB returned and
-seen by the driver plan by plan; every event waited at most 192 ms for its step.
+had an upgrade plan cancelled. S5 at 018193a (`survival` `15927e16…`,
+`ad920f4f…`, `62abaf82…`): the static engine ran out of memory at 21,504
+positions, 2.6 s after the take; the semantic engine completed, 34 plans,
+748 MiB returned and seen by the driver plan by plan; every event waited at
+most 196 ms for its step.

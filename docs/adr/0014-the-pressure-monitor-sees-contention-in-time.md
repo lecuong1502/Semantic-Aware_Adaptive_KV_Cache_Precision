@@ -522,11 +522,12 @@ settle before it runs.
 
 ## Note from #237: S5 and S6 on the fixed upgrades
 
-#237 fixed the upgrades' pace and margin (ADR-0016, amendment from #237) and ran
-S5 and S6 again at 1442f35. S5: the static FP16 engine ran out of memory at
-21,504 positions, 2.7 s after the take (`survival` `e5c675ad…`); the semantic
-engine completed, 33 plans, 85,596 downgrades, 748 MiB returned and seen by the
-driver, plan by plan to a granule (`2588d7d5…`). S6: every source completed and
-restored its whole cache to FP16, 17 to 56 s after the release
-(`pulse-release` `f0294324…`, `76b5cf30…`, `731c6406…`). The paper's survival
-figure is drawn from `survival-timeline` `f74739e3…`.
+#237 fixed the upgrades' pace and margin, and a batch's costs that grew with
+the cache (ADR-0016, amendment from #237), and ran S5 and S6 again at 018193a.
+S5: the static FP16 engine ran out of memory at 21,504 positions, 2.6 s after
+the take (`survival` `15927e16…`); the semantic engine completed, 34 plans,
+85,596 downgrades, 748 MiB returned and seen by the driver, plan by plan to a
+granule (`ad920f4f…`). S6: every source completed and restored its whole cache
+to FP16, 9.0 to 9.8 s after the release (`pulse-release` `2635abe0…`,
+`f0f9d1a8…`, `c37c16f2…`). The paper's survival figure is drawn from the
+`survival-timeline` `c32e0517…`.
