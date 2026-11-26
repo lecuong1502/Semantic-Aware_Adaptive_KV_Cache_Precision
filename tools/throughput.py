@@ -16,7 +16,11 @@ They are two different regimes, so they are two entries per length:
 - **Decode** runs one position per step and reads every weight each time,
   so it is bound by memory bandwidth. It is reported as generated tokens per
   second, after a prompt of each length, since each step's attention reads
-  the whole cache.
+  the whole cache. Each of --repeat runs times its steps themselves, each
+  from the report of the token before (#214): the median run is the figure,
+  and every run's rate is logged beside it. Before #214 a run's steps were
+  timed as a generation less its prefill, which at 32K, once prefill took
+  seconds and the steps one, left the steps' time in a prefill's noise.
 
 Each prefill entry also records the peak footprint, which is how a 32K-token
 prompt on the 1.5B model is shown to fit on a 6 GiB card. Prompts are
@@ -89,6 +93,24 @@ def with_steps(engine: Engine, prompt: np.ndarray, report=None):
     """The same, and DECODE_STEPS more tokens decoded, each reported to
     `report` as generate reports them, if given."""
     return lambda: engine.generate(prompt, DECODE_STEPS + 1, stop_at_eos=False, report=report)
+
+
+def decode_runs(engine: Engine, prompt: np.ndarray, repeat: int, warmup: int) -> dict:
+    """`repeat` runs of DECODE_STEPS decoded tokens after `prompt`, after
+    `warmup` untimed ones: each run's rate over the steps it timed, and the
+    median run's."""
+    for _ in range(warmup):
+        with_steps(engine, prompt)()
+    rates, timed = [], []
+    for _ in range(repeat):
+        token_s: list[float] = []
+        with_steps(engine, prompt, step_clock(token_s))()
+        rates.append(len(token_s) / sum(token_s))
+        timed.append(len(token_s))
+    # "seconds" was a generation less its prefill before #214; a run's steps'
+    # own time is in its rate, so it is not given.
+    return {"prompt_tokens": len(prompt), "steps": DECODE_STEPS, "steps_timed": timed,
+            "tokens_per_second": statistics.median(rates), "runs_tokens_per_second": rates}
 
 
 def step_clock(token_s: list[float], now=time.perf_counter):
@@ -221,8 +243,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--kv-tier", default="FP16", choices=Engine.KV_TIERS,
                         help="the static tier the cache is held at (#18)")
     parser.add_argument("--prefill-only", action="store_true",
-                        help="log prefill alone; at 32K each decode timing costs two "
-                             "more prefills")
+                        help="log prefill alone; at 32K each decode run costs a "
+                             "prefill more")
     parser.add_argument("--monitor", action="store_true",
                         help="measure the pressure monitor's cost to decoding, instead")
     parser.add_argument("--scorer", action="store_true",
@@ -275,21 +297,20 @@ def main(argv: list[str]) -> int:
         if args.prefill_only:
             continue
 
-        # Decode: generation of one token (prefill and its greedy choice)
-        # and of DECODE_STEPS more are both timed; the difference is the
-        # steps alone. The prompt is shortened, if it must be, so that the
-        # steps stay inside the model's context window.
+        # Decode: DECODE_STEPS tokens after the prefill's, each step timed
+        # from the token before's report, the first left out (step_clock).
+        # The prompt is shortened, if it must be, so that the steps stay
+        # inside the model's context window.
         prompt = decode_prompt(engine, ids)
-        prefill_only = prefill_seconds if len(prompt) == length else timed(
-            first_token(engine, prompt), args.repeat, args.warmup)
-        steps_seconds = max(timed(with_steps(engine, prompt), args.repeat, args.warmup)
-                            - prefill_only, 1e-9)
-        decode = {"prompt_tokens": len(prompt), "steps": DECODE_STEPS, "seconds": steps_seconds,
-                  "tokens_per_second": DECODE_STEPS / steps_seconds}
-        print(f"decode  after {length:6}: {DECODE_STEPS / steps_seconds:9.1f} tok/s")
+        decode = decode_runs(engine, prompt, args.repeat, args.warmup)
+        print(f"decode  after {length:6}: {decode['tokens_per_second']:9.1f} tok/s, runs "
+              + " ".join(f"{r:.1f}" for r in decode["runs_tokens_per_second"]))
         benchlog.append("decode-throughput", model=args.model,
                         context_length=len(prompt) + DECODE_STEPS,
-                        precision_tiers=tiers, config={**method, "steps": DECODE_STEPS},
+                        precision_tiers=tiers,
+                        config={**method, "steps": DECODE_STEPS,
+                                "timed": "each step from the token before's report, the "
+                                         "first step left out; the median run"},
                         results=decode, log=args.log)
     return 0
 

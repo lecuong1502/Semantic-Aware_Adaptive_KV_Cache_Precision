@@ -119,3 +119,45 @@ These are the provisional values of #61, now derived.
   RQ1 measured was 567 MiB. A spike above the P90 can still run a machine
   that sits just above RED out of memory. That risk is the one the P90
   accepts, and #64 and #65 measure what the monitor misses.
+
+---
+
+## Amendment (#214): the plan's measured cost replaces decoding's bandwidth
+
+The rule timed its plan at the bandwidth decoding reached, "until Milestone 2
+measures one. Once it does, its time replaces this estimate." #205 measured
+one (`plan-apply-speed` `867dcd81…`, ADR-0015): a batch of moves costs 20 µs
+and 18.2 µs a move, each move taking its page's shadow. #214 measured it again
+(`c1fbaf65…`): 0.86 ms and 18.1 µs, the table's below. #214 measures
+decoding again on an engine some fifty times faster at 32K, which at its
+bandwidth would have timed the plan at about 20 ms and moved YELLOW to 896 MiB.
+That would have been the estimate outliving what it stood for. The measured
+plan replaces it now, before the new decoding entries are logged:
+
+- **The plan** downgrades the FP16 pages that give the amplitude back at INT8,
+  one move a page of a layer, 32 KiB at Qwen2.5-1.5B's shape and 32 positions a
+  page. It takes the batch's fixed part and the moves' part.
+- The rule takes the latest `plan-apply-speed` entry of the model, as it took
+  the latest decoding entry, and no longer reads decoding or the weights.
+
+| | Working | Value |
+|---|---|---|
+| Plan applied | 1099 MiB of FP16, 35,153 moves, at 0.86 ms + 18.1 µs a move (`plan-apply-speed` `c1fbaf65…`, #214) | 638 ms |
+| Taken while acting | 506 MiB × (200 + 638) ms / 303 ms, at most 506 MiB | 506 MiB |
+| YELLOW below (T_high) | 512 + 506 MiB, rounded up | **1024 MiB** |
+
+**The thresholds are unchanged,** and so is what every result measured
+against them means. The plan still outlasts a fast spike's ramp: only one
+under 68 ms, under 2.0 µs a move, would lower YELLOW, to 960 MiB, and a move that
+takes its shadow costs about ten times that. A move from a shadow already
+held costs about 3 µs (ADR-0015), so even pinning every shadow ahead of need
+would leave YELLOW where it is.
+
+- **What the entry measured.** It is Seam B, at Qwen2.5-1.5B's shapes with no
+  model loaded, and its cost a move is the fit over batches of 1 to 4096
+  first downgrades to INT4. The rule's plan downgrades to INT8, which
+  quantises no more and writes more. The fit's fixed part is poorly measured,
+  20 µs in one entry and 0.86 ms in the next, against ADR-0015's 0.2 to 0.3 ms;
+  it is a millisecond of the plan's 638, and the moves are the rest.
+- **A later `plan-apply-speed` entry** is the one the rule takes; the test fails
+  if the thresholds move.

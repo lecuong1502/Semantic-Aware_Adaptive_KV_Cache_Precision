@@ -503,3 +503,17 @@ anew. The figure's script reads the log alone.
   them: B6's S6 run has nine of each.
 - **The headroom** is the lowest sample of each 0.25 s, to 620 s after the
   take.
+
+---
+
+## Note from #214: S5 and S6 again, on the present engine
+
+#214 ran the survival experiment again after #204, #205 and #213, at the code of
+839c7f2. S5: the static FP16 engine ran out of memory at 22,016 positions, 3.0 s
+after the take (`survival` `5e819ea1…`); the semantic engine completed, 17
+plans, 85,596 downgrades, 748 MiB returned and seen by the driver, plan by
+plan to a granule (`1e099d65…`). S6: every source completed, and none restored
+its cache to FP16 (ADR-0016, note from #214; #237). The survival matrix, S1 to
+S4, was not run again: its protocol meets little of S1's 494 s on an engine
+that finishes the positions after the take in some 15 s, which #216 is to
+settle before it runs.

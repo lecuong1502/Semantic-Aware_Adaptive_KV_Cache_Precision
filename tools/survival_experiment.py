@@ -8,6 +8,7 @@
         [--model qwen2.5-1.5b-instruct] [--prompt-positions 32704] [--new-tokens 64]
         [--contention-at 16384] [--shortfall 256] [--score-source semantic]
         [--pulse SECONDS] [--kv-tier FP16|INT8|INT4|INT2] [--scenario S1|S2|S3|S4|S5] [--run N]
+        [--pressure-chunk-seconds SECONDS]
 
 Qwen2.5-1.5B prefills a prompt and decodes to 32K positions, its cache at
 FP16, with its pressure monitor on (microinfer.survival.run). When the cache
@@ -113,6 +114,11 @@ def main(argv: list[str]) -> int:
                         help="the contention: S5's step, or a scenario of the matrix (#190)")
     parser.add_argument("--run", type=int, default=0,
                         help="the run of its cell, the scenario's seed")
+    parser.add_argument("--pressure-chunk-seconds", type=float, default=None,
+                        help="the time a prefill chunk is sized to under pressure (#135); "
+                             "the engine's default unless given. A large one, 1000, keeps "
+                             "chunks of 512 under pressure too, as before #135, which "
+                             "#214's reaction is set against")
     parser.add_argument("--log", type=Path, default=benchlog.DEFAULT_LOG)
     args = parser.parse_args(argv)
     if args.out.exists():
@@ -149,8 +155,10 @@ def main(argv: list[str]) -> int:
         contention = {"schedule": on_base}
     else:
         contention = {"shortfall_bytes": int(shortfall * MIB), "pulse_s": args.pulse}
+    chunk_seconds = ({} if args.pressure_chunk_seconds is None
+                     else {"pressure_chunk_seconds": args.pressure_chunk_seconds})
     engine = Engine(REPO / "models" / args.model, kv_tier=args.kv_tier, kv_adaptive=adaptive,
-                    kv_score_source=args.score_source)
+                    kv_score_source=args.score_source, **chunk_seconds)
     engine.load_weights()
     prompt = np.random.default_rng(SEED).integers(
         1000, engine.config.vocab_size - 1000, args.prompt_positions).astype(np.int32)
