@@ -195,7 +195,7 @@ def main(argv: list[str]) -> int:
               else None,
               "pulse_s": args.pulse,
               "upgrade_cooldown_seconds": engine.kv_upgrade_cooldown_seconds,
-              "upgrade_margin_mib": controller.DEFAULT_UPGRADE_SPIKE_BYTES / MIB,
+              "upgrade_margin_mib": controller.DEFAULT_UPGRADE_MARGIN_BYTES / MIB,
               "simulator_context_bytes": context_bytes, "poll_s": monitor.POLL_S,
               "thresholds": asdict(monitor.DEFAULT),
               "files": {f.name: benchlog.file_sha256(f) for f in files if f.exists()}}

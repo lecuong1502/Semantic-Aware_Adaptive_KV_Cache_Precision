@@ -294,7 +294,8 @@ BATCH_FIXED_SECONDS = 0.0005
 SHADOW_PIN_SECONDS = 2e-5
 #: The least a move is taken to cost when the budget sizes a batch.
 MIN_MOVE_SECONDS = 1e-6
-#: Moves a batch has before its time a move is measured past its fixed part.
+#: Moves a batch has before its time a move is measured, past its fixed
+#: part; a smaller batch gives the pace no time at all (#237).
 PACED_BATCH_MOVES = 32
 #: The empty granules an adaptive cache keeps mapped at each quantised tier,
 #: so that an emergency plan's first downgrades have room (#107).
@@ -1686,7 +1687,7 @@ class Engine:
         plan = controller.upgrade_plan_arrays(
             thresholds.yellow_below_bytes + needed + 1, thresholds, scores, tiers, shadowed,
             page_bytes, errors, move_seconds=seconds, last_downgrade_seconds=None,
-            spike_bytes=0, budget_seconds=self.kv_plan_budget_seconds,
+            upgrade_margin_bytes=0, budget_seconds=self.kv_plan_budget_seconds,
             options=self.kv_plan_options)
         entry = self._controlled_record(cache, plan, source, started)
         self._pending, entry.ended = None, "applied"

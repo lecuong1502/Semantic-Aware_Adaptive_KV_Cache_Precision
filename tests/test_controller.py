@@ -246,9 +246,9 @@ def test_the_floor_is_a_parameter_recorded_in_every_plan():
 
 # -- the upgrade policy (#103) ----------------------------------------------------
 
-#: Headroom at which upgrades may begin: GREEN's threshold, T_high, and a
-#: P90 spike above it.
-UPGRADE_LINE = THRESHOLDS.yellow_below_bytes + controller.DEFAULT_UPGRADE_SPIKE_BYTES
+#: Headroom at which upgrades may begin: GREEN's threshold, T_high, and the
+#: upgrade margin above it.
+UPGRADE_LINE = THRESHOLDS.yellow_below_bytes + controller.DEFAULT_UPGRADE_MARGIN_BYTES
 
 
 def make_upgrades(headroom, scores, tiers, now=100.0, last_downgrade=0.0, budget=0.020,
@@ -275,7 +275,7 @@ def test_no_upgrade_within_five_seconds_of_a_downgrade():
 
 
 def test_no_upgrade_leaves_headroom_below_the_line():
-    """Only at GREEN, and never past T_high + 512 MiB: the upgrades take at
+    """Only at GREEN, and never past T_high + the margin: the upgrades take at
     most the headroom above that line, at any headroom; below it, or at
     YELLOW or RED, there are none."""
     rng = np.random.default_rng(103)

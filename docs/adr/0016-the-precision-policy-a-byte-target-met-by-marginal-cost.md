@@ -369,11 +369,12 @@ milliseconds:
 causes, each measured on the engine, Qwen2.5-1.5B at 30,720 positions, a
 controlled plan at 80% then a controlled restore, which keeps no margin:
 
-**1. The pace.** A batch's time a move was its whole time over its moves for a
-batch of fewer than 32 moves, and the pace is twice the largest of the last 64.
-A step's last batch, cut short by what is left of the budget, is mostly its
-fixed part: a batch of one move takes 0.14 to 0.43 ms, of 512 moves 2.6 to
-4.3 ms (unlogged). Read as a move's time it raised the pace tenfold for the next
+**1. The pace.** The pace is twice the largest time a move of the last 64
+batches, and a batch of fewer than 32 moves gave its whole time over its
+moves as that time. A step's last batch, cut short by what is left of the
+budget, is mostly its fixed part: a batch of one move takes 0.14 to 0.43 ms,
+of 512 moves 2.6 to 4.3 ms (unlogged). Read as a move's time it set the pace
+at 0.3 to 0.9 ms a move, against about 10 µs from large batches, for the next
 64 batches, which were then as small and read the same way. The semantic and
 random sources, whose orders leave such batches, fell to about 36 moves a step;
 uniform's, which rarely did, did not. A batch too small to measure past its
@@ -386,7 +387,8 @@ controlled restore of every page (unlogged):
 | Uniform | 334, 6.8 s | 68, 1.5 s |
 | Random | 1,778, 36.0 s | 200, 4.0 s |
 
-Semantic's moves still cost about three times uniform's, 10 against 3.7 µs:
+Semantic's moves still cost about three times uniform's, 10 against 3.7 µs
+(unlogged):
 its pages are scattered through each tier, and a free fills each hole by
 moving a page down from the tier's end.
 
@@ -396,7 +398,8 @@ itself keeps one P90 spike above RED (ADR-0013). On the RTX 4050, Qwen2.5-1.5B
 with an FP16 cache of 32K positions leaves about 1310 MiB with nothing
 contending. Once a cache at 32K was downgraded, it could not come back to FP16.
 #155's runs came back only because their cache grew at FP16 after the release,
-and growth keeps no margin: they ended at 1511 MiB.
+and growth keeps no margin: the semantic one's last upgrade left 1511 MiB
+(`survival-timeline` `6ae3da2f…`, of `94948638…`).
 
 The margin is now **128 MiB, two spike thresholds**: enough that the desktop's
 own jitter does not swing the level between YELLOW and GREEN as upgrades bring

@@ -1,6 +1,6 @@
 """Upgrades at GREEN, in the decode loop (#106, Seam A).
 
-When the monitor reads GREEN, with headroom above T_high plus a P90 spike,
+When the monitor reads GREEN, with headroom above T_high plus the upgrade margin,
 and the cooldown since the last downgrade has passed, the engine restores
 pages from their FP16 shadows between steps, in the upgrade policy's order
 (#103), within the same per-step budget as a YELLOW plan. A pressure event
@@ -24,7 +24,7 @@ MIB = 2**20
 NAME = "qwen2.5-0.5b-instruct"
 #: Short, so that a test waits on it for a fraction of a second.
 COOLDOWN = 0.3
-#: GREEN, above T_high + 512 MiB by far: every page fits back at FP16.
+#: GREEN, above T_high and the upgrade margin by far: every page fits back at FP16.
 AMPLE_MIB = 8000
 
 
@@ -109,7 +109,8 @@ def test_after_contention_passes_pages_return_to_fp16_in_the_policy_s_order():
     headroom_bytes, thresholds, scores, tiers, shadowed = next(
         inputs for made, inputs in planned_from if made is plan)
     keys = list(zip(*np.nonzero(tiers >= 0)))
-    available = headroom_bytes - thresholds.yellow_below_bytes - controller.DEFAULT_UPGRADE_SPIKE_BYTES
+    available = (headroom_bytes - thresholds.yellow_below_bytes
+                 - controller.DEFAULT_UPGRADE_MARGIN_BYTES)
     assert [(u.layer, u.page, u.current_tier, u.target_tier) for u in plan.upgrades] == \
         upgrade_greedy_reference(
             available, {(int(l), int(p)): float(scores[l, p]) for l, p in keys},

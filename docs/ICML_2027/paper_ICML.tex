@@ -383,8 +383,8 @@ costs more per byte than the last; a page the model hardly attends to goes deep
 first. The open pages and the last 128 positions are never downgraded.
 Upgrades come at GREEN only, largest gain first, at least 5\,s after the later
 of the last downgrade and the end of pressure, and never below $T_\mathrm{high}
-+ 128$\,MiB of headroom, two spike thresholds against the desktop's jitter. Any \textit{score source} plugs into the same
-planner and meets the same byte target to within one page's move. At runtime it
++ 128$\,MiB of headroom, two spike thresholds against the desktop's jitter.
+Any \textit{score source} plugs into the same planner and meets the same byte target to within one page's move. At runtime it
 is the scorer's (\textit{semantic}), equal scores spread evenly across positions
 (\textit{uniform}, the baseline), or seeded random scores; RQ3 adds ZipCache's.
 
