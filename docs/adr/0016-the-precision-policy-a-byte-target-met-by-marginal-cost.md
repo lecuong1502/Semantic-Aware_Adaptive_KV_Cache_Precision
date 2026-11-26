@@ -331,3 +331,32 @@ the probes (2026-11-24).
   (`RUNTIME_SOURCES`); a pass over the cache would cost what it is planning
   for. The survival matrix has no such condition, and the emergency plan of
   a run under this source reads the scorer's scores.
+
+---
+
+## Note from #214: on the present engine, chunks stay at 512
+
+Since split-key decode (#204) and prefill on the tensor cores (#213), a chunk of
+512 positions of Qwen2.5-1.5B takes at most 0.44 s at 32K, at any tier
+(`prefill-chunk-cost`, #214). That is under `pressure_chunk_seconds`, 0.8 s,
+so the step-cost model leaves chunks at 512 under pressure, and the first event
+of an episode waits for one such chunk at most. Measured in the survival
+experiment, S5 (`survival` `1e099d65…`): every YELLOW and RED event waited at
+most 218 ms for its step, the episode's first 195 ms, and was planned 184 ms
+after it at the median. With chunks kept at 512 under pressure
+(`--pressure-chunk-seconds 1000`, `9544e952…`) the waits and the time from the
+take to the end, 16.9 s, were the same. The 2.4 times that sizing cost on the
+engine before is gone, and so is the first event's 11 s.
+
+The design stands for a slower engine or a longer context. Two of its
+constants were set for steps of a second or more, and now meet steps of tens of
+milliseconds:
+
+- **The plan budget, 20 ms a step,** is about half a decoding step at 32K
+  (26 tokens a second), where it was about 1% of one. A paced plan nearly
+  doubles a step while it lasts.
+- **Upgrades keep 512 MiB above YELLOW.** Prefill now ends before a 30 s pulse is
+  released, so the whole cache is held when the upgrades come, and the margin
+  left no room to restore it: no S6 run of #214 restored its cache
+  (`pulse-release` `a2f64a62…`, `b384d307…`, `054c06ed…`). #237 is to find out
+  whether that, and the semantic source's slow pacing there, should change.

@@ -127,7 +127,8 @@ These are the provisional values of #61, now derived.
 The rule timed its plan at the bandwidth decoding reached, "until Milestone 2
 measures one. Once it does, its time replaces this estimate." #205 measured
 one (`plan-apply-speed` `867dcd81…`, ADR-0015): a batch of moves costs 20 µs
-and 18.2 µs a move, each move taking its page's shadow. #214 measures
+and 18.2 µs a move, each move taking its page's shadow. #214 measured it again
+(`c1fbaf65…`): 0.86 ms and 18.1 µs, the table's below. #214 measures
 decoding again on an engine some fifty times faster at 32K, which at its
 bandwidth would have timed the plan at about 20 ms and moved YELLOW to 896 MiB.
 That would have been the estimate outliving what it stood for. The measured
@@ -141,8 +142,8 @@ plan replaces it now, before the new decoding entries are logged:
 
 | | Working | Value |
 |---|---|---|
-| Plan applied | 1099 MiB of FP16, 35,153 moves, at 20 µs + 18.2 µs a move | 641 ms |
-| Taken while acting | 506 MiB × (200 + 641) ms / 303 ms, at most 506 MiB | 506 MiB |
+| Plan applied | 1099 MiB of FP16, 35,153 moves, at 0.86 ms + 18.1 µs a move (`plan-apply-speed` `c1fbaf65…`, #214) | 638 ms |
+| Taken while acting | 506 MiB × (200 + 638) ms / 303 ms, at most 506 MiB | 506 MiB |
 | YELLOW below (T_high) | 512 + 506 MiB, rounded up | **1024 MiB** |
 
 **The thresholds are unchanged,** and so is what every result measured
@@ -155,8 +156,8 @@ would leave YELLOW where it is.
 - **What the entry measured.** It is Seam B, at Qwen2.5-1.5B's shapes with no
   model loaded, and its cost a move is the fit over batches of 1 to 4096
   first downgrades to INT4. The rule's plan downgrades to INT8, which
-  quantises no more and writes more; ADR-0015's figure for a batch's fixed part,
-  0.2 to 0.3 ms, is of the entry before its review's fixes (`1532d515…`).
-- **A later `plan-apply-speed` entry** is the one the rule takes. #214 logs
-  one; this table is derived again from it once logged, and the test fails if
-  the thresholds move.
+  quantises no more and writes more. The fit's fixed part is poorly measured,
+  20 µs in one entry and 0.86 ms in the next, against ADR-0015's 0.2 to 0.3 ms;
+  it is a millisecond of the plan's 638, and the moves are the rest.
+- **A later `plan-apply-speed` entry** is the one the rule takes; the test fails
+  if the thresholds move.
